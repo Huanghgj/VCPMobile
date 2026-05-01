@@ -66,8 +66,9 @@ enum BlockType {
 }
 
 lazy_static! {
-    // 核心修复：为所有 VCP 块的起始标记强制增加行首锚定符 `(?im)^[ \t]*`
-    // 这将彻底消除因正文提及 `<<<[TOOL_REQUEST]>>>` 等内联代码而引发的 AST 错误截断
+    // 核心修复：为主动生成类 VCP 块的起始标记强制增加行首锚定符 `(?im)^[ \t]*`
+    // 这将彻底消除因正文提及 `<<<[TOOL_REQUEST]>>>` 等内联代码而引发的 AST 错误截断。
+    // 工具结果块由后端拼入 AI 正文，桌面端允许其不在行首；这里保持同样兼容性。
     static ref TOOL_START: Regex = Regex::new(r"(?im)^[ \t]*<<<\[TOOL_REQUEST\]>>>").unwrap();
     static ref TOOL_END: Regex = Regex::new(r"(?im)^[ \t]*<<<\[END_TOOL_REQUEST\]>>>").unwrap();
     static ref TOOL_NAME: Regex = Regex::new(r"<tool_name>([\s\S]*?)</tool_name>|tool_name:\s*「始(?:exp)?」([^「」]*)「末(?:exp)?」").unwrap();
@@ -78,8 +79,8 @@ lazy_static! {
     static ref THINK_START: Regex = Regex::new(r"(?im)^[ \t]*(?i)<think(?:ing)?>").unwrap();
     static ref THINK_END: Regex = Regex::new(r"(?im)^[ \t]*(?i)</think(?:ing)?>").unwrap();
 
-    static ref TOOL_RESULT_START: Regex = Regex::new(r"(?im)^[ \t]*\[\[VCP调用结果信息汇总:").unwrap();
-    static ref TOOL_RESULT_END: Regex = Regex::new(r"(?im)^[ \t]*VCP调用结果结束\]\]").unwrap();
+    static ref TOOL_RESULT_START: Regex = Regex::new(r"\[\[VCP调用结果信息汇总:").unwrap();
+    static ref TOOL_RESULT_END: Regex = Regex::new(r"VCP调用结果结束\]\]").unwrap();
 
     static ref DIARY_START: Regex = Regex::new(r"(?im)^[ \t]*<<<DailyNoteStart>>>").unwrap();
     static ref DIARY_END: Regex = Regex::new(r"(?im)^[ \t]*<<<DailyNoteEnd>>>").unwrap();

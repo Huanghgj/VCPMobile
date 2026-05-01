@@ -17,6 +17,11 @@ export interface AppSettings {
   fileKey?: string;
   topicSummaryModel: string;
   syncLogLevel: string;
+  enableVcpToolInjection: boolean;
+  agentMusicControl: boolean;
+  enableAgentBubbleTheme: boolean;
+  enableModelThinking: boolean;
+  modelThinkingBudget: number;
   agentOrder: string[];
   groupOrder: string[];
   currentThemeMode?: string;

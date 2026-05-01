@@ -1,13 +1,18 @@
 use crate::vcp_modules::db_manager::DbState;
 use base64::{engine::general_purpose, Engine as _};
 use dashmap::DashMap;
+use futures_util::StreamExt;
+use percent_encoding::percent_decode_str;
+use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager, State};
+use tokio::io::AsyncWriteExt;
+use url::Url;
 
 use std::sync::Mutex;
 
@@ -51,6 +56,124 @@ pub struct AttachmentData {
     pub created_at: u64,
     pub extracted_text: Option<String>,
     pub thumbnail_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedMediaData {
+    pub name: String,
+    pub path: String,
+    pub mime_type: String,
+    pub size: u64,
+    pub hash: String,
+}
+
+const MAX_MANUAL_MEDIA_SAVE_BYTES: u64 = 120 * 1024 * 1024;
+const MAX_DATA_URL_MEDIA_SAVE_BYTES: usize = 24 * 1024 * 1024;
+
+fn normalize_mime_type(mime_type: &str) -> String {
+    mime_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_lowercase()
+}
+
+fn extension_from_mime(mime_type: &str) -> &'static str {
+    match normalize_mime_type(mime_type).as_str() {
+        "image/jpeg" => "jpg",
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/avif" => "avif",
+        "image/svg+xml" => "svg",
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
+        "video/quicktime" => "mov",
+        "audio/mpeg" => "mp3",
+        "audio/wav" => "wav",
+        "audio/ogg" => "ogg",
+        "audio/flac" => "flac",
+        "audio/mp4" => "m4a",
+        _ => "bin",
+    }
+}
+
+fn sanitize_media_file_name(input: &str) -> String {
+    let mut name = input
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches(|ch| ch == '.' || ch == '_')
+        .to_string();
+
+    if name.is_empty() {
+        name = "media".to_string();
+    }
+    if name.len() > 96 {
+        name.truncate(96);
+    }
+    name
+}
+
+fn file_name_from_url(url: &str) -> Option<String> {
+    let parsed = Url::parse(url).ok()?;
+    let last = parsed.path_segments()?.last()?.trim();
+    if last.is_empty() {
+        return None;
+    }
+    let decoded = percent_decode_str(last).decode_utf8_lossy().to_string();
+    Some(decoded)
+}
+
+fn ensure_media_extension(file_name: &str, mime_type: &str) -> String {
+    let sanitized = sanitize_media_file_name(file_name);
+    if std::path::Path::new(&sanitized).extension().is_some() {
+        return sanitized;
+    }
+
+    let ext = extension_from_mime(mime_type);
+    if ext == "bin" {
+        sanitized
+    } else {
+        format!("{}.{}", sanitized, ext)
+    }
+}
+
+fn decode_data_url(data_url: &str) -> Result<(Vec<u8>, String), String> {
+    let (header, body) = data_url
+        .split_once(',')
+        .ok_or_else(|| "无效的 data URL".to_string())?;
+    let header = header
+        .strip_prefix("data:")
+        .ok_or_else(|| "无效的 data URL 协议".to_string())?;
+    let mime_type = normalize_mime_type(
+        header
+            .split(';')
+            .next()
+            .unwrap_or("application/octet-stream"),
+    );
+
+    let bytes = if header.to_lowercase().contains(";base64") {
+        general_purpose::STANDARD
+            .decode(body)
+            .map_err(|e| format!("data URL 解码失败: {}", e))?
+    } else {
+        percent_decode_str(body).collect::<Vec<u8>>()
+    };
+
+    if bytes.len() > MAX_DATA_URL_MEDIA_SAVE_BYTES {
+        return Err("data URL 媒体过大，已拒绝保存".to_string());
+    }
+
+    Ok((bytes, mime_type))
 }
 
 /// 内部辅助函数：精细化 MIME 类型判定 (对齐桌面端 fileManager.js)
@@ -704,6 +827,169 @@ pub async fn read_local_file_base64(app_handle: AppHandle, path: String) -> Resu
     };
 
     Ok(format!("data:{};base64,{}", mime_type, base64_str))
+}
+
+#[tauri::command]
+pub async fn save_media_from_url(
+    app_handle: AppHandle,
+    url: String,
+    suggested_name: Option<String>,
+    mime_type: Option<String>,
+) -> Result<SavedMediaData, String> {
+    let mut saved_dir = app_handle
+        .path()
+        .app_config_dir()
+        .map_err(|e| e.to_string())?;
+    saved_dir.push("data");
+    saved_dir.push("saved_media");
+    tokio::fs::create_dir_all(&saved_dir)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if url.starts_with("data:") {
+        let (bytes, detected_mime) = decode_data_url(&url)?;
+        let final_mime = mime_type
+            .as_deref()
+            .map(normalize_mime_type)
+            .filter(|m| !m.is_empty())
+            .unwrap_or(detected_mime);
+        let base_name = suggested_name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or("media");
+        let original_name = ensure_media_extension(base_name, &final_mime);
+
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let hash = hex::encode(hasher.finalize());
+        let ext = std::path::Path::new(&original_name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        let saved_name = if ext.is_empty() {
+            hash.clone()
+        } else {
+            format!("{}.{}", hash, ext)
+        };
+        let final_path = saved_dir.join(saved_name);
+        if !final_path.exists() {
+            tokio::fs::write(&final_path, &bytes)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+
+        return Ok(SavedMediaData {
+            name: original_name,
+            path: final_path.to_string_lossy().to_string(),
+            mime_type: final_mime,
+            size: bytes.len() as u64,
+            hash,
+        });
+    }
+
+    let parsed_url = Url::parse(&url).map_err(|e| format!("无效的媒体 URL: {}", e))?;
+    if !matches!(parsed_url.scheme(), "http" | "https") {
+        return Err("仅支持保存 http、https 或 data URL 媒体".to_string());
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let response = client
+        .get(url.clone())
+        .send()
+        .await
+        .map_err(|e| format!("媒体下载失败: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!("媒体下载失败: HTTP {}", response.status()));
+    }
+
+    if let Some(content_length) = response
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        if content_length > MAX_MANUAL_MEDIA_SAVE_BYTES {
+            return Err("媒体文件过大，已拒绝保存".to_string());
+        }
+    }
+
+    let header_mime = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(normalize_mime_type)
+        .filter(|m| !m.is_empty());
+    let base_name = suggested_name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .map(|name| name.to_string())
+        .or_else(|| file_name_from_url(&url))
+        .unwrap_or_else(|| "media".to_string());
+    let supplied_mime = mime_type
+        .as_deref()
+        .map(normalize_mime_type)
+        .filter(|m| !m.is_empty());
+    let mut final_mime = supplied_mime
+        .or(header_mime)
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    if final_mime == "application/octet-stream" {
+        final_mime = get_refined_mime_type(&base_name, &final_mime);
+    }
+    let original_name = ensure_media_extension(&base_name, &final_mime);
+
+    let temp_path = saved_dir.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
+    let mut temp_file = tokio::fs::File::create(&temp_path)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut total_size: u64 = 0;
+    let mut stream = response.bytes_stream();
+
+    while let Some(chunk_result) = stream.next().await {
+        let chunk = chunk_result.map_err(|e| format!("媒体下载中断: {}", e))?;
+        total_size += chunk.len() as u64;
+        if total_size > MAX_MANUAL_MEDIA_SAVE_BYTES {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err("媒体文件过大，已拒绝保存".to_string());
+        }
+        hasher.update(&chunk);
+        temp_file
+            .write_all(&chunk)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    temp_file.flush().await.map_err(|e| e.to_string())?;
+
+    let hash = hex::encode(hasher.finalize());
+    let ext = std::path::Path::new(&original_name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let saved_name = if ext.is_empty() {
+        hash.clone()
+    } else {
+        format!("{}.{}", hash, ext)
+    };
+    let final_path = saved_dir.join(saved_name);
+    if final_path.exists() {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+    } else {
+        tokio::fs::rename(&temp_path, &final_path)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok(SavedMediaData {
+        name: original_name,
+        path: final_path.to_string_lossy().to_string(),
+        mime_type: final_mime,
+        size: total_size,
+        hash,
+    })
 }
 
 /// 清理上传缓存目录 (通常在启动时执行，清除上次闪退留下的僵尸文件)

@@ -15,7 +15,7 @@ lazy_static! {
     /// 清理 VCP 元思考链的正则表达式
     static ref THOUGHT_CHAIN_REGEX: Regex = Regex::new(r#"(?s)\[--- VCP元思考链(?::\s*"([^"]*)")?\s*---\].*?\[--- 元思考链结束 ---\]"#).unwrap();
     /// 清理常规 <think> 标签的正则表达式
-    static ref CONVENTIONAL_THOUGHT_REGEX: Regex = Regex::new(r"(?is)<think>.*?</think>").unwrap();
+    static ref CONVENTIONAL_THOUGHT_REGEX: Regex = Regex::new(r"(?is)<think(?:ing)?>.*?</think(?:ing)?>").unwrap();
     /// 简单检查是否包含 HTML 标签的正则表达式
     static ref HTML_CHECK_REGEX: Regex = Regex::new(r"<[^>]+>").unwrap();
     /// 清理多余空行（保留最多2个连续空行）的正则表达式

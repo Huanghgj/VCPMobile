@@ -6,7 +6,7 @@ use crate::vcp_modules::message_service;
 use crate::vcp_modules::vcp_client::{perform_vcp_request, ActiveRequests, VcpRequestPayload};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tauri::{ipc::Channel, AppHandle, State};
+use tauri::{AppHandle, State};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -26,7 +26,6 @@ pub async fn handle_agent_chat_message(
     db_state: State<'_, DbState>,
     active_requests: State<'_, ActiveRequests>,
     payload: AgentChatPayload,
-    stream_channel: Channel<crate::vcp_modules::vcp_client::StreamEvent>,
 ) -> Result<Value, String> {
     let agent_id = payload.agent_id;
     let topic_id = payload.topic_id;
@@ -37,19 +36,8 @@ pub async fn handle_agent_chat_message(
     let agent_config =
         read_agent_config_internal(&app_handle, &agent_state, &agent_id, Some(true)).await?;
 
-    // 2. 将用户消息追加到数据库
-    message_service::append_single_message(
-        app_handle.clone(),
-        &db_state.pool,
-        &agent_id,
-        "agent",
-        topic_id.clone(),
-        user_message.clone(),
-    )
-    .await?;
-
-    // 3. 加载完整历史记录用于上下文组装
-    let history = message_service::load_chat_history_internal(
+    // 2. 加载完整历史记录用于上下文组装；前端通常已经先落库，缺失时才补写。
+    let mut history = message_service::load_chat_history_internal(
         &app_handle,
         &agent_id,
         "agent",
@@ -59,6 +47,20 @@ pub async fn handle_agent_chat_message(
         true,
     )
     .await?;
+
+    if !history.iter().any(|message| message.id == user_message.id) {
+        message_service::append_single_message(
+            app_handle.clone(),
+            &db_state.pool,
+            &agent_id,
+            "agent",
+            topic_id.clone(),
+            user_message.clone(),
+        )
+        .await?;
+        history.push(user_message);
+        history.sort_by_key(|message| message.timestamp);
+    }
 
     // 4. 使用公共工具组装上下文
     let mut messages = assemble_history_for_vcp(&history);
@@ -96,16 +98,11 @@ pub async fn handle_agent_chat_message(
             "agentId": agent_id,
             "topicId": topic_id
         })),
+        stream_channel: Some("vcp-stream".to_string()),
     };
 
     // 7. 发起请求
-    perform_vcp_request(
-        &app_handle,
-        active_requests.0.clone(),
-        request_payload,
-        Some(stream_channel),
-    )
-    .await?;
+    perform_vcp_request(&app_handle, active_requests.0.clone(), request_payload).await?;
 
     Ok(json!({ "status": "sent", "messageId": thinking_id }))
 }

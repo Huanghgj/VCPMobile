@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { ref, watch, computed } from 'vue';
 import DOMPurify from 'dompurify';
-import hljs from 'highlight.js';
 import { useThemeStore } from '../../../core/stores/theme';
+import { highlightCode } from '../../../core/utils/highlight';
 
 const props = defineProps<{
   content: string;
@@ -16,7 +16,7 @@ const fullScreenTab = ref<'code' | 'preview'>('code');
 
 // 语法高亮处理
 const highlightedCode = computed(() => {
-  return hljs.highlight(props.content, { language: 'xml' }).value;
+  return highlightCode(props.content, 'xml');
 });
 
 // 复制功能

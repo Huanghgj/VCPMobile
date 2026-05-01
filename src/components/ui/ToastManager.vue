@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { useNotificationStore, type VcpNotification } from '../../core/stores/notification';
-import { Info, CheckCircle, AlertTriangle, X, Cpu, User } from 'lucide-vue-next';
+import { Info, CheckCircle, AlertTriangle, X, Cpu, User, BookOpen } from 'lucide-vue-next';
 import { invoke } from '@tauri-apps/api/core';
 
 const store = useNotificationStore();
@@ -12,6 +12,7 @@ const getIcon = (type: string) => {
     case 'error': return X;
     case 'tool': return Cpu;
     case 'agent': return User;
+    case 'diary': return BookOpen;
     default: return Info;
   }
 };
@@ -39,33 +40,43 @@ const handleAction = async (item: VcpNotification, action: any) => {
 </script>
 
 <template>
-  <div class="fixed top-safe left-0 right-0 z-[200] pointer-events-none px-4 pt-4 flex flex-col items-center gap-2">
+  <div class="fixed top-safe left-0 right-0 z-[200] pointer-events-none px-6 pt-4 flex flex-col items-center gap-3">
     <TransitionGroup name="toast">
       <div v-for="toast in store.activeToasts" :key="toast.id"
-        class="pointer-events-auto flex items-center justify-between gap-3 px-3 py-2 rounded-xl bg-black/85 backdrop-blur-md border border-white/10 shadow-lg max-w-sm w-full overflow-hidden">
-        
-        <div class="flex items-center gap-2.5 min-w-0 flex-1">
-          <component :is="getIcon(toast.type)" :size="14"
-            :class="toast.type === 'error' ? 'text-red-400' : toast.type === 'success' ? 'text-green-400' : 'text-blue-400'" class="shrink-0" />
-          <div class="flex-col flex min-w-0">
-             <span class="text-[11px] font-bold text-white truncate">{{ toast.title }}</span>
-             <span v-if="toast.type !== 'error' && !toast.isPreformatted" class="text-[10px] text-white/60 truncate">{{ toast.message }}</span>
+        class="pointer-events-auto flex flex-col gap-3 px-4 py-3 rounded-2xl bg-black/85 backdrop-blur-[10px] border border-white/10 shadow-2xl max-w-md w-full overflow-hidden">
+
+        <div class="flex items-center gap-3">
+          <div class="shrink-0 p-1.5 rounded-xl bg-white/5">
+            <component :is="getIcon(toast.type)" :size="14"
+              :class="toast.type === 'error' ? 'text-red-400' : 'text-blue-400'" />
           </div>
+          <div class="flex-1 min-w-0 pr-2">
+            <div class="text-[11px] font-black uppercase tracking-wider opacity-90 mb-0.5 text-white">{{ toast.title }}
+            </div>
+            <div v-if="toast.isPreformatted"
+              class="bg-black/20 p-1.5 rounded text-[0.85em] mt-1.5 max-h-[100px] overflow-y-auto whitespace-pre-wrap break-all font-mono text-white/90">
+              {{ toast.summary || toast.message }}
+            </div>
+            <div v-else class="text-[12px] text-white/80 truncate">
+              {{ toast.summary || toast.message }}
+            </div>
+          </div>
+          <button @click="store.activeToasts = store.activeToasts.filter((t: VcpNotification) => t.id !== toast.id)"
+            class="p-1 opacity-40 hover:opacity-100 text-white transition-opacity">
+            <X :size="14" />
+          </button>
         </div>
 
-        <div v-if="toast.actions && toast.actions.length > 0" class="flex gap-1.5 shrink-0">
+        <!-- 对标桌面端的按钮逻辑 -->
+        <div v-if="toast.actions && toast.actions.length > 0" class="flex gap-2 pb-1">
           <button v-for="action in toast.actions" :key="action.label" @click="handleAction(toast, action)" :class="[
-            action.label === 'Approve' || action.color?.includes('green') ? 'text-green-400 bg-green-500/10' :
-              action.label === 'Deny' || action.color?.includes('red') ? 'text-red-400 bg-red-500/10' : 'text-blue-400 bg-blue-500/10',
-            'px-2 py-1 transition-all duration-200 font-bold text-[10px] rounded-md'
+            action.label === 'Approve' || action.color?.includes('green') ? 'bg-green-600' :
+              action.label === 'Deny' || action.color?.includes('red') ? 'bg-red-600' : action.color,
+            'flex-1 py-1.5 shadow-sm hover:shadow-md hover:-translate-y-0.5 active:translate-y-0 transition-all duration-200 font-medium text-[11px] rounded-lg text-white'
           ]">
             {{ action.label }}
           </button>
         </div>
-        <button v-else @click="store.activeToasts = store.activeToasts.filter((t: VcpNotification) => t.id !== toast.id)"
-          class="p-1 opacity-40 hover:opacity-100 text-white transition-opacity shrink-0">
-          <X :size="14" />
-        </button>
       </div>
     </TransitionGroup>
   </div>
@@ -93,4 +104,5 @@ const handleAction = async (item: VcpNotification, action: any) => {
 .toast-move {
   transition: transform 0.4s ease;
 }
+
 </style>

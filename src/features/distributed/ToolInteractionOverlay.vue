@@ -4,6 +4,7 @@
 // Phase 3 skeleton — will be populated when Interactive tools are added.
 
 import { ref, onMounted, onUnmounted } from "vue";
+import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 interface ToolUiRequest {
@@ -13,6 +14,17 @@ interface ToolUiRequest {
 }
 
 const activeRequest = ref<ToolUiRequest | null>(null);
+interface MobilePromptRequest {
+  requestId: string;
+  title: string;
+  prompt: string;
+  placeholder?: string;
+  options?: string[];
+  timeout?: number;
+}
+
+const promptRequest = ref<MobilePromptRequest | null>(null);
+const promptResponse = ref("");
 let unlisten: UnlistenFn | null = null;
 
 onMounted(async () => {
@@ -25,6 +37,39 @@ onMounted(async () => {
 onUnmounted(() => {
   unlisten?.();
 });
+
+let unlistenMobilePrompt: UnlistenFn | null = null;
+
+onMounted(async () => {
+  unlistenMobilePrompt = await listen<MobilePromptRequest>(
+    "distributed-mobile-prompt",
+    (event) => {
+      promptRequest.value = event.payload;
+      promptResponse.value = event.payload.placeholder || "";
+    },
+  );
+});
+
+onUnmounted(() => {
+  unlistenMobilePrompt?.();
+});
+
+async function submitPrompt(response?: string, cancelled = false) {
+  if (!promptRequest.value) return;
+  const requestId = promptRequest.value.requestId;
+  const finalResponse = response ?? promptResponse.value;
+  promptRequest.value = null;
+  promptResponse.value = "";
+  try {
+    await invoke("submit_distributed_prompt_response", {
+      requestId,
+      response: finalResponse,
+      cancelled,
+    });
+  } catch (e) {
+    console.error("[Distributed Prompt] Failed to submit response:", e);
+  }
+}
 
 // Notification handler — listens for distributed-notification events
 let unlistenNotification: UnlistenFn | null = null;
@@ -98,6 +143,64 @@ onUnmounted(() => {
                 @click="activeRequest = null"
               >
                 取消
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </Transition>
+
+    <Transition name="fade">
+      <div
+        v-if="promptRequest"
+        class="fixed inset-0 z-[260] flex items-center justify-center bg-black/65 backdrop-blur-md pointer-events-auto px-4"
+      >
+        <div
+          class="w-full max-w-md rounded-[1.75rem] border border-white/10 bg-secondary-bg shadow-2xl overflow-hidden"
+        >
+          <div class="p-5 border-b border-white/10">
+            <div class="text-xs uppercase tracking-[0.24em] opacity-45 font-mono">
+              Mobile Tool Request
+            </div>
+            <div class="text-xl font-black text-primary-text mt-2">
+              {{ promptRequest.title || "等待用户回复" }}
+            </div>
+            <div class="text-sm opacity-65 mt-2 leading-relaxed whitespace-pre-wrap">
+              {{ promptRequest.prompt }}
+            </div>
+          </div>
+
+          <div class="p-5 space-y-4">
+            <div v-if="promptRequest.options?.length" class="grid gap-2">
+              <button
+                v-for="option in promptRequest.options"
+                :key="option"
+                class="w-full text-left rounded-2xl border border-white/10 bg-white/8 px-4 py-3 text-sm font-bold active:scale-[0.98] transition-transform"
+                @click="submitPrompt(option)"
+              >
+                {{ option }}
+              </button>
+            </div>
+
+            <textarea
+              v-model="promptResponse"
+              rows="4"
+              class="w-full resize-none rounded-2xl border border-white/10 bg-black/10 px-4 py-3 text-sm text-primary-text outline-none focus:border-primary/60"
+              :placeholder="promptRequest.placeholder || '输入回复...'"
+            ></textarea>
+
+            <div class="flex gap-3">
+              <button
+                class="flex-1 rounded-2xl bg-white/10 px-4 py-3 text-sm font-bold active:scale-[0.98] transition-transform"
+                @click="submitPrompt('', true)"
+              >
+                取消
+              </button>
+              <button
+                class="flex-1 rounded-2xl bg-primary text-white px-4 py-3 text-sm font-black active:scale-[0.98] transition-transform"
+                @click="submitPrompt()"
+              >
+                提交
               </button>
             </div>
           </div>

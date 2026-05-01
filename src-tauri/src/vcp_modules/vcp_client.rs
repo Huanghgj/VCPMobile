@@ -7,10 +7,10 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::Error as IoError;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
-use tauri::{ipc::Channel, AppHandle, Manager, Runtime};
+use std::time::{Duration, Instant};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tokio::sync::oneshot;
 use tokio_util::codec::{FramedRead, LinesCodec};
 use tokio_util::io::StreamReader;
@@ -28,55 +28,402 @@ use crate::vcp_modules::settings_manager::{create_default_settings, Settings};
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VcpRequestPayload {
-    pub vcp_url: String,        // VCP服务器URL
-    pub vcp_api_key: String,    // API密钥
-    pub messages: Vec<Value>,   // 消息数组
-    pub model_config: Value,    // 模型配置 (包含 model, stream, temperature 等)
-    pub message_id: String,     // 消息ID (用于跟踪和中止)
-    pub context: Option<Value>, // 上下文信息 (agentId, topicId等)
+    pub vcp_url: String,                // VCP服务器URL
+    pub vcp_api_key: String,            // API密钥
+    pub messages: Vec<Value>,           // 消息数组
+    pub model_config: Value,            // 模型配置 (包含 model, stream, temperature 等)
+    pub message_id: String,             // 消息ID (用于跟踪和中止)
+    pub context: Option<Value>,         // 上下文信息 (agentId, topicId等)
+    pub stream_channel: Option<String>, // 流式数据频道名称 (默认为 vcp-stream-event)
 }
 
 /// 流式事件结构体，用于向前端发送数据
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamEvent {
-    pub r#type: String,         // 事件类型: "data", "end", "error", "reconnecting"
+    pub r#type: String,         // 事件类型: "data", "end", "error"
     pub chunk: Option<Value>,   // 数据块 (仅 type="data" 时有效)
     pub message_id: String,     // 消息ID
     pub context: Option<Value>, // 透传的上下文信息
-    pub finish_reason: Option<String>, // 结束原因
     pub error: Option<String>,  // 错误信息 (仅 type="error" 时有效)
 }
 
-/// 全局活跃请求管理器，使用 DashMap 存储中止信号发送端
-/// messageId -> oneshot::Sender
-pub struct ActiveRequests(pub Arc<DashMap<String, oneshot::Sender<()>>>);
+const STREAM_EMIT_MIN_CHARS: usize = 96;
+const DEFAULT_THINKING_BUDGET: i64 = 4096;
+const MIN_THINKING_BUDGET: i64 = 1024;
+const MAX_THINKING_BUDGET: i64 = 32768;
+const MAX_ORIGINAL_INLINE_IMAGE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_ORIGINAL_INLINE_MEDIA_BYTES: u64 = 24 * 1024 * 1024;
+const MAX_INLINE_IMAGE_DIMENSION: u32 = 2048;
+const INLINE_IMAGE_JPEG_QUALITY: u8 = 85;
+
+#[derive(Default)]
+struct StreamTextParts {
+    reasoning: String,
+    answer: String,
+}
+
+fn parse_i64_setting(value: Option<&Value>) -> Option<i64> {
+    match value {
+        Some(Value::Number(number)) => number
+            .as_i64()
+            .or_else(|| number.as_u64().and_then(|n| i64::try_from(n).ok())),
+        Some(Value::String(text)) => text.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+fn normalized_thinking_budget(value: Option<&Value>) -> i64 {
+    parse_i64_setting(value)
+        .unwrap_or(DEFAULT_THINKING_BUDGET)
+        .clamp(MIN_THINKING_BUDGET, MAX_THINKING_BUDGET)
+}
+
+fn reasoning_effort_for_budget(budget: i64) -> &'static str {
+    if budget >= 8192 {
+        "high"
+    } else if budget <= 2048 {
+        "low"
+    } else {
+        "medium"
+    }
+}
+
+fn is_claude_thinking_capable(model_lower: &str) -> bool {
+    model_lower.contains("3-7")
+        || model_lower.contains("3.7")
+        || model_lower.contains("claude-4")
+        || model_lower.contains("sonnet-4")
+        || model_lower.contains("opus-4")
+        || model_lower.contains("haiku-4")
+        || model_lower.contains("4-")
+        || model_lower.contains("4.")
+        || model_lower.contains("mythos")
+}
+
+fn is_gemini_thinking_capable(model_lower: &str) -> bool {
+    model_lower.contains("2.5")
+        || model_lower.contains("gemini-3")
+        || model_lower.contains("thinking")
+        || model_lower.contains("think")
+}
+
+fn ensure_token_limit_above_budget(obj: &mut serde_json::Map<String, Value>, budget: i64) {
+    let target_limit = budget + 1024;
+    let has_known_limit =
+        obj.contains_key("max_tokens") || obj.contains_key("max_completion_tokens");
+
+    if has_known_limit {
+        for key in ["max_tokens", "max_completion_tokens"] {
+            let current = parse_i64_setting(obj.get(key));
+            if current.map(|limit| limit <= budget).unwrap_or(false) {
+                obj.insert(key.to_string(), json!(target_limit));
+            }
+        }
+    } else {
+        obj.insert("max_tokens".to_string(), json!(target_limit));
+    }
+}
+
+fn set_nested_object<'a>(
+    obj: &'a mut serde_json::Map<String, Value>,
+    key: &str,
+) -> &'a mut serde_json::Map<String, Value> {
+    let value = obj.entry(key.to_string()).or_insert_with(|| json!({}));
+    if !value.is_object() {
+        *value = json!({});
+    }
+    value
+        .as_object_mut()
+        .expect("value was normalized to object")
+}
+
+fn apply_model_thinking_params(request_body: &mut Value, model: &str, budget: i64) {
+    let Some(obj) = request_body.as_object_mut() else {
+        return;
+    };
+
+    let model_lower = model.to_ascii_lowercase();
+    let effort = reasoning_effort_for_budget(budget);
+
+    if model_lower.contains("claude") && is_claude_thinking_capable(&model_lower) {
+        let uses_adaptive_thinking = model_lower.contains("4-6")
+            || model_lower.contains("4.6")
+            || model_lower.contains("4-7")
+            || model_lower.contains("4.7")
+            || model_lower.contains("mythos");
+
+        if uses_adaptive_thinking {
+            obj.insert(
+                "thinking".to_string(),
+                json!({
+                    "type": "adaptive",
+                    "display": "summarized"
+                }),
+            );
+            obj.insert("output_config".to_string(), json!({ "effort": effort }));
+        } else {
+            obj.insert(
+                "thinking".to_string(),
+                json!({
+                    "type": "enabled",
+                    "budget_tokens": budget
+                }),
+            );
+            ensure_token_limit_above_budget(obj, budget);
+        }
+
+        obj.remove("temperature");
+        return;
+    }
+
+    if model_lower.contains("gemini") && is_gemini_thinking_capable(&model_lower) {
+        let extra_body = set_nested_object(obj, "extra_body");
+        let google = set_nested_object(extra_body, "google");
+        let thinking_config = set_nested_object(google, "thinking_config");
+        thinking_config.insert("include_thoughts".to_string(), json!(true));
+
+        if model_lower.contains("gemini-3") {
+            thinking_config.insert("thinking_level".to_string(), json!(effort));
+        } else {
+            thinking_config.insert("thinking_budget".to_string(), json!(budget));
+        }
+        return;
+    }
+
+    if model_lower.contains("deepseek") {
+        obj.insert(
+            "thinking".to_string(),
+            json!({
+                "type": "enabled"
+            }),
+        );
+        obj.insert("reasoning_effort".to_string(), json!(effort));
+    }
+}
+
+fn append_text_value(target: &mut String, value: &Value) {
+    match value {
+        Value::String(text) => target.push_str(text),
+        Value::Array(items) => {
+            for item in items {
+                append_text_value(target, item);
+            }
+        }
+        Value::Object(map) => {
+            for key in ["text", "content", "summary"] {
+                if let Some(value) = map.get(key) {
+                    let mut nested = String::new();
+                    append_text_value(&mut nested, value);
+                    if !nested.is_empty() {
+                        target.push_str(&nested);
+                        break;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn append_deduped_text(target: &mut String, text: &str) {
+    if text.is_empty() || target.ends_with(text) {
+        return;
+    }
+    target.push_str(text);
+}
+
+fn append_first_field(target: &mut String, source: &Value, keys: &[&str]) {
+    for key in keys {
+        if let Some(value) = source.get(*key) {
+            let mut text = String::new();
+            append_text_value(&mut text, value);
+            if !text.is_empty() {
+                append_deduped_text(target, &text);
+                return;
+            }
+        }
+    }
+}
+
+fn append_openai_choice_parts(parts: &mut StreamTextParts, source: &Value) {
+    append_first_field(
+        &mut parts.reasoning,
+        source,
+        &[
+            "reasoning_content",
+            "reasoning",
+            "reasoning_text",
+            "reasoning_details",
+            "thinking",
+            "thought",
+        ],
+    );
+    append_first_field(&mut parts.answer, source, &["content", "text"]);
+}
+
+fn extract_stream_text_parts(chunk: &Value) -> StreamTextParts {
+    let mut parts = StreamTextParts::default();
+
+    if let Some(choices) = chunk.get("choices").and_then(Value::as_array) {
+        for choice in choices {
+            if let Some(delta) = choice.get("delta") {
+                append_openai_choice_parts(&mut parts, delta);
+            }
+            if let Some(message) = choice.get("message") {
+                append_openai_choice_parts(&mut parts, message);
+            }
+        }
+    }
+
+    if let Some(delta) = chunk.get("delta") {
+        match delta.get("type").and_then(Value::as_str) {
+            Some("thinking_delta") => {
+                append_first_field(&mut parts.reasoning, delta, &["thinking", "text"])
+            }
+            Some("text_delta") => append_first_field(&mut parts.answer, delta, &["text"]),
+            _ => append_openai_choice_parts(&mut parts, delta),
+        }
+    }
+
+    if let Some(content_block) = chunk.get("content_block") {
+        match content_block.get("type").and_then(Value::as_str) {
+            Some("thinking") => {
+                append_first_field(&mut parts.reasoning, content_block, &["thinking", "text"])
+            }
+            Some("text") => append_first_field(&mut parts.answer, content_block, &["text"]),
+            _ => append_openai_choice_parts(&mut parts, content_block),
+        }
+    }
+
+    if let Some(candidates) = chunk.get("candidates").and_then(Value::as_array) {
+        for candidate in candidates {
+            if let Some(gemini_parts) = candidate
+                .pointer("/content/parts")
+                .and_then(Value::as_array)
+            {
+                for part in gemini_parts {
+                    if part
+                        .get("thought")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        append_first_field(&mut parts.reasoning, part, &["text"]);
+                    } else {
+                        append_first_field(&mut parts.answer, part, &["text"]);
+                    }
+                }
+            }
+        }
+    }
+
+    if parts.reasoning.is_empty() && parts.answer.is_empty() {
+        append_first_field(
+            &mut parts.reasoning,
+            chunk,
+            &["reasoning_content", "reasoning", "thinking", "thought"],
+        );
+        append_first_field(&mut parts.answer, chunk, &["content", "text"]);
+    }
+
+    parts
+}
+
+fn push_stream_segment(
+    full_content: &mut String,
+    pending_emit_text: &mut String,
+    reasoning_block_open: &mut bool,
+    text: &str,
+    is_reasoning: bool,
+) {
+    if text.is_empty() {
+        return;
+    }
+
+    if is_reasoning {
+        if !*reasoning_block_open {
+            let opener = if full_content.is_empty() {
+                "<think>\n"
+            } else {
+                "\n\n<think>\n"
+            };
+            full_content.push_str(opener);
+            pending_emit_text.push_str(opener);
+            *reasoning_block_open = true;
+        }
+    } else if *reasoning_block_open {
+        let closer = "\n</think>\n\n";
+        full_content.push_str(closer);
+        pending_emit_text.push_str(closer);
+        *reasoning_block_open = false;
+    }
+
+    full_content.push_str(text);
+    pending_emit_text.push_str(text);
+}
+
+fn close_reasoning_block(
+    full_content: &mut String,
+    pending_emit_text: &mut String,
+    reasoning_block_open: &mut bool,
+) {
+    if *reasoning_block_open {
+        let closer = "\n</think>\n\n";
+        full_content.push_str(closer);
+        pending_emit_text.push_str(closer);
+        *reasoning_block_open = false;
+    }
+}
+
+fn emit_pending_stream_text<R: Runtime>(
+    app_handle: &AppHandle<R>,
+    stream_channel: &str,
+    message_id: &str,
+    context: &Option<Value>,
+    pending_text: &mut String,
+    last_emit_at: &mut Instant,
+    force: bool,
+) {
+    if pending_text.is_empty() {
+        return;
+    }
+
+    if !force
+        && pending_text.len() < STREAM_EMIT_MIN_CHARS
+        && last_emit_at.elapsed() < Duration::from_millis(120)
+    {
+        return;
+    }
+
+    let chunk = std::mem::take(pending_text);
+    let _ = app_handle.emit(
+        stream_channel,
+        StreamEvent {
+            r#type: "data".to_string(),
+            chunk: Some(json!(chunk)),
+            message_id: message_id.to_string(),
+            context: context.clone(),
+            error: None,
+        },
+    );
+    *last_emit_at = Instant::now();
+}
+
+/// 单个活跃 VCP 请求的中断上下文。
+pub struct ActiveRequestHandle {
+    pub abort_sender: oneshot::Sender<()>,
+    pub vcp_url: String,
+    pub vcp_api_key: String,
+}
+
+/// 全局活跃请求管理器，使用 DashMap 存储中止信号发送端与 VCP 后端信息。
+/// messageId -> ActiveRequestHandle
+pub struct ActiveRequests(pub Arc<DashMap<String, ActiveRequestHandle>>);
 
 impl Default for ActiveRequests {
     fn default() -> Self {
         println!("[VCPClient] Initialized ActiveRequests successfully.");
         Self(Arc::new(DashMap::new()))
-    }
-}
-
-/// RAII guard：在 Drop 时自动从 ActiveRequests 中移除对应条目，防止 panic 导致泄漏
-pub struct ActiveRequestGuard {
-    requests: Arc<DashMap<String, oneshot::Sender<()>>>,
-    message_id: String,
-}
-
-impl ActiveRequestGuard {
-    pub fn new(requests: Arc<DashMap<String, oneshot::Sender<()>>>, message_id: String) -> Self {
-        Self {
-            requests,
-            message_id,
-        }
-    }
-}
-
-impl Drop for ActiveRequestGuard {
-    fn drop(&mut self) {
-        self.requests.remove(&self.message_id);
     }
 }
 
@@ -96,6 +443,60 @@ async fn get_app_data_path<R: Runtime>(app: &AppHandle<R>) -> PathBuf {
     app.path()
         .app_data_dir()
         .unwrap_or_else(|_| PathBuf::from("AppData"))
+}
+
+fn image_mime_for_ext(ext: &str) -> Option<&'static str> {
+    match ext {
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "webp" => Some("image/webp"),
+        "gif" => Some("image/gif"),
+        _ => None,
+    }
+}
+
+fn encode_original_data_url(path: &Path, mime_type: &str) -> Result<String, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("读取附件失败: {}", e))?;
+    let b64 = general_purpose::STANDARD.encode(&bytes);
+    Ok(format!("data:{};base64,{}", mime_type, b64))
+}
+
+fn encode_image_data_url(path: &Path, ext: &str) -> Result<String, String> {
+    let mime_type = image_mime_for_ext(ext).unwrap_or("image/jpeg");
+    let file_size = std::fs::metadata(path)
+        .map_err(|e| format!("读取图片元数据失败: {}", e))?
+        .len();
+    let dimensions = image::image_dimensions(path).ok();
+
+    if ext == "gif" {
+        if file_size > MAX_ORIGINAL_INLINE_MEDIA_BYTES {
+            return Err("GIF 图片过大，无法作为模型输入内联发送".to_string());
+        }
+        return encode_original_data_url(path, mime_type);
+    }
+
+    if file_size <= MAX_ORIGINAL_INLINE_IMAGE_BYTES {
+        if let Some((width, height)) = dimensions {
+            if width <= MAX_INLINE_IMAGE_DIMENSION && height <= MAX_INLINE_IMAGE_DIMENSION {
+                return encode_original_data_url(path, mime_type);
+            }
+        }
+    }
+
+    let img = image::open(path).map_err(|e| format!("图片压缩前解码失败: {}", e))?;
+    let resized = img.thumbnail(MAX_INLINE_IMAGE_DIMENSION, MAX_INLINE_IMAGE_DIMENSION);
+    let rgb = resized.to_rgb8();
+    let mut encoded = Vec::new();
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
+        &mut encoded,
+        INLINE_IMAGE_JPEG_QUALITY,
+    );
+    encoder
+        .encode_image(&rgb)
+        .map_err(|e| format!("图片压缩编码失败: {}", e))?;
+
+    let b64 = general_purpose::STANDARD.encode(&encoded);
+    Ok(format!("data:image/jpeg;base64,{}", b64))
 }
 
 /// 中止群组的整个接力赛回合
@@ -126,10 +527,8 @@ pub async fn sendToVCP<R: Runtime>(
     app: AppHandle<R>,
     state: tauri::State<'_, ActiveRequests>,
     payload: VcpRequestPayload,
-    stream_channel: Channel<StreamEvent>,
 ) -> Result<Value, String> {
-    let (res, _is_aborted) =
-        perform_vcp_request(&app, state.0.clone(), payload, Some(stream_channel)).await?;
+    let (res, _is_aborted) = perform_vcp_request(&app, state.0.clone(), payload).await?;
     Ok(res)
 }
 
@@ -137,21 +536,18 @@ pub async fn sendToVCP<R: Runtime>(
 /// 返回 Result<(全量内容/响应体, 是否被中止), 错误信息>
 pub async fn perform_vcp_request<R: Runtime>(
     app: &AppHandle<R>,
-    active_requests: Arc<DashMap<String, oneshot::Sender<()>>>,
+    active_requests: Arc<DashMap<String, ActiveRequestHandle>>,
     payload: VcpRequestPayload,
-    stream_channel: Option<Channel<StreamEvent>>,
 ) -> Result<(Value, bool), String> {
     println!(
         "[VCPClient] perform_vcp_request called for messageId: {}, context: {:?}",
         payload.message_id, payload.context
     );
     let app_data_path = get_app_data_path(app).await;
-
-    let send_stream_event = |event: StreamEvent| {
-        if let Some(ref ch) = stream_channel {
-            let _ = ch.send(event);
-        }
-    };
+    let stream_channel = payload
+        .stream_channel
+        .clone()
+        .unwrap_or_else(|| "vcp-stream".to_string());
 
     // === 0. 数据验证和规范化 ===
     let mut messages: Vec<Value> = Vec::new();
@@ -175,7 +571,6 @@ pub async fn perform_vcp_request<R: Runtime>(
                             let clean_path = path_str.replace("file://", "");
                             let path_buf = std::path::PathBuf::from(&clean_path);
 
-                            let mut converted = false;
                             if path_buf.exists() {
                                 // 提取扩展名决定 mime_type
                                 let ext = path_buf
@@ -183,33 +578,48 @@ pub async fn perform_vcp_request<R: Runtime>(
                                     .and_then(|e| e.to_str())
                                     .unwrap_or("")
                                     .to_lowercase();
-                                let (mime, part_type) = match ext.as_str() {
+                                let encoded_part = match ext.as_str() {
                                     "png" | "jpg" | "jpeg" | "webp" | "gif" => {
-                                        ("image", "image_url")
+                                        encode_image_data_url(&path_buf, &ext)
+                                            .map(|data_url| ("image_url", data_url))
                                     }
-                                    "mp3" | "wav" | "ogg" => ("audio", "audio_url"),
-                                    "mp4" | "mkv" | "webm" => ("video", "video_url"),
-                                    _ => ("application", "file_url"), // 非多模态文件回退
+                                    "mp3" => encode_original_data_url(&path_buf, "audio/mpeg")
+                                        .map(|data_url| ("audio_url", data_url)),
+                                    "wav" => encode_original_data_url(&path_buf, "audio/wav")
+                                        .map(|data_url| ("audio_url", data_url)),
+                                    "ogg" => encode_original_data_url(&path_buf, "audio/ogg")
+                                        .map(|data_url| ("audio_url", data_url)),
+                                    "mp4" => encode_original_data_url(&path_buf, "video/mp4")
+                                        .map(|data_url| ("video_url", data_url)),
+                                    "mkv" => encode_original_data_url(&path_buf, "video/x-matroska")
+                                        .map(|data_url| ("video_url", data_url)),
+                                    "webm" => encode_original_data_url(&path_buf, "video/webm")
+                                        .map(|data_url| ("video_url", data_url)),
+                                    _ => encode_original_data_url(
+                                        &path_buf,
+                                        "application/octet-stream",
+                                    )
+                                    .map(|data_url| ("file_url", data_url)),
                                 };
 
-                                if let Ok(bytes) = std::fs::read(&path_buf) {
-                                    let b64 = general_purpose::STANDARD.encode(&bytes);
-                                    let data_url = format!("data:{}/{};base64,{}", mime, ext, b64);
-
-                                    new_parts.push(json!({
-                                        "type": part_type,
-                                        part_type: { "url": data_url }
-                                    }));
-                                    converted = true;
+                                match encoded_part {
+                                    Ok((part_type, data_url)) => {
+                                        new_parts.push(json!({
+                                            "type": part_type,
+                                            part_type: { "url": data_url }
+                                        }));
+                                    }
+                                    Err(e) => {
+                                        new_parts.push(json!({
+                                            "type": "text",
+                                            "text": format!(
+                                                "[附件处理失败: {} - {}]",
+                                                path_buf.display(),
+                                                e
+                                            )
+                                        }));
+                                    }
                                 }
-                            }
-
-                            // 修复：若文件不存在或读取失败，至少保留文本描述，避免内容静默丢失
-                            if !converted {
-                                new_parts.push(json!({
-                                    "type": "text",
-                                    "text": format!("[附件文件: {}]", clean_path)
-                                }));
                             }
                         }
                     } else {
@@ -236,6 +646,8 @@ pub async fn perform_vcp_request<R: Runtime>(
     let mut enable_vcp_tool_injection = false;
     let mut agent_music_control = false;
     let mut enable_agent_bubble_theme = false;
+    let mut enable_model_thinking = true;
+    let mut model_thinking_budget = DEFAULT_THINKING_BUDGET;
 
     if let Ok(settings) = load_app_settings(app).await {
         if let Some(extra) = settings.extra.as_object() {
@@ -251,6 +663,11 @@ pub async fn perform_vcp_request<R: Runtime>(
                 .get("enableAgentBubbleTheme")
                 .and_then(|v: &Value| v.as_bool())
                 .unwrap_or(false);
+            enable_model_thinking = extra
+                .get("enableModelThinking")
+                .and_then(|v: &Value| v.as_bool())
+                .unwrap_or(true);
+            model_thinking_budget = normalized_thinking_budget(extra.get("modelThinkingBudget"));
         }
     }
 
@@ -335,6 +752,14 @@ pub async fn perform_vcp_request<R: Runtime>(
     // === 4. 准备请求体 ===
     let is_stream = payload.model_config["stream"].as_bool().unwrap_or(false);
     let mut request_body = payload.model_config.clone();
+    if enable_model_thinking {
+        let model_name = request_body
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_default();
+        apply_model_thinking_params(&mut request_body, &model_name, model_thinking_budget);
+    }
     if let Some(obj) = request_body.as_object_mut() {
         obj.insert("messages".to_string(), json!(messages));
         obj.insert("requestId".to_string(), json!(payload.message_id));
@@ -343,16 +768,20 @@ pub async fn perform_vcp_request<R: Runtime>(
 
     // === 5. 配置网络请求 ===
     let client = Client::builder()
-        // 不设 read_timeout：数小时自循环中，任何 read_timeout 都是定时炸弹
-        // tcp_keepalive(60s) 维持 TCP 层活性，防止 NAT/防火墙静默丢弃空闲连接
-        .tcp_keepalive(Duration::from_secs(60))
+        // 移除硬超时限制，对齐桌面端，让长思考模型有充足时间生成，连接管理交给 VCP 服务器
         .build()
         .map_err(|e| e.to_string())?;
 
     // 创建并注册中止信号
     let (abort_tx, abort_rx) = oneshot::channel();
-    active_requests.insert(payload.message_id.clone(), abort_tx);
-    let _guard = ActiveRequestGuard::new(active_requests.clone(), payload.message_id.clone());
+    active_requests.insert(
+        payload.message_id.clone(),
+        ActiveRequestHandle {
+            abort_sender: abort_tx,
+            vcp_url: payload.vcp_url.clone(),
+            vcp_api_key: payload.vcp_api_key.clone(),
+        },
+    );
 
     let message_id = payload.message_id.clone();
     let context = payload.context.clone();
@@ -360,13 +789,15 @@ pub async fn perform_vcp_request<R: Runtime>(
 
     if is_stream {
         // === 6. 流式处理模式 (同步等待，以便串行调用) ===
-        let _app_handle = app.clone();
+        let app_handle = app.clone();
         let message_id_inner = message_id.clone();
         let context_inner = context.clone();
         let active_requests_inner = active_requests.clone();
 
         let mut full_content = String::new();
-        let mut last_finish_reason: Option<String> = None;
+        let mut pending_emit_text = String::new();
+        let mut reasoning_block_open = false;
+        let mut last_emit_at = Instant::now();
         let mut is_aborted = false;
         let mut abort_rx = abort_rx; // 取得所有权进入循环
 
@@ -380,12 +811,11 @@ pub async fn perform_vcp_request<R: Runtime>(
         tokio::select! {
             _ = &mut abort_rx => {
                 println!("[VCPClient] Request aborted before response for message: {}", message_id_inner);
-                send_stream_event(StreamEvent {
+                let _ = app_handle.emit(&stream_channel, StreamEvent {
                     r#type: "end".to_string(),
                     chunk: None,
                     message_id: message_id_inner.clone(),
                     context: context_inner.clone(),
-                    finish_reason: Some("cancelled_by_user".to_string()),
                     error: Some("请求已中止".to_string()),
                 });
                 active_requests_inner.remove(&message_id_inner);
@@ -396,7 +826,7 @@ pub async fn perform_vcp_request<R: Runtime>(
                     Ok(resp) if resp.status().is_success() => {
                         let stream = resp.bytes_stream().map_err(IoError::other);
                         let reader = StreamReader::new(stream);
-                        let mut lines = FramedRead::new(reader, LinesCodec::new_with_max_length(512 * 1024));
+                        let mut lines = FramedRead::new(reader, LinesCodec::new());
 
                         loop {
                             tokio::select! {
@@ -404,12 +834,25 @@ pub async fn perform_vcp_request<R: Runtime>(
                                 _ = &mut abort_rx => {
                                     is_aborted = true;
                                     println!("[VCPClient] Stream deep-polling detected abort for message: {}", message_id_inner);
-                                    send_stream_event(StreamEvent {
+                                    close_reasoning_block(
+                                        &mut full_content,
+                                        &mut pending_emit_text,
+                                        &mut reasoning_block_open,
+                                    );
+                                    emit_pending_stream_text(
+                                        &app_handle,
+                                        &stream_channel,
+                                        &message_id_inner,
+                                        &context_inner,
+                                        &mut pending_emit_text,
+                                        &mut last_emit_at,
+                                        true,
+                                    );
+                                    let _ = app_handle.emit(&stream_channel, StreamEvent {
                                         r#type: "end".to_string(),
                                         chunk: None,
                                         message_id: message_id_inner.clone(),
                                         context: context_inner.clone(),
-                                        finish_reason: Some("cancelled_by_user".to_string()),
                                         error: Some("请求已中止".to_string()),
                                     });
                                     // 显式清理，防止 race
@@ -423,73 +866,111 @@ pub async fn perform_vcp_request<R: Runtime>(
                                             if line.starts_with("data: ") {
                                                 let data = line.trim_start_matches("data: ").trim();
                                                 if data == "[DONE]" {
-                                                    send_stream_event(StreamEvent {
+                                                    close_reasoning_block(
+                                                        &mut full_content,
+                                                        &mut pending_emit_text,
+                                                        &mut reasoning_block_open,
+                                                    );
+                                                    emit_pending_stream_text(
+                                                        &app_handle,
+                                                        &stream_channel,
+                                                        &message_id_inner,
+                                                        &context_inner,
+                                                        &mut pending_emit_text,
+                                                        &mut last_emit_at,
+                                                        true,
+                                                    );
+                                                    let _ = app_handle.emit(&stream_channel, StreamEvent {
                                                         r#type: "end".to_string(),
                                                         chunk: None,
                                                         message_id: message_id_inner.clone(),
                                                         context: context_inner.clone(),
-                                                        finish_reason: last_finish_reason.clone(),
                                                         error: None,
                                                     });
                                                     break;
                                                 }
                                                 if let Ok(chunk) = serde_json::from_str::<Value>(data) {
-                                                    // 累加全量内容
-                                                    if let Some(choice) = chunk["choices"].as_array().and_then(|a| a.first()) {
-                                                        if let Some(text) = choice["delta"]["content"].as_str() {
-                                                            full_content.push_str(text);
-                                                        }
-                                                        if let Some(reason) = choice["finish_reason"].as_str() {
-                                                            last_finish_reason = Some(reason.to_string());
-                                                        }
+                                                    let stream_parts = extract_stream_text_parts(&chunk);
+                                                    if !stream_parts.reasoning.is_empty() {
+                                                        push_stream_segment(
+                                                            &mut full_content,
+                                                            &mut pending_emit_text,
+                                                            &mut reasoning_block_open,
+                                                            &stream_parts.reasoning,
+                                                            true,
+                                                        );
                                                     }
-
-                                                    send_stream_event(StreamEvent {
-                                                        r#type: "data".to_string(),
-                                                        chunk: Some(chunk),
-                                                        message_id: message_id_inner.clone(),
-                                                        context: context_inner.clone(),
-                                                        finish_reason: None,
-                                                        error: None,
-                                                    });
+                                                    if !stream_parts.answer.is_empty() {
+                                                        push_stream_segment(
+                                                            &mut full_content,
+                                                            &mut pending_emit_text,
+                                                            &mut reasoning_block_open,
+                                                            &stream_parts.answer,
+                                                            false,
+                                                        );
+                                                    }
+                                                    if !stream_parts.reasoning.is_empty() || !stream_parts.answer.is_empty() {
+                                                        emit_pending_stream_text(
+                                                            &app_handle,
+                                                            &stream_channel,
+                                                            &message_id_inner,
+                                                            &context_inner,
+                                                            &mut pending_emit_text,
+                                                            &mut last_emit_at,
+                                                            false,
+                                                        );
+                                                    }
                                                 }
                                             }
                                         }
                                         Some(Err(e)) => {
                                             println!("[VCPClient] Stream read error: {:?}", e);
-                                            send_stream_event(StreamEvent {
+                                            close_reasoning_block(
+                                                &mut full_content,
+                                                &mut pending_emit_text,
+                                                &mut reasoning_block_open,
+                                            );
+                                            emit_pending_stream_text(
+                                                &app_handle,
+                                                &stream_channel,
+                                                &message_id_inner,
+                                                &context_inner,
+                                                &mut pending_emit_text,
+                                                &mut last_emit_at,
+                                                true,
+                                            );
+                                            let _ = app_handle.emit(&stream_channel, StreamEvent {
                                                 r#type: "error".to_string(),
                                                 chunk: None,
                                                 message_id: message_id_inner.clone(),
                                                 context: context_inner.clone(),
-                                                finish_reason: Some("error".to_string()),
                                                 error: Some(format!("流读取错误: {}", e)),
                                             });
                                             break;
                                         }
                                         None => {
-                                            // 修复：若此前已收到有效 chunk，则视为正常结束（对齐桌面端行为）
-                                            if !full_content.is_empty() || last_finish_reason.is_some() {
-                                                println!("[VCPClient] Stream ended without [DONE] but content was received. Treating as normal end.");
-                                                send_stream_event(StreamEvent {
-                                                    r#type: "end".to_string(),
-                                                    chunk: None,
-                                                    message_id: message_id_inner.clone(),
-                                                    context: context_inner.clone(),
-                                                    finish_reason: last_finish_reason.clone(),
-                                                    error: None,
-                                                });
-                                            } else {
-                                                println!("[VCPClient] Stream ended unexpectedly (None)");
-                                                send_stream_event(StreamEvent {
-                                                    r#type: "error".to_string(),
-                                                    chunk: None,
-                                                    message_id: message_id_inner.clone(),
-                                                    context: context_inner.clone(),
-                                                    finish_reason: Some("error".to_string()),
-                                                    error: Some("网络连接意外断开".to_string()),
-                                                });
-                                            }
+                                            println!("[VCPClient] Stream ended unexpectedly (None)");
+                                            close_reasoning_block(
+                                                &mut full_content,
+                                                &mut pending_emit_text,
+                                                &mut reasoning_block_open,
+                                            );
+                                            emit_pending_stream_text(
+                                                &app_handle,
+                                                &stream_channel,
+                                                &message_id_inner,
+                                                &context_inner,
+                                                &mut pending_emit_text,
+                                                &mut last_emit_at,
+                                                true,
+                                            );
+                                            let _ = app_handle.emit(&stream_channel, StreamEvent {
+                                                r#type: "error".to_string(),
+                                                chunk: None,
+                                                message_id: message_id_inner.clone(),
+                                                context: context_inner.clone(),
+                                                error: Some("网络连接意外断开".to_string()),
+                                            });
                                             break;
                                         }
                                     }
@@ -500,24 +981,22 @@ pub async fn perform_vcp_request<R: Runtime>(
                     Ok(resp) => {
                         let status = resp.status();
                         let text = resp.text().await.unwrap_or_default();
-                        send_stream_event(StreamEvent {
+                        let _ = app_handle.emit(&stream_channel, StreamEvent {
                             r#type: "error".to_string(),
                             chunk: None,
                             message_id: message_id_inner.clone(),
                             context: context_inner.clone(),
-                            finish_reason: Some("error".to_string()),
                             error: Some(format!("VCP服务器错误: {} - {}", status, text)),
                         });
                         active_requests_inner.remove(&message_id_inner);
                         return Err(format!("VCP Error: {}", status));
                     }
                     Err(e) => {
-                        send_stream_event(StreamEvent {
+                        let _ = app_handle.emit(&stream_channel, StreamEvent {
                             r#type: "error".to_string(),
                             chunk: None,
                             message_id: message_id_inner.clone(),
                             context: context_inner.clone(),
-                            finish_reason: Some("error".to_string()),
                             error: Some(format!("网络请求异常: {}", e)),
                         });
                         active_requests_inner.remove(&message_id_inner);
@@ -529,11 +1008,7 @@ pub async fn perform_vcp_request<R: Runtime>(
 
         active_requests_inner.remove(&message_id_inner);
         Ok((
-            json!({
-                "fullContent": full_content,
-                "streamingStarted": true,
-                "finishReason": last_finish_reason
-            }),
+            json!({ "fullContent": full_content, "streamingStarted": true }),
             is_aborted,
         ))
     } else {
@@ -560,6 +1035,23 @@ pub async fn perform_vcp_request<R: Runtime>(
             .map_err(|e| format!("JSON解析失败: {}", e))?;
         Ok((json!({"response": vcp_response, "context": context}), false))
     }
+}
+
+/// Normalize a VCP server URL by appending `/v1/chat/completions` if missing.
+pub fn normalize_vcp_url(url_str: &str) -> String {
+    if let Ok(url) = Url::parse(url_str) {
+        if !url.path().ends_with("/chat/completions") {
+            let mut url = url;
+            let new_path = if url.path().ends_with('/') {
+                format!("{}v1/chat/completions", url.path())
+            } else {
+                format!("{}/v1/chat/completions", url.path())
+            };
+            url.set_path(&new_path);
+            return url.to_string();
+        }
+    }
+    url_str.to_string()
 }
 
 async fn load_app_settings<R: Runtime>(app: &AppHandle<R>) -> Result<Settings, String> {
@@ -595,12 +1087,28 @@ pub fn interruptRequest(
         message_id,
         state.0.len()
     );
-    if let Some((_, sender)) = state.0.remove(&message_id) {
+    if let Some((_, handle)) = state.0.remove(&message_id) {
         println!(
-            "[VCPClient] Found AbortController for messageId: {}, aborting...",
+            "[VCPClient] Found active request for messageId: {}, aborting locally and notifying VCP backend...",
             message_id
         );
-        let _ = sender.send(());
+
+        let interrupt_message_id = message_id.clone();
+        let interrupt_url = handle.vcp_url.clone();
+        let interrupt_api_key = handle.vcp_api_key.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Err(err) =
+                notify_vcp_interrupt(&interrupt_url, &interrupt_api_key, &interrupt_message_id)
+                    .await
+            {
+                eprintln!(
+                    "[VCPClient] Failed to notify VCP backend interrupt for {}: {}",
+                    interrupt_message_id, err
+                );
+            }
+        });
+
+        let _ = handle.abort_sender.send(());
         println!(
             "[VCPClient] Request interrupted for messageId: {}. Remaining active requests: {}",
             message_id,
@@ -613,6 +1121,40 @@ pub fn interruptRequest(
             message_id
         );
         Err(format!("Request {} not found", message_id))
+    }
+}
+
+async fn notify_vcp_interrupt(
+    vcp_url: &str,
+    vcp_api_key: &str,
+    message_id: &str,
+) -> Result<(), String> {
+    let mut url = Url::parse(vcp_url).map_err(|e| format!("Invalid VCP URL: {}", e))?;
+    url.set_path("/v1/interrupt");
+    url.set_query(None);
+    url.set_fragment(None);
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let response = client
+        .post(url)
+        .header(AUTHORIZATION, format!("Bearer {}", vcp_api_key))
+        .header(CONTENT_TYPE, "application/json")
+        .json(&json!({
+            "requestId": message_id,
+            "messageId": message_id,
+        }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("VCP interrupt returned HTTP {}", response.status()))
     }
 }
 
@@ -689,22 +1231,4 @@ pub async fn test_vcp_connection(vcp_url: String, vcp_api_key: String) -> Result
         let text = res.text().await.unwrap_or_default();
         Err(format!("验证失败 ({}): {}", status.as_u16(), text))
     }
-}
-
-/// Normalize a VCP server URL by appending `/v1/chat/completions` if missing.
-/// Handles URLs with or without trailing slashes in the existing path.
-pub fn normalize_vcp_url(url_str: &str) -> String {
-    if let Ok(url) = Url::parse(url_str) {
-        if !url.path().ends_with("/chat/completions") {
-            let mut url = url;
-            let new_path = if url.path().ends_with('/') {
-                format!("{}v1/chat/completions", url.path())
-            } else {
-                format!("{}/v1/chat/completions", url.path())
-            };
-            url.set_path(&new_path);
-            return url.to_string();
-        }
-    }
-    url_str.to_string()
 }

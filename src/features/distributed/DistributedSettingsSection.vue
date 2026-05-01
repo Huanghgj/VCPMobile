@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, watch } from "vue";
+import { computed, ref, watch } from "vue";
 import type { AppSettings } from "../../core/stores/settings";
 import { useDistributed } from "./composables/useDistributed";
 
@@ -18,6 +18,7 @@ const emit = defineEmits<{
 }>();
 
 const { status, loading, start, stop } = useDistributed();
+const starting = ref(false);
 
 // Local toggle state — bound to settings for persistence
 const enabled = computed({
@@ -34,59 +35,110 @@ const deviceName = computed({
   },
 });
 
-// Derive WS URL from vcpLogUrl (same main server, different path)
+const normalizeDistributedBaseUrl = (rawUrl: string) => {
+  let url = rawUrl.trim();
+  if (!url) return "";
+
+  url = url
+    .replace(/^http:\/\//i, "ws://")
+    .replace(/^https:\/\//i, "wss://")
+    .replace(/\/+$/, "");
+
+  // Users may paste a full realtime/VCPInfo/distributed endpoint. The native
+  // client appends the distributed path itself, so keep only the server base.
+  url = url
+    .replace(/\/(?:VCPlog|vcpinfo)(?:\/VCP_Key=.*)?$/i, "")
+    .replace(/\/vcp-distributed-server(?:\/VCP_Key=.*)?$/i, "")
+    .replace(/\/VCP_Key=.*$/i, "")
+    .replace(/\/+$/, "");
+
+  return url;
+};
+
+// Derive WS URL from the shared realtime channel URL (same server, different path)
 const derivedWsUrl = computed(() => {
-  const logUrl = props.settings.vcpLogUrl || "";
-  // vcpLogUrl is like "ws://host:port" — reuse it directly
-  return logUrl.replace(/\/+$/, "");
+  return normalizeDistributedBaseUrl(props.settings.vcpLogUrl || "");
 });
 
 const derivedVcpKey = computed(() => {
-  return props.settings.vcpLogKey || "";
+  return (props.settings.vcpLogKey || "").trim();
 });
 
+const isConfigured = computed(() => Boolean(derivedWsUrl.value && derivedVcpKey.value));
+const nodeEnabled = computed(() => enabled.value || status.value.connected || starting.value);
+const canToggle = computed(() => isConfigured.value || nodeEnabled.value);
+
 const statusDisplay = computed(() => {
-  if (loading.value) return { type: "loading" as const, message: "连接中..." };
+  if (loading.value || starting.value) {
+    return { type: "loading" as const, message: "正在更新分布式节点..." };
+  }
   if (status.value.connected) {
+    const serverId = status.value.server_id || "等待服务器编号";
     return {
       type: "success" as const,
-      message: `已连接 · ${status.value.server_id} · ${status.value.registered_tools} 个工具`,
+      message: `已连接 · ${serverId} · ${status.value.registered_tools} 个工具`,
     };
+  }
+  if (enabled.value && status.value.last_error) {
+    return {
+      type: "error" as const,
+      message: `连接失败，后台将继续重试：${status.value.last_error}`,
+    };
+  }
+  if (enabled.value) {
+    return { type: "loading" as const, message: "正在连接/重连中..." };
   }
   if (status.value.last_error) {
     return { type: "error" as const, message: status.value.last_error };
   }
-  return { type: null, message: "未连接" };
+  if (!isConfigured.value) {
+    return { type: "info" as const, message: "未配置 VCP 实时通道 URL 或 Key" };
+  }
+  return { type: null, message: "未启用" };
 });
 
-const toggleConnection = async () => {
-  if (status.value.connected) {
-    await stop();
+const persistEnabled = (val: boolean) => {
+  enabled.value = val;
+  emit("save-request");
+};
+
+const startConnection = async () => {
+  if (starting.value || !isConfigured.value) return;
+  starting.value = true;
+  try {
+    await start(derivedWsUrl.value, derivedVcpKey.value, deviceName.value);
+  } catch (e) {
+    console.error("[Distributed] Start failed:", e);
     enabled.value = false;
-  } else {
-    if (!derivedWsUrl.value || !derivedVcpKey.value) {
-      return;
-    }
-    enabled.value = true;
     emit("save-request");
-    try {
-      await start(derivedWsUrl.value, derivedVcpKey.value, deviceName.value);
-    } catch (e) {
-      console.error("[Distributed] Start failed:", e);
-    }
+  } finally {
+    starting.value = false;
   }
+};
+
+const toggleConnection = async (nextValue?: boolean) => {
+  const shouldEnable = typeof nextValue === "boolean" ? nextValue : !nodeEnabled.value;
+
+  if (!shouldEnable) {
+    persistEnabled(false);
+    await stop();
+    return;
+  }
+
+  if (!isConfigured.value) {
+    return;
+  }
+
+  persistEnabled(true);
+  await startConnection();
 };
 
 // Auto-connect on mount if enabled was persisted
 watch(
   () => props.settings.distributedEnabled,
   async (val) => {
-    if (val && !status.value.connected && derivedWsUrl.value && derivedVcpKey.value) {
-      try {
-        await start(derivedWsUrl.value, derivedVcpKey.value, deviceName.value);
-      } catch (e) {
-        console.error("[Distributed] Auto-connect failed:", e);
-      }
+    if (val && !status.value.connected && isConfigured.value) {
+      await startConnection();
     }
   },
   { immediate: true },
@@ -99,9 +151,9 @@ watch(
     <SettingsRow title="分布式节点" :description="statusDisplay.message">
       <template #action>
         <SettingsSwitch
-          :model-value="status.connected"
+          :model-value="nodeEnabled"
           active-color="bg-purple-500"
-          :disabled="loading || (!derivedWsUrl && !status.connected)"
+          :disabled="loading || starting || !canToggle"
           @update:model-value="toggleConnection"
         />
       </template>
@@ -121,10 +173,10 @@ watch(
       placeholder="VCPMobile"
     />
 
-    <!-- 连接信息（只读，派生自 VCPLog 配置） -->
+    <!-- 连接信息（只读，派生自实时通道配置） -->
     <div class="text-xs opacity-40 space-y-1 pt-2">
       <div class="font-mono">
-        WS: {{ derivedWsUrl || "未配置（请先设置核心连接 → VCPLog URL）" }}
+        WS: {{ derivedWsUrl || "未配置（请先设置核心连接 → 实时通道 URL）" }}
       </div>
       <div class="font-mono">
         Key: {{ derivedVcpKey ? "●●●●●●●●" : "未配置" }}
@@ -134,13 +186,13 @@ watch(
     <!-- 手动重连按钮 -->
     <div class="pt-2 flex justify-end">
       <SettingsActionButton
-        variant="secondary"
+        :variant="nodeEnabled ? 'danger' : 'secondary'"
         size="sm"
-        :loading="loading"
-        :disabled="!derivedWsUrl || !derivedVcpKey"
+        :loading="loading || starting"
+        :disabled="!canToggle"
         @click="toggleConnection"
       >
-        {{ status.connected ? "断开连接" : "连接" }}
+        {{ nodeEnabled ? "停止节点" : "连接" }}
       </SettingsActionButton>
     </div>
   </div>

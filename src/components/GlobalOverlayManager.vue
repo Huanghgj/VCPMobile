@@ -4,6 +4,7 @@ import VcpPrompt from './ui/VcpPrompt.vue';
 import ToastManager from './ui/ToastManager.vue';
 import ContextMenuSheet from './ui/ContextMenuSheet.vue';
 import FullScreenEditor from './ui/FullScreenEditor.vue';
+import GlobalMediaViewer from './ui/GlobalMediaViewer.vue';
 
 const overlayStore = useOverlayStore();
 
@@ -40,6 +41,9 @@ const handleEditorSave = (newContent: string) => {
       :is-open="!!overlayStore.editorConfig" :initial-value="overlayStore.editorConfig.initialValue"
       @save="handleEditorSave" @cancel="overlayStore.closeEditor()"
       @update:isOpen="!$event && overlayStore.closeEditor()" />
+
+    <GlobalMediaViewer v-if="overlayStore.mediaViewerConfig" :config="overlayStore.mediaViewerConfig"
+      @close="overlayStore.closeMediaViewer()" />
 
     <ToastManager class="pointer-events-auto" />
 

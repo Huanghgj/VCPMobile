@@ -1,6 +1,5 @@
 <script setup lang="ts">
-import { computed, onUnmounted, ref, watch, nextTick } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { computed, onUnmounted, ref, watch } from "vue";
 import type { ChatMessage } from "../../core/stores/chatManager";
 import { useAssistantStore } from "../../core/stores/assistant";
 import { useSettingsStore } from "../../core/stores/settings";
@@ -8,15 +7,22 @@ import {
   useContentProcessor,
   type ContentBlock,
 } from "../../core/composables/useContentProcessor";
-import { useEmoticonFixer } from "../../core/composables/useEmoticonFixer";
 import { useOverlayStore } from "../../core/stores/overlay";
 import { useChatManagerStore } from "../../core/stores/chatManager";
 import { useNotificationStore } from "../../core/stores/notification";
+import { usePerformanceDiagnostics } from "../../core/utils/performanceDiagnostics";
+import {
+  TOOL_REQUEST_END,
+  TOOL_REQUEST_START,
+  TOOL_RESULT_END,
+  TOOL_RESULT_START,
+  extractToolNameFromRequest,
+  parseToolResultBody,
+} from "../../core/utils/toolPreview";
 import { Copy, Edit2, RotateCcw, Trash2, StopCircle } from "lucide-vue-next";
 
 // Import block components
 import MarkdownBlock from "./blocks/MarkdownBlock.vue";
-import MathBlock from "./blocks/MathBlock.vue";
 import ToolBlock from "./blocks/ToolBlock.vue";
 import DiaryBlock from "./blocks/DiaryBlock.vue";
 import ThoughtBlock from "./blocks/ThoughtBlock.vue";
@@ -37,9 +43,9 @@ const props = defineProps<{
 const assistantStore = useAssistantStore();
 const settingsStore = useSettingsStore();
 const { processMessageContent, removeScopedCss } = useContentProcessor();
-const { processEmoticonsInContainer } = useEmoticonFixer();
 const overlayStore = useOverlayStore();
 const notificationStore = useNotificationStore();
+const diagnostics = usePerformanceDiagnostics();
 
 const chatStore = useChatManagerStore();
 
@@ -86,38 +92,25 @@ const agentConfig = computed(() => {
   return null;
 });
 
-// 获取头像所需的基础信息
-const avatarOwnerInfo = computed(() => {
-  if (isUser.value) {
-    return { type: 'user' as const, id: 'user_avatar' };
-  }
+// 获取头像 URL
+const resolvedAvatarUrl = computed(() => {
+  if (isUser.value) return "vcp-avatar://user/user_avatar";
 
-  // 1. 优先使用匹配到的 Agent ID
+  // 优先使用匹配到的 Agent ID
   if (actualAgentId.value) {
-    return { type: 'agent' as const, id: actualAgentId.value };
+    return `vcp-avatar://agent/${actualAgentId.value}`;
   }
 
-  // 2. 如果只有名称，尝试从配置中反查 ID
+  // 如果没有 ID 只有名称，尝试按名称匹配 (兼容旧数据)
   if (props.message.name) {
     const agent = assistantStore.agents.find(
       (a) => a.name === props.message.name,
     );
-    if (agent) return { type: 'agent' as const, id: agent.id };
+    if (agent) return `vcp-avatar://agent/${agent.id}`;
   }
 
   return null;
 });
-
-// 统一后处理：表情包修复（VCPMagic 已退回 MarkdownBlock 内部，避免破坏 Vue 虚拟 DOM）
-const runPostProcess = async () => {
-  try {
-    await nextTick();
-    if (!messageContentRef.value || !props.message.id) return;
-    processEmoticonsInContainer(messageContentRef.value);
-  } catch (e) {
-    console.error('[MessageRenderer] Post-process error:', e);
-  }
-};
 
 onUnmounted(() => {
   // 彻底防止 Scoped CSS 在组件销毁后泄漏内存或污染全局
@@ -128,14 +121,8 @@ onUnmounted(() => {
 
 // 响应式消息块 (AST 树)
 const contentBlocks = ref<ContentBlock[]>([]);
-// 流式传输专用 Block 数组 (Rust AST 解析)
-const streamBlocks = ref<ContentBlock[]>([]);
-// 流式传输专用原始文本 (兼容旧逻辑)
+// 流式传输专用原始文本
 const streamContent = ref<string>("");
-// 内容容器 ref，用于统一后处理
-const messageContentRef = ref<HTMLElement | null>(null);
-
-watch([() => contentBlocks.value, () => streamBlocks.value], runPostProcess, { flush: 'post' });
 
 // 过渡状态：用于在流式结束、等待 Rust AST 解析完成前，保持流式视图不消失，防止闪烁
 const isTransitioning = ref(false);
@@ -145,15 +132,233 @@ const showStreamView = computed(
   () => isStreaming.value || isTransitioning.value,
 );
 
+const hasLayeredStream = computed(
+  () =>
+    isStreaming.value &&
+    (props.message.stableContent !== undefined ||
+      props.message.tailContent !== undefined),
+);
+
+const messageRenderSource = computed(() => {
+  if (hasLayeredStream.value) {
+    return props.message.tailContent || "";
+  }
+
+  return (
+    props.message.processedContent ||
+    props.message.displayedContent ||
+    props.message.content ||
+    ""
+  );
+});
+
+const streamTailContent = computed(() => {
+  if (hasLayeredStream.value) {
+    return props.message.tailContent || "";
+  }
+
+  return streamContent.value;
+});
+
+const hasVisibleStreamContent = computed(() => {
+  if (!isStreaming.value) return false;
+  return Boolean(
+    props.message.stableContent ||
+      props.message.tailContent ||
+      streamContent.value,
+  );
+});
+
+const normalizeThoughtContent = (content: string) => {
+  return content.replace(/^\n+/, "").replace(/\n+$/, "");
+};
+
+const pushMarkdownBlock = (blocks: ContentBlock[], content: string) => {
+  if (!content) return;
+  blocks.push({
+    type: "markdown",
+    content,
+  });
+};
+
+const findNextStreamMarker = (text: string, cursor: number) => {
+  const candidates: Array<{
+    index: number;
+    end: number;
+    type: "thought" | "think" | "tool-use" | "tool-result" | "role-divider";
+    match?: RegExpExecArray;
+  }> = [];
+
+  const addRegexCandidate = (
+    regex: RegExp,
+    type: "thought" | "think" | "role-divider",
+  ) => {
+    regex.lastIndex = cursor;
+    const match = regex.exec(text);
+    if (!match) return;
+    const linePrefix = match[1] || "";
+    candidates.push({
+      index: match.index + linePrefix.length,
+      end: match.index + match[0].length,
+      type,
+      match,
+    });
+  };
+
+  addRegexCandidate(
+    /(^|\n)[ \t]*(\[--- VCP元思考链(?::\s*([^\]]*?))?\s*---\])/gim,
+    "thought",
+  );
+  addRegexCandidate(/(^|\n)[ \t]*(<think(?:ing)?>)/gim, "think");
+  addRegexCandidate(
+    /(^|\n)[ \t]*(<<<\[(END_)?ROLE_DIVIDE_(SYSTEM|ASSISTANT|USER)\]>>>)/g,
+    "role-divider",
+  );
+
+  const toolRequestStart = text.indexOf(TOOL_REQUEST_START, cursor);
+  if (toolRequestStart !== -1) {
+    candidates.push({
+      index: toolRequestStart,
+      end: toolRequestStart + TOOL_REQUEST_START.length,
+      type: "tool-use",
+    });
+  }
+
+  const toolResultStart = text.indexOf(TOOL_RESULT_START, cursor);
+  if (toolResultStart !== -1) {
+    candidates.push({
+      index: toolResultStart,
+      end: toolResultStart + TOOL_RESULT_START.length,
+      type: "tool-result",
+    });
+  }
+
+  return candidates.sort((a, b) => a.index - b.index)[0] || null;
+};
+
+const splitStreamSpecialBlocks = (text: string): ContentBlock[] => {
+  if (!text) return [];
+
+  const blocks: ContentBlock[] = [];
+  let cursor = 0;
+
+  while (cursor < text.length) {
+    const nextMarker = findNextStreamMarker(text, cursor);
+    if (!nextMarker) {
+      pushMarkdownBlock(blocks, text.slice(cursor));
+      break;
+    }
+
+    pushMarkdownBlock(blocks, text.slice(cursor, nextMarker.index));
+
+    if (nextMarker.type === "role-divider") {
+      const isEnd = Boolean(nextMarker.match?.[3]);
+      const role = (nextMarker.match?.[4] || "").toLowerCase();
+      blocks.push({
+        type: "role-divider",
+        content: "",
+        role,
+        is_end: isEnd,
+      });
+      cursor = nextMarker.end;
+      continue;
+    }
+
+    if (nextMarker.type === "tool-use") {
+      const contentStart = nextMarker.end;
+      const endIndex = text.indexOf(TOOL_REQUEST_END, contentStart);
+      const contentEnd = endIndex === -1 ? text.length : endIndex;
+      const content = text.slice(contentStart, contentEnd);
+      blocks.push({
+        type: "tool-use",
+        content,
+        tool_name: extractToolNameFromRequest(content),
+        is_complete: endIndex !== -1,
+      });
+      cursor = endIndex === -1 ? text.length : endIndex + TOOL_REQUEST_END.length;
+      continue;
+    }
+
+    if (nextMarker.type === "tool-result") {
+      const contentStart = nextMarker.end;
+      const endIndex = text.indexOf(TOOL_RESULT_END, contentStart);
+      if (endIndex === -1) {
+        blocks.push({
+          type: "tool-result",
+          content: "",
+          tool_name: "VCP 工具",
+          status: "接收中",
+          details: [],
+          footer: "",
+          is_complete: false,
+        });
+        cursor = text.length;
+        continue;
+      }
+
+      const parsed = parseToolResultBody(text.slice(contentStart, endIndex));
+      blocks.push({
+        type: "tool-result",
+        content: "",
+        tool_name: parsed.toolName,
+        status: parsed.status,
+        details: parsed.details,
+        footer: parsed.footer,
+        is_complete: true,
+      });
+      cursor = endIndex + TOOL_RESULT_END.length;
+      continue;
+    }
+
+    const isVcpThought = nextMarker.type === "thought";
+    const contentStart = nextMarker.end;
+    const endRegex = isVcpThought
+      ? /(^|\n)[ \t]*\[--- 元思考链结束 ---\]/gim
+      : /(^|\n)[ \t]*<\/think(?:ing)?>/gim;
+    endRegex.lastIndex = contentStart;
+    const endMatch = endRegex.exec(text);
+    const endLinePrefix = endMatch?.[1] || "";
+    const contentEnd = endMatch
+      ? endMatch.index + endLinePrefix.length
+      : text.length;
+    const nextCursor = endMatch ? endMatch.index + endMatch[0].length : text.length;
+    const rawTheme = nextMarker.match?.[3]?.trim().replace(/"/g, "");
+
+    blocks.push({
+      type: "thought",
+      content: normalizeThoughtContent(text.slice(contentStart, contentEnd)),
+      theme: isVcpThought ? rawTheme || "元思考链" : "思维链",
+      is_complete: Boolean(endMatch),
+    });
+
+    cursor = nextCursor;
+  }
+
+  return blocks;
+};
+
+const stableStreamBlocks = computed(() =>
+  splitStreamSpecialBlocks(props.message.stableContent || ""),
+);
+
+const tailStreamBlocks = computed(() =>
+  splitStreamSpecialBlocks(streamTailContent.value || ""),
+);
+
 // 节流状态
 let isProcessing = false;
-let pendingText: string | null = null;
+let pendingRenderRequest: { text: string; streaming: boolean } | null = null;
 
 // 核心解析逻辑
 const updateContentBlocks = async (text: string) => {
+  const renderStartedAt = performance.now();
   if (!text && isStreaming.value) {
     contentBlocks.value = [];
     streamContent.value = "";
+    diagnostics.addTrace("message-render-empty-stream", {
+      messageId: props.message.id,
+      durationMs: Math.round((performance.now() - renderStartedAt) * 10) / 10,
+    });
     return;
   }
 
@@ -161,6 +366,12 @@ const updateContentBlocks = async (text: string) => {
   if (!isStreaming.value && props.message.blocks && props.message.blocks.length > 0) {
     contentBlocks.value = props.message.blocks;
     streamContent.value = "";
+    diagnostics.addTrace("message-render-cached-blocks", {
+      messageId: props.message.id,
+      totalChars: text?.length || 0,
+      durationMs: Math.round((performance.now() - renderStartedAt) * 10) / 10,
+      detail: `blocks=${props.message.blocks.length}`,
+    });
     return;
   }
 
@@ -175,9 +386,14 @@ const updateContentBlocks = async (text: string) => {
   };
 
   if (isStreaming.value) {
-    // 流式状态：跳过 Rust AST，直接生成混合 Markdown
-    const blocks = await processMessageContent(text || "", options);
-    streamContent.value = blocks[0]?.content || "";
+    streamContent.value = hasLayeredStream.value
+      ? props.message.tailContent || ""
+      : text || "";
+    diagnostics.addTrace("message-render-stream-text", {
+      messageId: props.message.id,
+      totalChars: text?.length || 0,
+      durationMs: Math.round((performance.now() - renderStartedAt) * 10) / 10,
+    });
   } else {
     // 动态编译态 (例如流式刚结束，或者刚编辑完)
     isTransitioning.value = true;
@@ -186,6 +402,12 @@ const updateContentBlocks = async (text: string) => {
       contentBlocks.value = newBlocks;
       // 可选：将新编译的块缓存到 message 对象上，防止后续频繁重编
       props.message.blocks = newBlocks;
+      diagnostics.addTrace("message-render-compiled-blocks", {
+        messageId: props.message.id,
+        totalChars: text?.length || 0,
+        durationMs: Math.round((performance.now() - renderStartedAt) * 10) / 10,
+        detail: `blocks=${newBlocks.length}`,
+      });
     } finally {
       // 确保无论解析成功失败，都能解除过渡状态
       isTransitioning.value = false;
@@ -193,81 +415,41 @@ const updateContentBlocks = async (text: string) => {
   }
 };
 
+const queueContentUpdate = async (text: string, streaming: boolean) => {
+  pendingRenderRequest = { text, streaming };
+  if (isProcessing) return;
+
+  isProcessing = true;
+  try {
+    while (pendingRenderRequest) {
+      const request = pendingRenderRequest;
+      pendingRenderRequest = null;
+
+      try {
+        await updateContentBlocks(request.text);
+
+        if (!request.streaming) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+      } catch (e) {
+        console.error("[MessageRenderer] Watcher error:", e);
+      }
+    }
+  } finally {
+    isProcessing = false;
+  }
+};
+
 // 监听文本变化或流状态变化，加入节流机制 (Throttle) 防止流式输出卡顿
 watch(
   [
-    () =>
-      props.message.processedContent ||
-      props.message.displayedContent ||
-      "",
+    () => messageRenderSource.value,
     () => isStreaming.value,
   ],
-  async ([newText, streaming]) => {
-    if (isProcessing) {
-      // 如果正在处理，则将最新文本存入 pending
-      pendingText = (newText as string) || "";
-      return;
-    }
-
-    try {
-      isProcessing = true;
-      await updateContentBlocks((newText as string) || "");
-
-      // [优化] 流式状态时放宽到 33ms (约 30fps) 以减轻渲染主线程负担
-      // 如果是非流式（例如切换话题、历史加载），保持 50ms 响应性
-      const throttleTime = streaming ? 33 : 50;
-      await new Promise((resolve) => setTimeout(resolve, throttleTime));
-    } catch (e) {
-      console.error("[MessageRenderer] Watcher error:", e);
-    } finally {
-      // [关键修复] 必须在 finally 中释放锁，防止发生错误后永久死锁
-      isProcessing = false;
-
-      // 消费积压的文本
-      if (pendingText !== null) {
-        const textToProcess = pendingText;
-        pendingText = null;
-        updateContentBlocks(textToProcess);
-      }
-    }
+  ([newText, streaming]) => {
+    void queueContentUpdate((newText as string) || "", Boolean(streaming));
   },
   { immediate: true },
-);
-
-// [重构] 流式模式 Rust AST 解析：监听 Aurora 稳定区/尾区变化，合并全文后调用 Rust 解析
-// 直接复用 Rust 后端的 parse_content，避免前端重复写正则
-let lastRustParseTime = 0;
-const RUST_PARSE_THROTTLE = 50; // ms，与 streamManager loop 周期对齐
-
-watch(
-  [() => props.message.stableContent, () => props.message.tailContent, () => isStreaming.value],
-  async ([stable, tail, streaming]) => {
-    if (!streaming) {
-      streamBlocks.value = [];
-      return;
-    }
-    const fullText = (stable || '') + (tail || '');
-    if (!fullText) {
-      streamBlocks.value = [];
-      return;
-    }
-
-    const now = performance.now();
-    if (now - lastRustParseTime < RUST_PARSE_THROTTLE) {
-      return;
-    }
-    lastRustParseTime = now;
-
-    try {
-      const blocks = await invoke<ContentBlock[]>('process_message_content', { content: fullText });
-      streamBlocks.value = blocks;
-    } catch (e) {
-      console.error('[MessageRenderer] Rust AST parse failed in streaming mode:', e);
-      streamBlocks.value = [{ type: 'markdown', content: fullText } as ContentBlock];
-    }
-  },
-  // { immediate: true } removed: streamBlocks watcher should only react to actual
-  // content changes, not fire on mount for every history message.
 );
 
 // 计算气泡背景颜色
@@ -290,7 +472,6 @@ const bubbleStyle = computed(() => {
   if (color) {
     baseStyle["--dynamic-color"] = color;
     baseStyle.borderColor = `${color}30`; // Adjust to very subtle 18% opacity
-    baseStyle.boxShadow = `0 4px 12px ${color}15`;
   }
 
   return baseStyle;
@@ -410,8 +591,6 @@ const showMessageContextMenu = async () => {
         const fullText = await getFullText();
         // 将内容填入全局编辑状态供 InputEnhancer 读取
         chatStore.editMessageContent = fullText || "";
-        // 标记当前正在编辑重发的消息 ID
-        chatStore.editingOriginalMessageId = props.message.id;
       },
     });
   }
@@ -447,12 +626,7 @@ const showMessageContextMenu = async () => {
 
 const handleSaveEdit = async (newContent: string) => {
   const chatStore = useChatManagerStore();
-  let currentContent = props.message.content || "";
-  if (!currentContent) {
-    currentContent = await chatStore.fetchRawContent(props.message.id);
-    props.message.content = currentContent;
-  }
-  if (newContent !== currentContent) {
+  if (newContent !== props.message.content) {
     await chatStore.updateMessageContent(props.message.id, newContent);
     // 立即重新触发渲染
     await updateContentBlocks(newContent);
@@ -462,74 +636,64 @@ const handleSaveEdit = async (newContent: string) => {
 
 <template>
   <div v-longpress="showMessageContextMenu"
-    class="vcp-message-item flex flex-col w-full mb-6 animate-fade-in px-1 min-w-0" :data-message-id="message.id"
+    class="vcp-message-item flex flex-col w-full mb-6 px-1 min-w-0" :data-message-id="message.id"
     :data-role="message.role">
-    <MessageHeader 
-      :is-user="isUser" 
-      :display-name="displayName" 
-      :name-style="nameStyle" 
-      :owner-type="avatarOwnerInfo?.type"
-      :owner-id="avatarOwnerInfo?.id"
-      :avatar-fallback-text="avatarFallbackText" 
-      :avatar-fallback-color="avatarFallbackColor" 
-    />
+    <MessageHeader :is-user="isUser" :display-name="displayName" :name-style="nameStyle" :avatar-url="resolvedAvatarUrl"
+      :avatar-fallback-text="avatarFallbackText" :avatar-fallback-color="avatarFallbackColor" />
 
     <ChatBubble :is-user="isUser" :is-streaming="isStreaming" :bubble-style="bubbleStyle">
-      <ThinkingIndicator v-if="isStreaming && streamBlocks.length === 0" />
+      <ThinkingIndicator v-if="isStreaming && !hasVisibleStreamContent" />
 
       <template v-if="!showStreamView">
-        <div ref="messageContentRef" class="vcp-content-blocks space-y-2 min-w-0 w-full overflow-hidden">
+        <div class="vcp-content-blocks space-y-2 min-w-0 w-full overflow-hidden">
           <template v-for="(block, index) in contentBlocks" :key="index">
-            <template v-if="block">
-              <MarkdownBlock v-if="block.type === 'markdown'" :content="block.content" :is-streaming="false" />
-              <MathBlock v-else-if="block.type === 'math'" :content="block.content" :block="block" />
-              <ToolBlock v-else-if="block.type === 'tool-use'" :type="block.type" :content="block.content"
-                :block="block" />
-              <ToolBlock v-else-if="block.type === 'tool-result'" :type="block.type" :block="block" />
-              <DiaryBlock v-else-if="block.type === 'diary'" :content="block.content" :block="block" />
-              <ThoughtBlock v-else-if="block.type === 'thought'" :content="block.content" :block="block" />
-              <HtmlPreviewBlock v-else-if="block.type === 'html-preview'" :content="block.content"
-                :message-id="message.id" />
-              <RoleDividerBlock v-else-if="block.type === 'role-divider'" :block="block" />
-              <div v-else-if="block.type === 'button-click'"
-                class="inline-block px-3 py-1 bg-black/10 dark:bg-white/10 rounded-full text-[10px] font-bold opacity-70 my-1">
-                {{ block.content }}
-              </div>
-            </template>
+            <MarkdownBlock v-if="block.type === 'markdown'" :content="block.content" :is-streaming="false" />
+            <ToolBlock v-else-if="block.type === 'tool-use'" :type="block.type" :content="block.content"
+              :block="block" />
+            <ToolBlock v-else-if="block.type === 'tool-result'" :type="block.type" :block="block" />
+            <DiaryBlock v-else-if="block.type === 'diary'" :content="block.content" :block="block" />
+            <ThoughtBlock v-else-if="block.type === 'thought'" :content="block.content" :block="block" />
+            <HtmlPreviewBlock v-else-if="block.type === 'html-preview'" :content="block.content"
+              :message-id="message.id" />
+            <RoleDividerBlock v-else-if="block.type === 'role-divider'" :block="block" />
+            <div v-else-if="block.type === 'button-click'"
+              class="inline-block px-3 py-1 bg-black/10 dark:bg-white/10 rounded-full text-[10px] font-bold opacity-70 my-1">
+              {{ block.content }}
+            </div>
           </template>
         </div>
       </template>
       <template v-else>
-        <div ref="messageContentRef" class="vcp-content-blocks space-y-2 min-w-0 w-full overflow-hidden">
-          <template v-for="(block, index) in streamBlocks" :key="`${block?.type || 'null'}-${index}`">
-            <template v-if="block">
-              <MarkdownBlock
-                v-if="block.type === 'markdown'"
-                :content="block.content"
-                :is-streaming="index === streamBlocks.length - 1"
-              />
-              <MathBlock v-else-if="block.type === 'math'" :content="block.content" :block="block" />
+        <div class="vcp-content-blocks space-y-2 min-w-0 w-full overflow-hidden aurora-container">
+          <div v-if="message.stableContent" v-memo="[message.stableContent]" class="aurora-stable-layer">
+            <template v-for="(block, index) in stableStreamBlocks" :key="`stable-${index}-${block.type}`">
+              <MarkdownBlock v-if="block.type === 'markdown'" :content="block.content" :is-streaming="false" />
+              <ThoughtBlock v-else-if="block.type === 'thought'" :content="block.content" :block="block" />
               <ToolBlock v-else-if="block.type === 'tool-use'" :type="block.type" :content="block.content"
                 :block="block" />
               <ToolBlock v-else-if="block.type === 'tool-result'" :type="block.type" :block="block" />
-              <DiaryBlock v-else-if="block.type === 'diary'" :content="block.content" :block="block" />
-              <ThoughtBlock v-else-if="block.type === 'thought'" :content="block.content" :block="block" />
-              <HtmlPreviewBlock v-else-if="block.type === 'html-preview'" :content="block.content"
-                :message-id="message.id" />
               <RoleDividerBlock v-else-if="block.type === 'role-divider'" :block="block" />
-              <div v-else-if="block.type === 'button-click'"
-                class="inline-block px-3 py-1 bg-black/10 dark:bg-white/10 rounded-full text-[10px] font-bold opacity-70 my-1">
-                {{ block.content }}
-              </div>
             </template>
-          </template>
+          </div>
+
+          <div class="aurora-tail-layer">
+            <template v-for="(block, index) in tailStreamBlocks" :key="`tail-${index}-${block.type}`">
+              <MarkdownBlock v-if="block.type === 'markdown'" :content="block.content" :is-streaming="true" />
+              <ThoughtBlock v-else-if="block.type === 'thought'" :content="block.content" :block="block"
+                :is-streaming="true" />
+              <ToolBlock v-else-if="block.type === 'tool-use'" :type="block.type" :content="block.content"
+                :block="block" />
+              <ToolBlock v-else-if="block.type === 'tool-result'" :type="block.type" :block="block" />
+              <RoleDividerBlock v-else-if="block.type === 'role-divider'" :block="block" />
+            </template>
+          </div>
         </div>
       </template>
 
       <AttachmentPreview v-if="message.attachments && message.attachments.length > 0" :attachments="message.attachments"
         class="pt-3 border-t border-black/5 dark:border-white/5" />
 
-      <StreamingTag v-if="isStreaming && streamBlocks.length > 0" />
+      <StreamingTag v-if="isStreaming && hasVisibleStreamContent" />
 
       <template #footer>
         <div class="text-[9px] mt-1.5 px-1 opacity-50 font-mono tracking-tighter w-full"
@@ -556,18 +720,14 @@ const handleSaveEdit = async (newContent: string) => {
 }
 
 .aurora-container {
-  /* 布局隔离：防止内部变动影响全局 */
-  contain: layout;
+  contain: layout paint style;
 }
 
 .aurora-stable-layer {
-  /* 稳定区：启用浏览器原生墓碑优化 */
-  content-visibility: auto;
-  contain-intrinsic-size: 0 50px;
+  contain: layout paint style;
 }
 
 .aurora-tail-layer {
-  /* 活跃区：确保动画不被裁切 */
   position: relative;
 }
 

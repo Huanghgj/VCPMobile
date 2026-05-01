@@ -2,7 +2,8 @@
 // Protocol message types for VCP Distributed Node
 // Mirrors the JSON protocol in VCPChat/VCPDistributedServer/VCPDistributedServer.js
 
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -153,7 +154,7 @@ impl IncomingEnvelope {
 
 /// Tool manifest matching VCPToolBox's plugin manifest format.
 /// VCPChat ref: Plugin.js getAllPluginManifests()
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ToolManifest {
     pub name: String,
     pub description: String,
@@ -162,6 +163,54 @@ pub struct ToolManifest {
     /// "service" | "hybridservice" | "static" | "mobile" — VCPMobile tools use "mobile"
     #[serde(rename = "type", default = "default_tool_type")]
     pub tool_type: String,
+}
+
+impl Serialize for ToolManifest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(11))?;
+        map.serialize_entry("manifestVersion", "1.0.0")?;
+        map.serialize_entry("name", &self.name)?;
+        map.serialize_entry("version", "1.0.0")?;
+        map.serialize_entry("displayName", &self.name)?;
+        map.serialize_entry("description", &self.description)?;
+        map.serialize_entry("author", "VCPMobile")?;
+        let plugin_type = if self.tool_type == "mobile" {
+            "synchronous"
+        } else {
+            self.tool_type.as_str()
+        };
+        map.serialize_entry("pluginType", plugin_type)?;
+        map.serialize_entry("type", &self.tool_type)?;
+        map.serialize_entry("parameters", &self.parameters)?;
+        map.serialize_entry(
+            "entryPoint",
+            &serde_json::json!({
+                "type": "native",
+                "command": format!("tauri:{}", self.name),
+            }),
+        )?;
+        map.serialize_entry(
+            "communication",
+            &serde_json::json!({
+                "protocol": "tauri-native",
+                "timeout": 1200000,
+            }),
+        )?;
+        map.serialize_entry(
+            "capabilities",
+            &serde_json::json!({
+                "invocationCommands": [{
+                    "commandIdentifier": self.name,
+                    "description": self.description,
+                    "parameters": self.parameters,
+                }],
+            }),
+        )?;
+        map.end()
+    }
 }
 
 fn default_tool_type() -> String {

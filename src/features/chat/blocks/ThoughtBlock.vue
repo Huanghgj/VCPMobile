@@ -1,12 +1,13 @@
 <script setup lang="ts">
-import { ref } from 'vue';
+import { computed, ref } from 'vue';
 import { ChevronDown, ChevronUp, Loader2 } from 'lucide-vue-next';
 import MarkdownBlock from './MarkdownBlock.vue';
 import type { ContentBlock } from '../../../core/composables/useContentProcessor';
 
-defineProps<{
+const props = defineProps<{
   content: string;
   block: ContentBlock;
+  isStreaming?: boolean;
 }>();
 
 const isExpanded = ref(false);
@@ -14,22 +15,29 @@ const isExpanded = ref(false);
 const toggleExpand = () => {
   isExpanded.value = !isExpanded.value;
 };
+
+const stateText = computed(() => {
+  if (props.block.is_complete === false) return '生成中';
+  return isExpanded.value ? '已展开' : '已折叠';
+});
 </script>
 
 <template>
   <div class="vcp-thought-block">
-    <div class="thought-header" @click="toggleExpand">
+    <div class="thought-header" role="button" :aria-expanded="isExpanded" tabindex="0" @click="toggleExpand"
+      @keydown.enter.prevent="toggleExpand" @keydown.space.prevent="toggleExpand">
       <span class="thought-icon">🧠</span>
       <span class="thought-label flex items-center gap-1">
         {{ block.theme || '元思考链' }}
-        <Loader2 v-if="!block.is_complete" :size="10" class="animate-spin" />
+        <Loader2 v-if="block.is_complete === false" :size="10" class="animate-spin" />
       </span>
+      <span class="thought-state">{{ stateText }}</span>
       <component :is="isExpanded ? ChevronUp : ChevronDown" :size="14" class="opacity-40 ml-auto" />
     </div>
 
-    <div v-show="isExpanded" class="thought-content animate-slide-down">
+    <div v-if="isExpanded" class="thought-content animate-slide-down">
       <div class="thought-body">
-        <MarkdownBlock :content="content" />
+        <MarkdownBlock :content="content" :is-streaming="isStreaming" />
       </div>
     </div>
   </div>
@@ -77,6 +85,15 @@ html.dark .vcp-thought-block {
 .thought-label {
   font-weight: 600;
   font-size: 0.95em;
+}
+
+.thought-state {
+  border-radius: 999px;
+  border: 1px solid rgba(120, 120, 128, 0.22);
+  font-size: 0.72em;
+  line-height: 1;
+  opacity: 0.58;
+  padding: 3px 7px;
 }
 
 .thought-content {

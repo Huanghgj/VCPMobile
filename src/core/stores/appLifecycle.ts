@@ -265,7 +265,7 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
       notificationStore.updateStatus({
         status: snapshot.log as any,
         message: snapshot.log === 'open' ? '已连接' : '正在连接...',
-        source: 'VCPLog'
+        source: '实时通道'
       });
 
       // 同步状态不再渲染到全局状态栏（同步已改为完全手动触发）

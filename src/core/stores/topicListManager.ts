@@ -41,6 +41,7 @@ export const useTopicStore = defineStore("topic", () => {
    */
   const invalidateAllTopicCaches = () => {
     topics.value = [];
+    chatManager.invalidateRuntimeCaches();
     // currentAgentId 保持不动，这样当前选中的话题列表会在 watch 中重新加载
     console.log("[TopicStore] All topic caches invalidated");
   };
@@ -201,6 +202,7 @@ export const useTopicStore = defineStore("topic", () => {
         (chatManager as any).currentTopicId = null;
         (chatManager as any).currentChatHistory = [];
       }
+      chatManager.invalidateRuntimeCaches();
     } catch (e) {
       console.error("[TopicStore] Failed to delete topic:", e);
       throw e;

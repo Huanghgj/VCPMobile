@@ -1,11 +1,28 @@
 import { defineStore } from 'pinia';
 import { onScopeDispose, ref } from 'vue';
+import { invoke } from '@tauri-apps/api/core';
+
+export type VcpObserverKind =
+  | 'rag'
+  | 'chain'
+  | 'memo'
+  | 'daily-note'
+  | 'dream'
+  | 'agent-chat'
+  | 'agent-notice'
+  | 'tool-approval'
+  | 'tool-result'
+  | 'tool-log'
+  | 'video-status'
+  | 'system'
+  | 'notification';
 
 export interface VcpNotification {
   id: string;
-  type: 'info' | 'success' | 'warning' | 'error' | 'tool' | 'agent';
+  type: 'info' | 'success' | 'warning' | 'error' | 'tool' | 'agent' | 'diary';
   title: string;
   message: string;
+  summary?: string;
   timestamp: number;
   duration?: number; // 毫秒, 0 为永不消失
   isPreformatted?: boolean;
@@ -13,6 +30,7 @@ export interface VcpNotification {
   silent?: boolean;
   toastOnly?: boolean; // 仅作为 Toast 悬浮显示，不进入通知中心历史
   historyOnly?: boolean; // 仅进入通知中心历史，不弹出 Toast
+  observerKind?: VcpObserverKind;
   read?: boolean;
   rawPayload?: any; // 用于保存原始数据，方便处理 action
 }
@@ -20,6 +38,7 @@ export interface VcpNotification {
 export interface VcpStatus {
   status: 'open' | 'closed' | 'error' | 'connecting' | 'connected' | 'disconnected' | 'ready' | 'initializing';
   message: string;
+  summary?: string;
   source: string;
 }
 
@@ -32,7 +51,7 @@ export const useNotificationStore = defineStore('notification', () => {
   const vcpStatus = ref<VcpStatus>({
     status: 'connecting',
     message: '等待初始化...',
-    source: 'VCPLog'
+    source: '实时通道'
   });
 
   const vcpCoreStatus = ref<VcpStatus>({
@@ -160,7 +179,6 @@ export const useNotificationStore = defineStore('notification', () => {
       };
 
       try {
-        const { invoke } = await import('@tauri-apps/api/core');
         // 通过 vcp_log_service 接口回传
         await invoke('send_vcp_log_message', { payload: response });
 

@@ -1,7 +1,7 @@
 // features/distributed/composables/useDistributed.ts
 // Self-contained composable for distributed node state.
 // Does NOT import chatManager, assistant, or any other existing store.
-// Only reads 2 fields from settings (vcpLogUrl, vcpLogKey) for server URL reuse.
+// Only reads the shared realtime channel fields from settings (vcpLogUrl, vcpLogKey) for server URL reuse.
 
 import { ref, readonly, onMounted, onUnmounted } from "vue";
 import { invoke } from "@tauri-apps/api/core";

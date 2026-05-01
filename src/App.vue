@@ -17,6 +17,7 @@ import AgentSidebar from "./components/layout/AgentSidebar.vue";
 import RightSidebar from "./components/layout/RightSidebar.vue";
 import GlobalOverlayManager from "./components/GlobalOverlayManager.vue";
 import FeatureOverlays from "./components/FeatureOverlays.vue";
+import GlobalPerformanceMonitor from "./components/GlobalPerformanceMonitor.vue";
 
 const themeStore = useThemeStore();
 const lifecycleStore = useAppLifecycleStore();
@@ -107,7 +108,7 @@ onMounted(async () => {
 
   await bootstrapApp();
 
-  // 启动 VCP Log IPC 监听 (使用 1:1 移植的解析大脑)
+  // 启动系统事件 IPC 监听
   unlistenLog = await listen("vcp-system-event", (event: any) => {
     const payload = event.payload;
     const processed = processPayload(payload);
@@ -146,7 +147,9 @@ onUnmounted(() => {
     <!-- 2. 主内容区先渲染，抽屉与遮罩在后声明，靠 DOM 顺位自然覆盖 -->
     <main class="flex-1 min-w-0 relative overflow-hidden">
       <router-view v-slot="{ Component }">
-        <component v-if="Component" :is="Component" />
+        <KeepAlive>
+          <component v-if="Component" :is="Component" />
+        </KeepAlive>
       </router-view>
     </main>
 
@@ -169,6 +172,9 @@ onUnmounted(() => {
 
     <!-- 6. 业务 Feature 视图挂载点 -->
     <FeatureOverlays />
+
+    <!-- 7. 全局性能采集悬浮状态 -->
+    <GlobalPerformanceMonitor />
   </div>
 </template>
 

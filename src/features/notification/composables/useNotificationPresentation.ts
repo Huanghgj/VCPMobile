@@ -1,5 +1,5 @@
 import { computed } from 'vue';
-import { Info, CheckCircle, AlertTriangle, X, Cpu, User } from 'lucide-vue-next';
+import { Info, CheckCircle, AlertTriangle, X, Cpu, User, BookOpen } from 'lucide-vue-next';
 import type { VcpNotification } from '../../../core/stores/notification';
 
 export function useNotificationPresentation() {
@@ -9,6 +9,7 @@ export function useNotificationPresentation() {
     error: X,
     tool: Cpu,
     agent: User,
+    diary: BookOpen,
     info: Info
   }));
 
@@ -18,6 +19,7 @@ export function useNotificationPresentation() {
     error: 'text-red-500',
     tool: 'text-purple-500',
     agent: 'text-blue-500',
+    diary: 'text-amber-500',
     info: 'text-blue-400'
   } as const;
 

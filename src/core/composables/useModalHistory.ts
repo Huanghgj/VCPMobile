@@ -150,9 +150,17 @@ export function useModalHistory() {
     modalStack.value.splice(index, 1);
   };
 
+  const unregisterModalSilently = (id: string) => {
+    const index = modalStack.value.findIndex(m => m.id === id);
+    if (index === -1) return;
+
+    modalStack.value.splice(index, 1);
+  };
+
   return {
     registerModal,
     unregisterModal,
+    unregisterModalSilently,
     modalStackLength: () => modalStack.value.length,
     showExitToast,
     initRootHistory

@@ -60,8 +60,8 @@ watch(
   position: absolute;
   top: 0;
   bottom: 0;
-  width: 82vw;
-  max-width: 340px;
+  width: 92vw;
+  max-width: 520px;
   background-color: color-mix(in srgb, var(--secondary-bg) 85%, transparent);
   backdrop-filter: blur(18px) saturate(165%);
   -webkit-backdrop-filter: blur(18px) saturate(165%);

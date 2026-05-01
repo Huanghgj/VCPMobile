@@ -12,6 +12,85 @@ export default defineConfig(async () => ({
     UnoCSS(),
   ],
 
+  build: {
+    chunkSizeWarningLimit: 900,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes('node_modules')) return;
+
+          if (
+            id.includes('/node_modules/vue/') ||
+            id.includes('/node_modules/vue-router/') ||
+            id.includes('/node_modules/pinia/') ||
+            id.includes('/node_modules/@vue/') ||
+            id.includes('/node_modules/@vueuse/')
+          ) {
+            return 'vendor-vue';
+          }
+
+          if (
+            id.includes('/node_modules/@tauri-apps/api/') ||
+            id.includes('/node_modules/@tauri-apps/plugin-opener/')
+          ) {
+            return 'vendor-tauri';
+          }
+
+          if (id.includes('/node_modules/highlight.js')) {
+            return 'vendor-highlight';
+          }
+
+          if (
+            id.includes('/node_modules/marked') ||
+            id.includes('/node_modules/marked-highlight') ||
+            id.includes('/node_modules/dompurify') ||
+            id.includes('/node_modules/morphdom')
+          ) {
+            return 'vendor-markdown';
+          }
+
+          if (id.includes('/node_modules/katex')) {
+            return 'vendor-katex';
+          }
+
+          if (id.includes('/node_modules/pdfjs-dist')) {
+            return 'vendor-pdf';
+          }
+
+          if (id.includes('/node_modules/mammoth')) {
+            return 'vendor-docx';
+          }
+
+          if (id.includes('/node_modules/vue-cropper')) {
+            return 'vendor-cropper';
+          }
+
+          if (id.includes('/node_modules/sortablejs')) {
+            return 'vendor-sortable';
+          }
+
+          if (
+            id.includes('/node_modules/lucide-vue-next') ||
+            id.includes('/node_modules/date-fns')
+          ) {
+            return 'vendor-ui';
+          }
+
+          if (
+            id.includes('/node_modules/@braintree') ||
+            id.includes('/node_modules/@xmldom') ||
+            id.includes('/node_modules/jszip') ||
+            id.includes('/node_modules/pako') ||
+            id.includes('/node_modules/saxes') ||
+            id.includes('/node_modules/sax')
+          ) {
+            return 'vendor-docx';
+          }
+        },
+      },
+    },
+  },
+
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
   // 1. prevent Vite from obscuring rust errors

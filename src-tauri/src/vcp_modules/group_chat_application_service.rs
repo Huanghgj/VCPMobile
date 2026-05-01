@@ -15,7 +15,7 @@ use crate::vcp_modules::vcp_client::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::{ipc::Channel, AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, State};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -33,7 +33,6 @@ pub struct GroupChatParams {
     pub user_message: ChatMessage,
     pub vcp_url: String,
     pub vcp_api_key: String,
-    pub stream_channel: Option<Channel<crate::vcp_modules::vcp_client::StreamEvent>>,
 }
 
 pub async fn process_group_chat_message(
@@ -45,7 +44,6 @@ pub async fn process_group_chat_message(
     cancelled_turns: State<'_, CancelledGroupTurns>,
     params: GroupChatParams,
 ) -> Result<Value, String> {
-    let stream_channel = params.stream_channel;
     let group_id = params.group_id;
     let topic_id = params.topic_id;
     let user_message = params.user_message;
@@ -79,19 +77,8 @@ pub async fn process_group_chat_message(
         }
     }
 
-    // 3. 异步追加用户消息 (不再需要全量 load 再全量 save)
-    message_service::append_single_message(
-        app_handle.clone(),
-        &db_state.pool,
-        &group_id,
-        "group",
-        topic_id.clone(),
-        user_message.clone(),
-    )
-    .await?;
-
-    // 为了给 AI 决策提供上下文，我们只读取最新的 20 条（或按需分配）
-    let current_history = message_service::load_chat_history_internal(
+    // 3. 为了给 AI 决策提供上下文，我们只读取最新消息；前端通常已先落库，缺失时才补写。
+    let mut current_history = message_service::load_chat_history_internal(
         &app_handle,
         &group_id,
         "group",
@@ -101,6 +88,23 @@ pub async fn process_group_chat_message(
         true,
     )
     .await?;
+
+    if !current_history
+        .iter()
+        .any(|message| message.id == user_message.id)
+    {
+        message_service::append_single_message(
+            app_handle.clone(),
+            &db_state.pool,
+            &group_id,
+            "group",
+            topic_id.clone(),
+            user_message.clone(),
+        )
+        .await?;
+        current_history.push(user_message.clone());
+        current_history.sort_by_key(|message| message.timestamp);
+    }
 
     // 4. 决策引擎：谁该说话？
     let speakers = if group_config.mode == "sequential" {
@@ -199,25 +203,15 @@ pub async fn process_group_chat_message(
                 "isGroupMessage": true,
                 "agentName": agent_name
             })),
+            stream_channel: None,
         };
 
         // 执行请求 (串行等待)
-        let res_result = perform_vcp_request(
-            &app_handle,
-            active_requests_map,
-            request_payload,
-            stream_channel.clone(),
-        )
-        .await;
+        let res_result =
+            perform_vcp_request(&app_handle, active_requests_map, request_payload).await;
 
-        if let Ok((res, is_aborted)) = res_result {
+        if let Ok((res, _is_aborted)) = res_result {
             if let Some(full_content) = res["fullContent"].as_str() {
-                let finish_reason = if is_aborted {
-                    Some("cancelled_by_user".to_string())
-                } else {
-                    res["finishReason"].as_str().map(|s| s.to_string())
-                };
-
                 let ai_msg = ChatMessage {
                     id: message_id,
                     role: "assistant".to_string(),
@@ -232,7 +226,7 @@ pub async fn process_group_chat_message(
                     group_id: Some(group_id.clone()),
                     topic_id: Some(topic_id.clone()),
                     is_group_message: Some(true),
-                    finish_reason,
+                    finish_reason: None,
                     attachments: None,
                     blocks: None,
                 };
@@ -281,7 +275,6 @@ pub async fn process_group_chat_message(
 }
 
 #[tauri::command]
-#[allow(clippy::too_many_arguments)]
 pub async fn handle_group_chat_message(
     app_handle: AppHandle,
     group_state: State<'_, GroupManagerState>,
@@ -290,7 +283,6 @@ pub async fn handle_group_chat_message(
     active_requests: State<'_, ActiveRequests>,
     cancelled_turns: State<'_, CancelledGroupTurns>,
     payload: GroupChatPayload,
-    stream_channel: Channel<crate::vcp_modules::vcp_client::StreamEvent>,
 ) -> Result<Value, String> {
     log::info!(
         "[GroupChatAppService] handle_group_chat_message invoked for group: {}",
@@ -310,7 +302,6 @@ pub async fn handle_group_chat_message(
             user_message: payload.user_message,
             vcp_url: payload.vcp_url,
             vcp_api_key: payload.vcp_api_key,
-            stream_channel: Some(stream_channel),
         },
     )
     .await

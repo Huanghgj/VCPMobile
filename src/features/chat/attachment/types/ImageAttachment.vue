@@ -1,28 +1,32 @@
 <template>
-  <AttachmentPreviewBase 
-    :file="file" 
-    :index="index" 
+  <AttachmentPreviewBase
+    :file="file"
+    :index="index"
     :size="size"
     :show-remove="showRemove"
     @remove="emit('remove', index)"
   >
     <!-- Image Card -->
     <div class="w-full h-full rounded-xl overflow-hidden bg-black/5 dark:bg-white/5">
-      <img 
-        :src="safeSrc" 
+      <img
+        :src="safeSrc"
         :alt="file.name"
         class="w-full h-full object-cover"
         loading="lazy"
+        decoding="async"
       />
     </div>
   </AttachmentPreviewBase>
 </template>
 
 <script setup lang="ts">
-import { computed } from "vue";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { computed, onMounted, ref, watch } from "vue";
 import AttachmentPreviewBase from "../AttachmentPreviewBase.vue";
 import type { Attachment } from "../../../../core/stores/chatManager";
+import {
+  ensureAttachmentThumbnailCached,
+  getAttachmentPreviewSrc,
+} from "../../../../core/utils/mediaCache";
 
 interface Props {
   file: Attachment;
@@ -37,23 +41,28 @@ const props = withDefaults(defineProps<Props>(), {
 });
 
 const emit = defineEmits<{ (e: "remove", index: number): void }>();
+const cachedSrc = ref("");
+let warmPreviewRunId = 0;
 
 const safeSrc = computed(() => {
-  // Priority use thumbnailPath if available
-  const src = props.file.thumbnailPath || props.file.src;
-  if (!src) return "";
-  
-  if (
-    src.startsWith("http") ||
-    src.startsWith("data:") ||
-    src.startsWith("blob:")
-  ) {
-    return src;
-  }
-  try {
-    return convertFileSrc(src.replace("file://", ""));
-  } catch (e) {
-    return "";
-  }
+  return cachedSrc.value || getAttachmentPreviewSrc(props.file, { allowOriginal: true });
 });
+
+const warmPreview = async () => {
+  const runId = ++warmPreviewRunId;
+  cachedSrc.value = getAttachmentPreviewSrc(props.file, { allowOriginal: true });
+  const src = await ensureAttachmentThumbnailCached(props.file, { allowOriginal: true });
+  if (src && runId === warmPreviewRunId) cachedSrc.value = src;
+};
+
+onMounted(() => {
+  void warmPreview();
+});
+
+watch(
+  () => [props.file.thumbnailPath, props.file.src, props.file.internalPath, props.file.hash, props.file.size],
+  () => {
+    void warmPreview();
+  },
+);
 </script>

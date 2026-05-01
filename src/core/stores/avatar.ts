@@ -1,10 +1,12 @@
 import { defineStore } from "pinia";
 import { invoke } from "@tauri-apps/api/core";
 import { reactive } from "vue";
+import { RuntimeLruCache } from "../utils/runtimeLruCache";
 
 interface AvatarCache {
   blobUrl: string;
   version: number;
+  bytes: number;
 }
 
 interface AvatarResult {
@@ -17,9 +19,38 @@ interface AvatarResult {
 export const useAvatarStore = defineStore("avatar", () => {
   // 使用 reactive 包装 Map，配合同步访问
   const cache = reactive(new Map<string, AvatarCache>());
+  const avatarLru = new RuntimeLruCache<string, AvatarCache>({
+    maxBytes: 6 * 1024 * 1024,
+    maxEntries: 96,
+    getSize: (entry) => entry.bytes,
+    dispose: (entry) => {
+      URL.revokeObjectURL(entry.blobUrl);
+    },
+  });
   
   // 用于追踪正在进行的请求，防止并发重复请求同一个 ID
   const pending = new Map<string, Promise<string>>();
+
+  const syncReactiveCache = () => {
+    cache.clear();
+    for (const key of avatarLru.keys()) {
+      const value = avatarLru.peek(key);
+      if (value) cache.set(key, value);
+    }
+  };
+
+  const getCachedAvatar = (key: string) => {
+    const existing = avatarLru.get(key);
+    if (existing) {
+      syncReactiveCache();
+    }
+    return existing;
+  };
+
+  const setCachedAvatar = (key: string, value: AvatarCache) => {
+    avatarLru.set(key, value);
+    syncReactiveCache();
+  };
 
   /**
    * 获取头像 URL (带自动缓存和版本检查)
@@ -30,7 +61,7 @@ export const useAvatarStore = defineStore("avatar", () => {
     version: number = 0
   ): Promise<string> => {
     const key = `${ownerType}:${ownerId}`;
-    const existing = cache.get(key);
+    const existing = getCachedAvatar(key);
 
     // 核心修复：如果缓存存在，且满足以下任一条件，则直接返回：
     // 1. 请求的版本为 0 (不强制刷新，只要有就行)
@@ -61,20 +92,10 @@ export const useAvatarStore = defineStore("avatar", () => {
           const blob = new Blob([bytes], { type: result.mime_type });
           const blobUrl = URL.createObjectURL(blob);
 
-          // 核心修复：缓存版本号取 (后端实际时间戳 和 请求时间戳) 的最大值
-          // 这样确保下次进入时 existing.version >= version 成立，切断死循环
-          const MAX_AVATAR_CACHE = 50;
-          if (cache.size >= MAX_AVATAR_CACHE) {
-            const firstKey = cache.keys().next().value;
-            if (firstKey) {
-              const old = cache.get(firstKey);
-              if (old) URL.revokeObjectURL(old.blobUrl);
-              cache.delete(firstKey);
-            }
-          }
-          cache.set(key, { 
+          setCachedAvatar(key, {
             blobUrl, 
-            version: Math.max(result.updated_at, version) 
+            version: Math.max(result.updated_at, version),
+            bytes: bytes.byteLength,
           });
           return blobUrl;
         }
@@ -95,11 +116,8 @@ export const useAvatarStore = defineStore("avatar", () => {
    */
   const clearCache = (ownerType: string, ownerId: string) => {
     const key = `${ownerType}:${ownerId}`;
-    const existing = cache.get(key);
-    if (existing) {
-      URL.revokeObjectURL(existing.blobUrl);
-      cache.delete(key);
-    }
+    avatarLru.delete(key);
+    syncReactiveCache();
   };
 
   return {

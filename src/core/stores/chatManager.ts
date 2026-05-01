@@ -1,6 +1,6 @@
 import { defineStore } from "pinia";
 import { ref, computed, nextTick } from "vue";
-import { convertFileSrc, invoke, Channel } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 import { useStreamManagerStore } from "./streamManager";
@@ -8,9 +8,17 @@ import { useSettingsStore } from "./settings";
 import { useAssistantStore } from "./assistant";
 import { useTopicStore } from "./topicListManager";
 import { useNotificationStore } from "./notification";
+import { usePerformanceDiagnostics } from "../utils/performanceDiagnostics";
 import { syncService } from "../utils/syncService";
 import { useDocumentProcessor } from "../composables/useDocumentProcessor";
 import type { ContentBlock } from "../composables/useContentProcessor";
+import {
+  RuntimeLruCache,
+  estimateJsonBytes,
+  estimateStringBytes,
+} from "../utils/runtimeLruCache";
+import { clearMarkdownRenderCache } from "../utils/markdownRenderCache";
+import { clearAttachmentThumbnailCache } from "../utils/mediaCache";
 
 /**
  * Attachment 接口定义，严格对齐 Rust 端的 AttachmentSyncDTO / Attachment (仅保留核心字段)
@@ -21,11 +29,11 @@ export interface Attachment {
   name: string;
   size: number;
   progress?: number; // 0-100 的真实上传进度
-  src: string; // 物理存储路径：真理之源。用于后续超栈文件追踪，或跨端同步时的原始路径参考
-  resolvedSrc?: string; // Webview 可用的 asset:// 路径 (运行时动态生成，不进行持久化)
+  src: string; // 仅用于前端 UI 临时渲染路径 (如 file:// 或 blob:)
+  resolvedSrc?: string; // Webview 可用的 asset:// 路径
   hash?: string;
   status?: string;
-  internalPath?: string; // 手机本地物理路径，仅供前端通过 convertFileSrc 转换为安全 URL
+  internalPath?: string;
   extractedText?: string;
   imageFrames?: string[];
   thumbnailPath?: string;
@@ -39,7 +47,7 @@ export interface ChatMessage {
   id: string;
   role: string;
   name?: string;
-  content?: string; // 原文，现在变为按需懒加载的可选字段
+  content?: string; // 原文，打开话题时随历史一起加载，避免滑动时再补取
   blocks?: ContentBlock[]; // 预编译的 AST 数据块，前端直接渲染
   timestamp: number;
 
@@ -47,23 +55,13 @@ export interface ChatMessage {
   agentId?: string;
   groupId?: string;
   isGroupMessage?: boolean;
-  finishReason?: string;
   attachments?: Attachment[];
 
   // 以下为纯前端运行时 UI 状态 (Ephemeral)，绝不进行持久化
-  displayedContent?: string; // 用于兼容旧版渲染器的全量文本
-  stableContent?: string;    // Aurora: 稳定区 HTML/Markdown
-  tailContent?: string;      // Aurora: 尾随区 Markdown (高频变动)
+  displayedContent?: string; // 兼容旧渲染路径的流式全量文本
+  stableContent?: string; // 流式稳定层：已经沉淀、不需要高频刷新的内容
+  tailContent?: string; // 流式尾部层：正在生成、允许高频刷新的小段内容
   processedContent?: string; // 缓存 Rust 返回的 AST 或文本，避免重复解析
-}
-
-/**
- * HistoryChunk 接口定义，用于 Channel 流式加载
- */
-interface HistoryChunk {
-  message: ChatMessage;
-  index: number;
-  is_last: boolean;
 }
 
 /**
@@ -86,6 +84,15 @@ export interface TopicFingerprint {
   msg_count: number;
 }
 
+interface TopicHistoryCacheEntry {
+  ownerId: string;
+  ownerType: string;
+  topicId: string;
+  messages: ChatMessage[];
+  loadedAt: number;
+  estimatedBytes: number;
+}
+
 /**
  * useChatManagerStore
  */
@@ -96,11 +103,6 @@ export const useChatManagerStore = defineStore("chatManager", () => {
   const currentTopicId = ref<string | null>(null);
   const loading = ref(false);
   const streamingMessageId = ref<string | null>(null);
-
-  // 分页加载状态
-  const historyOffset = ref(0);        // 当前已加载的消息总数（= 下次请求的 offset 起点）
-  const hasMoreHistory = ref(true);    // 是否还有更多旧消息
-  const isLoadingHistory = ref(false); // 防止并发重复触发
 
   // 核心：记录每个会话（itemId + topicId）是否处于活动流状态
   // 格式: "itemId:topicId" -> [messageId1, messageId2, ...]
@@ -164,6 +166,8 @@ export const useChatManagerStore = defineStore("chatManager", () => {
     Map<string, { content: string; topicId: string; ownerId: string }>
   >(new Map());
 
+  const foregroundStreamingBuffers = new Map<string, string>();
+
   // 暂存的附件列表，准备随下一条消息发送
   const stagedAttachments = ref<Attachment[]>([]);
 
@@ -172,13 +176,136 @@ export const useChatManagerStore = defineStore("chatManager", () => {
   const assistantStore = useAssistantStore();
   const topicStore = useTopicStore();
   const notificationStore = useNotificationStore();
+  const diagnostics = usePerformanceDiagnostics();
 
   // 用于拦截重新生成时的输入框补全
   const editMessageContent = ref("");
-  // 用于标记当前是否正在“编辑重发”某条历史消息
-  const editingOriginalMessageId = ref<string | null>(null);
 
   let listenersRegistered = false;
+
+  const topicHistoryCache = new RuntimeLruCache<string, TopicHistoryCacheEntry>({
+    maxEntries: 5,
+    maxBytes: 28 * 1024 * 1024,
+    getSize: (entry) => entry.estimatedBytes,
+  });
+
+  const rawContentCache = new RuntimeLruCache<string, string>({
+    maxEntries: 250,
+    maxBytes: 12 * 1024 * 1024,
+    getSize: (value) => estimateStringBytes(value),
+  });
+
+  const topicCacheKey = (ownerId: string, ownerType: string, topicId: string) =>
+    `${ownerType}:${ownerId}:${topicId}`;
+
+  const estimateMessagesBytes = (messages: ChatMessage[]) =>
+    messages.reduce((total, message) => {
+      const scalarBytes =
+        estimateStringBytes(message.id) +
+        estimateStringBytes(message.role) +
+        estimateStringBytes(message.name || "") +
+        estimateStringBytes(message.agentId || "") +
+        estimateStringBytes(message.groupId || "") +
+        estimateStringBytes(message.content || "") +
+        estimateStringBytes(message.displayedContent || "") +
+        estimateStringBytes(message.stableContent || "") +
+        estimateStringBytes(message.tailContent || "");
+      return (
+        total +
+        scalarBytes +
+        estimateJsonBytes(message.blocks || null) +
+        estimateJsonBytes(message.attachments || null) +
+        256
+      );
+    }, 0);
+
+  const rememberRawContent = (message: ChatMessage) => {
+    if (message.id && message.content) {
+      rawContentCache.set(message.id, message.content);
+    }
+  };
+
+  const forgetRawContent = (messageId: string) => {
+    rawContentCache.delete(messageId);
+  };
+
+  const rememberRawContents = (messages: ChatMessage[]) => {
+    messages.forEach(rememberRawContent);
+  };
+
+  const putTopicHistoryCache = (
+    ownerId: string,
+    ownerType: string,
+    topicId: string,
+    messages: ChatMessage[],
+  ) => {
+    topicHistoryCache.set(topicCacheKey(ownerId, ownerType, topicId), {
+      ownerId,
+      ownerType,
+      topicId,
+      messages,
+      loadedAt: Date.now(),
+      estimatedBytes: estimateMessagesBytes(messages),
+    });
+  };
+
+  const getTopicHistoryCache = (
+    ownerId: string,
+    ownerType: string,
+    topicId: string,
+  ) => topicHistoryCache.get(topicCacheKey(ownerId, ownerType, topicId));
+
+  const invalidateTopicHistoryCache = (
+    ownerId: string,
+    ownerType: string,
+    topicId: string,
+  ) => {
+    topicHistoryCache.delete(topicCacheKey(ownerId, ownerType, topicId));
+  };
+
+  const refreshCurrentTopicCache = () => {
+    if (!currentSelectedItem.value?.id || !currentTopicId.value) return;
+    putTopicHistoryCache(
+      currentSelectedItem.value.id,
+      currentSelectedItem.value.type,
+      currentTopicId.value,
+      currentChatHistory.value,
+    );
+  };
+
+  const upsertCachedTopicMessage = (
+    ownerId: string,
+    ownerType: string,
+    topicId: string,
+    message: ChatMessage,
+  ) => {
+    const entry = getTopicHistoryCache(ownerId, ownerType, topicId);
+    if (!entry) return;
+
+    const index = entry.messages.findIndex((item) => item.id === message.id);
+    if (index >= 0) {
+      entry.messages[index] = message;
+    } else {
+      entry.messages.push(message);
+      entry.messages.sort((a, b) => a.timestamp - b.timestamp);
+    }
+    rememberRawContent(message);
+    putTopicHistoryCache(ownerId, ownerType, topicId, entry.messages);
+  };
+
+  const removeCachedMessagesAfter = (timestamp: number) => {
+    const removed = currentChatHistory.value.filter(
+      (message) => message.timestamp >= timestamp,
+    );
+    removed.forEach((message) => forgetRawContent(message.id));
+  };
+
+  const invalidateRuntimeCaches = () => {
+    topicHistoryCache.clear();
+    rawContentCache.clear();
+    clearMarkdownRenderCache();
+    clearAttachmentThumbnailCache();
+  };
 
   /**
    * 尝试为话题生成 AI 总结标题 (对齐桌面端 attemptTopicSummarization)
@@ -258,6 +385,87 @@ export const useChatManagerStore = defineStore("chatManager", () => {
     }
   };
 
+  const LARGE_FILE_THRESHOLD_BYTES = 2 * 1024 * 1024;
+  const UPLOAD_CHUNK_BYTES = 1024 * 1024;
+
+  const formatUploadSize = (bytes: number) => {
+    const units = ["B", "KB", "MB", "GB"];
+    let value = bytes;
+    let unitIndex = 0;
+    while (value >= 1024 && unitIndex < units.length - 1) {
+      value /= 1024;
+      unitIndex += 1;
+    }
+    return `${value.toFixed(unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
+  };
+
+  const updateStagedUploadProgress = (stableId: string, progress: number) => {
+    const index = stagedAttachments.value.findIndex((a) => a.id === stableId);
+    if (index !== -1) {
+      stagedAttachments.value[index].progress = progress;
+    }
+  };
+
+  const saveLargeFileByChunks = async (file: File, stableId: string) => {
+    let sessionId: string | null = null;
+    try {
+      sessionId = await invoke<string>("init_chunked_upload", {
+        originalName: file.name,
+        mimeType: file.type || "application/octet-stream",
+      });
+
+      let offset = 0;
+      while (offset < file.size) {
+        const chunk = file.slice(offset, offset + UPLOAD_CHUNK_BYTES);
+        const bytes = new Uint8Array(await chunk.arrayBuffer());
+        await invoke("append_chunk", {
+          sessionId,
+          chunkBytes: bytes,
+        });
+
+        offset += chunk.size;
+        updateStagedUploadProgress(
+          stableId,
+          Math.min(99, Math.round((offset / file.size) * 100)),
+        );
+      }
+
+      return await invoke<any>("finish_chunked_upload", { sessionId });
+    } catch (error) {
+      if (sessionId) {
+        await invoke("cancel_chunked_upload", { sessionId }).catch(
+          (cancelError) => {
+            console.warn(
+              "[ChatManager] Failed to cancel chunked upload:",
+              cancelError,
+            );
+          },
+        );
+      }
+      throw error;
+    }
+  };
+
+  const applyStoredAttachmentData = (stableId: string, finalData: any) => {
+    const index = stagedAttachments.value.findIndex((a) => a.id === stableId);
+    if (index === -1) return;
+
+    stagedAttachments.value[index] = {
+      ...stagedAttachments.value[index],
+      type: finalData.type,
+      src: finalData.internalPath,
+      name: finalData.name,
+      size: finalData.size,
+      hash: finalData.hash,
+      internalPath: finalData.internalPath,
+      extractedText: finalData.extractedText,
+      thumbnailPath: finalData.thumbnailPath,
+      createdAt: finalData.createdAt,
+      progress: 100,
+      status: "done",
+    };
+  };
+
   /**
    * 触发文件选择器并暂存附件 (使用标准 HTML Input 完美解决 Android content:// 协议名和类型丢失问题)
    */
@@ -301,8 +509,8 @@ export const useChatManagerStore = defineStore("chatManager", () => {
           try {
             let finalData: any = null;
 
-            // --- 分流策略：小文件 ( < 2MB ) 走 IPC，大文件走高速 TCP 链路 ---
-            if (file.size < 2 * 1024 * 1024) {
+            // --- 分流策略：小文件走单次 IPC，大文件走 IPC 分片，避免移动端 localhost/XHR 链路不稳定 ---
+            if (file.size < LARGE_FILE_THRESHOLD_BYTES) {
               console.log(
                 `[ChatManager] Small file detected (<2MB), using store_file IPC for ${file.name}`,
               );
@@ -317,86 +525,29 @@ export const useChatManagerStore = defineStore("chatManager", () => {
               });
             } else {
               console.log(
-                `[ChatManager] Large file detected, opening High-Speed Link for ${file.name} (${file.size} bytes)`,
+                `[ChatManager] Large file detected, using chunked IPC upload for ${file.name} (${file.size} bytes)`,
               );
-
-              // 1. 准备链路 (Rust 开启临时本地 TCP 接收器)
-              const endpoint = await invoke<any>("prepare_vcp_upload", {
-                metadata: {
-                  name: file.name,
-                  mime: file.type || "application/octet-stream",
-                  size: file.size,
-                },
-              });
-
-              // 2. 内核级搬运 (利用流式上传)
-              const xhr = new XMLHttpRequest();
-              const uploadPromise = new Promise((res, rej) => {
-                xhr.open("POST", endpoint.url, true);
-                xhr.setRequestHeader(
-                  "Content-Type",
-                  "application/octet-stream",
-                );
-                xhr.setRequestHeader("X-Upload-Token", endpoint.token);
-
-                let lastUpdate = 0;
-                xhr.upload.onprogress = (event) => {
-                  if (event.lengthComputable) {
-                    const now = Date.now();
-                    // 限制刷新频率为 ~30fps (每 33ms 刷新一次)，避免高频重绘导致卡顿
-                    if (now - lastUpdate < 33) return;
-                    lastUpdate = now;
-
-                    const progress = Math.round(
-                      (event.loaded / event.total) * 100,
-                    );
-                    const attIndex = stagedAttachments.value.findIndex(
-                      (a) => a.id === stableId,
-                    );
-                    if (attIndex !== -1) {
-                      stagedAttachments.value[attIndex].progress = progress;
-                    }
-                  }
-                };
-
-                xhr.onload = () => {
-                  if (xhr.status >= 200 && xhr.status < 300) {
-                    res(JSON.parse(xhr.responseText));
-                  } else {
-                    rej(new Error(`Upload failed with status ${xhr.status}`));
-                  }
-                };
-
-                xhr.onerror = () => rej(new Error("XHR Network Error"));
-                xhr.send(file);
-              });
-
-              finalData = await uploadPromise;
+              finalData = await saveLargeFileByChunks(file, stableId);
             }
 
             if (finalData) {
-              const index = stagedAttachments.value.findIndex(
-                (a) => a.id === stableId,
-              );
-              if (index !== -1) {
-                stagedAttachments.value[index] = {
-                  ...stagedAttachments.value[index],
-                  type: finalData.type,
-                  src: finalData.internalPath,
-                  name: finalData.name,
-                  size: finalData.size,
-                  hash: finalData.hash,
-                  status: "done",
-                };
-              }
+              applyStoredAttachmentData(stableId, finalData);
             }
             resolve();
           } catch (err) {
-            console.error("[ChatManager] High-speed upload failed:", err);
+            console.error("[ChatManager] Attachment upload failed:", err);
             const index = stagedAttachments.value.findIndex(
               (a) => a.id === stableId,
             );
             if (index !== -1) stagedAttachments.value.splice(index, 1);
+            notificationStore.addNotification({
+              type: "error",
+              title: "附件上传失败",
+              message: `${file.name} (${formatUploadSize(file.size)}): ${
+                err instanceof Error ? err.message : String(err)
+              }`,
+              toastOnly: true,
+            });
             reject(err);
           } finally {
             URL.revokeObjectURL(blobUrl);
@@ -426,179 +577,139 @@ export const useChatManagerStore = defineStore("chatManager", () => {
     ownerId: string,
     ownerType: string,
     topicId: string,
-    limit: number = 15,
+    limit?: number,
     offset: number = 0,
+    forceRefresh: boolean = false,
   ) => {
     console.log(
-      `[ChatManager] Streaming history for ${ownerId}, topic: ${topicId}`,
+      `[ChatManager] Loading history via VCP Protocol for ${ownerId}, topic: ${topicId}`,
     );
     loading.value = true;
-    isLoadingHistory.value = true;
     try {
-      // [分页防护] 记录请求时的话题 ID
-      const requestedTopicId = currentTopicId.value;
+      if (!forceRefresh && offset === 0 && typeof limit !== "number") {
+        const cached = getTopicHistoryCache(ownerId, ownerType, topicId);
+        if (cached) {
+          currentChatHistory.value = cached.messages;
+          currentTopicId.value = topicId;
 
-      const channel = new Channel<HistoryChunk>();
-      const buffer: ChatMessage[] = [];
-      let receivedCount = 0;
-      let resolveComplete: (() => void) | null = null;
-      const completePromise = new Promise<void>((resolve) => { resolveComplete = resolve; });
+          if (
+            !currentSelectedItem.value ||
+            currentSelectedItem.value.id !== ownerId
+          ) {
+            currentSelectedItem.value = { id: ownerId, type: ownerType };
+          }
 
-      channel.onmessage = (chunk) => {
-        // [话题一致性防护] 若用户在此期间切换了话题，丢弃后续数据
-        if (currentTopicId.value !== requestedTopicId && requestedTopicId !== null) {
+          rememberRawContents(cached.messages);
+          diagnostics.addTrace("topic-history-cache-hit", {
+            messageId: topicId,
+            totalChars: cached.estimatedBytes,
+            detail: `messages=${cached.messages.length}`,
+          });
+          console.log(
+            `[ChatManager] History cache hit: ${cached.messages.length} messages for ${topicId}`,
+          );
           return;
         }
+      }
 
-        if (offset === 0) {
-          // 首次加载：逐条 push，最新消息尽快出现
-          if (chunk.index === 0) {
-            currentChatHistory.value = [];
-            hasMoreHistory.value = true;
-          }
-          currentChatHistory.value.push(chunk.message);
-          receivedCount++;
-        } else {
-          // 加载更多：先 buffer 避免 Vue 频繁重渲染
-          buffer.push(chunk.message);
-          receivedCount++;
-        }
-
-        if (chunk.is_last) {
-          if (offset > 0) {
-            // 一次性 prepend 旧消息
-            currentChatHistory.value = [...buffer, ...currentChatHistory.value];
-            historyOffset.value += buffer.length;
-            if (buffer.length < limit) {
-              hasMoreHistory.value = false;
-            }
-          } else {
-            historyOffset.value = receivedCount;
-            if (receivedCount < limit) {
-              hasMoreHistory.value = false;
-            }
-          }
-          resolveComplete?.();
-        }
-      };
-
-      await invoke('load_chat_history_streamed', {
+      // 使用标准 Tauri IPC 加载历史记录，解决自定义协议在 Android 上的兼容性问题
+      const loadPayload: Record<string, unknown> = {
         ownerId,
         ownerType,
         topicId,
-        limit,
         offset,
-        onMessage: channel,
-      });
-
-      // 等待最后一条消息处理完毕
-      await completePromise;
-
-      // [话题一致性防护] 若用户在此期间切换了话题，丢弃旧结果
-      if (currentTopicId.value !== requestedTopicId && requestedTopicId !== null) {
-        console.warn(`[ChatManager] Topic changed during load, discarding ${receivedCount} messages.`);
-        return;
+      };
+      if (typeof limit === "number") {
+        loadPayload.limit = limit;
       }
 
+      const history = await invoke<ChatMessage[]>("load_chat_history", loadPayload);
+
       if (offset === 0) {
+        currentChatHistory.value = history;
+
         // 恢复后台缓存中的流式内容 (如果用户切回了正在流式的话题)
-        backgroundStreamingBuffers.value.forEach((buf, msgId) => {
-          if (buf.topicId === topicId) {
+        backgroundStreamingBuffers.value.forEach((buffer, msgId) => {
+          if (buffer.topicId === topicId) {
             const msg = currentChatHistory.value.find((m) => m.id === msgId);
             if (msg) {
               console.log(
                 `[ChatManager] Restoring background buffer for ${msgId} into current view.`,
               );
-              msg.content = (msg.content || "") + buf.content;
+              msg.content += buffer.content;
+              msg.displayedContent = msg.content;
+              msg.stableContent = msg.content;
+              msg.tailContent = "";
               msg.isThinking = false;
-              // 同时也同步给 streamManager 确保平滑显示
-              streamManager.appendChunk(msgId, "", (data) => {
-                msg.stableContent = data.stable;
-                msg.tailContent = data.tail;
-                msg.displayedContent = data.stable + data.tail;
-              });
+              streamManager.seedStream(msgId, msg.content || buffer.content);
             }
           }
         });
-
-        // 清理不属于当前话题的后台缓存，防止无界增长
-        for (const [msgId, buf] of backgroundStreamingBuffers.value.entries()) {
-          if (buf.topicId !== topicId) {
-            backgroundStreamingBuffers.value.delete(msgId);
-          }
-        }
+      } else {
+        currentChatHistory.value = [...history, ...currentChatHistory.value];
       }
 
       currentTopicId.value = topicId;
-
-      if (offset === 0) {
-        // --- 核心优化：记录当前活跃话题 ID 到后端持久化 ---
-        if (ownerType === 'agent') {
-          invoke('update_agent_config', { 
-            agentId: ownerId, 
-            updates: { currentTopicId: topicId } 
-          }).catch(e => console.warn('[ChatManager] Failed to persist currentTopicId:', e));
-        } else if (ownerType === 'group') {
-          invoke('update_group_config', { 
-            groupId: ownerId, 
-            updates: { currentTopicId: topicId } 
-          }).catch(e => console.warn('[ChatManager] Failed to persist currentTopicId:', e));
-        }
-      }
 
       if (
         !currentSelectedItem.value ||
         currentSelectedItem.value.id !== ownerId
       ) {
-        // 更新当前选中的项目详情 (确保头像和色调同步)
-        const agent = assistantStore.agents.find(a => a.id === ownerId);
-        const group = assistantStore.groups.find(g => g.id === ownerId);
-        currentSelectedItem.value = agent ? { ...agent, type: 'agent' } : (group ? { ...group, type: 'group' } : { id: ownerId, type: ownerType });
+        currentSelectedItem.value = { id: ownerId, type: ownerType };
       }
 
       // 异步解析本地资源路径
-      const messagesToResolve = offset === 0 ? currentChatHistory.value : buffer;
       await Promise.all(
-        messagesToResolve.map(async (msg) => {
+        history.map(async (msg) => {
           resolveMessageAssets(msg);
         }),
       );
 
+      rememberRawContents(currentChatHistory.value);
+      if (offset === 0 && typeof limit !== "number") {
+        putTopicHistoryCache(
+          ownerId,
+          ownerType,
+          topicId,
+          currentChatHistory.value,
+        );
+      }
+
       console.log(
-        `[ChatManager] History streamed: ${receivedCount} messages (Pre-processed by Rust)`,
+        `[ChatManager] History loaded: ${history.length} messages (Pre-processed by Rust)`,
       );
     } catch (e) {
-      console.error("[ChatManager] Failed to stream history:", e);
+      console.error("[ChatManager] Failed to load history:", e);
     } finally {
       loading.value = false;
-      isLoadingHistory.value = false;
     }
   };
 
-  /**
-   * 首屏加载：直接加载最新 15 条（流式 Channel 已无首屏阻塞问题）
-   */
   const loadHistoryPaginated = async (
     ownerId: string,
     ownerType: string,
     topicId: string,
   ) => {
-    await loadHistory(ownerId, ownerType, topicId, 15, 0);
+    await loadHistory(ownerId, ownerType, topicId);
   };
 
-  /**
-   * 滚动触发：加载下一页旧消息
-   */
-  const loadMoreHistory = async () => {
-    if (!hasMoreHistory.value || isLoadingHistory.value) return;
-    if (!currentSelectedItem.value?.id || !currentTopicId.value) return;
-    await loadHistory(
-      currentSelectedItem.value.id,
-      currentSelectedItem.value.type,
-      currentTopicId.value,
-      15,
-      historyOffset.value,
-    );
+  const selectItem = async (item: any) => {
+    if (!item?.id) return;
+
+    const ownerType =
+      item.type ||
+      (assistantStore.groups.some((group: any) => group.id === item.id)
+        ? "group"
+        : "agent");
+
+    currentSelectedItem.value = {
+      ...item,
+      type: ownerType,
+    };
+    currentTopicId.value = null;
+    currentChatHistory.value = [];
+
+    await topicStore.loadTopicList(item.id, ownerType);
   };
 
   /**
@@ -615,15 +726,20 @@ export const useChatManagerStore = defineStore("chatManager", () => {
     // 重置预编译和显示缓存，强制触发 MessageRenderer 重新请求 Rust 解析
     msg.blocks = undefined;
     msg.processedContent = undefined;
+    msg.stableContent = undefined;
+    msg.tailContent = undefined;
     if (msg.displayedContent) {
       msg.displayedContent = "";
     }
+    forgetRawContent(messageId);
+    rememberRawContent(msg);
+    clearMarkdownRenderCache();
 
     if (currentSelectedItem.value?.id && currentTopicId.value) {
       await invoke("patch_single_message", {
         ownerId: currentSelectedItem.value.id,
         ownerType: currentSelectedItem.value.type,
-        topicId: currentTopicId.value,
+        topic_id: currentTopicId.value,
         message: msg,
       });
 
@@ -640,163 +756,7 @@ export const useChatManagerStore = defineStore("chatManager", () => {
         currentTopicId.value,
         currentChatHistory.value,
       );
-    }
-  };
-
-  /**
-   * 内部方法：触发 AI 生成逻辑 (对接 Rust 后端)
-   * 支持单 Agent 和多 Agent 群组。
-   * 它不负责创建用户消息，只负责根据已有的 userMsg 触发后续生成流。
-   */
-  const triggerGeneration = async (userMsg: ChatMessage) => {
-    if (!currentSelectedItem.value || !currentTopicId.value) return;
-
-    const agentId = currentSelectedItem.value.id;
-    const now = Date.now();
-
-    // 构造 AI 思考占位消息
-    const thinkingId = `msg_${now}_assistant_${Math.random().toString(36).substring(2, 7)}`;
-    const thinkingMsg: ChatMessage = {
-      id: thinkingId,
-      role: "assistant",
-      name:
-        currentSelectedItem.value.type === "agent"
-          ? currentSelectedItem.value.name || "Assistant"
-          : undefined,
-      content: "",
-      timestamp: now + 1, // 增加 1ms 偏移，确保在时间序列上绝对位于提问之后
-      isThinking: false,
-      isGroupMessage: currentSelectedItem.value.type === "group",
-      groupId:
-        currentSelectedItem.value.type === "group"
-          ? currentSelectedItem.value.id
-          : undefined,
-      agentId:
-        currentSelectedItem.value.type === "agent"
-          ? currentSelectedItem.value.id
-          : undefined,
-    };
-
-    currentChatHistory.value.push(thinkingMsg);
-    streamingMessageId.value = thinkingId;
-
-    if (currentSelectedItem.value?.id && currentTopicId.value) {
-      addSessionStream(
-        currentSelectedItem.value.id,
-        currentTopicId.value,
-        thinkingId,
-      );
-    }
-
-    try {
-      // 立即保存一次历史记录 (包含用户消息和思考态)
-      // 注意：由于 Rust 使用 ON CONFLICT DO UPDATE，即使 userMsg 已经存在也没关系
-      if (currentSelectedItem.value?.id && currentTopicId.value) {
-        await invoke("append_single_message", {
-          ownerId: currentSelectedItem.value.id,
-          ownerType: currentSelectedItem.value.type,
-          topicId: currentTopicId.value,
-          message: userMsg,
-        });
-        await invoke("append_single_message", {
-          ownerId: currentSelectedItem.value.id,
-          ownerType: currentSelectedItem.value.type,
-          topicId: currentTopicId.value,
-          message: thinkingMsg,
-        });
-
-        // 触发同步到桌面端
-        syncService.pushTopicToDesktop(
-          currentSelectedItem.value.id,
-          currentTopicId.value,
-          currentChatHistory.value,
-        );
-      }
-
-      const settings = settingsStore.settings;
-      if (!settings) {
-        throw new Error("应用尚未完成初始化，缺少设置数据，无法发送消息");
-      }
-
-      const vcpUrl = settings.vcpServerUrl || "";
-      const vcpApiKey = settings.vcpApiKey || "";
-
-      // 创建流式 Channel，每个请求独立
-      const streamChannel = new Channel<StreamEvent>();
-      streamChannel.onmessage = handleStreamEvent;
-
-      // --- 群组消息路由 ---
-      if (currentSelectedItem.value?.type === "group") {
-        const groupId = currentSelectedItem.value.id;
-
-        const groupPayload = {
-          groupId,
-          topicId: currentTopicId.value,
-          userMessage: userMsg,
-          vcpUrl,
-          vcpApiKey,
-        };
-
-        console.log("[ChatManager] Sending group payload:", groupPayload);
-        await invoke("handle_group_chat_message", { payload: groupPayload, streamChannel });
-        return;
-      }
-
-      // --- 普通单 Agent 消息逻辑 ---
-      const agentPayload = {
-        agentId,
-        topicId: currentTopicId.value,
-        userMessage: userMsg,
-        vcpUrl,
-        vcpApiKey,
-        thinkingMessageId: thinkingId,
-      };
-
-      console.log("[ChatManager] Sending agent payload:", agentPayload);
-      await invoke("handle_agent_chat_message", { payload: agentPayload, streamChannel });
-    } catch (e) {
-      console.error("[ChatManager] Failed to trigger generation:", e);
-
-      const errorText = `\n\n> VCP错误: ${e instanceof Error ? e.message : String(e)}`;
-
-      const msgIndex = currentChatHistory.value.findIndex(
-        (m) => m.id === thinkingId,
-      );
-      if (msgIndex !== -1) {
-        const msg = currentChatHistory.value[msgIndex];
-        msg.isThinking = false;
-        msg.content += errorText;
-        if (msg.displayedContent !== undefined) {
-          msg.displayedContent += errorText;
-        }
-        if (currentSelectedItem.value?.id && currentTopicId.value) {
-          removeSessionStream(
-            currentSelectedItem.value.id,
-            currentTopicId.value,
-            thinkingId,
-          );
-        }
-      } else {
-        currentChatHistory.value.push({
-          id: `msg_${Date.now()}_system_error`,
-          role: "system",
-          content: errorText.trim(),
-          timestamp: Date.now(),
-        });
-      }
-
-      streamingMessageId.value = null;
-      if (currentSelectedItem.value?.id && currentTopicId.value) {
-        const msg = currentChatHistory.value.find((m) => m.id === thinkingId);
-        if (msg) {
-          await invoke("patch_single_message", {
-            ownerId: currentSelectedItem.value.id,
-            ownerType: currentSelectedItem.value.type,
-            topicId: currentTopicId.value,
-            message: msg,
-          });
-        }
-      }
+      refreshCurrentTopicCache();
     }
   };
 
@@ -811,42 +771,11 @@ export const useChatManagerStore = defineStore("chatManager", () => {
     )
       return;
 
-    // --- 拦截：编辑重发逻辑 ---
-    if (editingOriginalMessageId.value) {
-      const originalId = editingOriginalMessageId.value;
-      editingOriginalMessageId.value = null; // 消费掉
-
-      const targetIndex = currentChatHistory.value.findIndex(
-        (m) => m.id === originalId,
-      );
-      if (targetIndex !== -1) {
-        const targetMsg = currentChatHistory.value[targetIndex];
-        targetMsg.content = content;
-        // 重置缓存
-        targetMsg.blocks = undefined;
-        targetMsg.processedContent = undefined;
-
-        // 1. 截断后端数据库 (删除该消息之后的所有内容)
-        await invoke("truncate_history_after_timestamp", {
-          ownerId: currentSelectedItem.value.id,
-          ownerType: currentSelectedItem.value.type,
-          topicId: currentTopicId.value,
-          timestamp: targetMsg.timestamp, // 严格大于该时间戳的消息都将被删除
-        });
-
-        // 2. 截断前端 UI 历史
-        currentChatHistory.value = currentChatHistory.value.slice(
-          0,
-          targetIndex + 1,
-        );
-
-        // 3. 重新发起生成
-        await triggerGeneration(targetMsg);
-        return;
-      }
-    }
-
+    const agentId = currentSelectedItem.value.id;
+    const ownerType = currentSelectedItem.value.type;
+    const isGroupChat = ownerType === "group";
     const currentStaged = [...stagedAttachments.value];
+
     // Clear staged area immediately for UI responsiveness
     stagedAttachments.value = [];
 
@@ -879,14 +808,151 @@ export const useChatManagerStore = defineStore("chatManager", () => {
     const userMsg: ChatMessage = {
       id: `msg_${now}_user_${Math.random().toString(36).substring(2, 7)}`,
       role: "user",
-      name: settingsStore.settings?.userName || "User",
       content,
       timestamp: now,
       attachments: currentStaged.length > 0 ? currentStaged : undefined,
     };
 
     currentChatHistory.value.push(userMsg);
-    await triggerGeneration(userMsg);
+    rememberRawContent(userMsg);
+    refreshCurrentTopicCache();
+
+    // 单 Agent 使用本地占位消息；群聊由 Rust 为每个发言成员生成真实消息 ID。
+    const thinkingId = `msg_${now}_assistant_${Math.random().toString(36).substring(2, 7)}`;
+    const thinkingMsg: ChatMessage | null = isGroupChat ? null : {
+      id: thinkingId,
+      role: "assistant",
+      content: "",
+      timestamp: now + 1, // 增加 1ms 偏移，确保在时间序列上绝对位于提问之后
+      isThinking: true,
+      isGroupMessage: false,
+      agentId,
+    };
+
+    if (thinkingMsg) {
+      currentChatHistory.value.push(thinkingMsg);
+      streamingMessageId.value = thinkingId;
+      addSessionStream(
+        currentSelectedItem.value.id,
+        currentTopicId.value,
+        thinkingId,
+      );
+      refreshCurrentTopicCache();
+    }
+
+    try {
+      // 立即保存用户消息；AI 回复在流结束后一次性落库，流式期间只保存在内存 buffer。
+      if (currentSelectedItem.value?.id && currentTopicId.value) {
+        await invoke("append_single_message", {
+          ownerId: currentSelectedItem.value.id,
+          ownerType,
+          topicId: currentTopicId.value,
+          message: userMsg,
+        });
+
+        // 触发同步到桌面端
+        const persistedHistorySnapshot = thinkingMsg
+          ? currentChatHistory.value.filter((message) => message.id !== thinkingId)
+          : currentChatHistory.value;
+        syncService.pushTopicToDesktop(
+          currentSelectedItem.value.id,
+          currentTopicId.value,
+          persistedHistorySnapshot,
+        );
+      }
+
+      const settings = settingsStore.settings;
+      if (!settings) {
+        throw new Error("应用尚未完成初始化，缺少设置数据，无法发送消息");
+      }
+
+      const vcpUrl = settings.vcpServerUrl || "";
+      const vcpApiKey = settings.vcpApiKey || "";
+
+      // --- 群组消息路由 ---
+      if (isGroupChat) {
+        const groupId = currentSelectedItem.value.id;
+
+        const groupPayload = {
+          groupId,
+          topicId: currentTopicId.value,
+          userMessage: userMsg,
+          vcpUrl,
+          vcpApiKey,
+        };
+
+        console.log("[ChatManager] Sending group payload:", groupPayload);
+        // 直接调用 Rust 端群组调度器，不再设置前端硬超时
+        await invoke("handle_group_chat_message", { payload: groupPayload });
+
+        return;
+      }
+
+      // --- 普通单 Agent 消息逻辑 ---
+      const agentPayload = {
+        agentId,
+        topicId: currentTopicId.value,
+        userMessage: userMsg,
+        vcpUrl,
+        vcpApiKey,
+        thinkingMessageId: thinkingId,
+      };
+
+      console.log("[ChatManager] Sending agent payload:", agentPayload);
+      await invoke("handle_agent_chat_message", { payload: agentPayload });
+    } catch (e) {
+      console.error("[ChatManager] Failed to send message:", e);
+
+      const errorText = `\n\n> VCP错误: ${e instanceof Error ? e.message : String(e)}`;
+
+      const msgIndex = currentChatHistory.value.findIndex(
+        (m) => m.id === thinkingId,
+      );
+      if (msgIndex !== -1) {
+        const msg = currentChatHistory.value[msgIndex];
+        msg.isThinking = false;
+        msg.content = (msg.content || "") + errorText;
+        if (msg.displayedContent !== undefined) {
+          msg.displayedContent = (msg.displayedContent || "") + errorText;
+        }
+        if (currentSelectedItem.value?.id && currentTopicId.value) {
+          removeSessionStream(
+            currentSelectedItem.value.id,
+            currentTopicId.value,
+            thinkingId,
+          );
+        }
+      } else {
+        // Fallback if message was somehow lost
+        currentChatHistory.value.push({
+          id: `msg_${Date.now()}_system_error`,
+          role: "system",
+          content: errorText.trim(),
+          timestamp: Date.now(),
+        });
+      }
+
+      streamingMessageId.value = null;
+      if (currentSelectedItem.value?.id && currentTopicId.value) {
+        // 查找当前的思考占位消息
+        const msg = currentChatHistory.value.find((m) => m.id === thinkingId);
+          if (msg) {
+            await invoke("append_single_message", {
+              ownerId: currentSelectedItem.value.id,
+              ownerType,
+              topicId: currentTopicId.value,
+              message: msg,
+            });
+            rememberRawContent(msg);
+            refreshCurrentTopicCache();
+            syncService.pushTopicToDesktop(
+              currentSelectedItem.value.id,
+              currentTopicId.value,
+              currentChatHistory.value,
+            );
+        }
+      }
+    }
   };
 
   /**
@@ -910,6 +976,7 @@ export const useChatManagerStore = defineStore("chatManager", () => {
     const targetMsg = currentChatHistory.value[targetIndex];
 
     if (deleteAfter) {
+      removeCachedMessagesAfter(targetMsg.timestamp);
       // 物理截断：删除自身以及后面所有的
       await invoke("truncate_history_after_timestamp", {
         ownerId,
@@ -919,6 +986,7 @@ export const useChatManagerStore = defineStore("chatManager", () => {
       });
       currentChatHistory.value.splice(targetIndex);
     } else {
+      forgetRawContent(messageId);
       // 逻辑删除：仅删除自身
       await invoke("delete_messages", {
         ownerId,
@@ -928,6 +996,8 @@ export const useChatManagerStore = defineStore("chatManager", () => {
       });
       currentChatHistory.value.splice(targetIndex, 1);
     }
+    clearMarkdownRenderCache();
+    refreshCurrentTopicCache();
 
     // 触发同步到桌面端
     syncService.pushTopicToDesktop(ownerId, topicId, currentChatHistory.value);
@@ -947,7 +1017,7 @@ export const useChatManagerStore = defineStore("chatManager", () => {
     console.log(`[ChatManager] Global Group Interruption for topic: ${topicId}`);
     try {
       // 1. 发射后端熔断信号，打断 for 循环接力
-      await invoke("interruptGroupTurn", { topicId: topicId });
+      await invoke("interruptGroupTurn", { topic_id: topicId });
       
       // 2. 同时中止当前活跃的所有流消息（确保当前正在说话的 Agent 也立即停下）
       const activeIds = Array.from(activeStreamingIds.value);
@@ -967,7 +1037,7 @@ export const useChatManagerStore = defineStore("chatManager", () => {
       `[ChatManager] Sending interrupt signal for message: ${messageId}`,
     );
     try {
-      await invoke("interruptRequest", { messageId: messageId });
+      await invoke("interruptRequest", { message_id: messageId });
       // 本地伪造一个 end 事件，防止假死
       streamManager.finalizeStream(messageId);
 
@@ -979,7 +1049,15 @@ export const useChatManagerStore = defineStore("chatManager", () => {
       if (msgIndex !== -1) {
         msg = currentChatHistory.value[msgIndex];
         msg.isThinking = false;
-        msg.finishReason = "cancelled_by_user";
+        msg.content =
+          foregroundStreamingBuffers.get(messageId) ||
+          msg.content ||
+          msg.displayedContent ||
+          "";
+        msg.displayedContent = msg.content;
+        msg.stableContent = undefined;
+        msg.tailContent = undefined;
+        foregroundStreamingBuffers.delete(messageId);
       }
 
       const ownerId = currentSelectedItem.value?.id;
@@ -1000,6 +1078,8 @@ export const useChatManagerStore = defineStore("chatManager", () => {
           topicId,
           message: msg,
         });
+        rememberRawContent(msg);
+        refreshCurrentTopicCache();
         // 触发同步到桌面端
         syncService.pushTopicToDesktop(
           ownerId,
@@ -1020,46 +1100,121 @@ export const useChatManagerStore = defineStore("chatManager", () => {
    * @param targetMessageId 用户想要重新生成的 AI 回复的 ID
    */
   const regenerateResponse = async (targetMessageId: string) => {
-    // 1. 查找此消息在历史记录中的位置
+    if (!currentSelectedItem.value || !currentTopicId.value) return;
+
     const targetIndex = currentChatHistory.value.findIndex(
-      (m) => m.id === targetMessageId,
+      (message) => message.id === targetMessageId,
     );
     if (targetIndex === -1) return;
 
-    const targetMsg = currentChatHistory.value[targetIndex];
+    const sourceUserMessage = [...currentChatHistory.value]
+      .slice(0, targetIndex)
+      .reverse()
+      .find((message) => message.role === "user");
 
-    // 2. 截断后端数据库 (删除该 AI 消息及其之后的所有内容)
-    if (currentSelectedItem.value?.id && currentTopicId.value) {
-      await invoke("truncate_history_after_timestamp", {
-        ownerId: currentSelectedItem.value.id,
-        ownerType: currentSelectedItem.value.type,
-        topicId: currentTopicId.value,
-        timestamp: targetMsg.timestamp - 1, // 严格大于该时间戳的消息都将被删除，即包括目标消息本身
+    if (!sourceUserMessage) {
+      notificationStore.addNotification({
+        type: "warning",
+        title: "无法重新生成",
+        message: "没有找到这条 AI 回复对应的上一条用户消息。",
+        toastOnly: true,
       });
-    }
-
-    // 3. 截断前端 UI 历史
-    currentChatHistory.value = currentChatHistory.value.slice(0, targetIndex);
-
-    // 4. 寻找距离目前最近的一条用户消息，作为触发生成的“引子”
-    // 即使在群聊中存在连续 Agent 消息，后端也会从数据库加载完整的、已截断的历史上下文。
-    let lastUserMsgIndex = currentChatHistory.value.length - 1;
-    while (
-      lastUserMsgIndex >= 0 &&
-      currentChatHistory.value[lastUserMsgIndex].role !== "user"
-    ) {
-      lastUserMsgIndex--;
-    }
-
-    if (lastUserMsgIndex === -1) {
-      console.warn("[ChatManager] Cannot regenerate: No user message found.");
       return;
     }
 
-    const lastUserMsg = currentChatHistory.value[lastUserMsgIndex];
+    const ownerId = currentSelectedItem.value.id;
+    const ownerType = currentSelectedItem.value.type;
+    const topicId = currentTopicId.value;
+    const now = Date.now();
+    const thinkingId = `msg_${now}_assistant_${Math.random().toString(36).substring(2, 7)}`;
 
-    // 5. 重新发起生成
-    await triggerGeneration(lastUserMsg);
+    await invoke("truncate_history_after_timestamp", {
+      ownerId,
+      ownerType,
+      topicId,
+      timestamp: currentChatHistory.value[targetIndex].timestamp - 1,
+    });
+    removeCachedMessagesAfter(currentChatHistory.value[targetIndex].timestamp);
+    currentChatHistory.value.splice(targetIndex);
+    clearMarkdownRenderCache();
+    refreshCurrentTopicCache();
+
+    const thinkingMsg: ChatMessage | null = ownerType === "group" ? null : {
+      id: thinkingId,
+      role: "assistant",
+      content: "",
+      timestamp: now + 1,
+      isThinking: true,
+      isGroupMessage: false,
+      agentId: ownerId,
+    };
+
+    if (thinkingMsg) {
+      currentChatHistory.value.push(thinkingMsg);
+      streamingMessageId.value = thinkingId;
+      addSessionStream(ownerId, topicId, thinkingId);
+      refreshCurrentTopicCache();
+    }
+
+    try {
+      const settings = settingsStore.settings;
+      if (!settings) {
+        throw new Error("应用尚未完成初始化，缺少设置数据，无法重新生成");
+      }
+
+      const vcpUrl = settings.vcpServerUrl || "";
+      const vcpApiKey = settings.vcpApiKey || "";
+
+      if (ownerType === "group") {
+        await invoke("handle_group_chat_message", {
+          payload: {
+            groupId: ownerId,
+            topicId,
+            userMessage: sourceUserMessage,
+            vcpUrl,
+            vcpApiKey,
+          },
+        });
+      } else {
+        await invoke("handle_agent_chat_message", {
+          payload: {
+            agentId: ownerId,
+            topicId,
+            userMessage: sourceUserMessage,
+            vcpUrl,
+            vcpApiKey,
+            thinkingMessageId: thinkingId,
+          },
+        });
+      }
+
+      syncService.pushTopicToDesktop(ownerId, topicId, currentChatHistory.value);
+    } catch (error) {
+      console.error("[ChatManager] Failed to regenerate response:", error);
+      removeSessionStream(ownerId, topicId, thinkingId);
+      if (streamingMessageId.value === thinkingId) {
+        streamingMessageId.value = null;
+      }
+      const failedIndex = currentChatHistory.value.findIndex((message) => message.id === thinkingId);
+      if (failedIndex !== -1) {
+        currentChatHistory.value[failedIndex].content = `> 重新生成失败: ${error}`;
+        currentChatHistory.value[failedIndex].displayedContent = currentChatHistory.value[failedIndex].content;
+        await invoke("append_single_message", {
+          ownerId,
+          ownerType,
+          topicId,
+          message: currentChatHistory.value[failedIndex],
+        });
+        rememberRawContent(currentChatHistory.value[failedIndex]);
+        refreshCurrentTopicCache();
+      }
+      notificationStore.addNotification({
+        type: "error",
+        title: "重新生成失败",
+        message: String(error),
+        toastOnly: true,
+      });
+    }
   };
 
   /**
@@ -1067,22 +1222,26 @@ export const useChatManagerStore = defineStore("chatManager", () => {
    */
   const fetchRawContent = async (messageId: string): Promise<string> => {
     // 检查缓存中是否已有，或者是否正在流式传输
+    const cachedRaw = rawContentCache.get(messageId);
+    if (cachedRaw) return cachedRaw;
+
     const existingMsg = currentChatHistory.value.find((m) => m.id === messageId);
     if (existingMsg && existingMsg.content) {
+      rememberRawContent(existingMsg);
       return existingMsg.content;
     }
 
     try {
       const url = `vcp://api/messages?msg_id=${encodeURIComponent(messageId)}&fetch_raw=true`;
       console.log(`[ChatManager] Lazy loading raw content for message: ${messageId}`);
-      const rawData = await new Promise<{ content: string }>((resolve, reject) => {
+      const rawText = await new Promise<string>((resolve, reject) => {
         const xhr = new XMLHttpRequest();
         xhr.open('GET', url, true);
-        xhr.responseType = 'json';
+        xhr.responseType = 'text';
         
         xhr.onload = () => {
           if (xhr.status >= 200 && xhr.status < 300) {
-            resolve(xhr.response);
+            resolve(xhr.responseText || "");
           } else {
             reject(new Error(`VCP fetch_raw request failed with status ${xhr.status}`));
           }
@@ -1095,30 +1254,37 @@ export const useChatManagerStore = defineStore("chatManager", () => {
         xhr.send();
       });
 
-      if (existingMsg && rawData && typeof rawData.content === 'string') {
-        existingMsg.content = rawData.content;
-        return rawData.content;
+      if (rawText) {
+        rawContentCache.set(messageId, rawText);
       }
-      return "";
+      if (existingMsg) {
+        existingMsg.content = rawText;
+      }
+      return rawText;
     } catch (e) {
       console.error(`[ChatManager] Failed to fetch raw content for ${messageId}:`, e);
       return "";
     }
   };
 
-  interface StreamEvent {
-    type: string;
-    chunk?: any;
-    messageId?: string;
-    message_id?: string;
-    context?: any;
-    finishReason?: string;
-    error?: string;
-  }
+  // --- 初始化与销毁 (Lifecycle) ---
 
-  const handleStreamEvent = (event: StreamEvent) => {
-    const actualMessageId = event.messageId || event.message_id || "";
-    const { chunk, type, context } = event;
+  const ensureEventListenersRegistered = async () => {
+    if (listenersRegistered) return;
+    listenersRegistered = true;
+    console.log("[ChatManager] Registering Tauri listeners");
+
+    // 监听 AI 流式输出事件
+    listen("vcp-stream", (event: any) => {
+      // 适配 Rust 端默认序列化使用下划线命名法 (message_id)
+      const {
+        message_id,
+        messageId: legacyMessageId,
+        chunk,
+        type,
+        context,
+      } = event.payload;
+      const actualMessageId = message_id || legacyMessageId;
       // 无论是否在当前视图，都尝试更新数据
       let msg = currentChatHistory.value.find((m) => m.id === actualMessageId);
       const ctx = context || {};
@@ -1151,6 +1317,7 @@ export const useChatManagerStore = defineStore("chatManager", () => {
         currentChatHistory.value.push(msg as ChatMessage);
         // 保持排序
         currentChatHistory.value.sort((a, b) => a.timestamp - b.timestamp);
+        refreshCurrentTopicCache();
       }
 
       if (type === "data") {
@@ -1175,21 +1342,25 @@ export const useChatManagerStore = defineStore("chatManager", () => {
         }
 
         if (textChunk) {
+          diagnostics.addTrace('vcp-stream-data', {
+            messageId: actualMessageId,
+            chunkChars: textChunk.length,
+            detail: msg ? 'foreground' : 'background',
+          });
           // 1. 更新当前视图 (如果匹配)
           if (msg) {
-            msg.content = msg.content || "";
-            msg.content += textChunk;
-            // 使用 streamManager 平滑更新 Aurora 缓冲区
+            const currentContent = foregroundStreamingBuffers.get(actualMessageId) || msg.content || "";
+            foregroundStreamingBuffers.set(actualMessageId, currentContent + textChunk);
+            // 使用 streamManager 平滑更新 Aurora 分层内容；流式期间不写入 DB。
 
-            streamManager.appendChunk(actualMessageId, textChunk, (data) => {
+            streamManager.appendChunk(actualMessageId, textChunk, (state) => {
               const latestMsg = currentChatHistory.value.find(
                 (m) => m.id === actualMessageId,
               );
               if (latestMsg) {
-                latestMsg.stableContent = data.stable;
-                latestMsg.tailContent = data.tail;
-                // 保持兼容性：displayedContent 为两者合并，供旧版组件使用
-                latestMsg.displayedContent = data.stable + data.tail;
+                latestMsg.stableContent = state.stable;
+                latestMsg.tailContent = state.tail;
+                latestMsg.displayedContent = state.displayed;
               }
             });
           } else {
@@ -1202,16 +1373,17 @@ export const useChatManagerStore = defineStore("chatManager", () => {
               backgroundStreamingBuffers.value.set(actualMessageId, buffer);
             }
 
-            // 同时也喂给 streamManager，防止切回来时 buffer 为空
-            streamManager.appendChunk(actualMessageId, textChunk, (_data) => {});
           }
         }
       } else if (type === "end" || type === "error") {
-        const errorMsg = event.error;
-        const finishReason = event.finishReason;
+        const errorMsg = event.payload.error;
         console.log(
-          `[ChatManager] Stream ${type} for ${actualMessageId}${errorMsg ? ": " + errorMsg : ""}. Reason: ${finishReason}. Draining queue...`,
+          `[ChatManager] Stream ${type} for ${actualMessageId}${errorMsg ? ": " + errorMsg : ""}. Draining queue...`,
         );
+        diagnostics.addTrace(type === "end" ? 'vcp-stream-end' : 'vcp-stream-error', {
+          messageId: actualMessageId,
+          detail: errorMsg || undefined,
+        });
 
         // 流式结束时，等待 streamManager 缓冲队列排空后再切换状态
         streamManager.finalizeStream(actualMessageId, async () => {
@@ -1220,11 +1392,14 @@ export const useChatManagerStore = defineStore("chatManager", () => {
           );
           if (latestMsg) {
             // 确保最终内容一致
-            latestMsg.displayedContent = latestMsg.content;
-            if (finishReason) {
-              latestMsg.finishReason = finishReason;
+            latestMsg.isThinking = false;
+              latestMsg.content = foregroundStreamingBuffers.get(actualMessageId) || latestMsg.content || latestMsg.displayedContent || "";
+              latestMsg.displayedContent = latestMsg.content;
+              latestMsg.stableContent = undefined;
+              latestMsg.tailContent = undefined;
+              rememberRawContent(latestMsg);
             }
-          }
+          foregroundStreamingBuffers.delete(actualMessageId);
 
           // 清理活动流状态
           if (itemId && topicId) {
@@ -1237,9 +1412,10 @@ export const useChatManagerStore = defineStore("chatManager", () => {
           if (type === "error" && errorMsg && errorMsg !== "请求已中止") {
             const errorText = `\n\n> VCP流式错误: ${errorMsg}`;
             if (latestMsg) {
-              latestMsg.content += errorText;
+              latestMsg.content = (latestMsg.content || "") + errorText;
               latestMsg.displayedContent = latestMsg.content;
-              latestMsg.finishReason = "error";
+              latestMsg.stableContent = undefined;
+              latestMsg.tailContent = undefined;
             } else {
               // 如果不在当前视图，暂时不处理系统错误消息的追加，
               // 因为我们没有全局的消息持久化更新接口（本阶段目标是打通多流基础）
@@ -1247,27 +1423,48 @@ export const useChatManagerStore = defineStore("chatManager", () => {
           }
 
           if (latestMsg) {
-            // 使用 patch (墓碑更新) 代替 append
-            // 因为在发送瞬间我们已经 append 过一个思考态占位符了，现在是更新它的内容
-            if (currentSelectedItem.value?.id && currentTopicId.value) {
-              await invoke("patch_single_message", {
-                ownerId: currentSelectedItem.value.id,
-                ownerType: currentSelectedItem.value.type,
-                topicId: currentTopicId.value,
+            const ownerIdForPersist = currentSelectedItem.value?.id;
+            const ownerTypeForPersist = currentSelectedItem.value?.type;
+            const topicIdForPersist = currentTopicId.value;
+            const shouldPersistFromFrontend =
+              !latestMsg.isGroupMessage &&
+              !!ownerIdForPersist &&
+              !!ownerTypeForPersist &&
+              !!topicIdForPersist;
+
+            if (shouldPersistFromFrontend) {
+              await invoke("append_single_message", {
+                ownerId: ownerIdForPersist,
+                ownerType: ownerTypeForPersist,
+                topicId: topicIdForPersist,
                 message: latestMsg,
               });
+              syncService.pushTopicToDesktop(
+                ownerIdForPersist,
+                topicIdForPersist,
+                currentChatHistory.value,
+              );
+              refreshCurrentTopicCache();
+            }
 
-              // [核心升级] 流式结束后，立即获取一次预编译的 AST 块并存在内存中
-              // 这样在下次滚动或切换时，MessageRenderer 可以直接零耗时渲染
-              try {
-                const freshBlocks = await invoke<any[]>("process_message_content", { 
-                  content: latestMsg.content 
-                });
-                latestMsg.blocks = freshBlocks;
-                console.log(`[ChatManager] Fresh blocks pre-compiled for ${actualMessageId}`);
-              } catch (err) {
-                console.warn("[ChatManager] Post-stream compilation failed:", err);
-              }
+            // [核心升级] 流式结束后，立即获取一次预编译的 AST 块并存在内存中
+            // 这样在下次滚动或切换时，MessageRenderer 可以直接零耗时渲染
+            try {
+              const compileStartedAt = performance.now();
+              const freshBlocks = await invoke<any[]>("process_message_content", {
+                content: latestMsg.content
+              });
+              latestMsg.blocks = freshBlocks;
+              refreshCurrentTopicCache();
+              diagnostics.addTrace('post-stream-block-compile', {
+                messageId: actualMessageId,
+                totalChars: latestMsg.content?.length || 0,
+                durationMs: Math.round((performance.now() - compileStartedAt) * 10) / 10,
+                detail: `blocks=${freshBlocks.length}`,
+              });
+              console.log(`[ChatManager] Fresh blocks pre-compiled for ${actualMessageId}`);
+            } catch (err) {
+              console.warn("[ChatManager] Post-stream compilation failed:", err);
             }
 
             // 话题自动总结逻辑
@@ -1280,10 +1477,34 @@ export const useChatManagerStore = defineStore("chatManager", () => {
               console.log(
                 `[ChatManager] Finalizing background stream for ${actualMessageId}, triggering silent save.`,
               );
-              // 这里我们不直接调用 saveHistory，因为 saveHistory 依赖 currentChatHistory。
-              // 我们需要一个能保存特定话题历史的接口，或者依赖 Rust 端的断点存盘。
-              // 鉴于 Rust 端 handle_group_chat_message 已经有断点存盘，单聊 sendToVCP 结束后也会返回 fullContent，
-              // 前端这里的后台缓存主要用于“切回话题时立即显示最新进度”。
+              const isGroupStream = !!ctx.groupId || !!ctx.isGroupMessage;
+              if (!isGroupStream) {
+                const errorText =
+                  type === "error" && errorMsg && errorMsg !== "请求已中止"
+                    ? `\n\n> VCP流式错误: ${errorMsg}`
+                    : "";
+                const backgroundMessage: ChatMessage = {
+                  id: actualMessageId,
+                  role: "assistant",
+                  content: `${buffer.content}${errorText}`,
+                  timestamp: Date.now(),
+                  isThinking: false,
+                  isGroupMessage: false,
+                  agentId: buffer.ownerId,
+                };
+                await invoke("append_single_message", {
+                  ownerId: buffer.ownerId,
+                  ownerType: "agent",
+                  topicId: buffer.topicId,
+                  message: backgroundMessage,
+                });
+                upsertCachedTopicMessage(
+                  buffer.ownerId,
+                  "agent",
+                  buffer.topicId,
+                  backgroundMessage,
+                );
+              }
             }
           }
 
@@ -1291,17 +1512,7 @@ export const useChatManagerStore = defineStore("chatManager", () => {
           backgroundStreamingBuffers.value.delete(actualMessageId);
         });
       }
-    }
-  ;
-
-  // --- 初始化与销毁 (Lifecycle) ---
-
-  const ensureEventListenersRegistered = async () => {
-    if (listenersRegistered) return;
-    listenersRegistered = true;
-    console.log("[ChatManager] Registering Tauri listeners");
-
-    // 同步完成刷新已集中到 main.ts（window.location.reload），此处无需重复监听
+    });
 
     // 监听外部文件变更 (对应桌面端的 history-file-updated)
     listen("vcp-file-change", async (event: any) => {
@@ -1322,7 +1533,8 @@ export const useChatManagerStore = defineStore("chatManager", () => {
         const ownerId = currentSelectedItem.value?.id;
         const ownerType = currentSelectedItem.value?.type;
         if (ownerId && ownerType) {
-          await loadHistory(ownerId, ownerType, currentTopicId.value!);
+          invalidateTopicHistoryCache(ownerId, ownerType, currentTopicId.value!);
+          await loadHistory(ownerId, ownerType, currentTopicId.value!, undefined, 0, true);
         }
       }
     });
@@ -1336,58 +1548,18 @@ export const useChatManagerStore = defineStore("chatManager", () => {
         actualTopicId === currentTopicId.value
       ) {
         console.log(`[ChatManager] Group turn finished for ${groupId}`);
+        delete sessionActiveStreams.value[`${groupId}:${actualTopicId}`];
+        if (streamingMessageId.value) {
+          streamingMessageId.value = null;
+        }
         // 强制同步一次，确保所有并行 Agent 的最终结果都已落盘并同步到前端
         const ownerType = currentSelectedItem.value?.type;
         if (ownerType) {
-          await loadHistory(groupId, ownerType, actualTopicId);
+          invalidateTopicHistoryCache(groupId, ownerType, actualTopicId);
+          await loadHistory(groupId, ownerType, actualTopicId, undefined, 0, true);
         }
       }
     });
-  };
-
-  /**
-   * 选择一个助手或群组，并自动跳转到最近的话题
-   */
-  const selectItem = async (item: any) => {
-    if (!item) return;
-    
-    const ownerId = item.id;
-    const ownerType = item.members ? 'group' : 'agent';
-    
-    // 如果已经选中了该项，且当前已有话题，则不重复加载（除非需要强制刷新）
-    if (currentSelectedItem.value?.id === ownerId && currentTopicId.value) {
-      return;
-    }
-
-    // 1. 获取目标项的最新配置（含 currentTopicId）
-    let targetTopicId = item.currentTopicId;
-
-    // 2. 如果没有记录的话题，或者记录的话题已失效，则尝试获取该 Owner 下最新的话题
-    if (!targetTopicId) {
-      try {
-        const topics = await invoke<any[]>("get_topics", {
-          ownerId,
-          ownerType,
-        });
-        if (topics && topics.length > 0) {
-          // 列表通常按 updated_at 倒序，取第一个
-          targetTopicId = topics[0].id || topics[0].topic_id;
-        }
-      } catch (e) {
-        console.error("[ChatManager] Failed to fetch fallback topics:", e);
-      }
-    }
-
-    if (targetTopicId) {
-      currentSelectedItem.value = { ...item, type: ownerType };
-      await loadHistoryPaginated(ownerId, ownerType, targetTopicId);
-    } else {
-      // 没有任何话题的极端情况
-      console.warn(`[ChatManager] No topics found for ${ownerId}`);
-      currentSelectedItem.value = { ...item, type: ownerType };
-      currentChatHistory.value = [];
-      currentTopicId.value = null;
-    }
   };
 
   return {
@@ -1399,14 +1571,9 @@ export const useChatManagerStore = defineStore("chatManager", () => {
     streamingMessageId,
     stagedAttachments,
     editMessageContent,
-    editingOriginalMessageId,
     sessionActiveStreams,
     loadHistory,
     loadHistoryPaginated,
-    loadMoreHistory,
-    historyOffset,
-    hasMoreHistory,
-    isLoadingHistory,
     selectItem,
     fetchRawContent,
     sendMessage,
@@ -1418,5 +1585,6 @@ export const useChatManagerStore = defineStore("chatManager", () => {
     regenerateResponse,
     isGroupGenerating,
     activeStreamingIds,
+    invalidateRuntimeCaches,
   };
 });

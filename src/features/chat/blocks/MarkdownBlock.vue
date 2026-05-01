@@ -2,15 +2,18 @@
 import { computed, ref, watch, nextTick, onMounted, onUnmounted } from 'vue';
 import { Marked } from 'marked';
 import { markedHighlight } from 'marked-highlight';
-import hljs from 'highlight.js';
 import DOMPurify from 'dompurify';
 import morphdom from 'morphdom';
-
 // 移除同步导入，改为动态导入
 // import mermaid from 'mermaid';
 // import katex from 'katex';
 // import 'katex/dist/katex.min.css';
 import { useVcpMagic } from '../../../core/composables/useVcpMagic';
+import { useChatManagerStore } from '../../../core/stores/chatManager';
+import { useOverlayStore } from '../../../core/stores/overlay';
+import { useEmoticonFixer } from '../../../core/composables/useEmoticonFixer';
+import { getOrCreateMarkdownHtml } from '../../../core/utils/markdownRenderCache';
+import { hasHighlightLanguage, highlightCode } from '../../../core/utils/highlight';
 
 const props = defineProps<{
   content: string;
@@ -19,33 +22,19 @@ const props = defineProps<{
 
 const markdownContainer = ref<HTMLElement | null>(null);
 const innerContentRef = ref<HTMLElement | null>(null);
-const isVisible = ref(false);
+let enhancementRunId = 0;
 
 const { processMagic, cleanupMagic } = useVcpMagic();
-
-// 并发保护：防止 onMounted 和 watch 同时触发多个 processMagic 调用
-let isProcessingMagic = false;
-const safeProcessMagic = async (el: HTMLElement, scopeId: string) => {
-  if (isProcessingMagic) return;
-  isProcessingMagic = true;
-  try {
-    await processMagic(el, scopeId);
-  } catch (e) {
-    console.error('[MarkdownBlock] processMagic error:', e);
-  } finally {
-    isProcessingMagic = false;
-  }
-};
-
-
+const chatStore = useChatManagerStore();
+const overlayStore = useOverlayStore();
+const { processEmoticonsInContainer } = useEmoticonFixer();
 
 const marked = new Marked(
   markedHighlight({
     emptyLangClass: 'hljs',
     langPrefix: 'hljs language-',
     highlight(code, lang) {
-      const language = hljs.getLanguage(lang) ? lang : 'plaintext';
-      return hljs.highlight(code, { language }).value;
+      return hasHighlightLanguage(lang) ? highlightCode(code, lang) : highlightCode(code);
     }
   })
 );
@@ -57,37 +46,105 @@ marked.setOptions({
 
 import { convertFileSrc } from '@tauri-apps/api/core';
 
-// Custom renderer for Mermaid, Images, Tables and Code blocks
+type InlineMediaType = 'image' | 'video' | 'audio';
+
+const mediaExtensionMap: Record<string, InlineMediaType> = {
+  png: 'image',
+  jpg: 'image',
+  jpeg: 'image',
+  gif: 'image',
+  webp: 'image',
+  avif: 'image',
+  svg: 'image',
+  mp4: 'video',
+  webm: 'video',
+  mov: 'video',
+  m4v: 'video',
+  mkv: 'video',
+  mp3: 'audio',
+  wav: 'audio',
+  ogg: 'audio',
+  flac: 'audio',
+  m4a: 'audio',
+};
+
+const escapeAttr = (value: string) =>
+  value
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+
+const getMediaExtension = (href: string) => {
+  try {
+    const parsed = new URL(href, window.location.href);
+    const fileName = parsed.pathname.split('/').pop() || '';
+    return fileName.split('.').pop()?.toLowerCase() || '';
+  } catch {
+    const clean = href.split(/[?#]/)[0] || '';
+    return clean.split('.').pop()?.toLowerCase() || '';
+  }
+};
+
+const inferMediaType = (href: string, fallback?: InlineMediaType): InlineMediaType | null => {
+  if (href.startsWith('data:image/')) return 'image';
+  if (href.startsWith('data:video/')) return 'video';
+  if (href.startsWith('data:audio/')) return 'audio';
+  return mediaExtensionMap[getMediaExtension(href)] || fallback || null;
+};
+
+const resolveMediaSrc = (href: string) => {
+  if (href && (href.startsWith('/') || href.match(/^[a-zA-Z]:\\/))) {
+    try {
+      return convertFileSrc(href);
+    } catch (e) {
+      console.warn('Failed to convert media path to asset protocol:', href, e);
+    }
+  }
+  return href;
+};
+
+const renderInlineMedia = (href: string, title: string | null | undefined, text: string, fallback?: InlineMediaType) => {
+  const mediaType = inferMediaType(href, fallback);
+  if (!mediaType) return null;
+
+  const finalHref = resolveMediaSrc(href);
+  const safeSrc = escapeAttr(finalHref);
+  const safeOriginalSrc = escapeAttr(href);
+  const safeText = escapeAttr(text || title || '');
+  const safeTitle = title ? ` title="${escapeAttr(title)}"` : '';
+  const mediaAttrs = `data-vcp-media="true" data-media-src="${safeOriginalSrc}" data-media-type="${mediaType}" data-media-title="${safeText}"`;
+
+  if (mediaType === 'image') {
+    return `<img src="${safeSrc}" alt="${safeText}"${safeTitle} loading="lazy" decoding="async" fetchpriority="low" class="vcp-markdown-image" ${mediaAttrs} />`;
+  }
+
+  if (mediaType === 'video') {
+    return `<span class="vcp-media-frame vcp-media-video" ${mediaAttrs}><video src="${safeSrc}" preload="metadata" playsinline muted class="vcp-markdown-video"></video><span class="vcp-media-play" aria-hidden="true"><span class="vcp-media-play-icon"></span></span></span>`;
+  }
+
+  return `<span class="vcp-media-frame vcp-media-audio" ${mediaAttrs}><span class="vcp-media-audio-label">${safeText || 'Audio'}</span></span>`;
+};
+
+// Custom renderer for Mermaid and Images
 const renderer = {
   code({ text, lang }: { text: string; lang?: string; escaped?: boolean }) {
     if (lang === 'mermaid' || lang === 'flowchart' || lang === 'graph') {
       const encoded = btoa(encodeURIComponent(text));
       return `<div class="mermaid-placeholder" data-code="${encoded}">解析渲染中...</div>`;
     }
-    const langClass = lang ? `hljs language-${lang}` : 'hljs';
-    return `<pre class="vcp-scrollable no-swipe"><code class="${langClass}">${text}</code></pre>\n`;
+    return false; // use default
   },
-  image({ href, title, text }: { href: string; title: string | null; text: string }) {
-    let finalHref = href;
-    // 拦截本地绝对路径，转换为 Tauri asset 协议
-    if (href && (href.startsWith('/') || href.match(/^[a-zA-Z]:\\/))) {
-      try {
-        finalHref = convertFileSrc(href);
-      } catch (e) {
-        console.warn('Failed to convert image path to asset protocol:', href, e);
-      }
-    }
-
-    let out = `<img src="${finalHref}" alt="${text}"`;
-    if (title) {
-      out += ` title="${title}"`;
-    }
-    out += ' loading="lazy" class="vcp-markdown-image" />';
-    return out;
+  image({ href, title, text }: { href: string; title?: string | null; text: string }) {
+    return renderInlineMedia(href, title, text, 'image') || '';
+  },
+  link({ href, title, text }: { href: string; title?: string | null; text: string }) {
+    const mediaMarkup = renderInlineMedia(href, title, text);
+    return mediaMarkup || false;
   }
 };
 
-// VCP Math Extension for Marked (inline only; block math is handled by MathBlock)
+// VCP Math Extension for Marked
 const mathExtension = {
   extensions: [
     {
@@ -107,51 +164,77 @@ const mathExtension = {
         if (parenMatch) return { type: 'inlineMath', raw: parenMatch[0], text: parenMatch[1].trim() };
       },
       renderer(token: any) {
-        return `<span class="math-inline vcp-math-inline">${token.text}</span>`;
+        return `<span class="math-inline">${token.text}</span>`;
       }
     },
+    {
+      name: 'blockMath',
+      level: 'block',
+      start(src: string) {
+        const match = src.match(/\$\$|\\\[|\\begin/);
+        return match ? match.index : -1;
+      },
+      tokenizer(src: string) {
+        // 匹配 $$...$$ (允许前置空格)
+        const dollarMatch = src.match(/^ *\$\$([\s\S]+?)\$\$/);
+        if (dollarMatch) return { type: 'blockMath', raw: dollarMatch[0], text: dollarMatch[1].trim() };
+
+        // 匹配 \[...\]
+        const bracketMatch = src.match(/^ *\\\[([\s\S]+?)\\\]/);
+        if (bracketMatch) return { type: 'blockMath', raw: bracketMatch[0], text: bracketMatch[1].trim() };
+
+        // 匹配 \begin{...}...\end{...}
+        const envMatch = src.match(/^ *\\begin\{([a-z]*\*?)\}([\s\S]+?)\\end\{\1\}/);
+        if (envMatch) return { type: 'blockMath', raw: envMatch[0], text: envMatch[0].trim() };
+      },
+      renderer(token: any) {
+        return `<div class="language-math">${token.text}</div>`;
+      }
+    }
   ]
 };
 
-marked.use({
-  renderer,
-  hooks: {
-    postprocess(html: string) {
-      return html.replace(/<table>/g, '<div class="vcp-scrollable no-swipe" style="overflow-x: auto;"><table>').replace(/<\/table>/g, '</table></div>');
-    }
-  }
-});
+marked.use({ renderer });
 marked.use(mathExtension);
 
 // Sanitize HTML with DOMPurify
 const renderedHtml = computed(() => {
-  // Strip leading whitespace before HTML comment markers to prevent
-  // marked.js from treating indented <!-- ... --> as code blocks
-  const preprocessed = props.content.replace(/^[ \t]+<!--/gm, '<!--');
-  const rawHtml = marked.parse(preprocessed) as string;
-  // 保持安全过滤，但由于纠错已在 Rust 完成，不再需要放行 onerror
-  return DOMPurify.sanitize(rawHtml, {
-    ADD_TAGS: [
-      'iframe', 'canvas', 'script', 'style', 'button', 'img',
-      'svg', 'circle', 'line', 'text', 'animate', 'defs', 'linearGradient', 
-      'stop', 'filter', 'feDropShadow', 'path', 'g', 'polyline', 'polygon', 'rect',
-      'table', 'thead', 'tbody', 'tr', 'th', 'td'
-    ],
-    ADD_ATTR: [
-      'allow', 'allowfullscreen', 'frameborder', 'scrolling',
-      'data-send', 'data-vcp-interactive', 'data-vcp-scoped',
-      'class', 'width', 'height',
-      'viewBox', 'fill', 'stroke', 'stroke-width', 'cx', 'cy', 'r', 'x', 'y', 
-      'x1', 'y1', 'x2', 'y2', 'd', 'filter', 'attributeName', 'from', 'to', 
-      'begin', 'dur', 'dx', 'dy', 'stdDeviation', 'flood-color', 'flood-opacity', 
-      'offset', 'stop-color', 'text-anchor', 'opacity', 'style', 'id'
-    ],
-    FORCE_BODY: true
-  });
+  if (props.isStreaming) return "";
+
+  return getOrCreateMarkdownHtml(props.content, () => {
+    const rawHtml = marked.parse(props.content) as string;
+    // 保持安全过滤，但由于纠错已在 Rust 完成，不再需要放行 onerror
+    return DOMPurify.sanitize(rawHtml, {
+      ADD_TAGS: [
+        'iframe', 'canvas', 'script', 'style', 'button', 'img', 'video', 'audio', 'source',
+        'svg', 'circle', 'line', 'text', 'animate', 'defs', 'linearGradient',
+        'stop', 'filter', 'feDropShadow', 'path', 'g', 'polyline', 'polygon', 'rect',
+        'table', 'thead', 'tbody', 'tr', 'th', 'td'
+      ],
+      ADD_ATTR: [
+        'allow', 'allowfullscreen', 'frameborder', 'scrolling',
+        'data-send', 'data-vcp-interactive', 'data-vcp-scoped',
+        'data-vcp-media', 'data-media-src', 'data-media-type', 'data-media-title',
+        'class', 'width', 'height', 'loading', 'decoding', 'fetchpriority',
+        'src', 'alt', 'title', 'preload', 'playsinline', 'muted', 'controls',
+        'viewBox', 'fill', 'stroke', 'stroke-width', 'cx', 'cy', 'r', 'x', 'y',
+        'x1', 'y1', 'x2', 'y2', 'd', 'filter', 'attributeName', 'from', 'to',
+        'begin', 'dur', 'dx', 'dy', 'stdDeviation', 'flood-color', 'flood-opacity',
+        'offset', 'stop-color', 'text-anchor', 'opacity', 'style', 'id'
+      ],
+      FORCE_BODY: true
+    });
+  }).html;
 });
 
 const updateDOM = () => {
   if (innerContentRef.value) {
+    if (props.isStreaming) {
+      if (innerContentRef.value.textContent !== props.content) {
+        innerContentRef.value.textContent = props.content;
+      }
+      return;
+    }
     morphdom(innerContentRef.value, `<div class="vcp-markdown-inner">${renderedHtml.value}</div>`, {
       childrenOnly: false,
       onBeforeElUpdated: function (fromEl, toEl) {
@@ -161,39 +244,49 @@ const updateDOM = () => {
         if (fromEl.classList && fromEl.classList.contains('mermaid') && fromEl.tagName === 'DIV') {
           return false; // Don't overwrite rendered mermaid
         }
-        if (fromEl.classList && (fromEl.classList.contains('math-inline') || fromEl.classList.contains('vcp-math-inline')) && fromEl.querySelector('.katex')) {
+        if (fromEl.classList && (fromEl.classList.contains('language-math') || fromEl.classList.contains('math-inline')) && fromEl.querySelector('.katex')) {
           return false; // Don't overwrite rendered katex
         }
 
         return true;
       }
     });
-    
-
   }
 };
 
-// 监听渲染内容变化
-watch(() => renderedHtml.value, async () => {
-  updateDOM();
+const enhanceContent = async () => {
+  if (!innerContentRef.value || props.isStreaming) return;
+  const runId = ++enhancementRunId;
   await nextTick();
-  if (isVisible.value) {
-    renderHeavyContent();
+  const idle = (window as any).requestIdleCallback;
+  if (idle) {
+    await new Promise((resolve) => idle(resolve, { timeout: 800 }));
+  } else {
+    await new Promise((resolve) => window.setTimeout(resolve, 32));
   }
+  if (runId !== enhancementRunId || !innerContentRef.value || props.isStreaming) return;
+
   const scopeId = (markdownContainer.value?.closest('.vcp-message-item') as HTMLElement)?.dataset.messageId
     || Math.random().toString(36).substring(2, 9);
-  if (innerContentRef.value) {
-    safeProcessMagic(innerContentRef.value, scopeId);
+  await processEmoticonsInContainer(innerContentRef.value);
+  await processMagic(innerContentRef.value, scopeId);
+  await renderHeavyContent();
+};
+
+// 监听渲染内容变化
+watch(() => props.isStreaming ? props.content : renderedHtml.value, async () => {
+  enhancementRunId++;
+  updateDOM();
+
+  if (!props.isStreaming) {
+    await enhanceContent();
   }
 });
 
 onMounted(async () => {
   updateDOM();
-  await nextTick();
-  const scopeId = (markdownContainer.value?.closest('.vcp-message-item') as HTMLElement)?.dataset.messageId
-    || Math.random().toString(36).substring(2, 9);
-  if (innerContentRef.value) {
-    safeProcessMagic(innerContentRef.value, scopeId);
+  if (!props.isStreaming) {
+    await enhanceContent();
   }
 });
 
@@ -204,12 +297,12 @@ onUnmounted(() => {
 });
 
 const renderHeavyContent = async () => {
-  if (!innerContentRef.value || !isVisible.value) return;
+  if (!innerContentRef.value) return;
 
   await nextTick();
 
-  // 1. Render KaTeX (Lazy Load) —— 仅处理 inline math，block math 由 MathBlock 独立组件处理
-  const texElements = innerContentRef.value.querySelectorAll('.math-inline, .vcp-math-inline');
+  // 1. Render KaTeX
+  const texElements = innerContentRef.value.querySelectorAll('.language-math, .math-inline');
   if (texElements.length > 0) {
     try {
       // 动态导入 KaTeX 及其样式
@@ -221,16 +314,11 @@ const renderHeavyContent = async () => {
       (window as any).katex = katex; // 挂载到全局以便调试和兼容性
 
       texElements.forEach(el => {
-        if (!(el instanceof HTMLElement)) return;
         if (el.querySelector('.katex')) return; // Already rendered
-        const raw = el.textContent || '';
-        // 跳过非 LaTeX 内容：包含中文字符但没有 LaTeX 命令的表达式不是数学公式
-        if (/[\u4e00-\u9fff\u3400-\u4dbf]/.test(raw) && !/\\[a-zA-Z]+/.test(raw)) return;
-        const isBlock = false; // MarkdownBlock 仅处理 inline math
+        const isBlock = el.classList.contains('language-math');
         try {
-          katex.render(raw, el, {
+          katex.render(el.textContent || '', el as HTMLElement, {
             throwOnError: false,
-            strict: false,
             displayMode: isBlock
           });
         } catch (e) {
@@ -242,10 +330,7 @@ const renderHeavyContent = async () => {
     }
   }
 
-  // 2. Render Mermaid (Lazy Load)
-  // [修复] 流式过程中跳过 Mermaid 渲染，避免解析不完整代码导致报错
-  if (props.isStreaming) return;
-
+  // 2. Render Mermaid
   const placeholders = innerContentRef.value.querySelectorAll('.mermaid-placeholder');
   if (placeholders.length > 0) {
     try {
@@ -276,23 +361,69 @@ const renderHeavyContent = async () => {
   }
 };
 
-const handleIntersect = () => {
-  isVisible.value = true;
-  if (!props.isStreaming) {
-    renderHeavyContent();
+const handleContainerClick = (e: MouseEvent) => {
+  const target = e.target as HTMLElement;
+  const mediaTarget = target.closest('[data-vcp-media="true"], img, video, audio') as HTMLElement | null;
+  if (mediaTarget && innerContentRef.value?.contains(mediaTarget)) {
+    const tagName = mediaTarget.tagName.toLowerCase();
+    const rawSrc = mediaTarget.dataset.mediaSrc
+      || mediaTarget.getAttribute('src')
+      || mediaTarget.querySelector('source')?.getAttribute('src')
+      || '';
+    if (rawSrc) {
+      const mediaType = (mediaTarget.dataset.mediaType as InlineMediaType | undefined)
+        || (tagName === 'video' ? 'video' : tagName === 'audio' ? 'audio' : 'image');
+      const renderSource = mediaTarget.getAttribute('src')
+        || mediaTarget.querySelector('video, audio, img')?.getAttribute('src')
+        || rawSrc;
+
+      e.preventDefault();
+      e.stopPropagation();
+      overlayStore.openMediaViewer({
+        src: renderSource,
+        originalSrc: rawSrc,
+        mediaType,
+        title: mediaTarget.dataset.mediaTitle || mediaTarget.getAttribute('alt') || mediaTarget.getAttribute('title') || undefined,
+      });
+      return;
+    }
   }
+
+  const button = target.closest('button');
+
+  if (!button || button.dataset.vcpInteractive !== 'true') return;
+
+  e.preventDefault();
+  e.stopPropagation();
+
+  if (button.disabled) return;
+
+  const sendText = button.dataset.send || button.textContent?.trim() || '';
+  if (!sendText) return;
+
+  let finalSendText = `[[点击按钮:${sendText}]]`;
+  if (finalSendText.length > 500) {
+    const truncated = sendText.substring(0, 500 - '[[点击按钮:]]'.length);
+    finalSendText = `[[点击按钮:${truncated}]]`;
+  }
+
+  // Visual feedback
+  button.disabled = true;
+  button.style.opacity = '0.6';
+  button.style.cursor = 'not-allowed';
+  const originalText = button.textContent;
+  button.textContent = `${originalText} ✓`;
+
+  // Send message
+  chatStore.sendMessage(finalSendText);
 };
 
-watch(() => [props.content, props.isStreaming], () => {
-  if (isVisible.value && !props.isStreaming) {
-    renderHeavyContent();
-  }
-});
 </script>
 
 <template>
   <div ref="markdownContainer" class="vcp-markdown-block prose prose-sm dark:prose-invert max-w-none"
-    v-intersection-observer.once @intersect="handleIntersect">
+    :class="{ 'is-streaming': isStreaming }"
+    @click="handleContainerClick">
     <div ref="innerContentRef" class="vcp-markdown-inner"></div>
   </div>
 </template>
@@ -313,6 +444,47 @@ watch(() => [props.content, props.isStreaming], () => {
   max-width: 100%;
 }
 
+.vcp-markdown-block.is-streaming .vcp-markdown-inner {
+  white-space: pre-wrap;
+}
+
+/* VCP Role Divide Styles (Ported from VChat) */
+.vcp-role-divider {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 15px 0;
+  font-size: 0.85em;
+  color: var(--primary-text);
+  opacity: 0.7;
+  user-select: none;
+  clear: both;
+}
+
+.vcp-role-divider::before,
+.vcp-role-divider::after {
+  content: "";
+  flex: 1;
+  border-bottom: 1px dashed var(--border-color, #ccc);
+  margin: 0 15px;
+}
+
+.vcp-role-divider.role-system {
+  color: #e67e22;
+}
+
+.vcp-role-divider.role-assistant {
+  color: #3498db;
+}
+
+.vcp-role-divider.role-user {
+  color: #2ecc71;
+}
+
+.vcp-role-divider.type-end {
+  opacity: 0.5;
+}
+
 .vcp-markdown-block pre {
   @apply rounded-lg bg-gray-900/50 p-3 overflow-x-auto border border-white/10 my-2;
   max-width: 100%;
@@ -328,6 +500,76 @@ watch(() => [props.content, props.isStreaming], () => {
 .vcp-markdown-block img {
   max-width: 100%;
   height: auto;
+}
+
+.vcp-markdown-image,
+.vcp-markdown-video,
+.vcp-media-frame {
+  cursor: zoom-in;
+}
+
+.vcp-markdown-image {
+  border-radius: 8px;
+  max-height: min(58vh, 520px);
+  object-fit: contain;
+}
+
+.vcp-media-frame {
+  display: inline-flex;
+  position: relative;
+  max-width: 100%;
+  margin: 6px 0;
+  border-radius: 10px;
+  overflow: hidden;
+  background: rgba(0, 0, 0, 0.18);
+  border: 1px solid rgba(120, 120, 128, 0.2);
+  vertical-align: middle;
+}
+
+.vcp-media-video {
+  width: min(100%, 420px);
+  aspect-ratio: 16 / 9;
+}
+
+.vcp-markdown-video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  background: #000;
+}
+
+.vcp-media-play {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.vcp-media-play-icon {
+  width: 42px;
+  height: 42px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.14);
+  backdrop-filter: blur(10px);
+  position: relative;
+}
+
+.vcp-media-play-icon::after {
+  content: "";
+  position: absolute;
+  left: 17px;
+  top: 12px;
+  border-left: 13px solid rgba(255, 255, 255, 0.88);
+  border-top: 9px solid transparent;
+  border-bottom: 9px solid transparent;
+}
+
+.vcp-media-audio {
+  padding: 10px 12px;
+  font-size: 0.85em;
+  opacity: 0.78;
 }
 
 /* 表情包专属尺寸约束：使用 Rust 注入的 .vcp-emoticon 类名 */
@@ -377,7 +619,7 @@ watch(() => [props.content, props.isStreaming], () => {
   background-color: rgba(255, 255, 255, 0.1);
 }
 
-/* VCP 专属引号高亮样式 —— injected by useVcpMagic.ts highlightTextPatterns() */
+/* 修复：VCP 专属引号高亮样式 (移除固定的 font-weight，允许与加粗 ** 完美嵌套) */
 .highlighted-quote {
   color: var(--quoted-text, #ff7f50) !important;
   display: inline !important;
@@ -394,7 +636,7 @@ watch(() => [props.content, props.isStreaming], () => {
   color: var(--highlight-text, #3498db) !important;
 }
 
-/* VCP 专属标签高亮样式 —— injected by useVcpMagic.ts highlightTextPatterns() */
+/* VCP 专属标签高亮样式 (@标签 和 @!警告) */
 .highlighted-tag {
   color: var(--highlight-text, #3498db) !important;
   font-weight: 600;
@@ -427,18 +669,40 @@ watch(() => [props.content, props.isStreaming], () => {
   margin-bottom: 0.5em !important;
 }
 
-/* 修复：超长 inline 公式截断问题 */
+/* 修复：超长公式截断问题（为 KaTeX 公式容器分配独立的横向滚动上下文） */
+.vcp-markdown-block .vcp-math-block,
+.vcp-markdown-block .katex-display {
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+}
+
+.vcp-markdown-block .katex-display {
+  padding-bottom: 0.5em;
+  /* 防止垂直截断遮挡下标或滚动条 */
+}
+
 .vcp-markdown-block .vcp-math-inline {
   max-width: 100%;
   overflow-x: auto;
+  overflow-y: hidden;
   display: inline-block;
   vertical-align: middle;
 }
 
-/* 修复：KaTeX 默认 display: inline 时内部复杂布局（inline-table、absolute 定位等）
-   导致 scrollWidth 被错误计算，在无明显溢出时仍显示滚动条 */
-.vcp-markdown-block .vcp-math-inline .katex {
-  display: inline-block;
+/* 匹配整体美学的细长公式滚动条 */
+.vcp-markdown-block .vcp-math-block::-webkit-scrollbar,
+.vcp-markdown-block .katex-display::-webkit-scrollbar,
+.vcp-markdown-block .vcp-math-inline::-webkit-scrollbar {
+  height: 4px;
+}
+
+.vcp-markdown-block .vcp-math-block::-webkit-scrollbar-thumb,
+.vcp-markdown-block .katex-display::-webkit-scrollbar-thumb,
+.vcp-markdown-block .vcp-math-inline::-webkit-scrollbar-thumb {
+  background: rgba(150, 150, 150, 0.3);
+  border-radius: 4px;
 }
 
 /* 强化 Emoji 字体栈，强制手机端渲染更精美的原生彩色表情 */

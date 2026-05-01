@@ -4,6 +4,8 @@
 
 mod clipboard;
 mod device_info;
+mod mobile_file_operator;
+pub(crate) mod mobile_prompt;
 mod notification;
 
 mod battery;
@@ -31,6 +33,8 @@ pub fn build_registry() -> ToolRegistry {
     registry.register_oneshot(device_info::DeviceInfoTool);
     registry.register_oneshot(notification::NotificationTool);
     registry.register_oneshot(clipboard::ClipboardTool);
+    registry.register_oneshot(mobile_file_operator::MobileFileOperatorTool);
+    registry.register_oneshot(mobile_prompt::MobilePromptTool);
 
     // Streaming tools — hardware monitoring (Phase 1)
     registry.register_streaming(battery::BatteryInfoTool);

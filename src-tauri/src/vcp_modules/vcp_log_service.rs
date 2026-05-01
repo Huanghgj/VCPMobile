@@ -1,21 +1,43 @@
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Runtime};
 use tokio::sync::{mpsc, watch};
-use tokio::time::{sleep, Duration};
+use tokio::time::{interval, sleep, Duration, Instant, MissedTickBehavior};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 use url::Url;
 
 lazy_static::lazy_static! {
-static ref LOG_CONNECTION_ACTIVE: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
-static ref LOG_SENDER: Arc<tokio::sync::Mutex<Option<mpsc::UnboundedSender<Value>>>> = Arc::new(tokio::sync::Mutex::new(None));
-// 关键修复：保持 Sender 和一个 Receiver 都在生命周期内，防止通道因无接收者而被视为关闭
-static ref WS_URL_CHANNEL: (watch::Sender<Option<Url>>, watch::Receiver<Option<Url>>) = watch::channel(None);
-static ref CURRENT_LOG_STATUS: Arc<tokio::sync::RwLock<String>> = Arc::new(tokio::sync::RwLock::new("closed".to_string()));
+    static ref LOG_CONNECTION_ACTIVE: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    static ref OUTBOUND_QUEUE_LEN: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+    static ref LOG_SENDER: Arc<tokio::sync::Mutex<Option<mpsc::UnboundedSender<Value>>>> = Arc::new(tokio::sync::Mutex::new(None));
+    // 关键修复：保持 Sender 和一个 Receiver 都在生命周期内，防止通道因无接收者而被视为关闭
+    static ref WS_URL_CHANNEL: (watch::Sender<Option<Url>>, watch::Receiver<Option<Url>>) = watch::channel(None);
+    static ref CURRENT_LOG_TARGET: Arc<tokio::sync::RwLock<Option<String>>> = Arc::new(tokio::sync::RwLock::new(None));
+    static ref CURRENT_LOG_STATUS: Arc<tokio::sync::RwLock<String>> = Arc::new(tokio::sync::RwLock::new("disconnected".to_string()));
+    static ref CURRENT_LOG_STATUS_MESSAGE: Arc<tokio::sync::RwLock<String>> = Arc::new(tokio::sync::RwLock::new("等待初始化...".to_string()));
+}
+
+const HEARTBEAT_INTERVAL_SECS: u64 = 25;
+const CONNECTION_STALE_TIMEOUT_SECS: u64 = 90;
+const RECONNECT_INITIAL_DELAY_SECS: u64 = 2;
+const RECONNECT_MAX_DELAY_SECS: u64 = 60;
+const MAX_OUTBOUND_QUEUE_LEN: usize = 100;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionEnd {
+    UrlChanged,
+    Network,
+    Stale,
+    SenderClosed,
+}
+
+#[tauri::command]
+pub async fn get_vcp_log_status() -> Result<String, String> {
+    Ok(CURRENT_LOG_STATUS.read().await.clone())
 }
 
 pub async fn get_vcp_log_status_internal() -> String {
@@ -23,15 +45,62 @@ pub async fn get_vcp_log_status_internal() -> String {
 }
 
 #[tauri::command]
-pub async fn send_vcp_log_message(payload: serde_json::Value) -> Result<(), String> {
+pub async fn send_vcp_log_message(payload: Value) -> Result<(), String> {
+    if CURRENT_LOG_TARGET.read().await.is_none() {
+        return Err("VCPLog connection is not configured".to_string());
+    }
+
+    if OUTBOUND_QUEUE_LEN.load(Ordering::SeqCst) >= MAX_OUTBOUND_QUEUE_LEN {
+        return Err("VCPLog outgoing queue is full".to_string());
+    }
+
     let sender_lock = LOG_SENDER.lock().await;
     if let Some(sender) = sender_lock.as_ref() {
-        sender
-            .send(payload)
-            .map_err(|e| format!("Failed to send message to VCPLog: {}", e))?;
+        OUTBOUND_QUEUE_LEN.fetch_add(1, Ordering::SeqCst);
+        sender.send(payload).map_err(|e| {
+            OUTBOUND_QUEUE_LEN.fetch_sub(1, Ordering::SeqCst);
+            format!("Failed to send message to VCPLog: {}", e)
+        })?;
         Ok(())
     } else {
         Err("VCPLog connection is not active".to_string())
+    }
+}
+
+async fn emit_log_status<R: Runtime>(app_handle: &AppHandle<R>, status: &str, message: String) {
+    let current_status = CURRENT_LOG_STATUS.read().await.clone();
+    let current_message = CURRENT_LOG_STATUS_MESSAGE.read().await.clone();
+    if current_status == status && current_message == message {
+        return;
+    }
+
+    {
+        *CURRENT_LOG_STATUS.write().await = status.to_string();
+        *CURRENT_LOG_STATUS_MESSAGE.write().await = message.clone();
+    }
+
+    let _ = app_handle.emit(
+        "vcp-system-event",
+        serde_json::json!({
+            "type": "connection_status",
+            "status": status,
+            "message": message,
+            "source": "VCPLog"
+        }),
+    );
+}
+
+fn next_reconnect_delay(current: Duration) -> Duration {
+    let next_secs = current
+        .as_secs()
+        .saturating_mul(2)
+        .clamp(RECONNECT_INITIAL_DELAY_SECS, RECONNECT_MAX_DELAY_SECS);
+    Duration::from_secs(next_secs)
+}
+
+fn decrement_outbound_queue_len() {
+    if OUTBOUND_QUEUE_LEN.load(Ordering::SeqCst) > 0 {
+        OUTBOUND_QUEUE_LEN.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -67,16 +136,29 @@ pub async fn init_vcp_log_connection_internal<R: tauri::Runtime>(
     url: String,
     key: String,
 ) -> Result<(), String> {
-    // 如果 URL 或 Key 为空，发送 None 以停止现有连接并进入静默等待
-    if url.trim().is_empty() || key.trim().is_empty() {
-        let _ = WS_URL_CHANNEL.0.send(None);
-        return Ok(());
+    let ws_url = if url.trim().is_empty() || key.trim().is_empty() {
+        None
+    } else {
+        Some(parse_log_url(&url, &key)?)
+    };
+
+    let next_target = ws_url.as_ref().map(|u| u.as_str().to_string());
+    let listener_active = LOG_CONNECTION_ACTIVE.load(Ordering::SeqCst);
+    {
+        let mut current_target = CURRENT_LOG_TARGET.write().await;
+        if *current_target == next_target && listener_active {
+            log::debug!("[VCPLog] init skipped because target is unchanged.");
+            return Ok(());
+        }
+        *current_target = next_target;
     }
 
-    let ws_url = parse_log_url(&url, &key)?;
-
-    // Always send the new URL to the watch channel
-    let _ = WS_URL_CHANNEL.0.send(Some(ws_url.clone()));
+    // 如果 URL 或 Key 为空，发送 None 以停止现有连接并进入静默等待
+    let _ = WS_URL_CHANNEL.0.send(ws_url.clone());
+    if ws_url.is_none() {
+        emit_log_status(&app, "disconnected", "VCPLog 未配置".to_string()).await;
+        return Ok(());
+    }
 
     if LOG_CONNECTION_ACTIVE.swap(true, Ordering::SeqCst) {
         return Ok(());
@@ -92,6 +174,7 @@ pub async fn init_vcp_log_connection_internal<R: tauri::Runtime>(
 
 async fn start_vcp_log_listener<R: tauri::Runtime>(app_handle: AppHandle<R>) {
     let mut url_rx = WS_URL_CHANNEL.0.subscribe();
+    let mut reconnect_delay = Duration::from_secs(RECONNECT_INITIAL_DELAY_SECS);
 
     // 创建 mpsc 通道用于回传消息
     let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
@@ -102,7 +185,6 @@ async fn start_vcp_log_listener<R: tauri::Runtime>(app_handle: AppHandle<R>) {
         *sender_lock = Some(tx);
     }
 
-    let mut retry_delay = Duration::from_millis(1000);
     loop {
         // 获取当前 URL
         let ws_url = {
@@ -110,9 +192,12 @@ async fn start_vcp_log_listener<R: tauri::Runtime>(app_handle: AppHandle<R>) {
             match val {
                 Some(u) => u,
                 None => {
+                    OUTBOUND_QUEUE_LEN.store(0, Ordering::SeqCst);
+                    emit_log_status(&app_handle, "disconnected", "VCPLog 未配置".to_string()).await;
                     if url_rx.changed().await.is_err() {
                         break;
                     }
+                    reconnect_delay = Duration::from_secs(RECONNECT_INITIAL_DELAY_SECS);
                     continue;
                 }
             }
@@ -125,61 +210,22 @@ async fn start_vcp_log_listener<R: tauri::Runtime>(app_handle: AppHandle<R>) {
             ws_url.to_string()
         };
         log::info!("[VCPLog] Attempting to connect to {}...", masked_url);
-
-        {
-            *CURRENT_LOG_STATUS.write().await = "connecting".to_string();
-        }
-
-        let _ = app_handle.emit(
-            "vcp-system-event",
-            serde_json::json!({
-                "type": "vcp-log-status",
-                "status": "connecting",
-                "message": "连接中...",
-                "source": "VCPLog"
-            }),
-        );
+        emit_log_status(&app_handle, "connecting", "正在连接 VCPLog...".to_string()).await;
 
         let mut request = match ws_url.as_str().into_client_request() {
             Ok(req) => req,
             Err(e) => {
-                {
-                    *CURRENT_LOG_STATUS.write().await = "error".to_string();
-                }
                 log::error!(
                     "[VCPLog] Failed to build request: {}. Retrying in 5 seconds...",
                     e
                 );
-                let _ = app_handle.emit(
-                    "vcp-system-event",
-                    serde_json::json!({
-                        "type": "vcp-log-status",
-                        "status": "error",
-                        "message": "连接错误",
-                        "source": "VCPLog"
-                    }),
-                );
-
-                // 错误卡片 1：请求构建失败 (例如 URL 格式错误)
-                let _ = app_handle.emit(
-                    "vcp-system-event",
-                    serde_json::json!({
-                        "type": "vcp-log-message",
-                        "data": {
-                            "id": "vcp_log_connection_status",
-                            "status": "error",
-                            "tool_name": "VCPLog 请求异常",
-                            "content": format!("❌ 无法构造请求: {}\n\n提示：请检查配置的 URL 格式是否正确。", e),
-                            "source": "VCPLog"
-                        }
-                    }),
-                );
+                emit_log_status(&app_handle, "error", format!("VCPLog 请求构建失败: {}", e)).await;
 
                 tokio::select! {
                     _ = url_rx.changed() => {},
-                    _ = sleep(retry_delay) => {},
+                    _ = sleep(reconnect_delay) => {},
                 }
-                retry_delay = (retry_delay * 2).min(Duration::from_secs(60));
+                reconnect_delay = next_reconnect_delay(reconnect_delay);
                 continue;
             }
         };
@@ -216,50 +262,38 @@ async fn start_vcp_log_listener<R: tauri::Runtime>(app_handle: AppHandle<R>) {
         match tokio::time::timeout(Duration::from_secs(10), connect_async(request)).await {
             Ok(connection_result) => match connection_result {
                 Ok((ws_stream, _)) => {
-                    retry_delay = Duration::from_millis(1000);
-                    {
-                        *CURRENT_LOG_STATUS.write().await = "open".to_string();
-                    }
                     log::info!("[VCPLog] Connected successfully to {}", masked_url);
-
                     let (mut ws_write, mut ws_read) = ws_stream.split();
+                    let mut heartbeat = interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
+                    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                    let mut last_seen_at = Instant::now();
 
-                    let _ = app_handle.emit(
-                        "vcp-system-event",
-                        serde_json::json!({
-                            "type": "vcp-log-status",
-                            "status": "open",
-                            "message": "已连接",
-                            "source": "VCPLog"
-                        }),
-                    );
+                    reconnect_delay = Duration::from_secs(RECONNECT_INITIAL_DELAY_SECS);
+                    emit_log_status(&app_handle, "connected", "已连接 VCPLog".to_string()).await;
 
-                    // 额外发送一条连接成功的通知卡片
-                    let _ = app_handle.emit(
-                        "vcp-system-event",
-                        serde_json::json!({
-                            "type": "vcp-log-message",
-                            "data": {
-                                "id": "vcp_log_connection_status",
-                                "status": "success",
-                                "tool_name": "VCPLog",
-                                "content": "✅ VCPLog 连接成功！已建立实时数据通道。",
-                                "source": "VCPLog"
-                            }
-                        }),
-                    );
-
-                    loop {
+                    let end_reason = loop {
                         tokio::select! {
                             // 监听 URL 变更
                             _ = url_rx.changed() => {
                                 log::info!("[VCPLog] URL changed, closing current connection.");
-                                break;
+                                break ConnectionEnd::UrlChanged;
+                            }
+                            _ = heartbeat.tick() => {
+                                if last_seen_at.elapsed() >= Duration::from_secs(CONNECTION_STALE_TIMEOUT_SECS) {
+                                    log::warn!("[VCPLog] Connection stale for {:?}, rebuilding socket.", last_seen_at.elapsed());
+                                    break ConnectionEnd::Stale;
+                                }
+
+                                if let Err(e) = ws_write.send(Message::Ping(Vec::new().into())).await {
+                                    log::error!("[VCPLog] Heartbeat ping failed: {}", e);
+                                    break ConnectionEnd::Network;
+                                }
                             }
                             // 处理接收到的消息
                             msg_result = ws_read.next() => {
                                 match msg_result {
                                     Some(Ok(msg)) => {
+                                        last_seen_at = Instant::now();
                                         if msg.is_text() {
                                             let text = msg.to_text().unwrap_or_default();
                                             match serde_json::from_str::<Value>(text) {
@@ -275,15 +309,23 @@ async fn start_vcp_log_listener<R: tauri::Runtime>(app_handle: AppHandle<R>) {
                                                     }));
                                                 }
                                             }
+                                        } else if msg.is_ping() {
+                                            if let Err(e) = ws_write.send(Message::Pong(msg.into_data())).await {
+                                                log::error!("[VCPLog] Failed to reply pong: {}", e);
+                                                break ConnectionEnd::Network;
+                                            }
+                                        } else if msg.is_close() {
+                                            log::warn!("[VCPLog] Close frame received from server.");
+                                            break ConnectionEnd::Network;
                                         }
                                     }
                                     Some(Err(e)) => {
                                         log::error!("[VCPLog] WebSocket error during read: {}", e);
-                                        break;
+                                        break ConnectionEnd::Network;
                                     }
                                     None => {
                                         log::warn!("[VCPLog] Connection closed by server.");
-                                        break;
+                                        break ConnectionEnd::Network;
                                     }
                                 }
                             }
@@ -293,98 +335,59 @@ async fn start_vcp_log_listener<R: tauri::Runtime>(app_handle: AppHandle<R>) {
                                     if let Ok(text) = serde_json::to_string(&payload) {
                                         if let Err(e) = ws_write.send(Message::Text(text.into())).await {
                                             log::error!("[VCPLog] Failed to send message: {}", e);
-                                            break;
+                                            decrement_outbound_queue_len();
+                                            break ConnectionEnd::Network;
                                         }
                                     }
+                                    decrement_outbound_queue_len();
+                                } else {
+                                    break ConnectionEnd::SenderClosed;
                                 }
                             }
                         }
+                    };
+
+                    log::info!("[VCPLog] Disconnected from {}: {:?}", ws_url, end_reason);
+                    if end_reason == ConnectionEnd::UrlChanged {
+                        reconnect_delay = Duration::from_secs(RECONNECT_INITIAL_DELAY_SECS);
+                        continue;
                     }
 
-                    log::info!("[VCPLog] Disconnected from {}.", ws_url);
-                    {
-                        *CURRENT_LOG_STATUS.write().await = "closed".to_string();
-                    }
-                    let _ = app_handle.emit(
-                        "vcp-system-event",
-                        serde_json::json!({
-                            "type": "vcp-log-status",
-                            "status": "closed",
-                            "message": "连接已断开",
-                            "source": "VCPLog"
-                        }),
-                    );
+                    emit_log_status(
+                        &app_handle,
+                        "disconnected",
+                        "VCPLog 连接已断开，准备重连".to_string(),
+                    )
+                    .await;
                 }
                 Err(e) => {
-                    {
-                        *CURRENT_LOG_STATUS.write().await = "error".to_string();
-                    }
                     log::error!("[VCPLog] Connection Error: {}. Status: {}", e, e);
-                    let _ = app_handle.emit(
-                        "vcp-system-event",
-                        serde_json::json!({
-                            "type": "vcp-log-status",
-                            "status": "error",
-                            "message": "连接错误",
-                            "source": "VCPLog"
-                        }),
-                    );
-
-                    // 额外发送一条连接错误的通知卡片，辅助排查 (错误卡片 2)
-                    let _ = app_handle.emit(
-                        "vcp-system-event",
-                        serde_json::json!({
-                            "type": "vcp-log-message",
-                            "data": {
-                                "id": "vcp_log_connection_status",
-                                "status": "error",
-                                "tool_name": "VCPLog 连接失败",                                "content": format!("❌ 连接错误: {}\n\n提示：\n1. 请检查桌面端 VCP 是否已开启且 VCPLog 服务正常。\n2. 检查 VCP API 地址和 Key 配置是否正确。", e),
-                                "source": "VCPLog"
-                            }
-                        }),
-                    );
+                    emit_log_status(&app_handle, "error", format!("VCPLog 连接失败: {}", e)).await;
                 }
             },
             Err(_) => {
-                {
-                    *CURRENT_LOG_STATUS.write().await = "error".to_string();
-                }
                 log::error!(
                     "[VCPLog] Connection timed out after 10 seconds. Retrying in 5 seconds..."
                 );
-                let _ = app_handle.emit(
-                    "vcp-system-event",
-                    serde_json::json!({
-                        "type": "vcp-log-status",
-                        "status": "error",
-                        "message": "连接错误",
-                        "source": "VCPLog"
-                    }),
-                );
-
-                // 错误卡片 3：连接超时
-                let _ = app_handle.emit(
-                    "vcp-system-event",
-                    serde_json::json!({
-                        "type": "vcp-log-message",
-                        "data": {
-                            "id": "vcp_log_connection_status",
-                            "status": "error",
-                            "tool_name": "VCPLog 连接超时",
-                            "content": "❌ 连接 VCPLog 超时 (10s)。\n\n提示：\n1. 请检查桌面端是否处于运行状态。\n2. 确认手机与电脑是否处于同一局域网。",
-                            "source": "VCPLog"
-                        }
-                    }),
-                );
+                emit_log_status(&app_handle, "error", "VCPLog 连接超时".to_string()).await;
             }
         }
 
         tokio::select! {
-            _ = url_rx.changed() => log::info!("[VCPLog] URL changed during retry wait."),
-            _ = sleep(retry_delay) => {},
+            _ = url_rx.changed() => {
+                reconnect_delay = Duration::from_secs(RECONNECT_INITIAL_DELAY_SECS);
+                log::info!("[VCPLog] URL changed during retry wait.");
+            }
+            _ = sleep(reconnect_delay) => {
+                reconnect_delay = next_reconnect_delay(reconnect_delay);
+            },
         }
-        retry_delay = (retry_delay * 2).min(Duration::from_secs(60));
     }
+
     LOG_CONNECTION_ACTIVE.store(false, Ordering::SeqCst);
-    log::info!("[VCPLog] Listener task terminated, connection flag reset.");
+    OUTBOUND_QUEUE_LEN.store(0, Ordering::SeqCst);
+    {
+        let mut sender_lock = LOG_SENDER.lock().await;
+        *sender_lock = None;
+    }
 }

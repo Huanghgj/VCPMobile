@@ -41,6 +41,35 @@ pub fn update_sensor_data(key: String, value: String) {
     tools::frontend_bridge::update_sensor(&key, value);
 }
 
+/// Resolve an interactive mobile prompt shown by MobileWaitingForUrReply.
+#[tauri::command]
+pub fn submit_distributed_prompt_response(
+    request_id: String,
+    response: Option<String>,
+    cancelled: Option<bool>,
+) -> Result<(), String> {
+    tools::mobile_prompt::submit_prompt_response(request_id, response, cancelled)
+}
+
+/// Local diagnostics: list registered distributed tools without connecting to the server.
+#[tauri::command]
+pub async fn list_distributed_tools(
+    state: State<'_, DistributedState>,
+) -> Result<Vec<types::ToolManifest>, String> {
+    Ok(state.registry.get_all_manifests())
+}
+
+/// Local diagnostics: execute a registered distributed tool directly.
+#[tauri::command]
+pub async fn execute_distributed_tool(
+    app: tauri::AppHandle,
+    state: State<'_, DistributedState>,
+    tool_name: String,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    state.registry.execute(&tool_name, args, &app).await
+}
+
 /// Start the distributed node connection.
 #[tauri::command]
 pub async fn start_distributed_node(

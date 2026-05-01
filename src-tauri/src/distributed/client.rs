@@ -222,9 +222,23 @@ impl DistributedClient {
         // Wrap tx in Arc<Mutex> so we can send from multiple places.
         let ws_tx = Arc::new(Mutex::new(ws_tx));
 
+        // VCPChat registers immediately on socket open. Some VCPToolBox builds
+        // do not send a DistributedServer connection_ack, so do not gate tool
+        // registration behind ACK.
+        {
+            let mut s = status.write().await;
+            s.connected = true;
+            s.last_error = None;
+        }
+        Self::emit_status_with_app(app, status).await;
+        Self::register_tools(device_name, &ws_tx, registry, status).await;
+        Self::emit_status_with_app(app, status).await;
+        Self::report_ip(device_name, &ws_tx).await;
+        Self::push_static_placeholders(device_name, &ws_tx, registry).await;
+
         // Static placeholder push timer — mirrors setupStaticPlaceholderUpdates() (30s interval)
         let mut placeholder_interval = time::interval(Duration::from_secs(30));
-        // Skip the first immediate tick; we do an initial push below after registration.
+        // Skip the first immediate tick; we do an initial push above after registration.
         placeholder_interval.tick().await;
 
         loop {
@@ -236,7 +250,6 @@ impl DistributedClient {
                             Self::handle_incoming(
                                 app,
                                 &text,
-                                device_name,
                                 &ws_tx,
                                 status,
                                 registry,
@@ -287,7 +300,6 @@ impl DistributedClient {
     async fn handle_incoming(
         app: &AppHandle,
         text: &str,
-        device_name: &str,
         ws_tx: &WsSink,
         status: &Arc<RwLock<DistributedStatus>>,
         registry: &Arc<ToolRegistry>,
@@ -320,15 +332,6 @@ impl DistributedClient {
                     s.last_error = None;
                 }
                 Self::emit_status_with_app(app, status).await;
-
-                // Register tools — mirrors registerTools()
-                Self::register_tools(device_name, ws_tx, registry, status).await;
-
-                // Report IP — mirrors reportIPAddress()
-                Self::report_ip(device_name, ws_tx).await;
-
-                // Initial static placeholder push (2s delay in VCPChat, do it immediately here)
-                Self::push_static_placeholders(device_name, ws_tx, registry).await;
             }
 
             IncomingMessage::ExecuteTool {

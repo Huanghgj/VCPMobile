@@ -22,3 +22,11 @@ export interface EditorConfig {
   initialValue: string;
   onSave: (newContent: string) => void;
 }
+
+export interface MediaViewerConfig {
+  src: string;
+  originalSrc?: string;
+  mediaType: 'image' | 'video' | 'audio';
+  title?: string;
+  mimeType?: string;
+}

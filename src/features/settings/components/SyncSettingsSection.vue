@@ -60,6 +60,12 @@ const rebuildEmoticonLibrary = async () => {
       placeholder="输入桌面端 config.env 中的 Token"
       mono
     />
+    <SettingsTextField
+      v-model="settings.syncLogLevel"
+      label="同步日志等级"
+      placeholder="DEBUG / INFO / WARN / ERROR"
+      mono
+    />
 
     <div class="border-t border-black/5 dark:border-white/5 pt-2 space-y-4">
       <SettingsTextField

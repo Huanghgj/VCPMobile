@@ -50,10 +50,10 @@ const testVcpConnection = async () => {
 
     <div class="border-t border-black/5 dark:border-white/5 pt-2"></div>
 
-    <SettingsTextField v-model="settings.vcpLogUrl" label="VCP WebSocket 服务器 URL" placeholder="ws://localhost:8024"
+    <SettingsTextField v-model="settings.vcpLogUrl" label="VCP 实时通道 URL（VCPInfo 共用）" placeholder="ws://localhost:8024"
       mono />
-    <SettingsTextField v-model="settings.vcpLogKey" is-secure label="VCP WebSocket 鉴权 Key"
-      placeholder="输入 WebSocket Key" mono />
+    <SettingsTextField v-model="settings.vcpLogKey" is-secure label="VCP 实时通道 Key（VCPInfo 共用）"
+      placeholder="输入实时通道 Key" mono />
 
     <div class="pt-2 flex items-center justify-between gap-4">
       <SettingsInlineStatus v-if="vcpPingStatus.type" :type="vcpPingStatus.type" :message="vcpPingStatus.message"

@@ -4,6 +4,11 @@ import { useNotificationStore } from '../../core/stores/notification';
 
 const store = useNotificationStore();
 
+const displaySource = computed(() => {
+  const source = store.vcpStatus.source || '实时通道';
+  return source === 'VCPLog' ? '实时通道' : source;
+});
+
 const statusClass = computed(() => {
   switch (store.vcpStatus.status) {
     case 'connected':
@@ -25,6 +30,6 @@ const statusClass = computed(() => {
 <template>
   <div class="w-full text-center py-1.5 text-[10px] font-black uppercase tracking-[0.2em] transition-colors duration-300 shadow-sm relative z-20"
     :class="statusClass">
-    {{ store.vcpStatus.source || 'VCPLog' }}: {{ store.vcpStatus.message || 'IDLE' }}
+    {{ displaySource }}: {{ store.vcpStatus.message || 'IDLE' }}
   </div>
 </template>

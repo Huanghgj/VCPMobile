@@ -102,6 +102,36 @@ export const useAssistantStore = defineStore("assistant", () => {
     ...groups.value.map((group) => ({ ...group, type: "group" as const })),
   ]);
 
+  const upsertAgentLocally = (agent: AgentConfig) => {
+    const index = agents.value.findIndex((item) => item.id === agent.id);
+    const nextAgent = { ...agent };
+
+    if (index >= 0) {
+      agents.value[index] = {
+        ...agents.value[index],
+        ...nextAgent,
+        topics: nextAgent.topics ?? agents.value[index].topics,
+      };
+    } else {
+      agents.value.push(nextAgent);
+    }
+  };
+
+  const upsertGroupLocally = (group: GroupConfig) => {
+    const index = groups.value.findIndex((item) => item.id === group.id);
+    const nextGroup = { ...group };
+
+    if (index >= 0) {
+      groups.value[index] = {
+        ...groups.value[index],
+        ...nextGroup,
+        topics: nextGroup.topics ?? groups.value[index].topics,
+      };
+    } else {
+      groups.value.push(nextGroup);
+    }
+  };
+
   const fetchAgents = async () => {
     loading.value = true;
     error.value = null;
@@ -146,6 +176,7 @@ export const useAssistantStore = defineStore("assistant", () => {
         message: `助手 "${name}" 已就绪`,
         toastOnly: true,
       });
+      upsertAgentLocally(newAgent);
       // 不再自动全局 fetch，由生命周期或调用方决定是否增量更新
       return newAgent;
     } catch (e: any) {
@@ -182,6 +213,7 @@ export const useAssistantStore = defineStore("assistant", () => {
         message: `群组 "${name}" 已创建`,
         toastOnly: true,
       });
+      upsertGroupLocally(newGroup);
       // 不再自动全局 fetch
       return newGroup;
     } catch (e: any) {
@@ -211,13 +243,13 @@ export const useAssistantStore = defineStore("assistant", () => {
   const saveAgent = async (agent: AgentConfig) => {
     try {
       await invoke("save_agent_config", { agent });
+      upsertAgentLocally(agent);
       notificationStore.addNotification({
         type: "success",
         title: "Agent 配置保存成功",
         message: "助手的最新设置已同步到核心",
         toastOnly: true,
       });
-      await fetchAgents();
     } catch (e: any) {
       error.value = e.toString();
       throw e;
@@ -227,13 +259,13 @@ export const useAssistantStore = defineStore("assistant", () => {
   const saveGroup = async (group: GroupConfig) => {
     try {
       await invoke("save_group_config", { group });
+      upsertGroupLocally(group);
       notificationStore.addNotification({
         type: "success",
         title: "Group 配置保存成功",
         message: "群组设置已更新",
         toastOnly: true,
       });
-      await fetchGroups();
     } catch (e: any) {
       error.value = e.toString();
       throw e;

@@ -1,4 +1,5 @@
 use crate::vcp_modules::chat_manager::ChatMessage;
+use crate::vcp_modules::context_sanitizer::strip_thought_chains;
 use serde_json::{json, Value};
 
 /// 将数据库中的 ChatMessage 历史记录转换为发送给 VCP 的 JSON 格式
@@ -11,7 +12,11 @@ pub fn assemble_history_for_vcp(history: &[ChatMessage]) -> Vec<Value> {
         .iter()
         .filter(|msg| !msg.is_thinking.unwrap_or(false))
         .map(|msg| {
-            let mut combined_text = msg.content.clone();
+            let mut combined_text = if msg.role == "assistant" {
+                strip_thought_chains(&msg.content)
+            } else {
+                msg.content.clone()
+            };
             let mut content_parts = Vec::new();
 
             if let Some(attachments) = &msg.attachments {

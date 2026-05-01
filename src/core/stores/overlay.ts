@@ -1,7 +1,13 @@
-﻿import { defineStore } from 'pinia';
-import { ref, shallowRef, computed } from 'vue';
+import { defineStore } from 'pinia';
+import { computed, ref, shallowRef } from 'vue';
 import { useModalHistory } from '../composables/useModalHistory';
-import type { OverlayActionItem, ContextMenuConfig, PromptConfig, EditorConfig } from '../types/overlay';
+import type {
+  OverlayActionItem,
+  ContextMenuConfig,
+  PromptConfig,
+  EditorConfig,
+  MediaViewerConfig,
+} from '../types/overlay';
 
 interface PageStackItem {
   type: string;
@@ -10,18 +16,19 @@ interface PageStackItem {
 }
 
 export const useOverlayStore = defineStore('overlay', () => {
-  const { registerModal, unregisterModal } = useModalHistory();
+  const { registerModal, unregisterModal, unregisterModalSilently } = useModalHistory();
 
   const promptConfig = ref<PromptConfig | null>(null);
   const contextMenuConfig = shallowRef<ContextMenuConfig | null>(null);
   const editorConfig = ref<EditorConfig | null>(null);
+  const mediaViewerConfig = ref<MediaViewerConfig | null>(null);
 
-  // --- Page Stack (Virtual Navigation Stack) ---
   const pageStack = ref<PageStackItem[]>([]);
-
   const pageStackTop = computed(() => pageStack.value[pageStack.value.length - 1] || null);
 
   const isSettingsOpen = computed(() => pageStack.value.some(p => p.type === 'settings'));
+  const isToolboxOpen = computed(() => pageStack.value.some(p => p.type === 'toolbox'));
+  const isRagObserverOpen = computed(() => pageStack.value.some(p => p.type === 'ragObserver'));
   const isAgentSettingsOpen = computed(() => pageStack.value.some(p => p.type === 'agentSettings'));
   const isGroupSettingsOpen = computed(() => pageStack.value.some(p => p.type === 'groupSettings'));
 
@@ -51,18 +58,30 @@ export const useOverlayStore = defineStore('overlay', () => {
     });
   };
 
-  // Internal pop: removes from pageStack only (used by handlePopState close callback)
   const popPageInternal = () => {
     if (pageStack.value.length === 0) return;
     pageStack.value.pop();
   };
 
-  // Public pop: removes from pageStack and syncs modal history (used by UI close buttons)
   const popPage = () => {
     if (pageStack.value.length === 0) return;
     const top = pageStack.value[pageStack.value.length - 1];
     unregisterModal(top.modalId);
     pageStack.value.pop();
+  };
+
+  const closePageByType = (type: string) => {
+    const index = pageStack.value.findIndex(p => p.type === type);
+    if (index === -1) return;
+    const [page] = pageStack.value.splice(index, 1);
+    unregisterModal(page.modalId);
+  };
+
+  const closePageByTypeSilently = (type: string) => {
+    const index = pageStack.value.findIndex(p => p.type === type);
+    if (index === -1) return;
+    const [page] = pageStack.value.splice(index, 1);
+    unregisterModalSilently(page.modalId);
   };
 
   const popToRoot = () => {
@@ -73,32 +92,22 @@ export const useOverlayStore = defineStore('overlay', () => {
     }
   };
 
-  // --- Legacy API wrappers (backward compatible) ---
-  const openSettings = () => {
-    pushPage('settings');
-  };
+  const openSettings = () => pushPage('settings');
+  const closeSettings = () => closePageByType('settings');
+  const closeSettingsSilently = () => closePageByTypeSilently('settings');
 
-  const closeSettings = () => {
-    popPage();
-  };
+  const openToolbox = () => pushPage('toolbox');
+  const closeToolbox = () => closePageByType('toolbox');
 
-  const openAgentSettings = (id: string) => {
-    pushPage('agentSettings', id);
-  };
+  const openRagObserver = () => pushPage('ragObserver');
+  const closeRagObserver = () => closePageByType('ragObserver');
 
-  const closeAgentSettings = () => {
-    popPage();
-  };
+  const openAgentSettings = (id: string) => pushPage('agentSettings', id);
+  const closeAgentSettings = () => closePageByType('agentSettings');
 
-  const openGroupSettings = (id: string) => {
-    pushPage('groupSettings', id);
-  };
+  const openGroupSettings = (id: string) => pushPage('groupSettings', id);
+  const closeGroupSettings = () => closePageByType('groupSettings');
 
-  const closeGroupSettings = () => {
-    popPage();
-  };
-
-  // --- Modal API (unchanged) ---
   const openPrompt = (config: PromptConfig) => {
     promptConfig.value = config;
     registerModal('Prompt', () => { promptConfig.value = null; });
@@ -138,36 +147,54 @@ export const useOverlayStore = defineStore('overlay', () => {
     }
   };
 
+  const openMediaViewer = (config: MediaViewerConfig) => {
+    mediaViewerConfig.value = config;
+    registerModal('MediaViewer', () => { mediaViewerConfig.value = null; });
+  };
+
+  const closeMediaViewer = () => {
+    if (mediaViewerConfig.value) {
+      unregisterModal('MediaViewer');
+      mediaViewerConfig.value = null;
+    }
+  };
+
   return {
-    // Page stack
     pageStack,
     pageStackTop,
     getPageZIndex,
     pushPage,
     popPage,
     popToRoot,
-    // Legacy visibility flags (computed)
+    promptConfig,
+    contextMenuConfig,
+    editorConfig,
+    mediaViewerConfig,
     isSettingsOpen,
+    isToolboxOpen,
+    isRagObserverOpen,
     isAgentSettingsOpen,
     agentSettingsId,
     isGroupSettingsOpen,
     groupSettingsId,
-    // Legacy open/close (now backed by page stack)
     openSettings,
     closeSettings,
+    closeSettingsSilently,
+    openToolbox,
+    closeToolbox,
+    openRagObserver,
+    closeRagObserver,
     openAgentSettings,
     closeAgentSettings,
     openGroupSettings,
     closeGroupSettings,
-    // Modals
-    promptConfig,
-    contextMenuConfig,
-    editorConfig,
     openPrompt,
     closePrompt,
     openContextMenu,
     closeContextMenu,
     openEditor,
-    closeEditor
+    closeEditor,
+    openMediaViewer,
+    closeMediaViewer,
   };
 });

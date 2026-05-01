@@ -84,6 +84,10 @@ impl SettingsState {
 }
 
 pub fn create_default_settings() -> Settings {
+    let mut extra = serde_json::Map::new();
+    extra.insert("enableModelThinking".to_string(), serde_json::json!(true));
+    extra.insert("modelThinkingBudget".to_string(), serde_json::json!(4096));
+
     Settings {
         user_name: "用户".to_string(),
         vcp_server_url: "".to_string(),
@@ -101,7 +105,7 @@ pub fn create_default_settings() -> Settings {
         agent_order: vec![],
         group_order: vec![],
         current_theme_mode: Some("dark".to_string()),
-        extra: serde_json::Value::Object(serde_json::Map::new()),
+        extra: serde_json::Value::Object(extra),
     }
 }
 
