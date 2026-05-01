@@ -71,6 +71,37 @@ pub struct SavedMediaData {
 const MAX_MANUAL_MEDIA_SAVE_BYTES: u64 = 120 * 1024 * 1024;
 const MAX_DATA_URL_MEDIA_SAVE_BYTES: usize = 24 * 1024 * 1024;
 
+fn saved_media_dir(app_handle: &AppHandle) -> Result<std::path::PathBuf, String> {
+    #[cfg(target_os = "android")]
+    {
+        if let Some(mut saved_dir) = android_external_app_files_root(app_handle) {
+            saved_dir.push("saved_media");
+            return Ok(saved_dir);
+        }
+    }
+
+    let mut saved_dir = app_handle
+        .path()
+        .app_config_dir()
+        .map_err(|e| e.to_string())?;
+    saved_dir.push("data");
+    saved_dir.push("saved_media");
+    Ok(saved_dir)
+}
+
+#[cfg(target_os = "android")]
+fn android_external_app_files_root(app_handle: &AppHandle) -> Option<std::path::PathBuf> {
+    let mut dir = app_handle.path().document_dir().ok()?;
+    if dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("Documents"))
+    {
+        dir.pop();
+    }
+    Some(dir)
+}
+
 fn normalize_mime_type(mime_type: &str) -> String {
     mime_type
         .split(';')
@@ -274,6 +305,15 @@ fn ensure_safe_path(app_handle: &AppHandle, path: &std::path::Path) -> Result<()
     if path.starts_with(&config_dir) {
         Ok(())
     } else {
+        #[cfg(target_os = "android")]
+        {
+            if android_external_app_files_root(app_handle)
+                .as_ref()
+                .is_some_and(|external_dir| path.starts_with(external_dir))
+            {
+                return Ok(());
+            }
+        }
         Err("非法路径访问：禁止访问应用数据目录以外的文件".to_string())
     }
 }
@@ -836,12 +876,7 @@ pub async fn save_media_from_url(
     suggested_name: Option<String>,
     mime_type: Option<String>,
 ) -> Result<SavedMediaData, String> {
-    let mut saved_dir = app_handle
-        .path()
-        .app_config_dir()
-        .map_err(|e| e.to_string())?;
-    saved_dir.push("data");
-    saved_dir.push("saved_media");
+    let saved_dir = saved_media_dir(&app_handle)?;
     tokio::fs::create_dir_all(&saved_dir)
         .await
         .map_err(|e| e.to_string())?;

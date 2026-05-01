@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { ref } from 'vue';
 import type { OverlayActionItem } from '../../core/types/overlay';
 
 defineProps<{
@@ -8,15 +9,22 @@ defineProps<{
 }>();
 
 const emit = defineEmits(['close', 'action-click']);
+const activeActionLabel = ref<string | null>(null);
 
 const handleBackdropClick = () => {
   emit('close');
 };
 
-const handleAction = (action: OverlayActionItem) => {
-  if (action.disabled) return;
-  action.handler();
-  emit('action-click', action);
+const handleAction = async (action: OverlayActionItem) => {
+  if (action.disabled || activeActionLabel.value) return;
+
+  activeActionLabel.value = action.label;
+  try {
+    await action.handler();
+  } finally {
+    activeActionLabel.value = null;
+    emit('action-click', action);
+  }
 };
 </script>
 
@@ -32,10 +40,10 @@ const handleAction = (action: OverlayActionItem) => {
         </div>
         <div class="p-2">
           <button v-for="action in actions" :key="action.label" @click="handleAction(action)"
-            :disabled="action.disabled"
+            :disabled="action.disabled || !!activeActionLabel"
             class="w-full flex items-center gap-3 px-4 py-3 rounded-2xl text-left transition-all" :class="[
               action.danger ? 'text-red-500 hover:bg-red-500/10' : 'hover:bg-black/5 dark:hover:bg-white/5',
-              action.disabled ? 'opacity-40 cursor-not-allowed' : ''
+              (action.disabled || !!activeActionLabel) ? 'opacity-40 cursor-not-allowed' : ''
             ]">
             <component v-if="action.icon" :is="action.icon" class="w-4 h-4 shrink-0" />
             <span class="text-sm font-semibold">{{ action.label }}</span>

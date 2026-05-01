@@ -19,6 +19,11 @@ import {
 } from "../utils/runtimeLruCache";
 import { clearMarkdownRenderCache } from "../utils/markdownRenderCache";
 import { clearAttachmentThumbnailCache } from "../utils/mediaCache";
+import {
+  consumeDesktopPushBlocks,
+  resetDesktopPushConsumption,
+  stripDesktopPushBlocks,
+} from "../../features/surface/surfaceRuntime";
 
 /**
  * Attachment 接口定义，严格对齐 Rust 端的 AttachmentSyncDTO / Attachment (仅保留核心字段)
@@ -1350,7 +1355,9 @@ export const useChatManagerStore = defineStore("chatManager", () => {
           // 1. 更新当前视图 (如果匹配)
           if (msg) {
             const currentContent = foregroundStreamingBuffers.get(actualMessageId) || msg.content || "";
-            foregroundStreamingBuffers.set(actualMessageId, currentContent + textChunk);
+            const nextContent = currentContent + textChunk;
+            foregroundStreamingBuffers.set(actualMessageId, nextContent);
+            void consumeDesktopPushBlocks(actualMessageId, nextContent);
             // 使用 streamManager 平滑更新 Aurora 分层内容；流式期间不写入 DB。
 
             streamManager.appendChunk(actualMessageId, textChunk, (state) => {
@@ -1370,6 +1377,7 @@ export const useChatManagerStore = defineStore("chatManager", () => {
                 actualMessageId,
               ) || { content: "", topicId, ownerId: itemId };
               buffer.content += textChunk;
+              void consumeDesktopPushBlocks(actualMessageId, buffer.content);
               backgroundStreamingBuffers.value.set(actualMessageId, buffer);
             }
 
@@ -1452,7 +1460,7 @@ export const useChatManagerStore = defineStore("chatManager", () => {
             try {
               const compileStartedAt = performance.now();
               const freshBlocks = await invoke<any[]>("process_message_content", {
-                content: latestMsg.content
+                content: stripDesktopPushBlocks(latestMsg.content || "")
               });
               latestMsg.blocks = freshBlocks;
               refreshCurrentTopicCache();
@@ -1510,6 +1518,7 @@ export const useChatManagerStore = defineStore("chatManager", () => {
 
           // 彻底清理
           backgroundStreamingBuffers.value.delete(actualMessageId);
+          resetDesktopPushConsumption(actualMessageId);
         });
       }
     });

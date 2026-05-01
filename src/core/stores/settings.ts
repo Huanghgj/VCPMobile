@@ -20,6 +20,7 @@ export interface AppSettings {
   enableVcpToolInjection: boolean;
   agentMusicControl: boolean;
   enableAgentBubbleTheme: boolean;
+  enableMobileSurfaceInjection: boolean;
   enableModelThinking: boolean;
   modelThinkingBudget: number;
   agentOrder: string[];

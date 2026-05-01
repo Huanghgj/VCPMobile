@@ -6357,6 +6357,7 @@ dependencies = [
  "futures-util",
  "hex",
  "image",
+ "jni",
  "lazy_static",
  "libc",
  "log",

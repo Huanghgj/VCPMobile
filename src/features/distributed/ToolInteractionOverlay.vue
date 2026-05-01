@@ -71,15 +71,27 @@ async function submitPrompt(response?: string, cancelled = false) {
   }
 }
 
+async function ensureNotificationPermission() {
+  if (!("Notification" in window)) return "unsupported";
+  if (Notification.permission === "default" && Notification.requestPermission) {
+    try {
+      return await Notification.requestPermission();
+    } catch (e) {
+      console.warn("[Distributed Notification] Permission request failed:", e);
+    }
+  }
+  return Notification.permission;
+}
+
 // Notification handler — listens for distributed-notification events
 let unlistenNotification: UnlistenFn | null = null;
 
 onMounted(async () => {
   unlistenNotification = await listen<{ title: string; body: string }>(
     "distributed-notification",
-    (event) => {
-      // Use browser Notification API or fallback
-      if ("Notification" in window && Notification.permission === "granted") {
+    async (event) => {
+      const permission = await ensureNotificationPermission();
+      if (permission === "granted") {
         new Notification(event.payload.title, { body: event.payload.body });
       } else {
         console.log(

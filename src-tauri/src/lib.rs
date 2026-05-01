@@ -78,6 +78,68 @@ fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
 }
 
+#[cfg(target_os = "android")]
+#[tauri::command]
+fn show_desktop_overlay(
+    title: Option<String>,
+    html: String,
+    window: tauri::WebviewWindow,
+) -> Result<(), String> {
+    let title = title.unwrap_or_else(|| "VCP Surface".to_string());
+
+    window
+        .with_webview(move |platform_webview| {
+            let jni_handle = platform_webview.jni_handle();
+            jni_handle.exec(move |env, activity, _webview| {
+                use jni::objects::{JClass, JObject, JValue};
+
+                let result = (|| -> jni::errors::Result<()> {
+                    let class_loader = env
+                        .call_method(activity, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])?
+                        .l()?;
+                    let bridge_name = env.new_string("com.vcp.avatar.OverlayBridge")?;
+                    let bridge_name = JObject::from(bridge_name);
+                    let bridge_class = env
+                        .call_method(
+                            &class_loader,
+                            "loadClass",
+                            "(Ljava/lang/String;)Ljava/lang/Class;",
+                            &[JValue::Object(&bridge_name)],
+                        )?
+                        .l()?;
+                    let bridge_class = JClass::from(bridge_class);
+                    let title = env.new_string(title)?;
+                    let html = env.new_string(html)?;
+                    let title = JObject::from(title);
+                    let html = JObject::from(html);
+
+                    env.call_static_method(
+                        bridge_class,
+                        "showSurface",
+                        "(Landroid/app/Activity;Ljava/lang/String;Ljava/lang/String;)V",
+                        &[
+                            JValue::Object(activity),
+                            JValue::Object(&title),
+                            JValue::Object(&html),
+                        ],
+                    )?;
+                    Ok(())
+                })();
+
+                if let Err(error) = result {
+                    log::error!("failed to show Android desktop overlay: {error}");
+                }
+            });
+        })
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(target_os = "android"))]
+#[tauri::command]
+fn show_desktop_overlay(_title: Option<String>, _html: String) -> Result<(), String> {
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let mut builder = tauri::Builder::default();
@@ -202,6 +264,7 @@ pub fn run() {
             get_process_performance_snapshot,
             save_performance_report,
             call_vcp_toolbox_api,
+            show_desktop_overlay,
             distributed::start_distributed_node,
             distributed::stop_distributed_node,
             distributed::get_distributed_status,

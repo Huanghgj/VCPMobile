@@ -61,6 +61,7 @@ const settings = ref<AppSettings>({
   enableVcpToolInjection: false,
   agentMusicControl: false,
   enableAgentBubbleTheme: true,
+  enableMobileSurfaceInjection: true,
   enableModelThinking: true,
   modelThinkingBudget: 4096,
 });
@@ -77,6 +78,7 @@ const normalizeSettings = (rawSettings: AppSettings): AppSettings => ({
   enableVcpToolInjection: rawSettings.enableVcpToolInjection ?? false,
   agentMusicControl: rawSettings.agentMusicControl ?? false,
   enableAgentBubbleTheme: rawSettings.enableAgentBubbleTheme ?? true,
+  enableMobileSurfaceInjection: rawSettings.enableMobileSurfaceInjection ?? true,
   enableModelThinking: rawSettings.enableModelThinking ?? true,
   modelThinkingBudget: normalizeThinkingBudget(rawSettings.modelThinkingBudget),
 });

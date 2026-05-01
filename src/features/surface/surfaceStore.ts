@@ -76,9 +76,49 @@ export const useSurfaceStore = defineStore("surface", () => {
     }
   };
 
+  const replaceLatestWidgetContent = async (
+    targetSelector: string | undefined,
+    content: string,
+  ) => {
+    const widget = [...widgets.value].sort((a, b) => b.updatedAt - a.updatedAt)[0];
+    if (!widget) return widgets.value;
+
+    let nextHtml = content;
+    if (targetSelector?.trim()) {
+      try {
+        const parser = new DOMParser();
+        const document = parser.parseFromString(widget.html, "text/html");
+        const target = document.querySelector(targetSelector.trim());
+        if (target) {
+          target.outerHTML = content;
+          nextHtml = document.body.innerHTML || content;
+        }
+      } catch (error) {
+        console.warn("[SurfaceStore] Selector replacement failed:", error);
+      }
+    }
+
+    await upsertWidget({
+      id: widget.id,
+      title: widget.title,
+      html: nextHtml,
+      bounds: widget.bounds,
+      favorite: widget.favorite,
+      source: widget.source,
+    });
+
+    return widgets.value;
+  };
+
   const applyCommand = async (command: SurfaceCommand) => {
     lastError.value = null;
     try {
+      if (command.action === "replace") {
+        return await replaceLatestWidgetContent(
+          command.targetSelector,
+          command.content,
+        );
+      }
       widgets.value = await surfaceBridge.applyCommand(command);
       return widgets.value;
     } catch (error) {

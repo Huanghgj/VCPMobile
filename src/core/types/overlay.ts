@@ -3,7 +3,7 @@ export interface OverlayActionItem {
   icon?: any; // lucide-vue-next component
   danger?: boolean;
   disabled?: boolean;
-  handler: () => void;
+  handler: () => void | Promise<void>;
 }
 
 export interface ContextMenuConfig {

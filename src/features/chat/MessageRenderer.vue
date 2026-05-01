@@ -19,6 +19,11 @@ import {
   extractToolNameFromRequest,
   parseToolResultBody,
 } from "../../core/utils/toolPreview";
+import {
+  hasDesktopPushBlocks,
+  stripDesktopPushBlocks,
+} from "../surface/surfaceProtocol";
+import { resetDesktopPushConsumption } from "../surface/surfaceRuntime";
 import { Copy, Edit2, RotateCcw, Trash2, StopCircle } from "lucide-vue-next";
 
 // Import block components
@@ -116,6 +121,7 @@ onUnmounted(() => {
   // 彻底防止 Scoped CSS 在组件销毁后泄漏内存或污染全局
   if (props.message && props.message.id) {
     removeScopedCss(props.message.id);
+    resetDesktopPushConsumption(props.message.id);
   }
 });
 
@@ -139,25 +145,50 @@ const hasLayeredStream = computed(
       props.message.tailContent !== undefined),
 );
 
+const blocksTextFallback = computed(() => {
+  if (!props.message.blocks?.length) return "";
+
+  return props.message.blocks
+    .map((block) => block.content)
+    .filter(Boolean)
+    .join("\n\n")
+    .trim();
+});
+
+const getDisplayBlocks = (blocks: ContentBlock[]) => {
+  return blocks
+    .map((block) => {
+      if (!block.content || !hasDesktopPushBlocks(block.content)) return block;
+      return {
+        ...block,
+        content: stripDesktopPushBlocks(block.content),
+      };
+    })
+    .filter((block) => {
+      if (block.type !== "markdown" && block.type !== "html-preview") return true;
+      return Boolean(block.content?.trim());
+    });
+};
+
 const messageRenderSource = computed(() => {
   if (hasLayeredStream.value) {
-    return props.message.tailContent || "";
+    return stripDesktopPushBlocks(props.message.tailContent || "");
   }
 
-  return (
+  return stripDesktopPushBlocks(
     props.message.processedContent ||
-    props.message.displayedContent ||
-    props.message.content ||
-    ""
+      props.message.displayedContent ||
+      props.message.content ||
+      "",
   );
 });
 
 const streamTailContent = computed(() => {
   if (hasLayeredStream.value) {
-    return props.message.tailContent || "";
+    return stripDesktopPushBlocks(props.message.tailContent || "");
   }
 
-  return streamContent.value;
+  return stripDesktopPushBlocks(streamContent.value);
 });
 
 const hasVisibleStreamContent = computed(() => {
@@ -338,7 +369,7 @@ const splitStreamSpecialBlocks = (text: string): ContentBlock[] => {
 };
 
 const stableStreamBlocks = computed(() =>
-  splitStreamSpecialBlocks(props.message.stableContent || ""),
+  splitStreamSpecialBlocks(stripDesktopPushBlocks(props.message.stableContent || "")),
 );
 
 const tailStreamBlocks = computed(() =>
@@ -362,9 +393,13 @@ const updateContentBlocks = async (text: string) => {
     return;
   }
 
-  // 1. 优先使用预编译的 AST (零解析渲染)
-  if (!isStreaming.value && props.message.blocks && props.message.blocks.length > 0) {
-    contentBlocks.value = props.message.blocks;
+  // 1. 优先使用预编译的 AST (零解析渲染)，但剥离 Surface 指令块。
+  if (
+    !isStreaming.value &&
+    props.message.blocks &&
+    props.message.blocks.length > 0
+  ) {
+    contentBlocks.value = getDisplayBlocks(props.message.blocks);
     streamContent.value = "";
     diagnostics.addTrace("message-render-cached-blocks", {
       messageId: props.message.id,
@@ -506,6 +541,69 @@ const avatarFallbackColor = computed(() => {
   return agentConfig.value?.avatarCalculatedColor || "#374151";
 });
 
+const getLocalMessageText = () => {
+  if (props.message.content) return props.message.content;
+
+  if (hasLayeredStream.value) {
+    const layeredText =
+      `${props.message.stableContent || ""}${props.message.tailContent || ""}`;
+    if (layeredText) return layeredText;
+  }
+
+  return (
+    props.message.displayedContent ||
+    props.message.processedContent ||
+    streamContent.value ||
+    ""
+  );
+};
+
+const getBlocksTextFallback = () => {
+  return blocksTextFallback.value;
+};
+
+const getFullMessageText = async () => {
+  const localText = getLocalMessageText();
+  if (localText) return localText;
+
+  const rawText = await chatStore.fetchRawContent(props.message.id);
+  if (rawText) return rawText;
+
+  return getBlocksTextFallback();
+};
+
+const writeClipboardText = async (text: string) => {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+  } catch (error) {
+    console.warn(
+      "[MessageContextMenu] navigator.clipboard failed, falling back.",
+      error,
+    );
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  textarea.style.top = "0";
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+  textarea.setSelectionRange(0, textarea.value.length);
+
+  const copied = document.execCommand("copy");
+  document.body.removeChild(textarea);
+
+  if (!copied) {
+    throw new Error("document.execCommand('copy') returned false");
+  }
+};
+
 // 长按菜单触发逻辑
 const showMessageContextMenu = async () => {
   const chatStore = useChatManagerStore();
@@ -524,16 +622,6 @@ const showMessageContextMenu = async () => {
     });
   }
 
-  // 获取内容的统一方法，结合懒加载
-  const getFullText = async () => {
-    let text = props.message.content || streamContent.value;
-    if (!text && props.message.blocks) {
-      // 触发懒加载获取原文
-      text = await chatStore.fetchRawContent(props.message.id);
-    }
-    return text;
-  };
-
   // 2. 复制文本 (所有状态可用，除了纯占位符)
   // 为了不卡住菜单弹出，我们先在外部显示菜单，在 handler 中拉取内容
   actions.push({
@@ -541,20 +629,10 @@ const showMessageContextMenu = async () => {
     icon: Copy,
     handler: async () => {
       try {
-        const fullText = await getFullText();
+        const fullText = await getFullMessageText();
         if (!fullText) return;
-        
-        if (navigator.clipboard && navigator.clipboard.writeText) {
-          await navigator.clipboard.writeText(fullText);
-        } else {
-          // Fallback for some old webviews
-          const textarea = document.createElement("textarea");
-          textarea.value = fullText;
-          document.body.appendChild(textarea);
-          textarea.select();
-          document.execCommand("copy");
-          document.body.removeChild(textarea);
-        }
+
+        await writeClipboardText(fullText);
         notificationStore.addNotification({
           type: "success",
           title: "复制成功",
@@ -563,6 +641,12 @@ const showMessageContextMenu = async () => {
         });
       } catch (e) {
         console.error("[MessageContextMenu] Copy failed:", e);
+        notificationStore.addNotification({
+          type: "error",
+          title: "复制失败",
+          message: "当前 WebView 拒绝写入剪贴板",
+          duration: 2400,
+        });
       }
     },
   });
@@ -573,7 +657,7 @@ const showMessageContextMenu = async () => {
       label: "编辑消息",
       icon: Edit2,
       handler: async () => {
-        const fullText = await getFullText();
+        const fullText = await getFullMessageText();
         overlayStore.openEditor({
           initialValue: fullText || "",
           onSave: (newContent: string) => handleSaveEdit(newContent),
@@ -588,7 +672,7 @@ const showMessageContextMenu = async () => {
       label: "编辑重发",
       icon: Edit2,
       handler: async () => {
-        const fullText = await getFullText();
+        const fullText = await getFullMessageText();
         // 将内容填入全局编辑状态供 InputEnhancer 读取
         chatStore.editMessageContent = fullText || "";
       },

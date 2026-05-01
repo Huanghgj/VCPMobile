@@ -56,6 +56,18 @@ const MAX_ORIGINAL_INLINE_IMAGE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_ORIGINAL_INLINE_MEDIA_BYTES: u64 = 24 * 1024 * 1024;
 const MAX_INLINE_IMAGE_DIMENSION: u32 = 2048;
 const INLINE_IMAGE_JPEG_QUALITY: u8 = 85;
+const MOBILE_SURFACE_PROMPT: &str = r#"移动端 Surface 挂件能力：
+当用户需要临时看板、计时器、可视化、简单小工具、SVG/canvas 动画或交互式信息面板时，你可以输出一个完整的移动端 Surface 块。格式必须严格如下：
+<<<[DESKTOP_PUSH]>>>
+<div style="padding:16px;border-radius:14px;background:rgba(20,20,24,.86);color:#fff;">内容</div>
+<<<[DESKTOP_PUSH_END]>>>
+
+移动端会把块内 HTML/CSS/JS 渲染为可拖动浮层挂件。要求：
+- HTML 必须自包含，优先使用内联 style 和原生 JavaScript。
+- 适配手机屏幕，默认宽度约 320px，高度约 220px，避免桌面级大布局。
+- 不要使用 DesktopRemote、Dock、Windows 快捷方式、系统壁纸或 Electron 专属能力。
+- 可使用受限的 vcpAPI.weather()、vcpAPI.fetch(path, options)、vcpAPI.post(path, body) 访问移动端允许的 VCP 管理接口；musicAPI 仍可能不可用。
+- 不要把 DESKTOP_PUSH 块包进 Markdown 代码块。"#;
 
 #[derive(Default)]
 struct StreamTextParts {
@@ -487,10 +499,8 @@ fn encode_image_data_url(path: &Path, ext: &str) -> Result<String, String> {
     let resized = img.thumbnail(MAX_INLINE_IMAGE_DIMENSION, MAX_INLINE_IMAGE_DIMENSION);
     let rgb = resized.to_rgb8();
     let mut encoded = Vec::new();
-    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
-        &mut encoded,
-        INLINE_IMAGE_JPEG_QUALITY,
-    );
+    let mut encoder =
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, INLINE_IMAGE_JPEG_QUALITY);
     encoder
         .encode_image(&rgb)
         .map_err(|e| format!("图片压缩编码失败: {}", e))?;
@@ -591,8 +601,10 @@ pub async fn perform_vcp_request<R: Runtime>(
                                         .map(|data_url| ("audio_url", data_url)),
                                     "mp4" => encode_original_data_url(&path_buf, "video/mp4")
                                         .map(|data_url| ("video_url", data_url)),
-                                    "mkv" => encode_original_data_url(&path_buf, "video/x-matroska")
-                                        .map(|data_url| ("video_url", data_url)),
+                                    "mkv" => {
+                                        encode_original_data_url(&path_buf, "video/x-matroska")
+                                            .map(|data_url| ("video_url", data_url))
+                                    }
                                     "webm" => encode_original_data_url(&path_buf, "video/webm")
                                         .map(|data_url| ("video_url", data_url)),
                                     _ => encode_original_data_url(
@@ -646,6 +658,7 @@ pub async fn perform_vcp_request<R: Runtime>(
     let mut enable_vcp_tool_injection = false;
     let mut agent_music_control = false;
     let mut enable_agent_bubble_theme = false;
+    let mut enable_mobile_surface_injection = true;
     let mut enable_model_thinking = true;
     let mut model_thinking_budget = DEFAULT_THINKING_BUDGET;
 
@@ -663,6 +676,10 @@ pub async fn perform_vcp_request<R: Runtime>(
                 .get("enableAgentBubbleTheme")
                 .and_then(|v: &Value| v.as_bool())
                 .unwrap_or(false);
+            enable_mobile_surface_injection = extra
+                .get("enableMobileSurfaceInjection")
+                .and_then(|v: &Value| v.as_bool())
+                .unwrap_or(true);
             enable_model_thinking = extra
                 .get("enableModelThinking")
                 .and_then(|v: &Value| v.as_bool())
@@ -726,6 +743,11 @@ pub async fn perform_vcp_request<R: Runtime>(
     // 3.3 UI 规范要求注入
     if enable_agent_bubble_theme {
         bottom_parts.push("输出规范要求：{{VarDivRender}}".to_string());
+    }
+
+    // 3.4 移动端 Surface 挂件能力注入
+    if enable_mobile_surface_injection {
+        bottom_parts.push(MOBILE_SURFACE_PROMPT.to_string());
     }
 
     // 应用注入到 System Message
