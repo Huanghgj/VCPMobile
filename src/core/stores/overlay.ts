@@ -29,6 +29,7 @@ export const useOverlayStore = defineStore('overlay', () => {
   const isSettingsOpen = computed(() => pageStack.value.some(p => p.type === 'settings'));
   const isToolboxOpen = computed(() => pageStack.value.some(p => p.type === 'toolbox'));
   const isRagObserverOpen = computed(() => pageStack.value.some(p => p.type === 'ragObserver'));
+  const isBrowserOpen = computed(() => pageStack.value.some(p => p.type === 'browser'));
   const isAgentSettingsOpen = computed(() => pageStack.value.some(p => p.type === 'agentSettings'));
   const isGroupSettingsOpen = computed(() => pageStack.value.some(p => p.type === 'groupSettings'));
 
@@ -102,6 +103,9 @@ export const useOverlayStore = defineStore('overlay', () => {
   const openRagObserver = () => pushPage('ragObserver');
   const closeRagObserver = () => closePageByType('ragObserver');
 
+  const openBrowser = () => pushPage('browser');
+  const closeBrowser = () => closePageByType('browser');
+
   const openAgentSettings = (id: string) => pushPage('agentSettings', id);
   const closeAgentSettings = () => closePageByType('agentSettings');
 
@@ -173,6 +177,7 @@ export const useOverlayStore = defineStore('overlay', () => {
     isSettingsOpen,
     isToolboxOpen,
     isRagObserverOpen,
+    isBrowserOpen,
     isAgentSettingsOpen,
     agentSettingsId,
     isGroupSettingsOpen,
@@ -184,6 +189,8 @@ export const useOverlayStore = defineStore('overlay', () => {
     closeToolbox,
     openRagObserver,
     closeRagObserver,
+    openBrowser,
+    closeBrowser,
     openAgentSettings,
     closeAgentSettings,
     openGroupSettings,

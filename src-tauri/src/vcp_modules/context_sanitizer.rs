@@ -13,9 +13,9 @@ use std::time::{Duration, SystemTime};
 
 lazy_static! {
     /// 清理 VCP 元思考链的正则表达式
-    static ref THOUGHT_CHAIN_REGEX: Regex = Regex::new(r#"(?s)\[--- VCP元思考链(?::\s*"([^"]*)")?\s*---\].*?\[--- 元思考链结束 ---\]"#).unwrap();
+    static ref THOUGHT_CHAIN_REGEX: Regex = Regex::new(r#"(?s)\[--- VCP元思考链(?::\s*"([^"]*)")?\s*---\].*?(?:\[--- 元思考链结束 ---\]|$)"#).unwrap();
     /// 清理常规 <think> 标签的正则表达式
-    static ref CONVENTIONAL_THOUGHT_REGEX: Regex = Regex::new(r"(?is)<think(?:ing)?>.*?</think(?:ing)?>").unwrap();
+    static ref CONVENTIONAL_THOUGHT_REGEX: Regex = Regex::new(r"(?is)<think(?:ing)?>.*?(?:</think(?:ing)?>|$)").unwrap();
     /// 简单检查是否包含 HTML 标签的正则表达式
     static ref HTML_CHECK_REGEX: Regex = Regex::new(r"<[^>]+>").unwrap();
     /// 清理多余空行（保留最多2个连续空行）的正则表达式
@@ -353,6 +353,15 @@ mod tests {
     fn test_strip_thoughts() {
         let input = "Hello [--- VCP元思考链: \"test\" ---] secret [--- 元思考链结束 ---] World <think>internal</think>";
         assert_eq!(strip_thought_chains(input), "Hello  World ");
+    }
+
+    #[test]
+    fn test_strip_unclosed_thoughts() {
+        let input = "Answer before\n<think>unfinished internal text";
+        assert_eq!(strip_thought_chains(input), "Answer before\n");
+
+        let input = "Answer before\n[--- VCP元思考链: \"test\" ---] unfinished internal text";
+        assert_eq!(strip_thought_chains(input), "Answer before\n");
     }
 
     #[test]

@@ -91,6 +91,10 @@ pub fn create_default_settings() -> Settings {
         "enableMobileSurfaceInjection".to_string(),
         serde_json::json!(true),
     );
+    extra.insert(
+        "enableMobileBrowserInjection".to_string(),
+        serde_json::json!(true),
+    );
 
     Settings {
         user_name: "用户".to_string(),

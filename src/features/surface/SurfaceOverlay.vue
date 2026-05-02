@@ -11,6 +11,9 @@ import type { SurfaceWidget } from "../../core/api/surfaceBridge";
 const surfaceStore = useSurfaceStore();
 const themeStore = useThemeStore();
 const activeFullscreen = ref<SurfaceWidget | null>(null);
+const SURFACE_WIDGET_Z_INDEX_BASE = 1;
+const SURFACE_CLEAR_Z_INDEX = 2515;
+const SURFACE_FULLSCREEN_Z_INDEX = 2520;
 
 const widgets = computed(() => surfaceStore.orderedWidgets);
 const dragState = ref<{
@@ -251,11 +254,11 @@ const getSandboxHtml = (content: string) => {
   return `<!DOCTYPE html><html><head>${injections}</head><body>${cleanHtml}</body></html>`;
 };
 
-const widgetStyle = (widget: SurfaceWidget) => ({
+const widgetStyle = (widget: SurfaceWidget, stackIndex: number) => ({
   transform: `translate3d(${widget.bounds.x}px, ${widget.bounds.y}px, 0)`,
   width: `${Math.min(widget.bounds.width, window.innerWidth - 28)}px`,
   height: `${Math.min(widget.bounds.height, window.innerHeight - 150)}px`,
-  zIndex: widget.bounds.zIndex || 1,
+  zIndex: SURFACE_WIDGET_Z_INDEX_BASE + stackIndex,
 });
 
 const beginDrag = (event: PointerEvent, widget: SurfaceWidget) => {
@@ -458,17 +461,18 @@ onBeforeUnmount(() => {
     <div class="surface-root pointer-events-none fixed inset-0 z-[2500]">
       <button
         v-if="widgets.length"
-        class="surface-clear pointer-events-auto fixed right-3 top-[calc(env(safe-area-inset-top)+10px)] z-[2515]"
+        class="surface-clear pointer-events-auto fixed right-3 top-[calc(env(safe-area-inset-top)+10px)]"
+        :style="{ zIndex: SURFACE_CLEAR_Z_INDEX }"
         @click="clearWidgets"
       >
         <Trash2 :size="15" />
       </button>
 
       <div
-        v-for="widget in widgets"
+        v-for="(widget, stackIndex) in widgets"
         :key="widget.id"
         class="surface-widget pointer-events-auto fixed overflow-hidden border border-white/12 bg-black/35 shadow-2xl backdrop-blur-xl"
-        :style="widgetStyle(widget)"
+        :style="widgetStyle(widget, stackIndex)"
       >
         <div
           class="surface-titlebar flex h-9 touch-none items-center justify-between border-b border-white/10 bg-black/35 px-2 text-white"
@@ -508,7 +512,8 @@ onBeforeUnmount(() => {
       <Transition name="fade">
         <div
           v-if="activeFullscreen"
-          class="pointer-events-auto fixed inset-0 z-[2520] flex flex-col bg-black/90"
+          class="pointer-events-auto fixed inset-0 flex flex-col bg-black/90"
+          :style="{ zIndex: SURFACE_FULLSCREEN_Z_INDEX }"
         >
           <div class="flex h-[52px] items-center justify-between border-b border-white/10 px-3 pt-[env(safe-area-inset-top)] text-white">
             <div class="truncate text-sm font-bold">{{ activeFullscreen.title || "Surface" }}</div>

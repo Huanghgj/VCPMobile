@@ -68,6 +68,16 @@ const MOBILE_SURFACE_PROMPT: &str = r#"移动端 Surface 挂件能力：
 - 不要使用 DesktopRemote、Dock、Windows 快捷方式、系统壁纸或 Electron 专属能力。
 - 可使用受限的 vcpAPI.weather()、vcpAPI.fetch(path, options)、vcpAPI.post(path, body) 访问移动端允许的 VCP 管理接口；musicAPI 仍可能不可用。
 - 不要把 DESKTOP_PUSH 块包进 Markdown 代码块。"#;
+const MOBILE_BROWSER_PROMPT: &str = r#"移动端浏览器能力：
+你可以使用工具 MobileBrowser 访问和控制手机内置浏览器，用于打开网页、读取页面、点击、输入、滚动、截图、执行页面脚本，以及在必要时把控制权交给用户。
+
+使用原则：
+- 普通网页任务优先自己完成：navigate/open 打开 URL；snapshot/read_text 获取页面结构和文字；click/type/tap/scroll/back/forward/reload/screenshot/eval 操作页面并观察结果。
+- 每次关键操作后用 snapshot、read_text 或 screenshot 确认页面状态，不要凭猜测继续。
+- 遇到登录、验证码、2FA、人机验证、支付、授权确认或需要用户隐私凭据的步骤时，使用 handoff，并在 reason 中简要说明需要用户完成什么；不要索要或代填敏感信息。
+- 如果用户需要从另一台设备或本机浏览器辅助，通过 start_assist_server 开启临时辅助网页。默认只绑定 127.0.0.1；需要局域网访问时传 bindLan=true。把工具返回的 url/localUrl/token 告诉用户，用完后可调用 stop_assist_server。
+- 用户完成手动步骤后使用 resume 恢复 AI 控制，再继续 snapshot 检查当前页面。
+- 只在完成用户请求所必需的范围内访问网页，不要绕过网站安全、付费或访问控制。"#;
 
 #[derive(Default)]
 struct StreamTextParts {
@@ -203,14 +213,12 @@ fn apply_model_thinking_params(request_body: &mut Value, model: &str, budget: i6
         return;
     }
 
+    // DeepSeek-compatible endpoints are inconsistent about reasoning fields:
+    // some return final text in reasoning_content, and some expose raw <think>
+    // tags in content. Do not proactively request reasoning here; otherwise
+    // normal answers can be wrapped into the app's internal <think> transport.
     if model_lower.contains("deepseek") {
-        obj.insert(
-            "thinking".to_string(),
-            json!({
-                "type": "enabled"
-            }),
-        );
-        obj.insert("reasoning_effort".to_string(), json!(effort));
+        return;
     }
 }
 
@@ -384,6 +392,30 @@ fn close_reasoning_block(
         full_content.push_str(closer);
         pending_emit_text.push_str(closer);
         *reasoning_block_open = false;
+    }
+}
+
+fn should_emit_reasoning_output(model: &str) -> bool {
+    !model.to_ascii_lowercase().contains("deepseek")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deepseek_does_not_request_or_emit_reasoning_by_default() {
+        let mut body = json!({
+            "model": "deepseek-reasoner",
+            "temperature": 0.7
+        });
+
+        apply_model_thinking_params(&mut body, "deepseek-reasoner", DEFAULT_THINKING_BUDGET);
+
+        let obj = body.as_object().expect("request body should remain an object");
+        assert!(!obj.contains_key("thinking"));
+        assert!(!obj.contains_key("reasoning_effort"));
+        assert!(!should_emit_reasoning_output("deepseek-reasoner"));
     }
 }
 
@@ -659,6 +691,7 @@ pub async fn perform_vcp_request<R: Runtime>(
     let mut agent_music_control = false;
     let mut enable_agent_bubble_theme = false;
     let mut enable_mobile_surface_injection = true;
+    let mut enable_mobile_browser_injection = true;
     let mut enable_model_thinking = true;
     let mut model_thinking_budget = DEFAULT_THINKING_BUDGET;
 
@@ -678,6 +711,10 @@ pub async fn perform_vcp_request<R: Runtime>(
                 .unwrap_or(false);
             enable_mobile_surface_injection = extra
                 .get("enableMobileSurfaceInjection")
+                .and_then(|v: &Value| v.as_bool())
+                .unwrap_or(true);
+            enable_mobile_browser_injection = extra
+                .get("enableMobileBrowserInjection")
                 .and_then(|v: &Value| v.as_bool())
                 .unwrap_or(true);
             enable_model_thinking = extra
@@ -750,6 +787,11 @@ pub async fn perform_vcp_request<R: Runtime>(
         bottom_parts.push(MOBILE_SURFACE_PROMPT.to_string());
     }
 
+    // 3.5 移动端浏览器控制能力注入
+    if enable_mobile_browser_injection {
+        bottom_parts.push(MOBILE_BROWSER_PROMPT.to_string());
+    }
+
     // 应用注入到 System Message
     if !top_parts.is_empty() || !bottom_parts.is_empty() {
         for m in messages.iter_mut() {
@@ -774,12 +816,13 @@ pub async fn perform_vcp_request<R: Runtime>(
     // === 4. 准备请求体 ===
     let is_stream = payload.model_config["stream"].as_bool().unwrap_or(false);
     let mut request_body = payload.model_config.clone();
+    let model_name = request_body
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_default();
+    let emit_reasoning_output = should_emit_reasoning_output(&model_name);
     if enable_model_thinking {
-        let model_name = request_body
-            .get("model")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_default();
         apply_model_thinking_params(&mut request_body, &model_name, model_thinking_budget);
     }
     if let Some(obj) = request_body.as_object_mut() {
@@ -913,7 +956,7 @@ pub async fn perform_vcp_request<R: Runtime>(
                                                 }
                                                 if let Ok(chunk) = serde_json::from_str::<Value>(data) {
                                                     let stream_parts = extract_stream_text_parts(&chunk);
-                                                    if !stream_parts.reasoning.is_empty() {
+                                                    if emit_reasoning_output && !stream_parts.reasoning.is_empty() {
                                                         push_stream_segment(
                                                             &mut full_content,
                                                             &mut pending_emit_text,

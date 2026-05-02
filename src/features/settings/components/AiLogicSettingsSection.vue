@@ -113,6 +113,15 @@ const testSurfaceWidget = async () => {
     </SettingsRow>
 
     <SettingsRow
+      title="移动端浏览器提示词注入"
+      description="引导模型使用 MobileBrowser 访问网页、自动操作，并在验证或登录时移交给用户"
+    >
+      <template #action>
+        <SettingsSwitch v-model="settings.enableMobileBrowserInjection" active-color="bg-purple-500" />
+      </template>
+    </SettingsRow>
+
+    <SettingsRow
       title="Surface 浮层测试"
       description="跳过 AI 消息解析，直接创建一个测试挂件和 Android 系统悬浮窗"
     >
@@ -131,7 +140,7 @@ const testSurfaceWidget = async () => {
 
     <SettingsRow
       title="模型思考模式"
-      description="为 DeepSeek、Gemini、Claude 请求附加 reasoning/thinking 参数"
+      description="为 Gemini、Claude 请求附加 reasoning/thinking 参数；DeepSeek 默认不主动请求思维链"
     >
       <template #action>
         <SettingsSwitch v-model="settings.enableModelThinking" active-color="bg-purple-500" />
@@ -140,7 +149,7 @@ const testSurfaceWidget = async () => {
 
     <SettingsRow
       title="思考预算"
-      description="Claude 与 Gemini 使用 token 预算，DeepSeek 映射为推理强度"
+      description="Claude 与 Gemini 使用 token 预算；DeepSeek 不再映射推理强度"
       :disabled="!settings.enableModelThinking"
     >
       <template #action>

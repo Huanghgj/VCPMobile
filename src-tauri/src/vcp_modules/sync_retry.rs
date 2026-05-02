@@ -41,9 +41,13 @@ where
                 return Ok(result);
             }
             Err(e) => {
+                if !e.contains("database is locked") {
+                    return Err(e);
+                }
+
                 last_error = e.clone();
 
-                if e.contains("database is locked") && attempt < config.max_retries - 1 {
+                if attempt < config.max_retries - 1 {
                     println!(
                         "[Retry] {} failed with database locked, retrying in {}ms (attempt {}/{})",
                         operation_name,
@@ -54,8 +58,6 @@ where
 
                     tokio::time::sleep(Duration::from_millis(delay)).await;
                     delay = (delay * 2).min(config.max_delay_ms);
-                } else {
-                    return Err(e);
                 }
             }
         }

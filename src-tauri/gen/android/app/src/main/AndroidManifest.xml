@@ -34,6 +34,14 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".BrowserActivity"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:label="VCP Browser"
+            android:windowSoftInputMode="adjustResize" />
+
         <service
             android:name=".OverlayService"
             android:exported="false"

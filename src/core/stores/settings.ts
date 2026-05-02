@@ -21,6 +21,7 @@ export interface AppSettings {
   agentMusicControl: boolean;
   enableAgentBubbleTheme: boolean;
   enableMobileSurfaceInjection: boolean;
+  enableMobileBrowserInjection: boolean;
   enableModelThinking: boolean;
   modelThinkingBudget: number;
   agentOrder: string[];

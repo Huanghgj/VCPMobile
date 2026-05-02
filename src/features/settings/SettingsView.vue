@@ -62,6 +62,7 @@ const settings = ref<AppSettings>({
   agentMusicControl: false,
   enableAgentBubbleTheme: true,
   enableMobileSurfaceInjection: true,
+  enableMobileBrowserInjection: true,
   enableModelThinking: true,
   modelThinkingBudget: 4096,
 });
@@ -79,6 +80,7 @@ const normalizeSettings = (rawSettings: AppSettings): AppSettings => ({
   agentMusicControl: rawSettings.agentMusicControl ?? false,
   enableAgentBubbleTheme: rawSettings.enableAgentBubbleTheme ?? true,
   enableMobileSurfaceInjection: rawSettings.enableMobileSurfaceInjection ?? true,
+  enableMobileBrowserInjection: rawSettings.enableMobileBrowserInjection ?? true,
   enableModelThinking: rawSettings.enableModelThinking ?? true,
   modelThinkingBudget: normalizeThinkingBudget(rawSettings.modelThinkingBudget),
 });
@@ -102,6 +104,11 @@ const openDiagnostics = () => {
 const openToolboxView = () => {
   overlayStore.closeSettingsSilently();
   overlayStore.openToolbox();
+};
+
+const openBrowserView = () => {
+  overlayStore.closeSettingsSilently();
+  overlayStore.openBrowser();
 };
 
 const loadSettings = async () => {
@@ -253,6 +260,9 @@ watch(
               </div>
               <SettingsActionButton variant="secondary" size="sm" full-width @click="openToolboxView">
                 打开后端面板
+              </SettingsActionButton>
+              <SettingsActionButton variant="secondary" size="sm" full-width @click="openBrowserView">
+                Mobile Browser Runtime
               </SettingsActionButton>
             </div>
           </SettingsCard>

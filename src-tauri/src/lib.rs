@@ -9,6 +9,10 @@ use vcp_modules::agent_service::{
     update_agent_config,
 };
 use vcp_modules::avatar_service::{get_avatar, save_avatar_data};
+use vcp_modules::browser_service::{
+    browser_execute_action, get_browser_snapshot, start_browser_assist_server,
+    stop_browser_assist_server,
+};
 use vcp_modules::chat_manager::{
     append_single_message, delete_messages, load_chat_history, load_chat_history_streamed,
     patch_single_message, truncate_history_after_timestamp,
@@ -154,6 +158,7 @@ pub fn run() {
             app.manage(ContextSanitizer::default());
             app.manage(UploadManagerState::new());
             app.manage(distributed::DistributedState::new());
+            app.manage(vcp_modules::browser_service::BrowserRuntimeState::global());
 
             let handle = app.handle().clone();
 
@@ -265,6 +270,10 @@ pub fn run() {
             save_performance_report,
             call_vcp_toolbox_api,
             show_desktop_overlay,
+            browser_execute_action,
+            get_browser_snapshot,
+            start_browser_assist_server,
+            stop_browser_assist_server,
             distributed::start_distributed_node,
             distributed::stop_distributed_node,
             distributed::get_distributed_status,

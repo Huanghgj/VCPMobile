@@ -3,6 +3,8 @@
 // Mirrors VCPChat/VCPDistributedServer/VCPDistributedServer.js (class DistributedServer)
 // Self-contained — does NOT import anything from vcp_modules/.
 
+use std::collections::BTreeSet;
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -396,7 +398,7 @@ impl DistributedClient {
     /// VCPChat ref: reportIPAddress() line 310-347
     async fn report_ip(device_name: &str, ws_tx: &WsSink) {
         // Collect local IPv4 addresses (simplified — no external crate needed)
-        let local_ips = Vec::new(); // TODO: enumerate network interfaces in Phase 2
+        let local_ips = Self::collect_local_ipv4_addrs();
 
         // Optional: fetch public IP
         let public_ip: Option<String> =
@@ -423,6 +425,103 @@ impl DistributedClient {
         };
         Self::send_message(ws_tx, &msg).await;
         log::info!("[Distributed] IP report sent.");
+    }
+
+    fn collect_local_ipv4_addrs() -> Vec<String> {
+        let mut ips = BTreeSet::new();
+
+        Self::collect_interface_ipv4_addrs(&mut ips);
+        if ips.is_empty() {
+            Self::collect_udp_probe_ipv4_addr(&mut ips);
+        }
+
+        ips.into_iter().map(|ip| ip.to_string()).collect()
+    }
+
+    #[cfg(unix)]
+    fn collect_interface_ipv4_addrs(ips: &mut BTreeSet<Ipv4Addr>) {
+        struct IfAddrsGuard(*mut libc::ifaddrs);
+
+        impl Drop for IfAddrsGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    if !self.0.is_null() {
+                        libc::freeifaddrs(self.0);
+                    }
+                }
+            }
+        }
+
+        unsafe {
+            let mut addrs: *mut libc::ifaddrs = std::ptr::null_mut();
+            if libc::getifaddrs(&mut addrs) != 0 {
+                log::warn!("[Distributed] getifaddrs failed while collecting local IPs.");
+                return;
+            }
+
+            let _guard = IfAddrsGuard(addrs);
+            let mut cursor = addrs;
+            while !cursor.is_null() {
+                let ifaddr = &*cursor;
+                if !ifaddr.ifa_addr.is_null() {
+                    let flags = ifaddr.ifa_flags as libc::c_uint;
+                    let is_up = flags & (libc::IFF_UP as libc::c_uint) != 0;
+                    let is_loopback = flags & (libc::IFF_LOOPBACK as libc::c_uint) != 0;
+                    let family = (*ifaddr.ifa_addr).sa_family as libc::c_int;
+
+                    if is_up && !is_loopback && family == libc::AF_INET {
+                        let sockaddr = &*(ifaddr.ifa_addr as *const libc::sockaddr_in);
+                        let ip = Ipv4Addr::from(u32::from_be(sockaddr.sin_addr.s_addr));
+                        if Self::is_reportable_local_ipv4(ip) {
+                            ips.insert(ip);
+                        }
+                    }
+                }
+
+                cursor = ifaddr.ifa_next;
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn collect_interface_ipv4_addrs(_ips: &mut BTreeSet<Ipv4Addr>) {}
+
+    fn collect_udp_probe_ipv4_addr(ips: &mut BTreeSet<Ipv4Addr>) {
+        let socket = match UdpSocket::bind("0.0.0.0:0") {
+            Ok(socket) => socket,
+            Err(e) => {
+                log::warn!("[Distributed] Could not bind UDP probe socket: {}", e);
+                return;
+            }
+        };
+
+        if let Err(e) = socket.connect("8.8.8.8:80") {
+            log::warn!("[Distributed] Could not probe local IP via UDP: {}", e);
+            return;
+        }
+
+        let local_addr = match socket.local_addr() {
+            Ok(addr) => addr,
+            Err(e) => {
+                log::warn!("[Distributed] Could not read UDP probe local addr: {}", e);
+                return;
+            }
+        };
+
+        if let SocketAddr::V4(addr) = local_addr {
+            let ip = *addr.ip();
+            if Self::is_reportable_local_ipv4(ip) {
+                ips.insert(ip);
+            }
+        }
+    }
+
+    fn is_reportable_local_ipv4(ip: Ipv4Addr) -> bool {
+        !ip.is_loopback()
+            && !ip.is_unspecified()
+            && !ip.is_broadcast()
+            && !ip.is_multicast()
+            && !ip.is_link_local()
     }
 
     /// Push static placeholder values.

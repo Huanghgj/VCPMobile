@@ -13,6 +13,7 @@ import SyncSessionView from '../features/sync/SyncSessionView.vue';
 import VcpToolboxView from '../features/toolbox/VcpToolboxView.vue';
 import RagObserverView from '../features/rag/RagObserverView.vue';
 import SurfaceOverlay from '../features/surface/SurfaceOverlay.vue';
+import BrowserRuntimeView from '../features/browser/BrowserRuntimeView.vue';
 
 const overlayStore = useOverlayStore();
 const isMounted = ref(false);
@@ -40,6 +41,12 @@ onMounted(() => {
       :is-open="overlayStore.isRagObserverOpen"
       :z-index="overlayStore.getPageZIndex('ragObserver')"
       @close="overlayStore.closeRagObserver()"
+    />
+
+    <BrowserRuntimeView
+      :is-open="overlayStore.isBrowserOpen"
+      :z-index="overlayStore.getPageZIndex('browser')"
+      @close="overlayStore.closeBrowser()"
     />
 
     <AgentSettingsView
