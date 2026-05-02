@@ -1,6 +1,12 @@
 name: Android Release
 
 on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, for example v0.9.11
+        required: true
+        type: string
   release:
     types:
       - published
@@ -31,7 +37,11 @@ jobs:
         id: meta
         shell: bash
         run: |
-          TAG_NAME="${{ github.event.release.tag_name }}"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG_NAME="${{ inputs.tag }}"
+          else
+            TAG_NAME="${{ github.event.release.tag_name }}"
+          fi
 
           if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
             echo "Invalid release tag: $TAG_NAME" >&2
