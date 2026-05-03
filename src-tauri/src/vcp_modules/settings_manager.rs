@@ -85,6 +85,15 @@ impl SettingsState {
 
 pub fn create_default_settings() -> Settings {
     let mut extra = serde_json::Map::new();
+    extra.insert(
+        "enableVcpToolInjection".to_string(),
+        serde_json::json!(false),
+    );
+    extra.insert("agentMusicControl".to_string(), serde_json::json!(false));
+    extra.insert(
+        "enableAgentBubbleTheme".to_string(),
+        serde_json::json!(true),
+    );
     extra.insert("enableModelThinking".to_string(), serde_json::json!(true));
     extra.insert("modelThinkingBudget".to_string(), serde_json::json!(4096));
     extra.insert(

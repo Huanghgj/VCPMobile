@@ -399,6 +399,26 @@ fn should_emit_reasoning_output(model: &str) -> bool {
     !model.to_ascii_lowercase().contains("deepseek")
 }
 
+fn setting_value<'a>(settings: &'a Settings, key: &str) -> Option<&'a Value> {
+    settings.extra.get(key).or_else(|| {
+        settings
+            .extra
+            .get("extra")
+            .and_then(Value::as_object)
+            .and_then(|extra| extra.get(key))
+    })
+}
+
+fn setting_bool(settings: &Settings, key: &str, default: bool) -> bool {
+    setting_value(settings, key)
+        .and_then(Value::as_bool)
+        .unwrap_or(default)
+}
+
+fn setting_thinking_budget(settings: &Settings, key: &str) -> i64 {
+    normalized_thinking_budget(setting_value(settings, key))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,6 +436,20 @@ mod tests {
         assert!(!obj.contains_key("thinking"));
         assert!(!obj.contains_key("reasoning_effort"));
         assert!(!should_emit_reasoning_output("deepseek-reasoner"));
+    }
+
+    #[test]
+    fn settings_reader_accepts_nested_legacy_extra() {
+        let mut settings = create_default_settings();
+        settings.extra = json!({
+            "extra": {
+                "enableVcpToolInjection": true,
+                "modelThinkingBudget": 8192
+            }
+        });
+
+        assert!(setting_bool(&settings, "enableVcpToolInjection", false));
+        assert_eq!(setting_thinking_budget(&settings, "modelThinkingBudget"), 8192);
     }
 }
 
@@ -689,40 +723,22 @@ pub async fn perform_vcp_request<R: Runtime>(
     // === 1. 读取设置与动态路由切换 ===
     let mut enable_vcp_tool_injection = false;
     let mut agent_music_control = false;
-    let mut enable_agent_bubble_theme = false;
+    let mut enable_agent_bubble_theme = true;
     let mut enable_mobile_surface_injection = true;
     let mut enable_mobile_browser_injection = true;
     let mut enable_model_thinking = true;
     let mut model_thinking_budget = DEFAULT_THINKING_BUDGET;
 
     if let Ok(settings) = load_app_settings(app).await {
-        if let Some(extra) = settings.extra.as_object() {
-            enable_vcp_tool_injection = extra
-                .get("enableVcpToolInjection")
-                .and_then(|v: &Value| v.as_bool())
-                .unwrap_or(false);
-            agent_music_control = extra
-                .get("agentMusicControl")
-                .and_then(|v: &Value| v.as_bool())
-                .unwrap_or(false);
-            enable_agent_bubble_theme = extra
-                .get("enableAgentBubbleTheme")
-                .and_then(|v: &Value| v.as_bool())
-                .unwrap_or(false);
-            enable_mobile_surface_injection = extra
-                .get("enableMobileSurfaceInjection")
-                .and_then(|v: &Value| v.as_bool())
-                .unwrap_or(true);
-            enable_mobile_browser_injection = extra
-                .get("enableMobileBrowserInjection")
-                .and_then(|v: &Value| v.as_bool())
-                .unwrap_or(true);
-            enable_model_thinking = extra
-                .get("enableModelThinking")
-                .and_then(|v: &Value| v.as_bool())
-                .unwrap_or(true);
-            model_thinking_budget = normalized_thinking_budget(extra.get("modelThinkingBudget"));
-        }
+        enable_vcp_tool_injection = setting_bool(&settings, "enableVcpToolInjection", false);
+        agent_music_control = setting_bool(&settings, "agentMusicControl", false);
+        enable_agent_bubble_theme = setting_bool(&settings, "enableAgentBubbleTheme", true);
+        enable_mobile_surface_injection =
+            setting_bool(&settings, "enableMobileSurfaceInjection", true);
+        enable_mobile_browser_injection =
+            setting_bool(&settings, "enableMobileBrowserInjection", true);
+        enable_model_thinking = setting_bool(&settings, "enableModelThinking", true);
+        model_thinking_budget = setting_thinking_budget(&settings, "modelThinkingBudget");
     }
 
     let mut final_url = payload.vcp_url.clone();
@@ -878,7 +894,7 @@ pub async fn perform_vcp_request<R: Runtime>(
                 println!("[VCPClient] Request aborted before response for message: {}", message_id_inner);
                 let _ = app_handle.emit(&stream_channel, StreamEvent {
                     r#type: "end".to_string(),
-                    chunk: None,
+                    chunk: Some(json!({ "fullContent": full_content.clone() })),
                     message_id: message_id_inner.clone(),
                     context: context_inner.clone(),
                     error: Some("请求已中止".to_string()),
@@ -915,7 +931,7 @@ pub async fn perform_vcp_request<R: Runtime>(
                                     );
                                     let _ = app_handle.emit(&stream_channel, StreamEvent {
                                         r#type: "end".to_string(),
-                                        chunk: None,
+                                        chunk: Some(json!({ "fullContent": full_content.clone() })),
                                         message_id: message_id_inner.clone(),
                                         context: context_inner.clone(),
                                         error: Some("请求已中止".to_string()),
@@ -947,7 +963,7 @@ pub async fn perform_vcp_request<R: Runtime>(
                                                     );
                                                     let _ = app_handle.emit(&stream_channel, StreamEvent {
                                                         r#type: "end".to_string(),
-                                                        chunk: None,
+                                                        chunk: Some(json!({ "fullContent": full_content.clone() })),
                                                         message_id: message_id_inner.clone(),
                                                         context: context_inner.clone(),
                                                         error: None,
@@ -1006,7 +1022,7 @@ pub async fn perform_vcp_request<R: Runtime>(
                                             );
                                             let _ = app_handle.emit(&stream_channel, StreamEvent {
                                                 r#type: "error".to_string(),
-                                                chunk: None,
+                                                chunk: Some(json!({ "fullContent": full_content.clone() })),
                                                 message_id: message_id_inner.clone(),
                                                 context: context_inner.clone(),
                                                 error: Some(format!("流读取错误: {}", e)),
@@ -1031,7 +1047,7 @@ pub async fn perform_vcp_request<R: Runtime>(
                                             );
                                             let _ = app_handle.emit(&stream_channel, StreamEvent {
                                                 r#type: "error".to_string(),
-                                                chunk: None,
+                                                chunk: Some(json!({ "fullContent": full_content.clone() })),
                                                 message_id: message_id_inner.clone(),
                                                 context: context_inner.clone(),
                                                 error: Some("网络连接意外断开".to_string()),
@@ -1048,7 +1064,7 @@ pub async fn perform_vcp_request<R: Runtime>(
                         let text = resp.text().await.unwrap_or_default();
                         let _ = app_handle.emit(&stream_channel, StreamEvent {
                             r#type: "error".to_string(),
-                            chunk: None,
+                            chunk: Some(json!({ "fullContent": full_content.clone() })),
                             message_id: message_id_inner.clone(),
                             context: context_inner.clone(),
                             error: Some(format!("VCP服务器错误: {} - {}", status, text)),
@@ -1059,7 +1075,7 @@ pub async fn perform_vcp_request<R: Runtime>(
                     Err(e) => {
                         let _ = app_handle.emit(&stream_channel, StreamEvent {
                             r#type: "error".to_string(),
-                            chunk: None,
+                            chunk: Some(json!({ "fullContent": full_content.clone() })),
                             message_id: message_id_inner.clone(),
                             context: context_inner.clone(),
                             error: Some(format!("网络请求异常: {}", e)),

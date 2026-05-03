@@ -1,12 +1,127 @@
 <script setup lang="ts">
-import { onMounted } from 'vue';
+import { computed, onMounted, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import { Activity, ArrowLeft, CheckCircle2, FileJson, Gauge, Home, Play, Save, Square, Timer, Zap } from 'lucide-vue-next';
+import { invoke } from '@tauri-apps/api/core';
 import { usePerformanceDiagnostics } from '../../core/utils/performanceDiagnostics';
+import { useChatManagerStore } from '../../core/stores/chatManager';
+
+interface DiagnosticTestServerInfo {
+  running: boolean;
+  bindLan: boolean;
+  port: number;
+  token: string;
+  url: string;
+  localUrl: string;
+}
 
 const router = useRouter();
 const diagnostics = usePerformanceDiagnostics();
+const chatStore = useChatManagerStore();
 const state = diagnostics.state;
+const diagnosticServer = ref<DiagnosticTestServerInfo | null>(null);
+const diagnosticBusy = ref(false);
+const diagnosticError = ref('');
+const sampleInjected = ref(false);
+
+const diagnosticSampleContent = `Diagnostic AI reply for VCPMobile rendering.
+
+<<<[TOOL_REQUEST]>>>
+tool_name: 「始」ImageGen「末」
+prompt: 「始」mobile diagnostic tool preview「末」
+<<<[END_TOOL_REQUEST]>>>
+
+[[VCP调用结果信息汇总:
+- 工具名称: ImageGen
+- 执行状态: success
+- 返回内容: ![preview](https://picsum.photos/seed/vcp-mobile-tool/480/320)
+- Result: **Markdown field**
+  - item A
+  - item B
+VCP调用结果结束]]
+
+Text after the tool block. This should remain attached to the same assistant message.`;
+
+const hasCurrentChatTarget = computed(
+  () => !!chatStore.currentSelectedItem?.id && !!chatStore.currentTopicId,
+);
+
+const currentTestTarget = computed(() => {
+  if (!hasCurrentChatTarget.value) return 'Open a chat topic first';
+  return `${chatStore.currentSelectedItem.type}:${chatStore.currentSelectedItem.id} / ${chatStore.currentTopicId}`;
+});
+
+const buildDiagnosticPayload = () => {
+  if (!hasCurrentChatTarget.value) {
+    throw new Error('Open a chat topic before injecting a diagnostic reply.');
+  }
+
+  return {
+    ownerId: chatStore.currentSelectedItem.id,
+    ownerType: chatStore.currentSelectedItem.type || 'agent',
+    topicId: chatStore.currentTopicId,
+    name: 'Diagnostic AI',
+    content: diagnosticSampleContent,
+  };
+};
+
+const curlExample = computed(() => {
+  if (!diagnosticServer.value || !hasCurrentChatTarget.value) {
+    return 'Start the API after opening a chat topic.';
+  }
+
+  const lineContinuation = '`';
+  return [
+    `adb forward tcp:5897 tcp:${diagnosticServer.value.port}`,
+    `curl.exe -X POST "http://127.0.0.1:5897/inject/assistant?token=${diagnosticServer.value.token}" ${lineContinuation}`,
+    `  -H "Content-Type: application/json" ${lineContinuation}`,
+    `  --data '${JSON.stringify(buildDiagnosticPayload())}'`,
+  ].join('\n');
+});
+
+const injectDiagnosticReply = async () => {
+  diagnosticBusy.value = true;
+  diagnosticError.value = '';
+  sampleInjected.value = false;
+  try {
+    await invoke('inject_diagnostic_assistant_message', {
+      payload: buildDiagnosticPayload(),
+    });
+    sampleInjected.value = true;
+  } catch (error) {
+    diagnosticError.value = String(error);
+  } finally {
+    diagnosticBusy.value = false;
+  }
+};
+
+const startDiagnosticApi = async () => {
+  diagnosticBusy.value = true;
+  diagnosticError.value = '';
+  try {
+    diagnosticServer.value = await invoke<DiagnosticTestServerInfo>(
+      'start_diagnostic_test_server',
+      { bindLan: false },
+    );
+  } catch (error) {
+    diagnosticError.value = String(error);
+  } finally {
+    diagnosticBusy.value = false;
+  }
+};
+
+const stopDiagnosticApi = async () => {
+  diagnosticBusy.value = true;
+  diagnosticError.value = '';
+  try {
+    await invoke('stop_diagnostic_test_server');
+    diagnosticServer.value = null;
+  } catch (error) {
+    diagnosticError.value = String(error);
+  } finally {
+    diagnosticBusy.value = false;
+  }
+};
 
 const startDiagnostics = async () => {
   await diagnostics.startDiagnostics();
@@ -88,6 +203,39 @@ onMounted(async () => {
           <Save :size="16" /> 保存报告
         </button>
         <textarea v-model="state.userNotes" class="min-h-20 w-full rounded-xl border border-white/10 bg-black/10 p-3 text-sm outline-none focus:border-blue-400" placeholder="可选：写下测试时的现象，例如：刚打开 APP 手机发热、滑动卡、发送消息后掉帧。"></textarea>
+      </section>
+
+      <section class="rounded-2xl border border-cyan-400/25 bg-cyan-400/10 p-4 space-y-3">
+        <div class="flex items-center gap-2 font-black text-sm">
+          <Activity :size="16" /> Runtime Test API
+        </div>
+        <div class="rounded-xl bg-black/10 p-3 text-xs break-all">
+          Target: {{ currentTestTarget }}
+        </div>
+        <div class="grid grid-cols-2 gap-2">
+          <button class="rounded-xl bg-cyan-600 py-3 text-sm font-black text-white active:scale-95 disabled:opacity-40 flex items-center justify-center gap-2" :disabled="diagnosticBusy || !hasCurrentChatTarget" @click="injectDiagnosticReply">
+            <Zap :size="16" /> Inject Reply
+          </button>
+          <button v-if="!diagnosticServer" class="rounded-xl bg-white/10 py-3 text-sm font-black active:scale-95 disabled:opacity-40 flex items-center justify-center gap-2" :disabled="diagnosticBusy" @click="startDiagnosticApi">
+            <Play :size="16" /> Start API
+          </button>
+          <button v-else class="rounded-xl bg-red-500 py-3 text-sm font-black text-white active:scale-95 disabled:opacity-40 flex items-center justify-center gap-2" :disabled="diagnosticBusy" @click="stopDiagnosticApi">
+            <Square :size="16" /> Stop API
+          </button>
+        </div>
+        <div v-if="diagnosticServer" class="space-y-2 text-xs">
+          <div class="grid grid-cols-2 gap-2">
+            <div class="rounded-xl bg-black/10 p-3">Port: {{ diagnosticServer.port }}</div>
+            <div class="rounded-xl bg-black/10 p-3 break-all">Token: {{ diagnosticServer.token }}</div>
+          </div>
+          <pre class="rounded-xl bg-black/20 p-3 text-[11px] leading-relaxed overflow-x-auto whitespace-pre-wrap">{{ curlExample }}</pre>
+        </div>
+        <div v-if="sampleInjected" class="rounded-xl border border-green-500/25 bg-green-500/10 p-3 text-xs text-green-300">
+          Diagnostic reply injected into the current topic.
+        </div>
+        <div v-if="diagnosticError" class="rounded-xl border border-red-500/25 bg-red-500/10 p-3 text-xs text-red-300 break-all">
+          {{ diagnosticError }}
+        </div>
       </section>
 
       <section v-if="state.info" class="rounded-2xl border border-white/10 bg-white/5 p-4 space-y-2 text-xs">

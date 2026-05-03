@@ -27,6 +27,24 @@ export const showExitToast = ref(false);
 let lastBackPressTime = 0;
 const EXIT_THRESHOLD = 2000; // 2 seconds
 
+const buildVcpHistoryState = (extra: Record<string, unknown>) => {
+  const currentState = window.history.state || {};
+  const currentPosition =
+    typeof currentState.position === 'number'
+      ? currentState.position
+      : window.history.length - 1;
+
+  return {
+    ...currentState,
+    position: currentPosition + 1,
+    ...extra,
+  };
+};
+
+const pushVcpHistoryState = (extra: Record<string, unknown>) => {
+  window.history.pushState(buildVcpHistoryState(extra), '');
+};
+
 /**
  * Initialize root history state to intercept the final back gesture.
  * Should be called once at app startup (App.vue onMounted).
@@ -37,7 +55,7 @@ export const initRootHistory = () => {
   // If we are at the very beginning (length 1 or 2), push our dummy state
   // We don't use replaceState here because we WANT to be at depth > 1
   if (window.history.length <= 2) {
-    window.history.pushState({ vcpRoot: true, vcpMain: true }, '');
+    pushVcpHistoryState({ vcpRoot: true, vcpMain: true, vcpModalId: undefined });
   }
 };
 
@@ -86,7 +104,7 @@ const handlePopState = (event: PopStateEvent) => {
       setTimeout(() => { showExitToast.value = false; }, EXIT_THRESHOLD);
 
       // THE BOUNCE: Immediately re-inject the dummy state to keep the user in the "fake" 2nd layer
-      window.history.pushState({ vcpRoot: true, vcpMain: true }, '');
+      pushVcpHistoryState({ vcpRoot: true, vcpMain: true, vcpModalId: undefined });
     }
   }
 };
@@ -124,7 +142,7 @@ export function useModalHistory() {
     if (modalStack.value.some(m => m.id === id)) return;
 
     // Push state to history
-    window.history.pushState({ vcpRoot: true, vcpModalId: id }, '');
+    pushVcpHistoryState({ vcpRoot: true, vcpModalId: id });
 
     // Add to our LIFO stack
     modalStack.value.push({ id, close: closeHandler });

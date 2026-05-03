@@ -9,6 +9,7 @@ pub mod context_assembler_utils;
 pub mod context_sanitizer;
 pub mod db_manager;
 pub mod db_write_queue;
+pub mod diagnostic_test_service;
 pub mod emoticon_manager;
 pub mod file_manager;
 pub mod group_chat_application_service;

@@ -3,7 +3,7 @@ import { ref } from 'vue';
 import { useModalHistory } from '../composables/useModalHistory';
 
 export const useLayoutStore = defineStore('layout', () => {
-  const { registerModal, unregisterModal } = useModalHistory();
+  const { registerModal, unregisterModal, unregisterModalSilently } = useModalHistory();
 
   const leftDrawerOpen = ref(false);
   const rightDrawerOpen = ref(false);
@@ -45,12 +45,25 @@ export const useLayoutStore = defineStore('layout', () => {
     }
   };
 
+  const closeDrawersSilently = () => {
+    if (leftDrawerOpen.value) {
+      leftDrawerOpen.value = false;
+      unregisterModalSilently('LeftDrawer');
+    }
+
+    if (rightDrawerOpen.value) {
+      rightDrawerOpen.value = false;
+      unregisterModalSilently('RightDrawer');
+    }
+  };
+
   return {
     leftDrawerOpen,
     rightDrawerOpen,
     toggleLeftDrawer,
     toggleRightDrawer,
     setLeftDrawer,
-    setRightDrawer
+    setRightDrawer,
+    closeDrawersSilently
   };
 });

@@ -34,6 +34,8 @@ plans_back.zip
 GEMINI.md
 *.md
 !README.md
+!docs/
+!docs/*.md
 VCPMobile.code-workspace
 
 # Large Assets & Scripts
@@ -42,3 +44,4 @@ plans/Archive_Assets/
 # Local Release Artifacts
 releases/
 vector/
+.test-artifacts/

@@ -594,3 +594,33 @@ pub fn ensure_html_fenced(text: &str) -> String {
     result.push_str(&text[last_pos..]);
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_vcp_tool_result_blocks_inline() {
+        let blocks = parse_content(
+            "前言\n\n[[VCP调用结果信息汇总:\n- 工具名称: ImageGen\n- 执行状态: success\n- 返回内容: ![preview](https://example.com/a.png)\nVCP调用结果结束]]\n\n后续",
+        );
+
+        let tool_result = blocks.iter().find_map(|block| match block {
+            ContentBlock::ToolResult {
+                tool_name,
+                status,
+                details,
+                ..
+            } => Some((tool_name, status, details)),
+            _ => None,
+        });
+
+        let (tool_name, status, details) =
+            tool_result.expect("tool result block should be parsed");
+        assert_eq!(tool_name, "ImageGen");
+        assert_eq!(status, "success");
+        assert!(details.iter().any(|detail| {
+            detail.key == "返回内容" && detail.value.contains("https://example.com/a.png")
+        }));
+    }
+}

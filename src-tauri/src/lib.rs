@@ -18,6 +18,10 @@ use vcp_modules::chat_manager::{
     patch_single_message, truncate_history_after_timestamp,
 };
 use vcp_modules::context_sanitizer::ContextSanitizer;
+use vcp_modules::diagnostic_test_service::{
+    inject_diagnostic_assistant_message, start_diagnostic_test_server,
+    stop_diagnostic_test_server, DiagnosticTestServerState,
+};
 use vcp_modules::emoticon_manager::{
     fix_emoticon_url, get_emoticon_library, regenerate_emoticon_library,
 };
@@ -201,6 +205,7 @@ pub fn run() {
             app.manage(UploadManagerState::new());
             app.manage(distributed::DistributedState::new());
             app.manage(vcp_modules::browser_service::BrowserRuntimeState::global());
+            app.manage(DiagnosticTestServerState::new());
 
             let handle = app.handle().clone();
 
@@ -322,6 +327,9 @@ pub fn run() {
             get_browser_snapshot,
             start_browser_assist_server,
             stop_browser_assist_server,
+            inject_diagnostic_assistant_message,
+            start_diagnostic_test_server,
+            stop_diagnostic_test_server,
             get_sync_session_log_path,
             list_sync_log_files,
             read_sync_log_file,

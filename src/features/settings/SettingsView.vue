@@ -3,6 +3,7 @@ import { ref, onMounted, watch } from "vue";
 import { useRouter } from "vue-router";
 import { useSettingsStore, type AppSettings } from "../../core/stores/settings";
 import { useOverlayStore } from "../../core/stores/overlay";
+import { useLayoutStore } from "../../core/stores/layout";
 import SlidePage from "../../components/ui/SlidePage.vue";
 
 import UserProfileSection from "./components/UserProfileSection.vue";
@@ -41,6 +42,7 @@ const emit = defineEmits<{
 
 const settingsStore = useSettingsStore();
 const overlayStore = useOverlayStore();
+const layoutStore = useLayoutStore();
 const router = useRouter();
 
 const settings = ref<AppSettings>({
@@ -74,16 +76,53 @@ const normalizeThinkingBudget = (value: unknown) => {
   return Math.min(32768, Math.max(1024, parsed));
 };
 
+const legacyExtraValue = (rawSettings: AppSettings, key: string) => {
+  const extra = rawSettings.extra;
+  if (extra && typeof extra === "object" && !Array.isArray(extra)) {
+    if (extra[key] !== undefined) return extra[key];
+    const nestedExtra = extra.extra;
+    if (
+      nestedExtra &&
+      typeof nestedExtra === "object" &&
+      !Array.isArray(nestedExtra)
+    ) {
+      return nestedExtra[key];
+    }
+  }
+  return undefined;
+};
+
 const normalizeSettings = (rawSettings: AppSettings): AppSettings => ({
   ...rawSettings,
   syncLogLevel: rawSettings.syncLogLevel || "INFO",
-  enableVcpToolInjection: rawSettings.enableVcpToolInjection ?? false,
-  agentMusicControl: rawSettings.agentMusicControl ?? false,
-  enableAgentBubbleTheme: rawSettings.enableAgentBubbleTheme ?? true,
-  enableMobileSurfaceInjection: rawSettings.enableMobileSurfaceInjection ?? true,
-  enableMobileBrowserInjection: rawSettings.enableMobileBrowserInjection ?? true,
-  enableModelThinking: rawSettings.enableModelThinking ?? true,
-  modelThinkingBudget: normalizeThinkingBudget(rawSettings.modelThinkingBudget),
+  enableVcpToolInjection:
+    rawSettings.enableVcpToolInjection ??
+    legacyExtraValue(rawSettings, "enableVcpToolInjection") ??
+    false,
+  agentMusicControl:
+    rawSettings.agentMusicControl ??
+    legacyExtraValue(rawSettings, "agentMusicControl") ??
+    false,
+  enableAgentBubbleTheme:
+    rawSettings.enableAgentBubbleTheme ??
+    legacyExtraValue(rawSettings, "enableAgentBubbleTheme") ??
+    true,
+  enableMobileSurfaceInjection:
+    rawSettings.enableMobileSurfaceInjection ??
+    legacyExtraValue(rawSettings, "enableMobileSurfaceInjection") ??
+    true,
+  enableMobileBrowserInjection:
+    rawSettings.enableMobileBrowserInjection ??
+    legacyExtraValue(rawSettings, "enableMobileBrowserInjection") ??
+    true,
+  enableModelThinking:
+    rawSettings.enableModelThinking ??
+    legacyExtraValue(rawSettings, "enableModelThinking") ??
+    true,
+  modelThinkingBudget: normalizeThinkingBudget(
+    rawSettings.modelThinkingBudget ??
+      legacyExtraValue(rawSettings, "modelThinkingBudget"),
+  ),
 });
 
 const loading = ref(true);
@@ -98,17 +137,20 @@ const closeSettings = () => {
   emit("close");
 };
 
-const openDiagnostics = () => {
+const openDiagnostics = async () => {
+  layoutStore.closeDrawersSilently();
   overlayStore.closeSettingsSilently();
-  router.push("/diagnostics");
+  await router.push("/diagnostics");
 };
 
 const openToolboxView = () => {
+  layoutStore.closeDrawersSilently();
   overlayStore.closeSettingsSilently();
   overlayStore.openToolbox();
 };
 
 const openBrowserView = () => {
+  layoutStore.closeDrawersSilently();
   overlayStore.closeSettingsSilently();
   overlayStore.openBrowser();
 };

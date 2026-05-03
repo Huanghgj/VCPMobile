@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, computed, ref } from "vue";
-import { useRouter } from "vue-router";
+import { useRoute, useRouter } from "vue-router";
 import { listen } from "@tauri-apps/api/event";
 import { useSwipe } from "@vueuse/core";
 import { useThemeStore } from "./core/stores/theme";
@@ -29,6 +29,7 @@ const { processPayload } = useNotificationProcessor();
 const { initGlobalFixer } = useEmoticonFixer();
 const { isPromptOpen, updateInfo, handleConfirm, handleDismiss } = useAutoUpdate();
 const router = useRouter();
+const route = useRoute();
 
 const { initRootHistory } = useModalHistory();
 
@@ -151,7 +152,7 @@ onUnmounted(() => {
     <main class="flex-1 min-w-0 relative overflow-hidden">
       <router-view v-slot="{ Component }">
         <KeepAlive>
-          <component v-if="Component" :is="Component" />
+          <component v-if="Component" :is="Component" :key="route.fullPath" />
         </KeepAlive>
       </router-view>
     </main>

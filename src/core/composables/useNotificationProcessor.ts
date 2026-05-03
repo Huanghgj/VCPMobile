@@ -55,9 +55,45 @@ export function useNotificationProcessor() {
   const getPayloadSource = (payload: any) =>
     String(payload?.data?.source || payload?.source || '');
 
+  const getLegacyLogData = (payload: any) =>
+    payload?.data && typeof payload.data === 'object' ? payload.data : payload;
+
+  const normalizeStatusText = (status: any) =>
+    String(status || '').toLowerCase();
+
+  const isErrorStatus = (status: any) => {
+    const text = normalizeStatusText(status);
+    return (
+      text.includes('error') ||
+      text.includes('fail') ||
+      text.includes('失败') ||
+      text.includes('错误')
+    );
+  };
+
+  const isTerminalToolLog = (payload: any) => {
+    const data = getLegacyLogData(payload);
+    const toolName = data?.tool_name || data?.toolName || data?.name;
+    const status = normalizeStatusText(data?.status || data?.state);
+    if (!toolName || !status) return false;
+
+    return (
+      status.includes('success') ||
+      status.includes('complete') ||
+      status.includes('done') ||
+      isErrorStatus(status) ||
+      status.includes('成功') ||
+      status.includes('完成')
+    );
+  };
+
   const shouldKeepLegacyLogNotification = (payload: any) => {
     const source = getPayloadSource(payload);
-    return source === 'Sync' || payload?.data?.id === 'vcp_sync_connection_status';
+    return (
+      source === 'Sync' ||
+      payload?.data?.id === 'vcp_sync_connection_status' ||
+      isTerminalToolLog(payload)
+    );
   };
 
   const shouldRouteToVcpInfoOnly = (payload: any) => {
@@ -308,6 +344,8 @@ export function useNotificationProcessor() {
     // 1. 核心 VCP 日志解析 (对标 renderVCPLogNotification)
     if ((payload.type === 'vcp_log' || payload.type === 'vcp-log-message') && payload.data) {
       const vcpData = payload.data;
+      const logToolName = vcpData.tool_name || vcpData.toolName || vcpData.name;
+      const logStatus = vcpData.status || vcpData.state;
       if (vcpData.id) {
         notificationId = String(vcpData.id);
         if (vcpData.id === 'vcp_sync_connection_status' && vcpData.status === 'error') {
@@ -315,9 +353,9 @@ export function useNotificationProcessor() {
         }
       }
 
-      if (vcpData.tool_name && vcpData.status) {
-        type = vcpData.status === 'error' ? 'error' : 'tool';
-        title = `${vcpData.tool_name} ${vcpData.status}`;
+      if (logToolName && logStatus) {
+        type = isErrorStatus(logStatus) ? 'error' : 'tool';
+        title = `${logToolName} ${logStatus}`;
 
         let rawContent = String(vcpData.content || '');
         message = rawContent;
@@ -357,7 +395,7 @@ export function useNotificationProcessor() {
           }
 
           // DailyNote 成功状态 Fallback (P1-4 Gap)
-          if (!hasValidOutput && vcpData.tool_name === 'DailyNote' && vcpData.status === 'success') {
+          if (!hasValidOutput && logToolName === 'DailyNote' && logStatus === 'success') {
             message = "✅ 日记内容已成功记录到本地知识库。";
             summary = message;
             isPreformatted = false;

@@ -172,6 +172,24 @@ export const useChatManagerStore = defineStore("chatManager", () => {
 
   const foregroundStreamingBuffers = new Map<string, string>();
 
+  const extractFinalStreamContent = (chunk: unknown) => {
+    if (!chunk || typeof chunk !== "object") return "";
+    const payload = chunk as Record<string, unknown>;
+    const value =
+      payload.fullContent ?? payload.full_content ?? payload.content;
+    return typeof value === "string" ? value : "";
+  };
+
+  const pickLongestContent = (...candidates: Array<string | undefined>) => {
+    let best = "";
+    for (const candidate of candidates) {
+      if (candidate && candidate.length > best.length) {
+        best = candidate;
+      }
+    }
+    return best;
+  };
+
   // 暂存的附件列表，准备随下一条消息发送
   const stagedAttachments = ref<Attachment[]>([]);
 
@@ -1385,7 +1403,12 @@ export const useChatManagerStore = defineStore("chatManager", () => {
           if (latestMsg) {
             // 确保最终内容一致
             latestMsg.isThinking = false;
-              latestMsg.content = foregroundStreamingBuffers.get(actualMessageId) || latestMsg.content || latestMsg.displayedContent || "";
+              latestMsg.content = pickLongestContent(
+                foregroundStreamingBuffers.get(actualMessageId),
+                extractFinalStreamContent(chunk),
+                latestMsg.content,
+                latestMsg.displayedContent,
+              );
               latestMsg.displayedContent = latestMsg.content;
               latestMsg.stableContent = undefined;
               latestMsg.tailContent = undefined;
@@ -1470,10 +1493,14 @@ export const useChatManagerStore = defineStore("chatManager", () => {
                   type === "error" && errorMsg && errorMsg !== "请求已中止"
                     ? `\n\n> VCP流式错误: ${errorMsg}`
                     : "";
+                const finalBackgroundContent = pickLongestContent(
+                  buffer.content,
+                  extractFinalStreamContent(chunk),
+                );
                 const backgroundMessage: ChatMessage = {
                   id: actualMessageId,
                   role: "assistant",
-                  content: `${buffer.content}${errorText}`,
+                  content: `${finalBackgroundContent}${errorText}`,
                   timestamp: Date.now(),
                   isThinking: false,
                   isGroupMessage: false,
@@ -1502,7 +1529,62 @@ export const useChatManagerStore = defineStore("chatManager", () => {
       }
     });
 
-    // 监听外部文件变更 (对应桌面端的 history-file-updated)
+    // Runtime diagnostic API injects completed assistant messages through Rust.
+    listen("diagnostic-chat-message-injected", (event: any) => {
+      const payload = event.payload || {};
+      const message = payload.message as ChatMessage | undefined;
+      const ownerId = payload.ownerId || payload.owner_id;
+      const ownerType = payload.ownerType || payload.owner_type;
+      const topicId = payload.topicId || payload.topic_id;
+
+      if (!message || !ownerId || !ownerType || !topicId) return;
+
+      const injectedMessage: ChatMessage = {
+        ...message,
+        isThinking: false,
+        displayedContent: message.content,
+        stableContent: undefined,
+        tailContent: undefined,
+      };
+
+      resolveMessageAssets(injectedMessage);
+      rememberRawContent(injectedMessage);
+      upsertCachedTopicMessage(ownerId, ownerType, topicId, injectedMessage);
+
+      const isCurrentTopic =
+        currentSelectedItem.value?.id === ownerId &&
+        currentSelectedItem.value?.type === ownerType &&
+        currentTopicId.value === topicId;
+
+      if (!isCurrentTopic) return;
+
+      const index = currentChatHistory.value.findIndex(
+        (item) => item.id === injectedMessage.id,
+      );
+      if (index >= 0) {
+        currentChatHistory.value[index] = {
+          ...currentChatHistory.value[index],
+          ...injectedMessage,
+        };
+      } else {
+        currentChatHistory.value.push(injectedMessage);
+      }
+
+      currentChatHistory.value.sort((a, b) => a.timestamp - b.timestamp);
+      removeSessionStream(ownerId, topicId, injectedMessage.id);
+      if (streamingMessageId.value === injectedMessage.id) {
+        streamingMessageId.value = null;
+      }
+      refreshCurrentTopicCache();
+      diagnostics.addTrace("diagnostic-message-injected", {
+        messageId: injectedMessage.id,
+        totalChars: injectedMessage.content?.length || 0,
+        detail: `${ownerType}:${ownerId}/${topicId}`,
+      });
+      void nextTick().then(() => window.dispatchEvent(new Event("resize")));
+    });
+
+    // External history file change notification.
     listen("vcp-file-change", async (event: any) => {
       const paths = event.payload as string[];
       console.log("[ChatManager] File change detected by Rust Watcher:", paths);
