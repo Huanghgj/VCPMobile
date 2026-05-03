@@ -103,6 +103,7 @@ export default defineConfig(async () => ({
     hmr: host
       ? {
           protocol: "ws",
+          host,
           port: 1421,
         }
       : undefined,

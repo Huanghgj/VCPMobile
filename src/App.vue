@@ -10,6 +10,7 @@ import { useModalHistory } from "./core/composables/useModalHistory";
 import { useNotificationStore } from "./core/stores/notification";
 import { useNotificationProcessor } from "./core/composables/useNotificationProcessor";
 import { useEmoticonFixer } from "./core/composables/useEmoticonFixer";
+import { useAutoUpdate } from "./core/composables/useAutoUpdate";
 
 // Layout Components
 import BootScreen from "./components/layout/BootScreen.vue";
@@ -18,6 +19,7 @@ import RightSidebar from "./components/layout/RightSidebar.vue";
 import GlobalOverlayManager from "./components/GlobalOverlayManager.vue";
 import FeatureOverlays from "./components/FeatureOverlays.vue";
 import GlobalPerformanceMonitor from "./components/GlobalPerformanceMonitor.vue";
+import UpdatePrompt from "./components/ui/UpdatePrompt.vue";
 
 const themeStore = useThemeStore();
 const lifecycleStore = useAppLifecycleStore();
@@ -25,6 +27,7 @@ const notificationStore = useNotificationStore();
 const layoutStore = useLayoutStore();
 const { processPayload } = useNotificationProcessor();
 const { initGlobalFixer } = useEmoticonFixer();
+const { isPromptOpen, updateInfo, handleConfirm, handleDismiss } = useAutoUpdate();
 const router = useRouter();
 
 const { initRootHistory } = useModalHistory();
@@ -175,6 +178,16 @@ onUnmounted(() => {
 
     <!-- 7. 全局性能采集悬浮状态 -->
     <GlobalPerformanceMonitor />
+
+    <!-- 8. 自动更新提示弹窗 -->
+    <UpdatePrompt
+      v-model:is-open="isPromptOpen"
+      :version="updateInfo?.latestVersion || ''"
+      :release-notes="updateInfo?.releaseNotes"
+      :apk-size="updateInfo?.apkSize"
+      @confirm="handleConfirm"
+      @dismiss="handleDismiss"
+    />
   </div>
 </template>
 

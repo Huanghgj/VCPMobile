@@ -17,6 +17,7 @@ import ModelSelector from "../../components/ModelSelector.vue";
 import DistributedSettingsSection from "../distributed/DistributedSettingsSection.vue";
 import ToolInteractionOverlay from "../distributed/ToolInteractionOverlay.vue";
 import SensorCollector from "../distributed/SensorCollector.vue";
+import SyncLogBrowser from "./components/SyncLogBrowser.vue";
 
 import SettingsSection from "../../components/settings/SettingsSection.vue";
 import SettingsCard from "../../components/settings/SettingsCard.vue";
@@ -87,6 +88,7 @@ const normalizeSettings = (rawSettings: AppSettings): AppSettings => ({
 
 const loading = ref(true);
 const showSummaryModelSelector = ref(false);
+const showSyncLogBrowser = ref(false);
 
 const onSummaryModelSelect = (modelId: string) => {
   settings.value.topicSummaryModel = modelId;
@@ -290,6 +292,23 @@ watch(
           </SettingsCard>
         </SettingsSection>
 
+        <SettingsSection title="同步诊断" accent-color="bg-cyan-500">
+          <SettingsCard>
+            <div class="p-4">
+              <button @click="showSyncLogBrowser = true"
+                class="flex items-center justify-between w-full text-left">
+                <div>
+                  <div class="text-sm font-bold">同步日志浏览器</div>
+                  <div class="text-xs text-white/40 mt-0.5">查看历史同步会话的完整日志</div>
+                </div>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="text-white/20">
+                  <polyline points="9 18 15 12 9 6"></polyline>
+                </svg>
+              </button>
+            </div>
+          </SettingsCard>
+        </SettingsSection>
+
         <SettingsSection title="关于" accent-color="bg-gray-500">
           <SettingsCard>
             <UpdateSection />
@@ -316,6 +335,7 @@ watch(
 
       <ToolInteractionOverlay />
       <SensorCollector />
+      <SyncLogBrowser :is-open="showSyncLogBrowser" @close="showSyncLogBrowser = false" />
 
       <ModelSelector
         :model-value="showSummaryModelSelector"

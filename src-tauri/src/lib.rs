@@ -26,6 +26,10 @@ use vcp_modules::file_manager::{
     get_attachment_real_path, init_chunked_upload, open_file, read_local_file_base64,
     save_media_from_url, store_file, UploadManagerState,
 };
+use vcp_modules::frontend_update_manager::{
+    apply_frontend_update, check_for_frontend_update, clear_frontend_updates,
+    confirm_frontend_boot, download_frontend_update, get_active_frontend_version,
+};
 use vcp_modules::group_chat_application_service::handle_group_chat_message;
 use vcp_modules::group_service::{
     create_group, delete_group, get_groups, read_group_config, save_group_config,
@@ -35,6 +39,7 @@ use vcp_modules::lifecycle_manager::{
     bootstrap, get_core_status, get_last_error, get_system_snapshot, LifecycleState,
 };
 use vcp_modules::message_render_compiler::process_message_content;
+use vcp_modules::message_service::fetch_raw_message_content;
 use vcp_modules::model_manager::{
     get_cached_models, get_favorite_models, get_hot_models, record_model_usage, refresh_models,
     toggle_favorite_model,
@@ -42,13 +47,16 @@ use vcp_modules::model_manager::{
 use vcp_modules::performance_diagnostics::{
     get_performance_diagnostics_info, get_process_performance_snapshot, save_performance_report,
 };
-use vcp_modules::protocol_manager::{prepare_vcp_upload, register_vcp_protocols};
+use vcp_modules::protocol_manager::prepare_vcp_upload;
 use vcp_modules::settings_manager::{read_settings, set_theme, update_settings, write_settings};
 use vcp_modules::surface_service::{
     apply_surface_command, clear_surface_widgets, list_surface_widgets, remove_surface_widget,
     upsert_surface_widget,
 };
-use vcp_modules::sync_service::{get_sync_status, start_manual_sync};
+use vcp_modules::sync_service::{
+    clear_old_sync_logs, get_sync_session_log_path, get_sync_status, list_sync_log_files,
+    read_sync_log_file, start_manual_sync,
+};
 use vcp_modules::topic_service::{
     create_topic, delete_topic, get_topics, set_topic_unread, summarize_topic, toggle_topic_lock,
     update_topic_title,
@@ -146,9 +154,43 @@ fn show_desktop_overlay(_title: Option<String>, _html: String) -> Result<(), Str
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let mut builder = tauri::Builder::default();
+    let mut context = tauri::generate_context!();
 
-    builder = register_vcp_protocols(builder);
+    // 注入 OtaAssets：优先从文件系统读取前端热更新资源
+    {
+        let identifier = context.config().identifier.clone();
+        #[cfg(target_os = "android")]
+        let active_version_path = format!(
+            "/data/data/{}/files/frontend_updates/active_version",
+            identifier
+        );
+        #[cfg(not(target_os = "android"))]
+        let active_version_path = String::new();
+
+        let update_dir = if cfg!(target_os = "android") {
+            if let Ok(version) = std::fs::read_to_string(&active_version_path) {
+                let v = version.trim();
+                if v.is_empty() {
+                    std::path::PathBuf::new()
+                } else {
+                    std::path::PathBuf::from(format!(
+                        "/data/data/{}/files/frontend_updates/{}",
+                        identifier, v
+                    ))
+                }
+            } else {
+                std::path::PathBuf::new()
+            }
+        } else {
+            std::path::PathBuf::new()
+        };
+
+        let embedded = context.set_assets(Box::new(vcp_modules::ota_assets::EmptyAssets));
+        let ota_assets = vcp_modules::ota_assets::OtaAssets::new(embedded, update_dir);
+        context.set_assets(Box::new(ota_assets));
+    }
+
+    let builder = tauri::Builder::default();
 
     builder
         .setup(|app| {
@@ -162,6 +204,11 @@ pub fn run() {
 
             let handle = app.handle().clone();
 
+            // 0. 前端 OTA：APK 升级清理 & 损坏版本回滚
+            vcp_modules::frontend_update_manager::clear_on_apk_upgrade(&handle);
+            vcp_modules::frontend_update_manager::rollback_if_needed(&handle);
+
+            // 1. 清理上传缓存
             vcp_modules::file_manager::clear_upload_cache(&handle);
 
             tauri::async_runtime::spawn(async move {
@@ -237,6 +284,7 @@ pub fn run() {
             finish_chunked_upload,
             cancel_chunked_upload,
             prepare_vcp_upload,
+            fetch_raw_message_content,
             read_local_file_base64,
             save_media_from_url,
             get_attachment_real_path,
@@ -274,6 +322,10 @@ pub fn run() {
             get_browser_snapshot,
             start_browser_assist_server,
             stop_browser_assist_server,
+            get_sync_session_log_path,
+            list_sync_log_files,
+            read_sync_log_file,
+            clear_old_sync_logs,
             distributed::start_distributed_node,
             distributed::stop_distributed_node,
             distributed::get_distributed_status,
@@ -284,7 +336,13 @@ pub fn run() {
             check_for_update,
             download_update,
             install_update,
+            check_for_frontend_update,
+            download_frontend_update,
+            apply_frontend_update,
+            get_active_frontend_version,
+            clear_frontend_updates,
+            confirm_frontend_boot,
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running tauri application");
 }

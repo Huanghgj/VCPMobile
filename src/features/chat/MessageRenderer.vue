@@ -430,7 +430,8 @@ const updateContentBlocks = async (text: string) => {
       durationMs: Math.round((performance.now() - renderStartedAt) * 10) / 10,
     });
   } else {
-    // 动态编译态 (例如流式刚结束，或者刚编辑完)
+    // 动态编译态 (例如流式刚结束，或者刚编辑完，或者历史消息缺少预编译)
+    const hadBlocks = !!props.message.blocks && props.message.blocks.length > 0;
     isTransitioning.value = true;
     try {
       const newBlocks = await processMessageContent(text || "", options);
@@ -443,6 +444,11 @@ const updateContentBlocks = async (text: string) => {
         durationMs: Math.round((performance.now() - renderStartedAt) * 10) / 10,
         detail: `blocks=${newBlocks.length}`,
       });
+
+      // 核心修复：如果原始消息缺少预编译块，或者这是刚解析出的新块，则尝试保存到数据库
+      if (!hadBlocks || text !== props.message.content) {
+        void chatStore.persistMessageBlocks(props.message.id, newBlocks);
+      }
     } finally {
       // 确保无论解析成功失败，都能解除过渡状态
       isTransitioning.value = false;
@@ -710,7 +716,12 @@ const showMessageContextMenu = async () => {
 
 const handleSaveEdit = async (newContent: string) => {
   const chatStore = useChatManagerStore();
-  if (newContent !== props.message.content) {
+  let currentContent = props.message.content;
+  if (currentContent === undefined || currentContent === null || currentContent === "") {
+    currentContent = await chatStore.fetchRawContent(props.message.id);
+    props.message.content = currentContent;
+  }
+  if (newContent !== currentContent) {
     await chatStore.updateMessageContent(props.message.id, newContent);
     // 立即重新触发渲染
     await updateContentBlocks(newContent);
