@@ -6,6 +6,24 @@ export interface VcpNotification {
   type: 'info' | 'success' | 'warning' | 'error' | 'tool' | 'agent';
   title: string;
   message: string;
+  subtitle?: string;
+  source?: string;
+  category?: string;
+  infoType?: string;
+  tags?: string[];
+  meta?: { label: string; value: string }[];
+  details?: { label: string; value: string; mono?: boolean; multiline?: boolean }[];
+  structured?: {
+    kind: 'rag' | 'thinking' | 'private_chat' | 'dream' | 'generic';
+    summary?: string;
+    rows?: {
+      title: string;
+      subtitle?: string;
+      body?: string;
+      chips?: string[];
+      metrics?: { label: string; value: string }[];
+    }[];
+  };
   timestamp: number;
   duration?: number; // 毫秒, 0 为永不消失
   isPreformatted?: boolean;
@@ -154,7 +172,7 @@ export const useNotificationStore = defineStore('notification', () => {
     const item = historyList.value.find(n => n.id === notificationId);
     if (!item) return;
 
-    if (item.type === 'warning' && item.rawPayload?.type === 'tool_approval_request') {
+    if (item.rawPayload?.type === 'tool_approval_request') {
       const response = {
         type: 'tool_approval_response',
         data: {

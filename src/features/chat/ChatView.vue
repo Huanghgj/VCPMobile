@@ -7,12 +7,13 @@ import { useTopicStore } from "../../core/stores/topicListManager";
 import { useThemeStore } from "../../core/stores/theme";
 import { useAppLifecycleStore } from "../../core/stores/appLifecycle";
 import { useLayoutStore } from "../../core/stores/layout";
+import { useNotificationStore } from "../../core/stores/notification";
 import MessageRenderer from "./MessageRenderer.vue";
 import InputEnhancer from "./InputEnhancer.vue";
 import TarvenSelector from "./components/TarvenSelector.vue";
 import VcpAvatar from "../../components/ui/VcpAvatar.vue";
 import CoreStatusIndicator from "../../components/ui/CoreStatusIndicator.vue";
-import { ArrowDown } from "lucide-vue-next";
+import { ArrowDown, BellRing } from "lucide-vue-next";
 import { useKeyboardInsets } from "../../core/composables/useKeyboardInsets";
 import { useChatScroll } from "../../core/composables/useChatScroll";
 
@@ -23,6 +24,7 @@ const streamStore = useChatStreamStore();
 const themeStore = useThemeStore();
 const lifecycleStore = useAppLifecycleStore();
 const layoutStore = useLayoutStore();
+const notificationStore = useNotificationStore();
 const { keyboardHeight, forceRecalculate } = useKeyboardInsets();
 
 // 跟踪输入增强组件底部的扩展菜单状态
@@ -206,12 +208,12 @@ onUnmounted(() => {
         </button>
         <!-- 通知中心按钮 -->
         <button @click="layoutStore.toggleRightDrawer()"
-          class="w-10 h-10 flex items-center justify-center rounded-xl bg-black/5 dark:bg-white/10 active:scale-90 transition-all border border-black/5 dark:border-white/5">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-            stroke-linecap="round" stroke-linejoin="round">
-            <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"></path>
-            <path d="M13.73 21a2 2 0 0 1-3.46 0"></path>
-          </svg>
+          class="relative w-10 h-10 flex items-center justify-center rounded-xl bg-black/5 dark:bg-white/10 active:scale-90 transition-all border border-black/5 dark:border-white/5 overflow-visible">
+          <BellRing :size="19" :stroke-width="2.2" />
+          <span v-if="notificationStore.unreadCount > 0"
+            class="absolute -top-1 -right-1 min-w-[18px] h-[18px] px-1 rounded-full bg-blue-600 text-white text-[9px] font-black leading-[18px] shadow-lg shadow-blue-600/30">
+            {{ notificationStore.unreadCount > 99 ? '99+' : notificationStore.unreadCount }}
+          </span>
         </button>
       </div>
     </header>

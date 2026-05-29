@@ -5,9 +5,11 @@
   --primary-text: #e0e0e0;
   --border-color: #3a3a3e;
 
-  /* 移动端安全区 - 增加物理回退值 (24px 是安卓常见的刘海高度) */
-  --vcp-safe-top: env(safe-area-inset-top, 24px);
-  --vcp-safe-bottom: env(safe-area-inset-bottom, 20px);
+  /* 移动端安全区。Android edge-to-edge 下 env 可能为 0，由 App.vue 注入兜底值。 */
+  --vcp-android-safe-top-fallback: 0px;
+  --vcp-android-safe-bottom-fallback: 0px;
+  --vcp-safe-top: max(env(safe-area-inset-top, 0px), var(--vcp-android-safe-top-fallback));
+  --vcp-safe-bottom: max(env(safe-area-inset-bottom, 0px), var(--vcp-android-safe-bottom-fallback));
 
   /* === VCP 全局层级系统 ===
    * 用途：统一管理 z-index，消除魔法数字

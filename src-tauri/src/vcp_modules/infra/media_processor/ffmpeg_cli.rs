@@ -13,6 +13,8 @@ mod android {
 
 #[cfg(target_os = "android")]
 fn extract_android_binary(name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt;
+
     if bytes.len() < 1024 {
         return Err(format!(
             "Embedded {} binary is empty or too small ({} bytes). \
@@ -27,10 +29,17 @@ fn extract_android_binary(name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
     let cache_dir = std::env::temp_dir();
     let path = cache_dir.join(name);
 
-    if !path.exists() {
+    let needs_write = match std::fs::metadata(&path) {
+        Ok(meta) => meta.len() != bytes.len() as u64,
+        Err(_) => true,
+    };
+
+    if needs_write {
         std::fs::write(&path, bytes)
             .map_err(|e| format!("Failed to write {} to cache: {}", name, e))?;
     }
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("Failed to chmod {}: {}", name, e))?;
 
     Ok(path)
 }

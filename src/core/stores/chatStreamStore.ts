@@ -18,6 +18,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
   // 全局活跃流消息池：存储所有正在生成的响应对象 (messageId -> Reactive<ChatMessage>)
   // 无论是在前台还是后台，流式消息都从此池中获取，保证响应式链路不断裂
   const activeStreamMessages = reactive<Map<string, ChatMessage>>(new Map());
+  const auroraActiveMessageIds = new Set<string>();
   const cleanupTimers = new Set<ReturnType<typeof setTimeout>>();
 
   const sessionStore = useChatSessionStore();
@@ -130,6 +131,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     const cleanupTimer = setTimeout(() => {
         if (!activeStreamingIds.value.has(messageId)) {
             activeStreamMessages.delete(messageId);
+            auroraActiveMessageIds.delete(messageId);
         }
     }, 1000);
     cleanupTimers.add(cleanupTimer);
@@ -155,6 +157,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     const isNewStream = !msg;
  
     if (isNewStream) {
+      auroraActiveMessageIds.delete(actualMessageId);
       msg = reactive<ChatMessage>({
         id: actualMessageId,
         role: "assistant",
@@ -214,6 +217,10 @@ export const useChatStreamStore = defineStore("chatStream", () => {
       msg!.isThinking = false;
       addSessionStream(itemId, topicId, actualMessageId);
 
+      // Aurora 是当前协议的真实流式渲染通道。原始 data 事件只保留给旧协议兜底，
+      // 避免在 Aurora 已接管后把同一段 AI 回复按原文再输出一遍。
+      if (auroraActiveMessageIds.has(actualMessageId)) return;
+
       let textChunk = "";
       if (typeof chunk === "string") {
         textChunk = chunk;
@@ -224,15 +231,15 @@ export const useChatStreamStore = defineStore("chatStream", () => {
 
       if (textChunk) {
         msg!.content = (msg!.content || "") + textChunk;
-        msg!.tailContent = msg!.content;
       }
     } else if (type === "aurora") {
       const aurora = event.aurora;
       if (aurora) {
+        auroraActiveMessageIds.add(actualMessageId);
         msg!.content = aurora.content;
         msg!.tailContent = aurora.tail;
         msg!.blocks = (aurora.stableBlocks || []) as any;
-        msg!.tailBlock = aurora.tailBlock as any;
+        msg!.tailBlock = (aurora.tailBlock as any) || undefined;
       }
       msg!.isThinking = false;
       addSessionStream(itemId, topicId, actualMessageId);
@@ -242,6 +249,8 @@ export const useChatStreamStore = defineStore("chatStream", () => {
 
       // 执行完成逻辑 (取代原 streamManager.finalizeStream)
       msg!.tailContent = "";
+      msg!.tailBlock = undefined;
+      auroraActiveMessageIds.delete(actualMessageId);
       if (finishReason) msg!.finishReason = finishReason;
 
       removeSessionStream(itemId, topicId, actualMessageId);
@@ -351,5 +360,4 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     stopGroupTurn,
   };
 });
-
 

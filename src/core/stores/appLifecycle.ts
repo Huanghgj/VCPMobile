@@ -5,6 +5,7 @@ import { useAssistantStore } from './assistant';
 import { useSettingsStore } from './settings';
 import { useThemeStore } from './theme';
 import { useNotificationStore } from './notification';
+import { isTauriRuntime } from '../utils/runtime';
 
 export type AppState = 'PERMISSIONS' | 'BOOTING' | 'CONNECTING' | 'PRELOADING' | 'READY' | 'ERROR';
 
@@ -320,6 +321,27 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
         isBootstrapping.value = true;
         errorMsg.value = null;
         hasBootstrapped.value = false;
+
+        if (!isTauriRuntime()) {
+          setState('BOOTING', 'Web 预览模式初始化');
+          updatePhaseLabel('加载本地界面资源...');
+          await themeStore.initTheme();
+          notificationStore.updateCoreStatus({
+            status: 'ready',
+            message: 'Web 预览模式',
+            source: 'Core'
+          });
+          notificationStore.updateStatus({
+            status: 'disconnected',
+            message: 'Web 预览模式（未连接 VCPToolBox）',
+            source: 'VCPLog'
+          });
+          hasBootstrapped.value = true;
+          isBootstrapping.value = false;
+          bootstrapPromise = null;
+          setState('READY', 'Web 预览模式就绪');
+          return;
+        }
 
         setState('PERMISSIONS', '检查系统权限完整性');
         const pStatus = await invoke<{ notification: boolean; storage: boolean; battery: boolean }>('plugin:vcp-mobile|check_all_permissions');

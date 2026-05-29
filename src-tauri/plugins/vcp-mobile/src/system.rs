@@ -144,6 +144,45 @@ pub fn get_battery_status<R: Runtime>(app: AppHandle<R>) -> Result<BatteryStatus
     }
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowSnapshot {
+    pub data_url: String,
+    pub width: i32,
+    pub height: i32,
+}
+
+#[tauri::command]
+pub fn capture_window_snapshot<R: Runtime>(
+    app: AppHandle<R>,
+    max_width: Option<i32>,
+    quality: Option<i32>,
+) -> Result<WindowSnapshot, String> {
+    #[cfg(target_os = "android")]
+    {
+        let state = app.state::<VcpMobileState<R>>();
+        let handle = state.plugin_handle.lock().map_err(|e| e.to_string())?;
+        let plugin_handle = handle.as_ref().ok_or("Plugin handle not initialized")?;
+        let max_width = max_width.unwrap_or(200).clamp(160, 420);
+        let quality = quality.unwrap_or(64).clamp(45, 85);
+
+        let snapshot = plugin_handle
+            .run_mobile_plugin::<WindowSnapshot>(
+                "captureWindowSnapshot",
+                serde_json::json!({ "maxWidth": max_width, "quality": quality }),
+            )
+            .map_err(|e| format!("run_mobile_plugin failed: {}", e))?;
+        Ok(snapshot)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        let _ = max_width;
+        let _ = quality;
+        Err("该接口仅在 Android 物理端可用".to_string())
+    }
+}
+
 #[tauri::command]
 pub fn open_file_native<R: Runtime>(app: AppHandle<R>, path: String) -> Result<(), String> {
     #[cfg(target_os = "android")]

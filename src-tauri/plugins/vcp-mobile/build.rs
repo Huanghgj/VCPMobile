@@ -7,6 +7,9 @@ const COMMANDS: &[&str] = &[
     "request_android_permission",
     "move_task_to_back",
     "pick_file",
+    "get_battery_status",
+    "capture_window_snapshot",
+    "open_file_native",
 ];
 
 fn main() {

@@ -52,7 +52,7 @@ const openSettings = () => {
   <aside ref="sidebarRef" class="vcp-drawer vcp-drawer-left flex flex-col" :class="{ 'is-open': layoutStore.leftDrawerOpen }">
 
     <!-- 顶部 Tabs -->
-    <div class="pt-safe px-4 pt-6 pb-2 shrink-0 border-b border-black/5 dark:border-white/5">
+    <div class="sidebar-header-safe px-4 pb-2 shrink-0 border-b border-black/5 dark:border-white/5">
       <h2 class="text-xl font-black opacity-90 mb-4 tracking-tighter text-blue-500 dark:text-blue-400 px-2">VCP MOBILE
       </h2>
 
@@ -107,6 +107,10 @@ const openSettings = () => {
 </template>
 
 <style scoped>
+.sidebar-header-safe {
+  padding-top: calc(var(--vcp-safe-top, 24px) + 24px);
+}
+
 .vcp-drawer {
   position: absolute;
   top: 0;

@@ -156,7 +156,7 @@ const handlePrerenderToggle = (val: boolean) => {
          :class="{ 'pointer-events-none': !store.isOpen }">
 
       <!-- 顶部栏 -->
-      <div class="flex items-center justify-between px-4 pt-[calc(env(safe-area-inset-top)+8px)] pb-3">
+      <div class="flex items-center justify-between px-4 pt-[calc(var(--vcp-safe-top,24px)+8px)] pb-3">
         <div class="flex items-center gap-3">
           <div class="flex items-center gap-2">
             <div class="w-2 h-2 rounded-full" :class="statusDotClass"></div>

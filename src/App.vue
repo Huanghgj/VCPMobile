@@ -14,16 +14,17 @@ import { useNotificationProcessor } from "./core/composables/useNotificationProc
 import { useEmoticonFixer } from "./core/composables/useEmoticonFixer";
 import { useAutoUpdate } from "./core/composables/useAutoUpdate";
 import { useChatSessionStore } from "./core/stores/chatSessionStore";
+import { isTauriRuntime } from "./core/utils/runtime";
 import { reapplyScreenKeepIfActive, suspendPhysicalScreenKeep } from "./core/composables/useScreenKeeper";
 
 // Layout Components
 import PermissionGate from "./components/layout/PermissionGate.vue";
 import BootScreen from "./components/layout/BootScreen.vue";
 import AgentSidebar from "./components/layout/AgentSidebar.vue";
-import RightSidebar from "./components/layout/RightSidebar.vue";
 import GlobalOverlayManager from "./components/GlobalOverlayManager.vue";
 import FeatureOverlays from "./components/FeatureOverlays.vue";
 import UpdatePrompt from "./components/ui/UpdatePrompt.vue";
+import NotificationCenterPage from "./features/notification/NotificationCenterPage.vue";
 
 const themeStore = useThemeStore();
 const lifecycleStore = useAppLifecycleStore();
@@ -192,14 +193,18 @@ onMounted(async () => {
   initGlobalFixer();
 
   // 1.5. 启动 VCP Log IPC 监听 (必须在 bootstrapApp 前挂载，防止 bootstrap 期间的 ready 事件丢失)
-  unlistenLog = await listen("vcp-system-event", (event: any) => {
-    const payload = event.payload;
-    const processed = processPayload(payload);
+  if (isTauriRuntime()) {
+    unlistenLog = await listen("vcp-system-event", (event: any) => {
+      const payload = event.payload;
+      const processed = processPayload(payload);
 
-    if (processed && !processed.silent) {
-      notificationStore.addNotification(processed);
-    }
-  });
+      if (processed && !processed.silent) {
+        notificationStore.addNotification(processed);
+      }
+    });
+  } else {
+    console.info("[App] Web preview runtime detected, skipping Tauri event listeners.");
+  }
 
   // 2. 异步执行重度核心资源加载 (启动引导)
   await bootstrapApp();
@@ -224,7 +229,11 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div ref="appRootRef" class="vcp-app-root h-full w-full overflow-hidden flex flex-col select-none relative">
+  <div
+    ref="appRootRef"
+    class="vcp-app-root h-full w-full overflow-hidden flex flex-col select-none relative"
+    :class="{ 'is-notification-open': layoutStore.rightDrawerOpen }"
+  >
     <!-- 0. 权限门禁 (仅在 PERMISSIONS 状态显示) -->
     <PermissionGate v-if="lifecycleStore.state === 'PERMISSIONS'" />
 
@@ -245,19 +254,21 @@ onUnmounted(() => {
       </router-view>
     </main>
 
-    <!-- 3. 抽屉遮罩层位于主内容之后、抽屉之前，点击空白即可关闭 -->
+    <!-- 3. 左侧抽屉遮罩层位于主内容之后、抽屉之前，点击空白即可关闭 -->
     <Transition name="fade">
-      <div v-if="layoutStore.leftDrawerOpen || layoutStore.rightDrawerOpen"
+      <div v-if="layoutStore.leftDrawerOpen"
         class="vcp-overlay fixed inset-0 z-drawer bg-black/12 md:hidden" @click.self="
           layoutStore.setLeftDrawer(false);
-        layoutStore.setRightDrawer(false);
         "></div>
     </Transition>
 
-    <!-- 4. 左右抽屉在遮罩之后声明，不写 z-index 也能稳定压过主内容 -->
+    <!-- 4. 左侧抽屉在遮罩之后声明，不写 z-index 也能稳定压过主内容 -->
     <AgentSidebar />
-    <RightSidebar class="pointer-events-auto shrink-0" :is-open="layoutStore.rightDrawerOpen"
-      @close="layoutStore.setRightDrawer(false)" />
+    <NotificationCenterPage
+      :is-open="layoutStore.rightDrawerOpen"
+      :z-index="40"
+      @close="layoutStore.setRightDrawer(false)"
+    />
 
     <!-- 5. 全局覆盖层管理器 -->
     <GlobalOverlayManager />
@@ -278,10 +289,22 @@ onUnmounted(() => {
 </template>
 
 <style>
-/* 全局基础样式保持不变 */
 :root {
-  --vcp-safe-top: 0px;
-  --vcp-safe-bottom: 0px;
+  --vcp-android-safe-top-fallback: 0px;
+  --vcp-android-safe-bottom-fallback: 0px;
+  --vcp-safe-top: max(env(safe-area-inset-top, 0px), var(--vcp-android-safe-top-fallback));
+  --vcp-safe-bottom: max(env(safe-area-inset-bottom, 0px), var(--vcp-android-safe-bottom-fallback));
+}
+
+@media (pointer: coarse) {
+  :root {
+    /*
+      Android edge-to-edge WebView can report env(safe-area-inset-top) as 0.
+      Keep mobile UI below the status/navigation bars even when CSS env is unavailable.
+    */
+    --vcp-android-safe-top-fallback: 24px;
+    --vcp-android-safe-bottom-fallback: 20px;
+  }
 }
 
 html,
@@ -307,6 +330,16 @@ body,
   background-position: center;
   background-repeat: no-repeat;
   transition: background-image 0.8s ease-in-out;
+}
+
+.vcp-app-root.is-notification-open > .vcp-background-layer,
+.vcp-app-root.is-notification-open > .vcp-background-overlay,
+.vcp-app-root.is-notification-open > main {
+  visibility: hidden;
+}
+
+.vcp-app-root.is-notification-open > main {
+  content-visibility: hidden;
 }
 
 /* Transitions */
@@ -336,14 +369,6 @@ body,
 
 .mb-safe {
   margin-bottom: var(--vcp-safe-bottom, 20px);
-}
-
-/* 移动端适配：安全区域 */
-@supports (padding-top: env(safe-area-inset-top)) {
-  :root {
-    --vcp-safe-top: env(safe-area-inset-top);
-    --vcp-safe-bottom: env(safe-area-inset-bottom);
-  }
 }
 
 /* 全局动画暂停：切到后台时由 JS 添加此 class 到 <html> */

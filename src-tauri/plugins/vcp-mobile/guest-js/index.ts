@@ -45,3 +45,24 @@ export function openFileNative(path: string): Promise<void> {
   return invoke('plugin:vcp-mobile|open_file_native', { path });
 }
 
+// ==================================================================
+// Window Snapshot
+// ==================================================================
+
+export interface WindowSnapshot {
+  dataUrl: string;
+  width: number;
+  height: number;
+}
+
+export interface CaptureWindowSnapshotOptions {
+  maxWidth?: number;
+  quality?: number;
+}
+
+export function captureWindowSnapshot(
+  options: CaptureWindowSnapshotOptions = {},
+): Promise<WindowSnapshot> {
+  const args: Record<string, unknown> = { ...options };
+  return invoke<WindowSnapshot>('plugin:vcp-mobile|capture_window_snapshot', args);
+}

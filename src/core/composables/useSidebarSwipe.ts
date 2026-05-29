@@ -12,7 +12,7 @@ export interface SidebarSwipeOptions {
 /**
  * 统一管理侧边栏滑动响应的组合式函数
  * 支持：
- * 1. global: 仅在侧边栏关闭时，从左滑向右开启左侧边栏，从右滑向左开启右侧边栏（避开滚动区域）
+ * 1. global: 仅在侧边栏/通知页关闭时，从左滑向右开启左侧边栏，从右滑向左开启通知页（避开滚动区域）
  * 2. left: 左侧边栏内部，向左滑关闭，或向右滑执行自定义 tab 切换行为
  * 3. right: 右侧边栏内部，向右滑关闭
  */
@@ -41,7 +41,7 @@ export function useSidebarSwipe(target: Ref<HTMLElement | null>, options: Sideba
           if (direction.value === 'right' && absX > 60) {
             layoutStore.setLeftDrawer(true);
           }
-          // 从右往左划 -> 开启右侧边栏
+          // 从右往左划 -> 开启通知页
           else if (direction.value === 'left' && absX > 60) {
             layoutStore.setRightDrawer(true);
           }

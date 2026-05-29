@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, watch } from 'vue';
 import { useThemeStore } from '../../core/stores/theme';
+import { useLayoutStore } from '../../core/stores/layout';
 
 const themeStore = useThemeStore();
+const layoutStore = useLayoutStore();
 const canvasRef = ref<HTMLCanvasElement | null>(null);
 
 let gl: WebGLRenderingContext | null = null;
@@ -23,6 +25,20 @@ const mousePos = { x: 0.5, y: 0.5 };
 const targetMousePos = { x: 0.5, y: 0.5 };
 let activeValue = 0.0;
 let targetActiveValue = 0.0;
+
+const shouldRender = () => !layoutStore.rightDrawerOpen && !document.hidden;
+
+const stopRenderLoop = () => {
+  if (animationFrameId) {
+    cancelAnimationFrame(animationFrameId);
+    animationFrameId = 0;
+  }
+};
+
+const startRenderLoop = () => {
+  if (animationFrameId || !shouldRender()) return;
+  animationFrameId = requestAnimationFrame(renderLoop);
+};
 
 // Vertex Shader: Renders a screen-filling quad
 const vsSource = `
@@ -147,10 +163,10 @@ const initWebGL = () => {
 
   gl = canvas.getContext('webgl', { 
     alpha: false, 
-    antialias: true,
+    antialias: false,
     depth: false,
     stencil: false,
-    powerPreference: 'high-performance'
+    powerPreference: 'low-power'
   });
 
   if (!gl) {
@@ -202,10 +218,12 @@ const initWebGL = () => {
   uIsDarkLoc = gl.getUniformLocation(program, 'u_is_dark');
 
   startTime = performance.now();
-  renderLoop();
+  startRenderLoop();
 };
 
 const renderLoop = () => {
+  animationFrameId = 0;
+  if (!shouldRender()) return;
   if (!gl || !program) return;
 
   const canvas = canvasRef.value;
@@ -270,7 +288,17 @@ const releaseInteraction = () => {
 
 let boundParent: HTMLElement | null = null;
 
+const syncRenderLoop = () => {
+  if (shouldRender()) {
+    startRenderLoop();
+  } else {
+    stopRenderLoop();
+  }
+};
+
 onMounted(() => {
+  document.addEventListener('visibilitychange', syncRenderLoop);
+
   // Let the browser settle before compiling shader
   setTimeout(() => {
     initWebGL();
@@ -306,9 +334,8 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
-  if (animationFrameId) {
-    cancelAnimationFrame(animationFrameId);
-  }
+  document.removeEventListener('visibilitychange', syncRenderLoop);
+  stopRenderLoop();
   
   if (resizeObserver) {
     resizeObserver.disconnect();
@@ -341,6 +368,8 @@ watch(() => themeStore.isDarkResolved, (isDark) => {
     gl.uniform1f(uIsDarkLoc, isDark ? 1.0 : 0.0);
   }
 });
+
+watch(() => layoutStore.rightDrawerOpen, syncRenderLoop);
 </script>
 
 <template>

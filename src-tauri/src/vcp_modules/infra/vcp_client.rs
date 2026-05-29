@@ -256,31 +256,47 @@ pub async fn perform_vcp_request<R: Runtime>(
                     if obj.get("type").and_then(|t| t.as_str()) == Some("local_file") {
                         if let Some(path_str) = obj.get("path").and_then(|p| p.as_str()) {
                             let clean_path = path_str.replace("file://", "");
+                            let display_name = obj
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .filter(|n| !n.is_empty())
+                                .unwrap_or(&clean_path);
                             let path_buf = std::path::PathBuf::from(&clean_path);
 
                             let mut converted = false;
                             if path_buf.exists() {
-                                // 提取扩展名决定 mime_type
+                                // 优先使用附件注册时记录的 MIME，后备才看扩展名。
+                                // Android 相册/文件选择器有时给的是无后缀临时文件名，仅靠扩展名会误判。
+                                let declared_mime =
+                                    obj.get("mime").and_then(|m| m.as_str()).unwrap_or("");
                                 let ext = path_buf
                                     .extension()
                                     .and_then(|e| e.to_str())
                                     .unwrap_or("")
                                     .to_lowercase();
-                                let (mime, part_type) = match ext.as_str() {
-                                    "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tiff"
-                                    | "tif" | "heic" | "heif" | "avif" | "ico" => {
-                                        ("image", "image_url")
+                                let media_kind = if declared_mime.starts_with("image/") {
+                                    "image"
+                                } else if declared_mime.starts_with("audio/") {
+                                    "audio"
+                                } else if declared_mime.starts_with("video/") {
+                                    "video"
+                                } else {
+                                    match ext.as_str() {
+                                        "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp"
+                                        | "tiff" | "tif" | "heic" | "heif" | "avif" | "ico" => {
+                                            "image"
+                                        }
+                                        "mp3" | "wav" | "ogg" | "flac" | "aac" | "m4a" | "opus"
+                                        | "wma" | "amr" | "aiff" | "aif" => "audio",
+                                        "mp4" | "mkv" | "webm" | "avi" | "mov" | "flv" | "m4v"
+                                        | "3gp" | "3g2" | "wmv" | "ts" | "mts" | "m2ts" | "qt" => {
+                                            "video"
+                                        }
+                                        _ => "application",
                                     }
-                                    "mp3" | "wav" | "ogg" | "flac" | "aac" | "m4a" | "opus"
-                                    | "wma" | "amr" | "aiff" | "aif" => ("audio", "input_audio"),
-                                    "mp4" | "mkv" | "webm" | "avi" | "mov" | "flv" | "m4v"
-                                    | "3gp" | "3g2" | "wmv" | "ts" | "mts" | "m2ts" | "qt" => {
-                                        ("video", "image_url")
-                                    }
-                                    _ => ("application", "file_url"), // 非多模态文件回退
                                 };
 
-                                if mime == "image" {
+                                if media_kind == "image" {
                                     // 图片类型：长边 > 1120px 时缩放，避免多模态 payload 过大
                                     let path_buf_clone = path_buf.clone();
                                     match tokio::task::spawn_blocking(move || {
@@ -290,8 +306,8 @@ pub async fn perform_vcp_request<R: Runtime>(
                                     {
                                         Ok(Ok(data_url)) => {
                                             new_parts.push(json!({
-                                                "type": part_type,
-                                                part_type: { "url": data_url }
+                                                "type": "image_url",
+                                                "image_url": { "url": data_url }
                                             }));
                                             converted = true;
                                         }
@@ -309,7 +325,7 @@ pub async fn perform_vcp_request<R: Runtime>(
                                             );
                                         }
                                     }
-                                } else if mime == "video" {
+                                } else if media_kind == "video" {
                                     // 视频：抽帧 → 每张帧作为 image_url
                                     let path_clone = path_buf.clone();
                                     match tokio::task::spawn_blocking(move || {
@@ -331,18 +347,18 @@ pub async fn perform_vcp_request<R: Runtime>(
                                             log::warn!("[VCPClient] Video processing task panicked: {}", e);
                                         }
                                     }
-                                } else if mime == "audio" {
-                                    // 音频：提取为 MP3 (32kbps) -> input_audio
+                                } else if media_kind == "audio" {
+                                    // 音频：提取为 WAV -> input_audio
                                     let path_clone = path_buf.clone();
                                     match tokio::task::spawn_blocking(move || {
                                         crate::vcp_modules::media_processor::process_audio_for_multimodal(&path_clone)
                                     }).await {
-                                        Ok(Ok(audio_url)) => {
+                                        Ok(Ok(audio)) => {
                                             new_parts.push(json!({
                                                 "type": "input_audio",
                                                 "input_audio": { 
-                                                    "data": audio_url, 
-                                                    "format": "mp3" // 修正为 mp3
+                                                    "data": audio.data,
+                                                    "format": audio.format
                                                 }
                                             }));
                                             converted = true;
@@ -361,7 +377,7 @@ pub async fn perform_vcp_request<R: Runtime>(
                             if !converted {
                                 new_parts.push(json!({
                                     "type": "text",
-                                    "text": format!("[附件文件: {}]", clean_path)
+                                    "text": format!("[附件文件: {}]", display_name)
                                 }));
                             }
                         }
@@ -523,7 +539,8 @@ pub async fn perform_vcp_request<R: Runtime>(
         let mut is_aborted = false;
         let mut abort_rx = abort_rx; // 取得所有权进入循环
         let mut aurora_buffer = AuroraBuffer::new();
-        let mut last_aurora_send = std::time::Instant::now();
+        let stream_render_interval = Duration::from_millis(100);
+        let mut last_aurora_render: Option<std::time::Instant> = None;
 
         // 辅助闭包：发送 Aurora 更新事件
         let send_aurora_update =
@@ -607,10 +624,15 @@ pub async fn perform_vcp_request<R: Runtime>(
 
                                                     if !text_chunk.is_empty() {
                                                         aurora_buffer.append_chunk(&text_chunk);
-                                                        let (stable_changed, tail_changed) = aurora_buffer.process_queue();
-                                                        if stable_changed || tail_changed || last_aurora_send.elapsed().as_millis() > 50 {
-                                                            send_aurora_update(&aurora_buffer, None, None);
-                                                            last_aurora_send = std::time::Instant::now();
+                                                        let should_render = last_aurora_render
+                                                            .as_ref()
+                                                            .map_or(true, |last| last.elapsed() >= stream_render_interval);
+                                                        if should_render {
+                                                            let (stable_changed, tail_changed) = aurora_buffer.process_queue();
+                                                            if stable_changed || tail_changed {
+                                                                send_aurora_update(&aurora_buffer, None, None);
+                                                                last_aurora_render = Some(std::time::Instant::now());
+                                                            }
                                                         }
                                                     }
 

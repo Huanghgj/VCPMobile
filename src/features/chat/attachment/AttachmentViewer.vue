@@ -152,7 +152,7 @@ const close = () => emit("close");
     >
       <!-- Toolbar -->
       <div
-        class="flex items-center justify-between px-4 pt-[calc(env(safe-area-inset-top,24px)+8px)] pb-3 bg-white/80 dark:bg-gray-900/80 border-b border-black/5 dark:border-white/5 shrink-0 shadow-sm z-10"
+        class="flex items-center justify-between px-4 pt-[calc(var(--vcp-safe-top,24px)+8px)] pb-3 bg-white/80 dark:bg-gray-900/80 border-b border-black/5 dark:border-white/5 shrink-0 shadow-sm z-10"
       >
         <div class="flex flex-col overflow-hidden mr-4 min-w-0">
           <span class="text-sm font-bold text-gray-800 dark:text-gray-200 truncate">{{
@@ -180,7 +180,7 @@ const close = () => emit("close");
 
       <!-- Main Content -->
       <div
-        class="flex-1 overflow-auto vcp-scrollable no-rubber-band pb-[env(safe-area-inset-bottom)]"
+        class="flex-1 overflow-auto vcp-scrollable no-rubber-band pb-[var(--vcp-safe-bottom,0px)]"
       >
         <!-- Text/Code/MD Viewer -->
         <div

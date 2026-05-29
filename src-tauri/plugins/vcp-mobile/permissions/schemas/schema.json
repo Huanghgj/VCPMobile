@@ -301,6 +301,18 @@
           "markdownDescription": "Allow all commands in vcp-mobile plugin"
         },
         {
+          "description": "Enables the capture_window_snapshot command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-capture-window-snapshot",
+          "markdownDescription": "Enables the capture_window_snapshot command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the capture_window_snapshot command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-capture-window-snapshot",
+          "markdownDescription": "Denies the capture_window_snapshot command without any pre-configured scope."
+        },
+        {
           "description": "Enables the check_all_permissions command without any pre-configured scope.",
           "type": "string",
           "const": "allow-check-all-permissions",
@@ -347,6 +359,18 @@
           "type": "string",
           "const": "deny-move-task-to-back",
           "markdownDescription": "Denies the move_task_to_back command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the open_file_native command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-open-file-native",
+          "markdownDescription": "Enables the open_file_native command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the open_file_native command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-open-file-native",
+          "markdownDescription": "Denies the open_file_native command without any pre-configured scope."
         },
         {
           "description": "Enables the pick_file command without any pre-configured scope.",

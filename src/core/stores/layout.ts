@@ -7,9 +7,34 @@ export const useLayoutStore = defineStore('layout', () => {
 
   const leftDrawerOpen = ref(false);
   const rightDrawerOpen = ref(false);
+  const rightDrawerPreparing = ref(false);
+  let rightDrawerRequestId = 0;
 
   const toggleLeftDrawer = () => setLeftDrawer(!leftDrawerOpen.value);
-  const toggleRightDrawer = () => setRightDrawer(!rightDrawerOpen.value);
+  const toggleRightDrawer = () => { void setRightDrawer(!rightDrawerOpen.value); };
+
+  const closeRightDrawer = () => {
+    rightDrawerRequestId++;
+    rightDrawerPreparing.value = false;
+    if (!rightDrawerOpen.value) return;
+
+    rightDrawerOpen.value = false;
+    unregisterModal('RightDrawer');
+  };
+
+  const openRightDrawer = () => {
+    if (rightDrawerOpen.value || rightDrawerPreparing.value) return;
+
+    const requestId = ++rightDrawerRequestId;
+    rightDrawerPreparing.value = true;
+    setLeftDrawer(false);
+
+    if (requestId === rightDrawerRequestId) {
+      rightDrawerOpen.value = true;
+      registerModal('RightDrawer', closeRightDrawer);
+    }
+    rightDrawerPreparing.value = false;
+  };
 
   const setLeftDrawer = (open: boolean) => {
     if (open === leftDrawerOpen.value) return;
@@ -20,28 +45,24 @@ export const useLayoutStore = defineStore('layout', () => {
       return;
     }
 
-    setRightDrawer(false);
+    void setRightDrawer(false);
     leftDrawerOpen.value = true;
     registerModal('LeftDrawer', () => { leftDrawerOpen.value = false; });
   };
 
-  const setRightDrawer = (open: boolean) => {
-    if (open === rightDrawerOpen.value) return;
-
+  const setRightDrawer = async (open: boolean) => {
     if (!open) {
-      rightDrawerOpen.value = false;
-      unregisterModal('RightDrawer');
+      closeRightDrawer();
       return;
     }
 
-    setLeftDrawer(false);
-    rightDrawerOpen.value = true;
-    registerModal('RightDrawer', () => { rightDrawerOpen.value = false; });
+    openRightDrawer();
   };
 
   return {
     leftDrawerOpen,
     rightDrawerOpen,
+    rightDrawerPreparing,
     toggleLeftDrawer,
     toggleRightDrawer,
     setLeftDrawer,

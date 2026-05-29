@@ -4,7 +4,10 @@ import android.app.Activity
 import android.content.Context
 import android.content.IntentFilter
 import android.content.res.Configuration
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.os.Build
+import android.util.Base64
 import android.webkit.WebView
 import androidx.appcompat.app.AppCompatActivity
 import app.tauri.annotation.Command
@@ -28,6 +31,12 @@ import androidx.core.content.ContextCompat
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.Invoke
 import com.vcp.mobile.service.StreamKeepaliveService
+import java.io.ByteArrayOutputStream
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.roundToInt
 
 @TauriPlugin(permissions = [
     Permission(strings = ["android.permission.POST_NOTIFICATIONS"], alias = "notification"),
@@ -192,6 +201,76 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
             Log.e(TAG, "getBatteryStatus failed", e)
             invoke.reject(e.message ?: "Unknown error")
         }
+    }
+
+    @Command
+    fun captureWindowSnapshot(invoke: Invoke) {
+        val args = try {
+            invoke.parseArgs(CaptureWindowSnapshotArgs::class.java)
+        } catch (_: Throwable) {
+            CaptureWindowSnapshotArgs()
+        }
+
+        val maxWidth = args.maxWidth.coerceIn(160, 420)
+        val quality = args.quality.coerceIn(45, 85)
+        val latch = CountDownLatch(1)
+        var resultObject: JSObject? = null
+        var errorMessage: String? = null
+
+        activity.runOnUiThread {
+            try {
+                val rootView = activity.window.decorView.rootView
+                val sourceWidth = rootView.width
+                val sourceHeight = rootView.height
+                if (sourceWidth <= 0 || sourceHeight <= 0) {
+                    throw IllegalStateException("View has invalid size: ${sourceWidth}x${sourceHeight}")
+                }
+
+                val scale = min(1f, maxWidth.toFloat() / sourceWidth.toFloat())
+                val outputWidth = max(1, (sourceWidth * scale).roundToInt())
+                val outputHeight = max(1, (sourceHeight * scale).roundToInt())
+                val snapshot = Bitmap.createBitmap(outputWidth, outputHeight, Bitmap.Config.RGB_565)
+                val canvas = Canvas(snapshot)
+                canvas.scale(scale, scale)
+                rootView.draw(canvas)
+
+                // Freeze-and-blur strategy: capture once at low resolution, then upscale in CSS.
+                // This avoids Android WebView's expensive live backdrop-filter sampling.
+                val encoded = ByteArrayOutputStream()
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    snapshot.compress(Bitmap.CompressFormat.WEBP_LOSSY, quality, encoded)
+                } else {
+                    @Suppress("DEPRECATION")
+                    snapshot.compress(Bitmap.CompressFormat.WEBP, quality, encoded)
+                }
+                snapshot.recycle()
+
+                val base64 = Base64.encodeToString(encoded.toByteArray(), Base64.NO_WRAP)
+                resultObject = JSObject().apply {
+                    put("dataUrl", "data:image/webp;base64,$base64")
+                    put("width", outputWidth)
+                    put("height", outputHeight)
+                }
+            } catch (e: Throwable) {
+                Log.e(TAG, "captureWindowSnapshot failed", e)
+                errorMessage = e.message ?: "captureWindowSnapshot failed"
+            } finally {
+                latch.countDown()
+            }
+        }
+
+        if (!latch.await(900, TimeUnit.MILLISECONDS)) {
+            invoke.reject("captureWindowSnapshot timed out")
+            return
+        }
+
+        val error = errorMessage
+        if (error != null) {
+            invoke.reject(error)
+            return
+        }
+
+        invoke.resolve(resultObject ?: JSObject())
     }
 
     // ==================================================================
@@ -569,4 +648,10 @@ class RequestPermissionArgs {
 @InvokeArg
 class OpenFileArgs {
     lateinit var path: String
+}
+
+@InvokeArg
+class CaptureWindowSnapshotArgs {
+    var maxWidth: Int = 260
+    var quality: Int = 68
 }

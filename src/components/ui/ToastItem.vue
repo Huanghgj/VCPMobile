@@ -69,15 +69,24 @@ const handleClick = () => {
     <div class="flex items-start gap-3 min-w-0 flex-1">
       <component :is="getIcon(toast.type)" :size="14" :class="getIconColor(toast.type)" class="mt-0.5 shrink-0 opacity-80" />
       <div class="flex flex-col min-w-0 flex-1">
-         <span class="text-[11px] font-bold text-primary-text leading-tight tracking-wide truncate">{{ toast.title }}</span>
-         
-         <div v-if="toast.isPreformatted" 
-           class="mt-1 p-1.5 bg-black/[0.04] dark:bg-black/25 rounded text-[8px] max-h-[60px] overflow-y-auto whitespace-pre-wrap break-all font-mono opacity-60 text-primary-text leading-normal select-text">
-           {{ toast.message }}
-         </div>
-         <p v-else-if="toast.message" class="text-[9.5px] text-primary-text opacity-50 break-words mt-0.5 leading-snug select-text">
-           {{ toast.message }}
-         </p>
+        <span class="text-[11px] font-bold text-primary-text leading-tight tracking-wide truncate">{{ toast.title }}</span>
+        <span v-if="toast.subtitle" class="text-[9px] text-primary-text opacity-40 leading-snug truncate mt-0.5">
+          {{ toast.subtitle }}
+        </span>
+        <div v-if="toast.tags && toast.tags.length > 0" class="flex gap-1 mt-1 overflow-hidden">
+          <span v-for="tag in toast.tags.slice(0, 3)" :key="tag"
+            class="text-[7.5px] font-bold px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-500/90 shrink-0">
+            {{ tag }}
+          </span>
+        </div>
+
+        <div v-if="toast.isPreformatted"
+          class="mt-1 p-1.5 bg-black/[0.04] dark:bg-black/25 rounded text-[8px] max-h-[60px] overflow-y-auto whitespace-pre-wrap break-all font-mono opacity-60 text-primary-text leading-normal select-text">
+          {{ toast.message }}
+        </div>
+        <p v-else-if="toast.message" class="text-[9.5px] text-primary-text opacity-50 break-words mt-0.5 leading-snug select-text">
+          {{ toast.message }}
+        </p>
       </div>
     </div>
 
@@ -87,4 +96,3 @@ const handleClick = () => {
     </button>
   </div>
 </template>
-

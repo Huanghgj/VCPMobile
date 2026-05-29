@@ -39,7 +39,7 @@ pub fn assemble_history_for_vcp(history: &[ChatMessage], is_group: bool) -> Vec<
                         if !text.is_empty() {
                             combined_text.push_str(&format!(
                                 "\n\n[附加文件: {}]\n{}\n[/附加文件结束: {}]",
-                                att.internal_path, text, att.name
+                                att.name, text, att.name
                             ));
                         }
                     }
@@ -58,33 +58,22 @@ pub fn assemble_history_for_vcp(history: &[ChatMessage], is_group: bool) -> Vec<
                             att.src.clone()
                         };
 
-                        // 注入路径标记，对齐桌面端逻辑，并无缝注入原始文件名
+                        // 文本说明只暴露文件名；真实路径仅作为 local_file sentinel 供发送前转码。
                         if is_image {
-                            combined_text.push_str(&format!(
-                                "\n\n[附加图片: {}] (文件名: {})",
-                                path, att.name
-                            ));
+                            combined_text.push_str(&format!("\n\n[附加图片: {}]", att.name));
                         } else {
-                            combined_text.push_str(&format!(
-                                "\n\n[附加文件: {}] (文件名: {})",
-                                path, att.name
-                            ));
+                            combined_text.push_str(&format!("\n\n[附加文件: {}]", att.name));
                         }
 
                         content_parts.push(json!({
                             "type": "local_file",
                             "path": path,
-                            "mime": mime
+                            "mime": mime,
+                            "name": att.name
                         }));
                     } else if att.extracted_text.is_none() {
                         // 既没有提取文本也不是多模态，仅做标记 (对齐桌面端 fallback)
-                        let path = if !att.internal_path.is_empty() {
-                            att.internal_path.clone()
-                        } else {
-                            att.src.clone()
-                        };
-                        combined_text
-                            .push_str(&format!("\n\n[附加文件: {}] (文件名: {})", path, att.name));
+                        combined_text.push_str(&format!("\n\n[附加文件: {}]", att.name));
                     }
                 }
             }

@@ -59,21 +59,42 @@ const statusDisplay = computed(() => {
   return { type: null, message: "未连接" };
 });
 
-const toggleConnection = async () => {
-  if (status.value.connected) {
+const configMessage = computed(() => {
+  if (!derivedWsUrl.value) return "请先设置核心连接 → VCPLog URL";
+  if (!derivedVcpKey.value) return "请先设置核心连接 → VCP WebSocket 鉴权 Key";
+  return "";
+});
+
+const rowDescription = computed(() => {
+  if (configMessage.value) return configMessage.value;
+  if (enabled.value && !status.value.connected && !loading.value) {
+    return status.value.last_error || "已启用，等待连接";
+  }
+  return statusDisplay.value.message;
+});
+
+const toggleConnection = async (nextEnabled?: boolean) => {
+  const shouldEnable = nextEnabled ?? !enabled.value;
+
+  if (!shouldEnable) {
     await stop();
     enabled.value = false;
-  } else {
-    if (!derivedWsUrl.value || !derivedVcpKey.value) {
-      return;
-    }
-    enabled.value = true;
     emit("save-request");
-    try {
-      await start(derivedWsUrl.value, derivedVcpKey.value, deviceName.value);
-    } catch (e) {
-      console.error("[Distributed] Start failed:", e);
-    }
+    return;
+  }
+
+  if (configMessage.value) {
+    return;
+  }
+
+  enabled.value = true;
+  emit("save-request");
+  try {
+    await start(derivedWsUrl.value, derivedVcpKey.value, deviceName.value);
+  } catch (e) {
+    enabled.value = false;
+    console.error("[Distributed] Start failed:", e);
+    emit("save-request");
   }
 };
 
@@ -96,12 +117,12 @@ watch(
 <template>
   <div class="space-y-5 px-1">
     <!-- 主开关 -->
-    <SettingsRow title="分布式节点" :description="statusDisplay.message">
+    <SettingsRow title="分布式节点" :description="rowDescription">
       <template #action>
         <SettingsSwitch
-          :model-value="status.connected"
+          :model-value="enabled"
           active-color="bg-purple-500"
-          :disabled="loading || (!derivedWsUrl && !status.connected)"
+          :disabled="loading || (!enabled && !!configMessage)"
           @update:model-value="toggleConnection"
         />
       </template>
@@ -137,10 +158,10 @@ watch(
         variant="secondary"
         size="sm"
         :loading="loading"
-        :disabled="!derivedWsUrl || !derivedVcpKey"
-        @click="toggleConnection"
+        :disabled="!enabled && !!configMessage"
+        @click="toggleConnection()"
       >
-        {{ status.connected ? "断开连接" : "连接" }}
+        {{ enabled ? "断开连接" : "连接" }}
       </SettingsActionButton>
     </div>
   </div>

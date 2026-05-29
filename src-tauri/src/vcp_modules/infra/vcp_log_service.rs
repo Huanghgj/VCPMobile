@@ -14,12 +14,13 @@ static HEARTBEAT_INTERVAL_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(15000);
 
 lazy_static::lazy_static! {
-static ref LOG_CONNECTION_ACTIVE: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
-static ref LOG_SENDER: Arc<tokio::sync::Mutex<Option<mpsc::UnboundedSender<Value>>>> = Arc::new(tokio::sync::Mutex::new(None));
-// 关键修复：保持 Sender 和一个 Receiver 都在生命周期内，防止通道因无接收者而被视为关闭
-static ref WS_URL_CHANNEL: (watch::Sender<Option<Url>>, watch::Receiver<Option<Url>>) = watch::channel(None);
-static ref CURRENT_LOG_STATUS: Arc<tokio::sync::RwLock<String>> = Arc::new(tokio::sync::RwLock::new("closed".to_string()));
-static ref HEARTBEAT_RESET_TX: Arc<tokio::sync::Mutex<Option<mpsc::Sender<()>>>> = Arc::new(tokio::sync::Mutex::new(None));
+    static ref LOG_CONNECTION_ACTIVE: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    static ref INFO_CONNECTION_ACTIVE: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    static ref LOG_SENDER: Arc<tokio::sync::Mutex<Option<mpsc::UnboundedSender<Value>>>> = Arc::new(tokio::sync::Mutex::new(None));
+    // 关键修复：保持 Sender 和一个 Receiver 都在生命周期内，防止通道因无接收者而被视为关闭
+    static ref WS_URL_CHANNEL: (watch::Sender<Option<Url>>, watch::Receiver<Option<Url>>) = watch::channel(None);
+    static ref CURRENT_LOG_STATUS: Arc<tokio::sync::RwLock<String>> = Arc::new(tokio::sync::RwLock::new("closed".to_string()));
+    static ref HEARTBEAT_RESET_TX: Arc<tokio::sync::Mutex<Option<mpsc::Sender<()>>>> = Arc::new(tokio::sync::Mutex::new(None));
 }
 
 #[tauri::command]
@@ -67,6 +68,22 @@ fn parse_log_url(url: &str, key: &str) -> Result<Url, String> {
     Url::parse(&url_with_key).map_err(|e| format!("Invalid URL: {}", e))
 }
 
+fn derive_info_url(log_url: &Url) -> Result<Url, String> {
+    let mut info_url = log_url.clone();
+    let path = info_url.path();
+
+    let info_path = if path.contains("/VCPlog/") {
+        path.replacen("/VCPlog/", "/vcpinfo/", 1)
+    } else if path.contains("/vcpinfo/") {
+        path.to_string()
+    } else {
+        return Err(format!("Cannot derive VCPInfo URL from path: {}", path));
+    };
+
+    info_url.set_path(&info_path);
+    Ok(info_url)
+}
+
 #[tauri::command]
 pub async fn init_vcp_log_connection(
     app: AppHandle,
@@ -91,6 +108,13 @@ pub async fn init_vcp_log_connection_internal<R: tauri::Runtime>(
 
     // Always send the new URL to the watch channel
     let _ = WS_URL_CHANNEL.0.send(Some(ws_url.clone()));
+
+    if !INFO_CONNECTION_ACTIVE.swap(true, Ordering::SeqCst) {
+        let h = app.clone();
+        tauri::async_runtime::spawn(async move {
+            start_vcp_info_listener(h).await;
+        });
+    }
 
     if LOG_CONNECTION_ACTIVE.swap(true, Ordering::SeqCst) {
         return Ok(());
@@ -430,4 +454,231 @@ async fn start_vcp_log_listener<R: tauri::Runtime>(app_handle: AppHandle<R>) {
     }
     LOG_CONNECTION_ACTIVE.store(false, Ordering::SeqCst);
     log::info!("[VCPLog] Listener task terminated, connection flag reset.");
+}
+
+async fn start_vcp_info_listener<R: tauri::Runtime>(app_handle: AppHandle<R>) {
+    let mut url_rx = WS_URL_CHANNEL.0.subscribe();
+    let mut retry_delay = Duration::from_millis(1000);
+
+    loop {
+        let log_url = {
+            let val = url_rx.borrow().clone();
+            match val {
+                Some(u) => u,
+                None => {
+                    if url_rx.changed().await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+            }
+        };
+
+        let info_url = match derive_info_url(&log_url) {
+            Ok(url) => url,
+            Err(e) => {
+                log::error!("[VCPInfo] Failed to derive URL: {}", e);
+                let _ = app_handle.emit(
+                    "vcp-system-event",
+                    serde_json::json!({
+                        "type": "vcp-info-status",
+                        "status": "error",
+                        "message": "VCPInfo URL 无法生成",
+                        "source": "VCPInfo"
+                    }),
+                );
+                tokio::select! {
+                    _ = url_rx.changed() => {},
+                    _ = sleep(retry_delay) => {},
+                }
+                retry_delay = (retry_delay * 2).min(Duration::from_secs(60));
+                continue;
+            }
+        };
+
+        let masked_url = if info_url.as_str().contains("VCP_Key=") {
+            let parts: Vec<&str> = info_url.as_str().split("VCP_Key=").collect();
+            format!("{}VCP_Key=********", parts[0])
+        } else {
+            info_url.to_string()
+        };
+        log::info!("[VCPInfo] Attempting to connect to {}...", masked_url);
+
+        let mut request = match info_url.as_str().into_client_request() {
+            Ok(req) => req,
+            Err(e) => {
+                log::error!("[VCPInfo] Failed to build request: {}", e);
+                let _ = app_handle.emit(
+                    "vcp-system-event",
+                    serde_json::json!({
+                        "type": "vcp-info-status",
+                        "status": "error",
+                        "message": "VCPInfo 请求异常",
+                        "source": "VCPInfo"
+                    }),
+                );
+                tokio::select! {
+                    _ = url_rx.changed() => {},
+                    _ = sleep(retry_delay) => {},
+                }
+                retry_delay = (retry_delay * 2).min(Duration::from_secs(60));
+                continue;
+            }
+        };
+
+        if let Some(host) = info_url.host_str() {
+            let host_with_port = if let Some(port) = info_url.port() {
+                format!("{}:{}", host, port)
+            } else {
+                host.to_string()
+            };
+            if let Ok(val) = host_with_port.parse() {
+                request.headers_mut().insert("Host", val);
+            }
+
+            let origin_scheme = match info_url.scheme() {
+                "wss" => "https",
+                _ => "http",
+            };
+            let origin = if let Some(port) = info_url.port() {
+                format!("{}://{}:{}", origin_scheme, host, port)
+            } else {
+                format!("{}://{}", origin_scheme, host)
+            };
+            if let Ok(val) = origin.parse() {
+                request.headers_mut().insert("Origin", val);
+            }
+        }
+
+        request.headers_mut().insert(
+            "User-Agent",
+            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36".parse().unwrap()
+        );
+
+        match tokio::time::timeout(Duration::from_secs(10), connect_async(request)).await {
+            Ok(connection_result) => match connection_result {
+                Ok((ws_stream, _)) => {
+                    retry_delay = Duration::from_millis(1000);
+                    log::info!("[VCPInfo] Connected successfully to {}", masked_url);
+
+                    let (mut ws_write, mut ws_read) = ws_stream.split();
+                    let _ = app_handle.emit(
+                        "vcp-system-event",
+                        serde_json::json!({
+                            "type": "vcp-info-status",
+                            "status": "open",
+                            "message": "VCPInfo 已连接",
+                            "source": "VCPInfo"
+                        }),
+                    );
+
+                    let mut heartbeat_timer = Box::pin(sleep(Duration::from_millis(30000)));
+
+                    loop {
+                        tokio::select! {
+                            _ = url_rx.changed() => {
+                                log::info!("[VCPInfo] URL changed, closing current connection.");
+                                break;
+                            }
+                            _ = &mut heartbeat_timer => {
+                                if let Err(e) = ws_write.send(Message::Ping(vec![].into())).await {
+                                    log::error!("[VCPInfo] Failed to send Ping: {}", e);
+                                    break;
+                                }
+                                heartbeat_timer.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(30000));
+                            }
+                            msg_result = ws_read.next() => {
+                                match msg_result {
+                                    Some(Ok(msg)) => {
+                                        if msg.is_text() {
+                                            let text = msg.to_text().unwrap_or_default();
+                                            match serde_json::from_str::<Value>(text) {
+                                                Ok(payload) => {
+                                                    if payload.get("type").and_then(Value::as_str) == Some("connection_ack") {
+                                                        continue;
+                                                    }
+                                                    let _ = app_handle.emit(
+                                                        "vcp-system-event",
+                                                        serde_json::json!({
+                                                            "type": "vcp-info-message",
+                                                            "source": "VCPInfo",
+                                                            "data": payload
+                                                        }),
+                                                    );
+                                                }
+                                                Err(_) => {
+                                                    let _ = app_handle.emit(
+                                                        "vcp-system-event",
+                                                        serde_json::json!({
+                                                            "type": "vcp-info-message",
+                                                            "source": "VCPInfo",
+                                                            "data": {
+                                                                "type": "raw_text",
+                                                                "message": text
+                                                            }
+                                                        }),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Some(Err(e)) => {
+                                        log::error!("[VCPInfo] WebSocket error during read: {}", e);
+                                        break;
+                                    }
+                                    None => {
+                                        log::warn!("[VCPInfo] Connection closed by server.");
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let _ = app_handle.emit(
+                        "vcp-system-event",
+                        serde_json::json!({
+                            "type": "vcp-info-status",
+                            "status": "closed",
+                            "message": "VCPInfo 已断开",
+                            "source": "VCPInfo"
+                        }),
+                    );
+                }
+                Err(e) => {
+                    log::error!("[VCPInfo] Connection Error: {}", e);
+                    let _ = app_handle.emit(
+                        "vcp-system-event",
+                        serde_json::json!({
+                            "type": "vcp-info-status",
+                            "status": "error",
+                            "message": "VCPInfo 连接错误",
+                            "source": "VCPInfo"
+                        }),
+                    );
+                }
+            },
+            Err(_) => {
+                log::error!("[VCPInfo] Connection timed out after 10 seconds.");
+                let _ = app_handle.emit(
+                    "vcp-system-event",
+                    serde_json::json!({
+                        "type": "vcp-info-status",
+                        "status": "error",
+                        "message": "VCPInfo 连接超时",
+                        "source": "VCPInfo"
+                    }),
+                );
+            }
+        }
+
+        tokio::select! {
+            _ = url_rx.changed() => log::info!("[VCPInfo] URL changed during retry wait."),
+            _ = sleep(retry_delay) => {},
+        }
+        retry_delay = (retry_delay * 2).min(Duration::from_secs(60));
+    }
+
+    INFO_CONNECTION_ACTIVE.store(false, Ordering::SeqCst);
+    log::info!("[VCPInfo] Listener task terminated, connection flag reset.");
 }

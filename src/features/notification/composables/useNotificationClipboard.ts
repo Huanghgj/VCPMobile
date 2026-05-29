@@ -7,9 +7,18 @@ export const useNotificationClipboard = () => {
   let copyTimer: ReturnType<typeof setTimeout> | null = null;
 
   const buildCopyText = (item: VcpNotification) => {
-    return item.rawPayload
-      ? JSON.stringify(item.rawPayload, null, 2)
-      : `${item.title}\n${item.message}`;
+    if (item.rawPayload) return JSON.stringify(item.rawPayload, null, 2);
+
+    const lines = [item.title];
+    if (item.subtitle) lines.push(item.subtitle);
+    if (item.message) lines.push('', item.message);
+    if (item.meta?.length) {
+      lines.push('', ...item.meta.map((entry) => `${entry.label}: ${entry.value}`));
+    }
+    if (item.details?.length) {
+      lines.push('', ...item.details.map((detail) => `${detail.label}:\n${detail.value}`));
+    }
+    return lines.join('\n');
   };
 
   const copyContent = async (item: VcpNotification) => {

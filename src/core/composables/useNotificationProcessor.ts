@@ -25,6 +25,566 @@ export interface FilterRule {
 export function useNotificationProcessor() {
   const store = useNotificationStore();
 
+  const stringifyCompact = (value: any, maxLength = 160) => {
+    if (value === null || typeof value === 'undefined') return '';
+    const text = typeof value === 'string' ? value : JSON.stringify(value);
+    return text.length > maxLength ? `${text.substring(0, maxLength)}...` : text;
+  };
+
+  const stringifyPretty = (value: any, maxLength = 5000) => {
+    if (value === null || typeof value === 'undefined') return '';
+    const text = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+    return text.length > maxLength ? `${text.substring(0, maxLength)}...` : text;
+  };
+
+  const hasDetailLabel = (details: NonNullable<VcpNotification['details']>, label: string) =>
+    details.some((detail) => detail.label === label);
+
+  const appendRawDataDetail = (
+    details: NonNullable<VcpNotification['details']>,
+    data: any,
+    payload: any,
+  ) => {
+    const knownKeys = new Set([
+      'type',
+      'message',
+      'timestamp',
+      'dbName',
+      'query',
+      'k',
+      'results',
+      'useTime',
+      'useGroup',
+      'useRerank',
+      'useRerankPlus',
+      'useGeodesicRerank',
+      'useExpand',
+      'useAssociate',
+      'useTagMemo',
+      'rrfAlpha',
+      'geoAlpha',
+      'tagWeight',
+      'associateCount',
+      'coreTags',
+      'timeRanges',
+      'tagStats',
+      'chainName',
+      'totalStages',
+      'stages',
+      'fromCache',
+      'activatedGroups',
+      'kSequence',
+      'agentName',
+      'sessionId',
+      'response',
+      'dreamId',
+      'seedCount',
+      'associationCount',
+      'recentSeedsCount',
+      'midSeedsCount',
+      'deepRecallsCount',
+      'narrative',
+      'summary',
+      'seeds',
+      'associations',
+      'operations',
+      'operationLog',
+      'action',
+      'source',
+      'pluginName',
+      'status',
+      'requestId',
+      'prompt',
+      'result',
+      'content',
+      'error',
+    ]);
+    const extras = Object.entries(data || {}).filter(([key]) => !knownKeys.has(key));
+
+    if (extras.length && !hasDetailLabel(details, '额外字段')) {
+      details.push({
+        label: '额外字段',
+        value: stringifyPretty(Object.fromEntries(extras), 3000),
+        mono: true,
+        multiline: true,
+      });
+    }
+
+    if (!hasDetailLabel(details, '原始数据')) {
+      details.push({
+        label: '原始数据',
+        value: stringifyPretty(payload, 6000),
+        mono: true,
+        multiline: true,
+      });
+    }
+  };
+
+  const normalizeList = (value: any, max = 4) => {
+    if (!Array.isArray(value)) return [];
+    return value
+      .map((item) => String(item))
+      .filter(Boolean)
+      .slice(0, max);
+  };
+
+  const formatScore = (value: any) => {
+    const num = Number(value);
+    if (!Number.isFinite(num)) return '';
+    if (Math.abs(num) <= 1) return num.toFixed(3);
+    return num.toFixed(2);
+  };
+
+  const formatMetric = (label: string, value: any) => {
+    const formatted = formatScore(value);
+    return formatted ? `${label} ${formatted}` : '';
+  };
+
+  const estimateDistanceFromScore = (result: any) => {
+    if (typeof result?.distance !== 'undefined') return '';
+    const score = Number(result?.score);
+    if (!Number.isFinite(score) || score <= 0) return '';
+    return formatMetric('dist≈', (1 / score) - 1);
+  };
+
+  const formatTime = (value: any) => {
+    if (typeof value !== 'string' || value.length < 16) return '';
+    return value.substring(11, 19);
+  };
+
+  const compactLines = (lines: string[], maxLength = 900) => {
+    const text = lines.filter(Boolean).join('\n');
+    return text.length > maxLength ? `${text.substring(0, maxLength)}...` : text;
+  };
+
+  const resultText = (result: any, maxLength = 140) => stringifyCompact(
+    result?.text || result?.content || result?.file || result?.sourceFile || result?.fullPath || result?.title || result,
+    maxLength
+  );
+
+  const resultMetrics = (result: any) => [
+    formatMetric('score', result?.score),
+    formatMetric('rerank', result?.rerank_score),
+    formatMetric('rrf', result?.rrf_score),
+    formatMetric('knn', result?.original_knn_score),
+    formatMetric('geo', result?.geo_score),
+    formatMetric('nGeo', result?.normalized_geo),
+    formatMetric('dist', result?.distance),
+    estimateDistanceFromScore(result),
+    formatMetric('orig', result?.original_score ?? result?.originalScore),
+    formatMetric('tag', result?.tagMatchScore),
+    formatMetric('boost', result?.boostFactor),
+    formatMetric('decay', result?.decay_factor),
+    typeof result?.diff_days !== 'undefined' ? `age ${result.diff_days}d` : '',
+    typeof result?.geo_hit_count !== 'undefined' ? `geoHits ${result.geo_hit_count}` : '',
+    typeof result?.retrieval_rank !== 'undefined' ? `retrieval#${result.retrieval_rank}` : '',
+    typeof result?.rerank_rank !== 'undefined' ? `rerank#${result.rerank_rank}` : '',
+    typeof result?.tagMatchCount !== 'undefined' ? `tagCount ${result.tagMatchCount}` : '',
+    typeof result?.associateCoCount !== 'undefined' ? `co ${result.associateCoCount}` : '',
+    typeof result?.originalChunkCount !== 'undefined' ? `chunks ${result.originalChunkCount}` : '',
+  ].filter(Boolean).join(' · ');
+
+  const formatResultLine = (result: any, index: number) => {
+    const source = result?.source || 'memory';
+    const metrics = resultMetrics(result);
+    const tags = [
+      ...normalizeList(result?.matchedTags, 4),
+      ...normalizeList(result?.coreTagsMatched, 4),
+    ];
+    const tagText = tags.length ? ` [${tags.join(', ')}]` : '';
+    return `${index + 1}. ${source}${metrics ? ` · ${metrics}` : ''}${tagText}\n${resultText(result, 180)}`;
+  };
+
+  const metricPair = (label: string, value: any) => {
+    const formatted = formatScore(value);
+    return formatted ? { label, value: formatted } : null;
+  };
+
+  const compactFileName = (value: any) => {
+    const text = String(value || '');
+    if (!text) return '';
+    const parts = text.split(/[\\/]/);
+    return parts[parts.length - 1] || text;
+  };
+
+  const resultStructuredMetrics = (result: any) => [
+    metricPair('score', result?.score),
+    metricPair('rerank', result?.rerank_score),
+    metricPair('rrf', result?.rrf_score),
+    metricPair('dist', result?.distance),
+    metricPair('geo', result?.geo_score),
+    metricPair('tag', result?.tagMatchScore),
+    metricPair('boost', result?.boostFactor),
+  ].filter(Boolean) as { label: string; value: string }[];
+
+  const buildRagRows = (results: any[]) => results.slice(0, 6).map((result, index) => {
+    const sourceFile = compactFileName(result?.sourceFile || result?.fullPath || result?.file);
+    const chips = [
+      result?.source ? String(result.source) : 'memory',
+      typeof result?.retrieval_rank !== 'undefined' ? `retrieval#${result.retrieval_rank}` : '',
+      typeof result?.rerank_rank !== 'undefined' ? `rerank#${result.rerank_rank}` : '',
+      ...normalizeList(result?.matchedTags, 3),
+      ...normalizeList(result?.coreTagsMatched, 2),
+    ].filter(Boolean);
+
+    return {
+      title: sourceFile ? `${index + 1}. ${sourceFile}` : `${index + 1}. ${result?.source || 'memory'}`,
+      subtitle: typeof result?.chunkId !== 'undefined' ? `Chunk ${result.chunkId}` : undefined,
+      body: resultText(result, 260),
+      chips,
+      metrics: resultStructuredMetrics(result),
+    };
+  });
+
+  const buildStageRows = (stages: any[]) => stages.slice(0, 6).map((stage, index) => {
+    const stageLabel = stage.stageName || stage.name || stage.clusterName || `Stage ${stage.stage || index + 1}`;
+    const chips = [
+      typeof stage.resultCount !== 'undefined' ? `命中 ${stage.resultCount}` : '',
+      typeof stage.k !== 'undefined' ? `K ${stage.k}` : '',
+      stage.error ? 'error' : '',
+    ].filter(Boolean);
+    return {
+      title: `${index + 1}. ${stageLabel}`,
+      body: stringifyCompact(stage.summary || stage.query || stage.error || stage, 260),
+      chips,
+      metrics: [],
+    };
+  });
+
+  const stageCount = (data: any) => String(data.totalStages ?? data.stages?.length ?? 0);
+
+  const detailIsHeavy = (detail: NonNullable<VcpNotification['details']>[number]) =>
+    detail.label === '原始数据' || detail.label === '额外字段';
+
+  const buildVcpInfoNotification = (payload: any): Partial<VcpNotification> => {
+    const data = payload.data || payload;
+    const infoType = String(data.type || 'VCP_INFO');
+    const meta: NonNullable<VcpNotification['meta']> = [];
+    const details: NonNullable<VcpNotification['details']> = [];
+    const tags = ['VCPInfo'];
+    let title = 'VCPInfo';
+    let subtitle = infoType;
+    let message = data.message || '';
+    let type: VcpNotification['type'] = 'info';
+    let category = 'VCPInfo';
+    let duration = 9000;
+    let historyOnly = false;
+    let structured: VcpNotification['structured'] | undefined;
+
+    const timestamp = formatTime(data.timestamp);
+    if (timestamp) meta.push({ label: '时间', value: timestamp });
+
+    switch (infoType) {
+      case 'RAG_RETRIEVAL_DETAILS': {
+        type = 'tool';
+        category = 'RAG';
+        title = `RAG 召回 · ${data.dbName || '日记本'}`;
+        subtitle = data.query ? String(data.query) : '语义记忆召回详情';
+        const results = Array.isArray(data.results) ? data.results : [];
+        const top = results[0];
+        const modeTags = [
+          data.useTime ? 'Time' : '',
+          data.useGroup ? 'Group' : '',
+          data.useRerank ? 'Rerank' : '',
+          data.useRerankPlus ? 'RRF' : '',
+          data.useGeodesicRerank ? 'Geo' : '',
+          data.useExpand ? 'Expand' : '',
+          data.useAssociate ? 'Associate' : '',
+          data.useTagMemo ? 'TagMemo' : '',
+        ].filter(Boolean);
+        tags.push(...modeTags);
+        meta.push({ label: 'K', value: String(data.k ?? results.length) });
+        meta.push({ label: '命中', value: String(results.length) });
+        if (typeof data.rrfAlpha !== 'undefined') meta.push({ label: 'RRF α', value: String(data.rrfAlpha) });
+        if (typeof data.geoAlpha !== 'undefined') meta.push({ label: 'Geo α', value: String(data.geoAlpha) });
+        if (typeof data.tagWeight !== 'undefined') meta.push({ label: 'Tag 权重', value: String(data.tagWeight) });
+        if (typeof data.associateCount !== 'undefined') {
+          meta.push({ label: '联想', value: String(data.associateCount) });
+        }
+        if (Array.isArray(data.coreTags) && data.coreTags.length) {
+          details.push({ label: '核心标签', value: normalizeList(data.coreTags, 8).join(' · ') });
+        }
+        if (Array.isArray(data.timeRanges) && data.timeRanges.length) {
+          details.push({
+            label: '时间范围',
+            value: data.timeRanges
+              .slice(0, 4)
+              .map((range: any) => `${stringifyCompact(range.start, 32)} → ${stringifyCompact(range.end, 32)}`)
+              .join('\n'),
+            multiline: true,
+          });
+        }
+        if (data.tagStats) {
+          const tagStats = data.tagStats;
+          const tagStatsLines = [
+            typeof tagStats.totalTagMatches !== 'undefined' ? `匹配标签数: ${tagStats.totalTagMatches}` : '',
+            typeof tagStats.resultsWithTags !== 'undefined' ? `带标签结果: ${tagStats.resultsWithTags}` : '',
+            typeof tagStats.avgBoostFactor !== 'undefined' ? `平均 Boost: ${tagStats.avgBoostFactor}` : '',
+            Array.isArray(tagStats.uniqueMatchedTags) && tagStats.uniqueMatchedTags.length
+              ? `标签: ${normalizeList(tagStats.uniqueMatchedTags, 12).join(' · ')}`
+              : '',
+          ].filter(Boolean);
+          if (tagStatsLines.length) details.push({ label: 'Tag 统计', value: tagStatsLines.join('\n'), multiline: true });
+        }
+        if (top) {
+          const metrics = resultMetrics(top);
+          message = `${top.source || 'memory'}${metrics ? ` · ${metrics}` : ''}: ${resultText(top, 220)}`;
+          details.push({
+            label: 'Top Hit 指标',
+            value: compactLines([
+              top.sourceFile || top.fullPath ? `文件: ${top.sourceFile || top.fullPath}` : '',
+              typeof top.chunkId !== 'undefined' ? `Chunk: ${top.chunkId}` : '',
+              metrics,
+            ], 520),
+            multiline: true,
+          });
+          details.push({
+            label: 'Top Hit 内容',
+            value: resultText(top, 520),
+            multiline: true,
+          });
+        } else {
+          message = '没有召回可展示的条目。';
+        }
+        if (results.length) {
+          details.push({
+            label: '召回列表',
+            value: compactLines(results.slice(0, 8).map(formatResultLine), 1800),
+            multiline: true,
+          });
+        }
+        structured = {
+          kind: 'rag',
+          summary: `${data.dbName || 'DailyNote'} · ${results.length} 条命中 · ${data.query || 'RAG 检索'}`,
+          rows: buildRagRows(results),
+        };
+        historyOnly = true;
+        break;
+      }
+      case 'META_THINKING_CHAIN': {
+        type = 'tool';
+        category = 'Meta';
+        title = `元思考链 · ${data.chainName || 'default'}`;
+        subtitle = data.query ? String(data.query) : 'Meta Thinking 执行详情';
+        tags.push('MetaThinking');
+        meta.push({ label: '阶段', value: String(data.totalStages ?? data.stages?.length ?? 0) });
+        if (typeof data.fromCache !== 'undefined') meta.push({ label: '缓存', value: data.fromCache ? '是' : '否' });
+        const groups = normalizeList(data.activatedGroups, 4);
+        if (groups.length) meta.push({ label: '分组', value: groups.join(', ') });
+        if (Array.isArray(data.kSequence)) meta.push({ label: 'K序列', value: data.kSequence.join('→') });
+        const firstStage = Array.isArray(data.stages) ? data.stages[0] : null;
+        message = firstStage
+          ? stringifyCompact(firstStage.summary || firstStage.query || firstStage.stageName || firstStage, 220)
+          : '元思考链已完成。';
+        if (Array.isArray(data.stages)) {
+          details.push({
+            label: '阶段摘要',
+            value: data.stages
+              .slice(0, 4)
+              .map((stage: any, index: number) => {
+                const stageLabel = stage.stageName || stage.name || stage.clusterName || `Stage ${stage.stage || index + 1}`;
+                const count = typeof stage.resultCount !== 'undefined' ? ` · 命中 ${stage.resultCount}` : '';
+                return `${index + 1}. ${stageLabel}${count}\n${stringifyCompact(stage.query || stage.summary || stage, 160)}`;
+              })
+              .join('\n'),
+            multiline: true,
+          });
+          const stageResults = data.stages
+            .slice(0, 3)
+            .flatMap((stage: any, stageIndex: number) => {
+              const results = Array.isArray(stage.results) ? stage.results : [];
+              return results.slice(0, 3).map((result: any, resultIndex: number) => {
+                const prefix = `S${stage.stage || stageIndex + 1}.${resultIndex + 1}`;
+                return `${prefix} ${resultMetrics(result)}\n${resultText(result, 160)}`;
+              });
+            });
+          if (stageResults.length) {
+            details.push({
+              label: '阶段命中',
+              value: compactLines(stageResults, 1400),
+              multiline: true,
+            });
+          }
+        }
+        structured = {
+          kind: 'thinking',
+          summary: `${stageCount(data)} 个阶段 · ${data.chainName || 'Meta Thinking'}`,
+          rows: buildStageRows(Array.isArray(data.stages) ? data.stages : []),
+        };
+        historyOnly = true;
+        break;
+      }
+      case 'AGENT_PRIVATE_CHAT_PREVIEW': {
+        type = 'agent';
+        category = 'Agent';
+        title = `私聊预览 · ${data.agentName || 'Agent'}`;
+        subtitle = data.sessionId ? `Session ${data.sessionId}` : 'AgentAssistant';
+        tags.push('Agent');
+        message = stringifyCompact(data.response || data.message || '', 240);
+        if (data.sessionId) meta.push({ label: 'Session', value: String(data.sessionId) });
+        if (data.agentName) meta.push({ label: 'Agent', value: String(data.agentName) });
+        if (data.query) details.push({ label: '请求', value: String(data.query), multiline: true });
+        if (data.response) details.push({ label: '回复', value: String(data.response), multiline: true });
+        structured = {
+          kind: 'private_chat',
+          summary: `${data.agentName || 'Agent'} · ${data.sessionId || '临时会话'}`,
+          rows: [
+            {
+              title: '请求',
+              body: stringifyCompact(data.query || data.message || '', 320),
+              chips: data.sessionId ? [`Session ${data.sessionId}`] : [],
+            },
+            {
+              title: '回复',
+              body: stringifyCompact(data.response || '', 420),
+              chips: data.agentName ? [String(data.agentName)] : [],
+            },
+          ].filter((row) => row.body),
+        };
+        break;
+      }
+      case 'AGENT_DREAM_START':
+      case 'AGENT_DREAM_ASSOCIATIONS':
+      case 'AGENT_DREAM_NARRATIVE':
+      case 'AGENT_DREAM_OPERATIONS':
+      case 'AGENT_DREAM_END': {
+        type = 'agent';
+        category = 'Dream';
+        title = `梦境 · ${data.agentName || 'Agent'}`;
+        subtitle = infoType.replace('AGENT_DREAM_', '').toLowerCase();
+        tags.push('Dream');
+        if (data.dreamId) meta.push({ label: 'Dream', value: String(data.dreamId) });
+        if (typeof data.seedCount !== 'undefined') meta.push({ label: '种子', value: String(data.seedCount) });
+        if (typeof data.associationCount !== 'undefined') meta.push({ label: '联想', value: String(data.associationCount) });
+        if (typeof data.recentSeedsCount !== 'undefined') meta.push({ label: '近期', value: String(data.recentSeedsCount) });
+        if (typeof data.midSeedsCount !== 'undefined') meta.push({ label: '中期', value: String(data.midSeedsCount) });
+        if (typeof data.deepRecallsCount !== 'undefined') meta.push({ label: '深层', value: String(data.deepRecallsCount) });
+        const associations = Array.isArray(data.associations) ? data.associations : [];
+        message = stringifyCompact(data.narrative || data.summary || data.message || (associations.length ? `${associations.length} 条联想召回` : '梦境事件更新'), 240);
+        if (Array.isArray(data.seeds) && data.seeds.length) {
+          details.push({
+            label: '种子',
+            value: data.seeds.slice(0, 5).map((item: any) => `${item.file || item.title || 'seed'}: ${stringifyCompact(item.snippet || item.content || item, 110)}`).join('\n'),
+            multiline: true,
+          });
+        }
+        if (associations.length) {
+          details.push({
+            label: '联想',
+            value: associations.slice(0, 8).map((item: any) => {
+              const score = formatMetric('score', item.score);
+              return `${item.file || item.title || 'association'}${score ? ` · ${score}` : ''}: ${stringifyCompact(item.content || item.snippet || item, 100)}`;
+            }).join('\n'),
+            multiline: true,
+          });
+        }
+        if (data.operations || data.operationLog) {
+          details.push({
+            label: '操作',
+            value: stringifyCompact(data.operations || data.operationLog, 900),
+            multiline: true,
+          });
+        }
+        structured = {
+          kind: 'dream',
+          summary: `${data.agentName || 'Agent'} · ${infoType.replace('AGENT_DREAM_', '').toLowerCase()}`,
+          rows: [
+            {
+              title: subtitle,
+              body: stringifyCompact(data.narrative || data.summary || data.message || data.error || '', 360),
+              chips: [
+                data.dreamId ? String(data.dreamId) : '',
+                typeof data.seedCount !== 'undefined' ? `种子 ${data.seedCount}` : '',
+                typeof data.associationCount !== 'undefined' ? `联想 ${data.associationCount}` : '',
+                typeof data.operationCount !== 'undefined' ? `操作 ${data.operationCount}` : '',
+              ].filter(Boolean),
+            },
+            ...associations.slice(0, 4).map((item: any, index: number) => ({
+              title: compactFileName(item.file || item.title) || `联想 ${index + 1}`,
+              body: stringifyCompact(item.content || item.snippet || item, 180),
+              metrics: metricPair('score', item.score) ? [metricPair('score', item.score)!] : [],
+            })),
+          ].filter((row) => row.body || row.chips?.length),
+        };
+        break;
+      }
+      case 'DailyNote': {
+        type = 'success';
+        category = 'DailyNote';
+        title = `日记召回 · ${data.dbName || 'DailyNote'}`;
+        subtitle = data.action ? String(data.action) : 'DailyNote';
+        tags.push('DailyNote');
+        message = data.message || JSON.stringify(data);
+        if (data.dbName) meta.push({ label: '日记本', value: String(data.dbName) });
+        if (data.action) meta.push({ label: '动作', value: String(data.action) });
+        if (data.fromCache) meta.push({ label: '缓存', value: '是' });
+        if (data.error) details.push({ label: '错误', value: String(data.error), multiline: true });
+        break;
+      }
+      default: {
+        category = data.source ? String(data.source) : 'Other';
+        if (data.source) meta.push({ label: '来源', value: String(data.source) });
+        if (data.agentName) meta.push({ label: 'Agent', value: String(data.agentName) });
+        if (data.pluginName) meta.push({ label: '插件', value: String(data.pluginName) });
+        if (data.status) meta.push({ label: '状态', value: String(data.status) });
+        if (data.sessionId) meta.push({ label: 'Session', value: String(data.sessionId) });
+        if (data.requestId) meta.push({ label: 'Request', value: String(data.requestId) });
+        for (const key of ['query', 'prompt', 'response', 'result', 'content', 'summary', 'error']) {
+          if (typeof data[key] !== 'undefined') {
+            details.push({
+              label: key,
+              value: stringifyCompact(data[key], 900),
+              multiline: true,
+            });
+          }
+        }
+        title = data.source ? `VCPInfo · ${data.source}` : `VCPInfo · ${infoType}`;
+        if (!message) {
+          message = stringifyCompact(data.summary || data.content || data.response || data.query || data, 260);
+        }
+        type = String(data.type).toLowerCase() === 'warning' ? 'warning' : type;
+        structured = {
+          kind: 'generic',
+          summary: infoType,
+          rows: Object.entries(data || {})
+            .filter(([key]) => !['type', 'timestamp'].includes(key))
+            .slice(0, 6)
+            .map(([key, value]) => ({
+              title: key,
+              body: stringifyCompact(value, 260),
+            })),
+        };
+      }
+    }
+
+    appendRawDataDetail(details, data, payload);
+    const sortedDetails = [
+      ...details.filter((detail) => !detailIsHeavy(detail)),
+      ...details.filter(detailIsHeavy),
+    ];
+
+    const result: Partial<VcpNotification> = {
+      id: `vcp-info-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      title,
+      subtitle: String(subtitle),
+      message: String(message || 'VCPInfo 事件'),
+      type,
+      source: 'VCPInfo',
+      category,
+      infoType,
+      tags,
+      meta,
+      details: sortedDetails,
+      structured,
+      duration,
+      rawPayload: payload,
+      silent: false,
+      historyOnly,
+    };
+
+    return result;
+  };
+
   /**
    * 全局消息过滤引擎 (对标桌面端 filterManager.js)
    * 允许根据标题、内容或原始负载拦截/修改消息展示行为
@@ -105,6 +665,14 @@ export function useNotificationProcessor() {
 
       // 彻底静默连接状态通知
       return { silent: true };
+    }
+
+    if (payload.type === 'vcp-info-status') {
+      return { silent: true };
+    }
+
+    if (payload.type === 'vcp-info-message') {
+      return buildVcpInfoNotification(payload);
     }
 
     // --- 核心引擎状态处理 (P0 级别) ---
@@ -299,6 +867,8 @@ export function useNotificationProcessor() {
       title,
       message,
       type,
+      category: payload?.type ? String(payload.type) : type,
+      infoType: payload?.type ? String(payload.type) : undefined,
       isPreformatted,
       duration: filterResult.duration ?? duration,
       actions,

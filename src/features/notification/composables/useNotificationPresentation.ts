@@ -1,45 +1,120 @@
-import { computed } from 'vue';
-import { Info, CheckCircle, AlertTriangle, X, Cpu, User } from 'lucide-vue-next';
+import { format, formatDistanceToNow, isToday, isYesterday } from 'date-fns';
+import { zhCN } from 'date-fns/locale';
 import type { VcpNotification } from '../../../core/stores/notification';
 
 export function useNotificationPresentation() {
-  const iconMap = computed<Record<string, any>>(() => ({
-    success: CheckCircle,
-    warning: AlertTriangle,
-    error: X,
-    tool: Cpu,
-    agent: User,
-    info: Info
-  }));
+  const formatTime = (timestamp: number): string => {
+    const date = new Date(timestamp);
+    if (isToday(date)) {
+      return format(date, 'HH:mm:ss');
+    }
+    if (isYesterday(date)) {
+      return `昨天 ${format(date, 'HH:mm')}`;
+    }
+    return format(date, 'yyyy-MM-dd HH:mm');
+  };
 
-  const colorMap = {
-    success: 'text-green-500',
-    warning: 'text-amber-500',
-    error: 'text-red-500',
-    tool: 'text-purple-500',
-    agent: 'text-blue-500',
-    info: 'text-blue-400'
-  } as const;
+  const formatRelativeTime = (timestamp: number): string => {
+    try {
+      return formatDistanceToNow(new Date(timestamp), { addSuffix: true, locale: zhCN });
+    } catch (e) {
+      return '';
+    }
+  };
 
-  const getIcon = (type: VcpNotification['type']) => (iconMap.value as any)[type] ?? Info;
+  const getDistance = (item: any): { value: string; isEstimated: boolean } | null => {
+    if (!item) return null;
 
-  const getTypeColor = (type: VcpNotification['type']) => (colorMap as any)[type] ?? colorMap.info;
-  const getActionButtonClass = (action: { label: string; color: string }) => {
-    const isGreen = action.label === '允许' || action.label === 'Approve' || action.color?.includes('green');
-    const isRed = action.label === '拒绝' || action.label === 'Deny' || action.color?.includes('red');
-    const toneClass = isGreen ? 'bg-green-600' : isRed ? 'bg-red-600' : action.color;
+    if (typeof item.distance === 'number') {
+      return { value: item.distance.toFixed(4), isEstimated: false };
+    }
+    if (typeof item.normalized_geo === 'number') {
+      return { value: item.normalized_geo.toFixed(4), isEstimated: false };
+    }
 
-    return [
-      toneClass,
-      'px-2.5 py-1 text-[9.5px] rounded-md text-white font-medium',
-      'hover:opacity-90 active:scale-95',
-      'transition-all duration-100'
-    ];
+    const score = item.score ?? item.rerank_score ?? item.original_score ?? item.rrf_score;
+    if (typeof score === 'number' && score > 0) {
+      const est = (1 / score) - 1;
+      return { value: est.toFixed(4), isEstimated: true };
+    }
+
+    return null;
+  };
+
+  const getTypeColor = (type: VcpNotification['type']) => {
+    switch (type) {
+      case 'error':
+        return {
+          text: 'text-rose-600',
+          bg: 'bg-rose-50',
+          border: 'border-rose-100',
+          dot: 'bg-rose-500'
+        };
+      case 'warning':
+        return {
+          text: 'text-amber-600',
+          bg: 'bg-amber-50',
+          border: 'border-amber-100',
+          dot: 'bg-amber-500'
+        };
+      case 'success':
+        return {
+          text: 'text-emerald-600',
+          bg: 'bg-emerald-50',
+          border: 'border-emerald-100',
+          dot: 'bg-emerald-500'
+        };
+      case 'tool':
+        return {
+          text: 'text-sky-600',
+          bg: 'bg-sky-50',
+          border: 'border-sky-100',
+          dot: 'bg-sky-400'
+        };
+      case 'agent':
+        return {
+          text: 'text-purple-600',
+          bg: 'bg-purple-50',
+          border: 'border-purple-100',
+          dot: 'bg-purple-400'
+        };
+      case 'info':
+      default:
+        return {
+          text: 'text-slate-600',
+          bg: 'bg-slate-50',
+          border: 'border-slate-100',
+          dot: 'bg-slate-400'
+        };
+    }
+  };
+
+  const copyToClipboard = async (text: string): Promise<boolean> => {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+      const textArea = document.createElement('textarea');
+      textArea.value = text;
+      textArea.style.position = 'fixed';
+      textArea.style.opacity = '0';
+      document.body.appendChild(textArea);
+      textArea.focus();
+      textArea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textArea);
+      return true;
+    } catch (err) {
+      return false;
+    }
   };
 
   return {
-    getIcon,
+    formatTime,
+    formatRelativeTime,
+    getDistance,
     getTypeColor,
-    getActionButtonClass
+    copyToClipboard
   };
-};
+}

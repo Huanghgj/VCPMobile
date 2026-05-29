@@ -1,6 +1,7 @@
 import { defineStore, acceptHMRUpdate } from 'pinia';
 import { onScopeDispose, ref, watch } from 'vue';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { isTauriRuntime } from '../utils/runtime';
 
 export type ThemeMode = 'light' | 'dark' | 'system';
 
@@ -242,16 +243,18 @@ export const useThemeStore = defineStore('theme', () => {
   // Listen for theme updates from backend
   // Store the promise so onScopeDispose can clean up even if the listener
   // hasn't resolved yet (avoids dangling listeners on hot reload / scope disposal)
-  const unlistenThemePromise = listen('onThemeUpdated', (event) => {
-    const fileName = event.payload as string;
-    if (fileName !== currentTheme.value) {
-      applyThemeFile(fileName);
-    }
-  });
+  const unlistenThemePromise = isTauriRuntime()
+    ? listen('onThemeUpdated', (event) => {
+        const fileName = event.payload as string;
+        if (fileName !== currentTheme.value) {
+          applyThemeFile(fileName);
+        }
+      })
+    : null;
 
   onScopeDispose(() => {
     mediaQuery.removeEventListener('change', handleMediaChange);
-    unlistenThemePromise.then((fn: UnlistenFn) => fn()).catch(() => {});
+    unlistenThemePromise?.then((fn: UnlistenFn) => fn()).catch(() => {});
   });
 
   // Vite HMR: 当主题 TS 文件修改时，Vite 会热更新该模块并冒泡到 theme.ts。

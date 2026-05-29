@@ -71,6 +71,12 @@ const isStreaming = computed(() => {
   return streams ? streams.includes(props.message.id) : false;
 });
 
+const shouldRenderRawContentFallback = computed(() => {
+  if (!props.message.content) return false;
+  if (!isStreaming.value) return true;
+  return !props.message.tailBlock && !props.message.tailContent;
+});
+
 // === Event Delegation ===
 const messageContentRef = ref<HTMLElement | null>(null);
 useMessageEvents(messageContentRef);
@@ -423,7 +429,7 @@ onUnmounted(() => {
         '--dynamic-color': shell.avatarColor,
       }"
     >
-      <ThinkingIndicator v-if="isStreaming && (!message.blocks || message.blocks.length === 0)" />
+      <ThinkingIndicator v-if="isStreaming && (!message.blocks || message.blocks.length === 0) && !message.tailBlock && !message.tailContent" />
 
       <div ref="messageContentRef" class="vcp-content-blocks space-y-2 min-w-0 w-full overflow-hidden">
         <template v-if="message.blocks && message.blocks.length > 0">
@@ -457,7 +463,7 @@ onUnmounted(() => {
             </div>
           </template>
         </template>
-        <template v-else-if="message.content">
+        <template v-else-if="shouldRenderRawContentFallback">
           <div class="vcp-markdown-block select-text">
             <p>{{ message.content }}</p>
           </div>
