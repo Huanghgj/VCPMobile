@@ -63,8 +63,96 @@ const getSandboxHtml = (content: string) => {
       }
       body { margin: 0; padding: 16px; box-sizing: border-box; min-height: 100%; }
       canvas, img, video, iframe { max-width: 100% !important; }
+      img, canvas, svg, [style*="background-image"] { cursor: zoom-in; }
     </style>
     <` + `script>
+      function __vcpAbsoluteUrl(url) {
+        if (!url) return '';
+        var trimmed = String(url).trim();
+        if (!trimmed) return '';
+        if (/^(data:|blob:|file:|content:)/i.test(trimmed)) return trimmed;
+        try { return new URL(trimmed, document.baseURI || window.location.href).href; } catch (e) { return trimmed; }
+      }
+
+      function __vcpFileNameFromUrl(url) {
+        if (!url || /^(data:|blob:)/i.test(url)) return '';
+        try {
+          var parsed = new URL(url, document.baseURI || window.location.href);
+          var segment = parsed.pathname.split('/').filter(Boolean).pop() || '';
+          return decodeURIComponent(segment);
+        } catch (e) {
+          var fallback = String(url).split(/[/?#]/).filter(Boolean).pop() || '';
+          try { return decodeURIComponent(fallback); } catch (_) { return fallback; }
+        }
+      }
+
+      function __vcpSvgToDataUrl(svg) {
+        var clone = svg.cloneNode(true);
+        if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+        return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(new XMLSerializer().serializeToString(clone));
+      }
+
+      function __vcpImagePayloadFromElement(element) {
+        if (!element) return null;
+        var tag = (element.tagName || '').toLowerCase();
+        var src = '';
+        var title = element.getAttribute('title') || element.getAttribute('aria-label') || '';
+        var alt = element.getAttribute('alt') || '';
+
+        if (tag === 'img') {
+          src = element.currentSrc || element.src || element.getAttribute('src') || '';
+        } else if (tag === 'image') {
+          src = (element.href && element.href.baseVal) || element.getAttribute('href') || element.getAttribute('xlink:href') || '';
+        } else if (tag === 'canvas') {
+          try { src = element.toDataURL('image/png'); } catch (e) { src = ''; }
+        } else if (tag === 'svg') {
+          try { src = __vcpSvgToDataUrl(element); } catch (e) { src = ''; }
+        }
+
+        src = __vcpAbsoluteUrl(src);
+        if (!src) return null;
+        return { src: src, alt: alt, title: title, fileName: __vcpFileNameFromUrl(src), sourceLabel: 'HTML 预览图片' };
+      }
+
+      function __vcpBackgroundPayloadFromElement(element) {
+        if (!element || !window.getComputedStyle) return null;
+        var bg = window.getComputedStyle(element).backgroundImage || '';
+        var match = bg.match(/url\\((["']?)(.*?)\\1\\)/i);
+        if (!match || !match[2]) return null;
+        var src = __vcpAbsoluteUrl(match[2]);
+        if (!src) return null;
+        return {
+          src: src,
+          title: element.getAttribute('title') || element.getAttribute('aria-label') || '',
+          fileName: __vcpFileNameFromUrl(src),
+          sourceLabel: 'HTML 预览背景图'
+        };
+      }
+
+      function __vcpFindImagePayload(target) {
+        if (!target || !target.closest) return null;
+        var direct = target.closest('img, image, canvas, svg');
+        var payload = __vcpImagePayloadFromElement(direct);
+        if (payload) return payload;
+
+        var current = target;
+        while (current && current !== document.documentElement) {
+          payload = __vcpBackgroundPayloadFromElement(current);
+          if (payload) return payload;
+          current = current.parentElement;
+        }
+        return null;
+      }
+
+      document.addEventListener('click', function(e) {
+        var payload = __vcpFindImagePayload(e.target);
+        if (payload) {
+          e.preventDefault();
+          e.stopPropagation();
+          window.parent.postMessage({ source: 'vcp-mobile', type: 'rendered-image-click', image: payload }, '*');
+        }
+      }, true);
+
       document.addEventListener('click', function(e) {
         const target = e.target.closest('a');
         if (target) {

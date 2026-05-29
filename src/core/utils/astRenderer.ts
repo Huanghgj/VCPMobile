@@ -135,7 +135,9 @@ function renderInline(node: InlineNode): string {
       const src = node.needs_asset_conversion && node.src
         ? convertFileSrc(node.src)
         : escapeHtml(node.src || '');
-      return `<img src="${src}" alt="${escapeHtml(node.alt || '')}" title="${escapeHtml(node.title || '')}" loading="lazy" class="vcp-markdown-image" />`;
+      const originalSrc = node.src ? escapeHtml(node.src) : '';
+      const originalAttr = originalSrc ? ` data-vcp-image-src="${originalSrc}"` : '';
+      return `<img src="${src}"${originalAttr} alt="${escapeHtml(node.alt || '')}" title="${escapeHtml(node.title || '')}" loading="lazy" class="vcp-markdown-image" />`;
     }
     
     case 'line_break':

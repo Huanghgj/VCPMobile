@@ -202,3 +202,41 @@ pub fn open_file_native<R: Runtime>(app: AppHandle<R>, path: String) -> Result<(
     }
     Ok(())
 }
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GallerySaveResult {
+    pub uri: String,
+    pub display_name: String,
+    pub mime_type: String,
+    pub size: i32,
+}
+
+#[tauri::command]
+pub fn save_image_to_gallery<R: Runtime>(
+    app: AppHandle<R>,
+    source_url: String,
+    file_name: Option<String>,
+) -> Result<GallerySaveResult, String> {
+    #[cfg(target_os = "android")]
+    {
+        let state = app.state::<VcpMobileState<R>>();
+        let handle = state.plugin_handle.lock().map_err(|e| e.to_string())?;
+        let plugin_handle = handle.as_ref().ok_or("Plugin handle not initialized")?;
+
+        let result = plugin_handle
+            .run_mobile_plugin::<GallerySaveResult>(
+                "saveImageToGallery",
+                serde_json::json!({ "sourceUrl": source_url, "fileName": file_name }),
+            )
+            .map_err(|e| format!("run_mobile_plugin failed: {}", e))?;
+        Ok(result)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        let _ = source_url;
+        let _ = file_name;
+        Err("该接口仅在 Android 物理端可用".to_string())
+    }
+}

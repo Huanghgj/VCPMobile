@@ -1,12 +1,14 @@
 package com.vcp.mobile
 
 import android.app.Activity
+import android.content.ContentValues
 import android.content.Context
 import android.content.IntentFilter
 import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.os.Build
+import android.os.Environment
 import android.util.Base64
 import android.webkit.WebView
 import androidx.appcompat.app.AppCompatActivity
@@ -22,8 +24,10 @@ import android.content.Intent
 import android.util.Log
 import androidx.core.content.FileProvider
 import android.webkit.MimeTypeMap
+import android.media.MediaScannerConnection
 import android.os.PowerManager
 import android.net.Uri
+import android.provider.MediaStore
 import android.provider.Settings
 import android.content.pm.PackageManager
 import androidx.core.app.ActivityCompat
@@ -32,6 +36,13 @@ import app.tauri.plugin.JSObject
 import app.tauri.plugin.Invoke
 import com.vcp.mobile.service.StreamKeepaliveService
 import java.io.ByteArrayOutputStream
+import java.io.InputStream
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLDecoder
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.math.max
@@ -41,7 +52,7 @@ import kotlin.math.roundToInt
 @TauriPlugin(permissions = [
     Permission(strings = ["android.permission.POST_NOTIFICATIONS"], alias = "notification"),
     Permission(strings = ["android.permission.READ_MEDIA_IMAGES"], alias = "storage"),
-    Permission(strings = ["android.permission.READ_EXTERNAL_STORAGE"], alias = "storageLegacy"),
+    Permission(strings = ["android.permission.READ_EXTERNAL_STORAGE", "android.permission.WRITE_EXTERNAL_STORAGE"], alias = "storageLegacy"),
     Permission(strings = ["android.permission.RECORD_AUDIO"], alias = "microphone")
 ])
 class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
@@ -75,8 +86,11 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
             hasAll || hasVisualSelected
         } else if (Build.VERSION.SDK_INT >= 33) {
             ContextCompat.checkSelfPermission(activity, android.Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED
-        } else {
+        } else if (Build.VERSION.SDK_INT >= 29) {
             ContextCompat.checkSelfPermission(activity, android.Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+        } else {
+            ContextCompat.checkSelfPermission(activity, android.Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED &&
+                ContextCompat.checkSelfPermission(activity, android.Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
         }
 
         val microphoneGranted = ContextCompat.checkSelfPermission(activity, android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
@@ -164,8 +178,11 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
             hasAll || hasVisualSelected
         } else if (Build.VERSION.SDK_INT >= 33) {
             ContextCompat.checkSelfPermission(activity, android.Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED
-        } else {
+        } else if (Build.VERSION.SDK_INT >= 29) {
             ContextCompat.checkSelfPermission(activity, android.Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+        } else {
+            ContextCompat.checkSelfPermission(activity, android.Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED &&
+                ContextCompat.checkSelfPermission(activity, android.Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
         }
 
         val microphoneGranted = ContextCompat.checkSelfPermission(activity, android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
@@ -566,6 +583,229 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
+    @Command
+    fun saveImageToGallery(invoke: Invoke) {
+        val args = invoke.parseArgs(SaveImageArgs::class.java)
+        if (args.sourceUrl.isBlank()) {
+            invoke.reject("图片地址为空")
+            return
+        }
+
+        fileIoExecutor.execute {
+            try {
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                    val writeGranted = ContextCompat.checkSelfPermission(activity, android.Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+                    if (!writeGranted) {
+                        invoke.reject("保存到相册需要储存空间权限")
+                        return@execute
+                    }
+                }
+
+                val loaded = loadImageBytes(args.sourceUrl)
+                if (!loaded.mimeType.startsWith("image/")) {
+                    invoke.reject("当前资源不是图片: ${loaded.mimeType}")
+                    return@execute
+                }
+
+                val displayName = buildGalleryFileName(args.fileName, args.sourceUrl, loaded.mimeType)
+                val savedUri = writeImageToGallery(loaded.bytes, displayName, loaded.mimeType)
+                val result = JSObject().apply {
+                    put("uri", savedUri.toString())
+                    put("displayName", displayName)
+                    put("mimeType", loaded.mimeType)
+                    put("size", loaded.bytes.size)
+                }
+                invoke.resolve(result)
+            } catch (e: Throwable) {
+                Log.e(TAG, "saveImageToGallery failed", e)
+                invoke.reject("保存图片失败: ${e.message}")
+            }
+        }
+    }
+
+    private data class LoadedImage(val bytes: ByteArray, val mimeType: String)
+
+    private fun loadImageBytes(sourceUrl: String): LoadedImage {
+        if (sourceUrl.startsWith("data:", ignoreCase = true)) {
+            return loadDataUrlImage(sourceUrl)
+        }
+
+        if (sourceUrl.startsWith("content:", ignoreCase = true)) {
+            val uri = Uri.parse(sourceUrl)
+            val mime = activity.contentResolver.getType(uri) ?: mimeFromSource(sourceUrl)
+            val bytes = activity.contentResolver.openInputStream(uri).use { input ->
+                readBytesLimited(input ?: throw IllegalStateException("无法读取 content 图片"))
+            }
+            return LoadedImage(bytes, sniffImageMime(bytes, mime))
+        }
+
+        if (sourceUrl.startsWith("file:", ignoreCase = true) || sourceUrl.startsWith("/")) {
+            val path = if (sourceUrl.startsWith("file:", ignoreCase = true)) {
+                Uri.parse(sourceUrl).path ?: sourceUrl.removePrefix("file://")
+            } else {
+                sourceUrl
+            }
+            val file = java.io.File(path)
+            val bytes = file.inputStream().use { readBytesLimited(it) }
+            return LoadedImage(bytes, sniffImageMime(bytes, mimeFromSource(file.name)))
+        }
+
+        val connection = (URL(sourceUrl).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 12_000
+            readTimeout = 25_000
+            instanceFollowRedirects = true
+            setRequestProperty("User-Agent", "VCPMobile/1.0")
+        }
+
+        try {
+            val status = connection.responseCode
+            if (status !in 200..299) {
+                throw IllegalStateException("HTTP $status")
+            }
+            val contentType = connection.contentType?.substringBefore(";")?.lowercase(Locale.US)
+            val bytes = connection.inputStream.use { readBytesLimited(it) }
+            return LoadedImage(bytes, sniffImageMime(bytes, contentType ?: mimeFromSource(sourceUrl)))
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun loadDataUrlImage(dataUrl: String): LoadedImage {
+        val commaIndex = dataUrl.indexOf(',')
+        if (commaIndex <= 0) throw IllegalArgumentException("无效的 data URL")
+
+        val header = dataUrl.substring(5, commaIndex)
+        val mime = header.substringBefore(";").ifBlank { "image/png" }.lowercase(Locale.US)
+        val payload = dataUrl.substring(commaIndex + 1)
+        val bytes = if (header.contains(";base64", ignoreCase = true)) {
+            Base64.decode(payload, Base64.DEFAULT)
+        } else {
+            URLDecoder.decode(payload, "UTF-8").toByteArray(Charsets.UTF_8)
+        }
+        return LoadedImage(bytes, sniffImageMime(bytes, mime))
+    }
+
+    private fun readBytesLimited(input: InputStream, maxBytes: Int = 50 * 1024 * 1024): ByteArray {
+        val output = ByteArrayOutputStream()
+        val buffer = ByteArray(64 * 1024)
+        var total = 0
+        while (true) {
+            val read = input.read(buffer)
+            if (read == -1) break
+            total += read
+            if (total > maxBytes) {
+                throw IllegalArgumentException("图片过大，超过 50MB")
+            }
+            output.write(buffer, 0, read)
+        }
+        return output.toByteArray()
+    }
+
+    private fun sniffImageMime(bytes: ByteArray, fallback: String): String {
+        val normalized = fallback.substringBefore(";").lowercase(Locale.US)
+        if (normalized.startsWith("image/")) return normalized
+        if (bytes.size >= 8 && bytes[0] == 0x89.toByte() && bytes[1] == 0x50.toByte() && bytes[2] == 0x4E.toByte() && bytes[3] == 0x47.toByte()) return "image/png"
+        if (bytes.size >= 3 && bytes[0] == 0xFF.toByte() && bytes[1] == 0xD8.toByte() && bytes[2] == 0xFF.toByte()) return "image/jpeg"
+        if (bytes.size >= 6 && String(bytes, 0, 6, Charsets.US_ASCII).startsWith("GIF")) return "image/gif"
+        if (bytes.size >= 12 && String(bytes, 0, 4, Charsets.US_ASCII) == "RIFF" && String(bytes, 8, 4, Charsets.US_ASCII) == "WEBP") return "image/webp"
+        if (bytes.size >= 2 && bytes[0] == 0x42.toByte() && bytes[1] == 0x4D.toByte()) return "image/bmp"
+        val sample = bytes.take(256).toByteArray().toString(Charsets.UTF_8).trimStart()
+        if (sample.startsWith("<svg", ignoreCase = true) || sample.startsWith("<?xml", ignoreCase = true)) return "image/svg+xml"
+        return "image/png"
+    }
+
+    private fun mimeFromSource(source: String): String {
+        val clean = source.substringBefore("?").substringBefore("#")
+        val ext = clean.substringAfterLast('.', "").lowercase(Locale.US)
+        return MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: when (ext) {
+            "jpg", "jpeg" -> "image/jpeg"
+            "png" -> "image/png"
+            "gif" -> "image/gif"
+            "webp" -> "image/webp"
+            "svg" -> "image/svg+xml"
+            "bmp" -> "image/bmp"
+            "avif" -> "image/avif"
+            "heic", "heif" -> "image/heic"
+            else -> "application/octet-stream"
+        }
+    }
+
+    private fun extensionForMime(mimeType: String): String {
+        return when (mimeType.lowercase(Locale.US)) {
+            "image/jpeg" -> "jpg"
+            "image/png" -> "png"
+            "image/gif" -> "gif"
+            "image/webp" -> "webp"
+            "image/svg+xml" -> "svg"
+            "image/bmp" -> "bmp"
+            "image/avif" -> "avif"
+            "image/heic" -> "heic"
+            "image/heif" -> "heif"
+            else -> "png"
+        }
+    }
+
+    private fun buildGalleryFileName(providedName: String?, sourceUrl: String, mimeType: String): String {
+        val fromUrl = if (!sourceUrl.startsWith("data:", ignoreCase = true) && !sourceUrl.startsWith("blob:", ignoreCase = true)) {
+            try {
+                Uri.parse(sourceUrl).lastPathSegment?.let { URLDecoder.decode(it, "UTF-8") }
+            } catch (_: Exception) {
+                null
+            }
+        } else {
+            null
+        }
+
+        val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val rawName = providedName?.takeIf { it.isNotBlank() } ?: fromUrl ?: "vcp_image_$timestamp"
+        val sanitized = rawName.replace(Regex("[\\\\/:*?\"<>|\\u0000-\\u001F]"), "_").trim().ifBlank { "vcp_image_$timestamp" }
+        val base = sanitized.substringBeforeLast('.', sanitized).take(96).ifBlank { "vcp_image_$timestamp" }
+        val ext = sanitized.substringAfterLast('.', "").lowercase(Locale.US).takeIf { it.isNotBlank() } ?: extensionForMime(mimeType)
+        return "$base.$ext"
+    }
+
+    private fun writeImageToGallery(bytes: ByteArray, displayName: String, mimeType: String): Uri {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val resolver = activity.contentResolver
+            val values = ContentValues().apply {
+                put(MediaStore.Images.Media.DISPLAY_NAME, displayName)
+                put(MediaStore.Images.Media.MIME_TYPE, mimeType)
+                put(MediaStore.Images.Media.RELATIVE_PATH, "${Environment.DIRECTORY_PICTURES}/VCPMobile")
+                put(MediaStore.Images.Media.IS_PENDING, 1)
+            }
+            val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                ?: throw IllegalStateException("无法创建相册图片")
+            try {
+                resolver.openOutputStream(uri)?.use { it.write(bytes) }
+                    ?: throw IllegalStateException("无法写入相册图片")
+                values.clear()
+                values.put(MediaStore.Images.Media.IS_PENDING, 0)
+                resolver.update(uri, values, null, null)
+                return uri
+            } catch (e: Throwable) {
+                resolver.delete(uri, null, null)
+                throw e
+            }
+        }
+
+        val picturesDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
+        val appDir = java.io.File(picturesDir, "VCPMobile").apply { mkdirs() }
+        var outputFile = java.io.File(appDir, displayName)
+        if (outputFile.exists()) {
+            val base = displayName.substringBeforeLast('.', displayName)
+            val ext = displayName.substringAfterLast('.', "")
+            var index = 1
+            do {
+                outputFile = java.io.File(appDir, if (ext.isBlank()) "${base}_$index" else "${base}_$index.$ext")
+                index += 1
+            } while (outputFile.exists())
+        }
+
+        java.io.FileOutputStream(outputFile).use { it.write(bytes) }
+        MediaScannerConnection.scanFile(activity, arrayOf(outputFile.absolutePath), arrayOf(mimeType), null)
+        return Uri.fromFile(outputFile)
+    }
+
     private fun escapeJsonForJsString(json: String): String {
         return json
             .replace("\\", "\\\\")
@@ -648,6 +888,12 @@ class RequestPermissionArgs {
 @InvokeArg
 class OpenFileArgs {
     lateinit var path: String
+}
+
+@InvokeArg
+class SaveImageArgs {
+    lateinit var sourceUrl: String
+    var fileName: String? = null
 }
 
 @InvokeArg

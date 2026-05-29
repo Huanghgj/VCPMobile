@@ -10,6 +10,7 @@ const COMMANDS: &[&str] = &[
     "get_battery_status",
     "capture_window_snapshot",
     "open_file_native",
+    "save_image_to_gallery",
 ];
 
 fn main() {

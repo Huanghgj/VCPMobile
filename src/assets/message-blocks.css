@@ -218,6 +218,12 @@ html.dark .vcp-markdown-block code:not(pre code) {
   border-radius: 4px;
 }
 
+.vcp-content-blocks img,
+.vcp-content-blocks canvas,
+.vcp-content-blocks svg {
+  cursor: zoom-in;
+}
+
 /* --- Links --- */
 .vcp-markdown-block a {
   color: var(--highlight-text, #3498db);

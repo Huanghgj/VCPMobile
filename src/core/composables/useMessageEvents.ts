@@ -1,12 +1,15 @@
 import { onMounted, onUnmounted, type Ref } from "vue";
 import { openUrl as openExternal } from "@tauri-apps/plugin-opener";
 import { useChatHistoryStore } from "../stores/chatHistoryStore";
+import { openRenderedImageViewer } from "./useRenderedImageViewer";
+import { findRenderedImagePayload } from "../utils/renderedImage";
 
 export function useMessageEvents(containerRef: Ref<HTMLElement | null>) {
   const historyStore = useChatHistoryStore();
 
   const handleClick = (e: MouseEvent) => {
-    const target = e.target as HTMLElement;
+    if (!(e.target instanceof Element)) return;
+    const target = e.target;
 
     // 1. VCP 按钮点击 (e.g., [[点击按钮:xxx]])
     const vcpButton = target.closest('[data-vcp-button]');
@@ -49,6 +52,18 @@ export function useMessageEvents(containerRef: Ref<HTMLElement | null>) {
         // 发送消息
         historyStore.sendMessage(finalSendText);
       }
+      return;
+    }
+
+    // 1.75 AI 渲染图片：覆盖 img / svg image / svg / canvas / CSS background-image
+    const imagePayload = findRenderedImagePayload(e.target, containerRef.value);
+    if (imagePayload) {
+      e.preventDefault();
+      e.stopPropagation();
+      openRenderedImageViewer({
+        ...imagePayload,
+        sourceLabel: "AI 渲染图片",
+      });
       return;
     }
 
