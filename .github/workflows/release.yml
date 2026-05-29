@@ -1,6 +1,9 @@
 name: Android Release
 
 on:
+  push:
+    tags:
+      - 'v*'
   release:
     types:
       - published
@@ -32,6 +35,9 @@ jobs:
         shell: bash
         run: |
           TAG_NAME="${{ github.event.release.tag_name }}"
+          if [[ -z "$TAG_NAME" ]]; then
+            TAG_NAME="${GITHUB_REF_NAME}"
+          fi
 
           if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
             echo "Invalid release tag: $TAG_NAME" >&2
@@ -183,4 +189,3 @@ jobs:
           files: |
             ${{ steps.artifacts.outputs.artifact_dir }}/*.apk
             ${{ steps.artifacts.outputs.artifact_dir }}/frontend-dist-*.zip
-
