@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to build and publish assets to'
+        required: true
+        default: 'v1.0.1'
   release:
     types:
       - published
@@ -35,6 +41,9 @@ jobs:
         shell: bash
         run: |
           TAG_NAME="${{ github.event.release.tag_name }}"
+          if [[ -z "$TAG_NAME" ]]; then
+            TAG_NAME="${{ github.event.inputs.release_tag }}"
+          fi
           if [[ -z "$TAG_NAME" ]]; then
             TAG_NAME="${GITHUB_REF_NAME}"
           fi
