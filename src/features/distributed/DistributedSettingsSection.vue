@@ -74,26 +74,23 @@ const rowDescription = computed(() => {
 });
 
 const toggleConnection = async (nextEnabled?: boolean) => {
-  const shouldEnable = nextEnabled ?? !enabled.value;
+  const shouldEnable = nextEnabled ?? !status.value.connected;
 
-  if (!shouldEnable) {
-    await stop();
-    enabled.value = false;
-    emit("save-request");
+  if (shouldEnable && configMessage.value) {
     return;
   }
 
-  if (configMessage.value) {
-    return;
-  }
-
-  enabled.value = true;
+  enabled.value = shouldEnable;
   emit("save-request");
   try {
-    await start(derivedWsUrl.value, derivedVcpKey.value, deviceName.value);
+    if (shouldEnable && !status.value.connected) {
+      await start(derivedWsUrl.value, derivedVcpKey.value, deviceName.value);
+    } else if (!shouldEnable && status.value.connected) {
+      await stop();
+    }
   } catch (e) {
-    enabled.value = false;
-    console.error("[Distributed] Start failed:", e);
+    enabled.value = status.value.connected;
+    console.error("[Distributed] Connection toggle failed:", e);
     emit("save-request");
   }
 };
@@ -158,10 +155,10 @@ watch(
         variant="secondary"
         size="sm"
         :loading="loading"
-        :disabled="!enabled && !!configMessage"
-        @click="toggleConnection()"
+        :disabled="!status.connected && !!configMessage"
+        @click="toggleConnection(!status.connected)"
       >
-        {{ enabled ? "断开连接" : "连接" }}
+        {{ status.connected ? "断开连接" : "连接" }}
       </SettingsActionButton>
     </div>
   </div>

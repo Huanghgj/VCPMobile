@@ -675,7 +675,7 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
         if (commaIndex <= 0) throw IllegalArgumentException("无效的 data URL")
 
         val header = dataUrl.substring(5, commaIndex)
-        val mime = header.substringBefore(";").ifBlank { "image/png" }.lowercase(Locale.US)
+        val mime = header.substringBefore(";").ifBlank { "application/octet-stream" }.lowercase(Locale.US)
         val payload = dataUrl.substring(commaIndex + 1)
         val bytes = if (header.contains(";base64", ignoreCase = true)) {
             Base64.decode(payload, Base64.DEFAULT)
@@ -711,7 +711,7 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
         if (bytes.size >= 2 && bytes[0] == 0x42.toByte() && bytes[1] == 0x4D.toByte()) return "image/bmp"
         val sample = bytes.take(256).toByteArray().toString(Charsets.UTF_8).trimStart()
         if (sample.startsWith("<svg", ignoreCase = true) || sample.startsWith("<?xml", ignoreCase = true)) return "image/svg+xml"
-        return "image/png"
+        return "application/octet-stream"
     }
 
     private fun mimeFromSource(source: String): String {

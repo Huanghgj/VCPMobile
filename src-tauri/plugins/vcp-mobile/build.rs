@@ -1,8 +1,8 @@
 const COMMANDS: &[&str] = &[
     "set_keep_screen_on",
     "clear_keep_screen_on",
-    "start_stream_service",
-    "stop_stream_service",
+    "start_streaming_service",
+    "stop_streaming_service",
     "check_all_permissions",
     "request_android_permission",
     "move_task_to_back",

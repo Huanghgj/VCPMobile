@@ -17,11 +17,23 @@ const formatBytes = (bytes: number) => {
 
 const DOWNLOAD_NOTIF_ID = 'vcp_update_download_progress';
 
+export const safeHttpUrl = (value: string | null | undefined): string => {
+  if (!value) return '';
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' || url.protocol === 'http:' ? url.href : '';
+  } catch {
+    return '';
+  }
+};
+
 export function useUpdateDownloader() {
   const notificationStore = useNotificationStore();
   const isDownloading = ref(false);
 
   const downloadAndInstall = async (url: string) => {
+    const safeUrl = safeHttpUrl(url);
+    if (!safeUrl) throw new Error('更新下载链接无效');
     if (isDownloading.value) return;
     isDownloading.value = true;
 
@@ -42,7 +54,7 @@ export function useUpdateDownloader() {
       };
 
       const apkPath = await invoke<string>('download_update', {
-        url,
+        url: safeUrl,
         onProgress: channel,
       });
 

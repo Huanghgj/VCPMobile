@@ -79,14 +79,22 @@ const activeGuide = computed(() => {
   return guides.find((g) => g.brand === selectedBrand.value) || guides[0];
 });
 
-// 富文本渲染：高亮箭头和操作项
-const highlightStep = (text: string) => {
+type StepSegment =
+  | { type: "text"; value: string }
+  | { type: "arrow"; value: string }
+  | { type: "highlight"; value: string };
+
+const formatStep = (text: string): StepSegment[] => {
   return text
-    .replace(/→/g, '<span class="opacity-30 mx-1.5 text-[9px]">▶</span>')
-    .replace(
-      /「(.*?)」/g,
-      '<span class="text-blue-600 dark:text-blue-400 font-bold bg-blue-500/10 px-1.5 py-0.5 rounded text-[11px] mx-0.5 border border-blue-500/20">$1</span>'
-    );
+    .split(/(→|「[^」]*」)/g)
+    .filter(Boolean)
+    .map((part) => {
+      if (part === "→") return { type: "arrow", value: "▶" };
+      if (part.startsWith("「") && part.endsWith("」")) {
+        return { type: "highlight", value: part.slice(1, -1) };
+      }
+      return { type: "text", value: part };
+    });
 };
 </script>
 
@@ -133,7 +141,18 @@ const highlightStep = (text: string) => {
             {{ i + 1 }}
           </div>
           <!-- 步骤内容 -->
-          <div class="text-[12px] leading-relaxed text-primary-text/80 pt-0.5" v-html="highlightStep(step)"></div>
+          <div class="text-[12px] leading-relaxed text-primary-text/80 pt-0.5">
+            <template v-for="(segment, segmentIndex) in formatStep(step)" :key="`${i}-${segmentIndex}`">
+              <span v-if="segment.type === 'arrow'" class="opacity-30 mx-1.5 text-[9px]">{{ segment.value }}</span>
+              <span
+                v-else-if="segment.type === 'highlight'"
+                class="text-blue-600 dark:text-blue-400 font-bold bg-blue-500/10 px-1.5 py-0.5 rounded text-[11px] mx-0.5 border border-blue-500/20"
+              >
+                {{ segment.value }}
+              </span>
+              <span v-else>{{ segment.value }}</span>
+            </template>
+          </div>
         </div>
       </div>
     </div>

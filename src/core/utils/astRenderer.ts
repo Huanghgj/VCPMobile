@@ -1,4 +1,5 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
+import DOMPurify from "dompurify";
 import type { MarkdownNode, InlineNode } from "../types/chat";
 
 // HTML 缓存：避免重复遍历 AST 拼接相同内容
@@ -40,7 +41,7 @@ export function renderMarkdownNodes(
   const cached = htmlCache.get(key);
   if (cached !== undefined) return cached;
 
-  const html = nodes.map(node => renderNode(node, messageId)).join('');
+  const html = sanitizeMarkdownHtml(nodes.map(node => renderNode(node, messageId)).join(''));
 
   // 简单的 LRU 保护：超限时清空（实际命中模式是批量命中/失效）
   if (htmlCache.size >= MAX_CACHE_SIZE) {
@@ -70,7 +71,7 @@ function renderNode(node: MarkdownNode, messageId: string): string {
             html = `<pre class="vcp-code-block vcp-scrollable">${innerMatch[1]}</pre>`;
           }
         }
-        return html;
+        return sanitizeHighlightedCodeHtml(html);
       }
       return `<pre class="vcp-code-block vcp-scrollable"><code>${escapeHtml(node.code || '')}</code></pre>`;
     }
@@ -90,7 +91,7 @@ function renderNode(node: MarkdownNode, messageId: string): string {
       const bodyHtml = (node.rows || []).map(row =>
         `<tr>${row.map(cell => `<td>${(cell as any).map(renderInline).join('')}</td>`).join('')}</tr>`
       ).join('');
-      const wrapper = node.wrapper_class || 'vcp-table-wrapper';
+      const wrapper = sanitizeClassList(node.wrapper_class, 'vcp-table-wrapper');
       return `<div class="${wrapper}"><table><thead>${headerHtml}</thead><tbody>${bodyHtml}</tbody></table></div>`;
     
     case 'thematic_break':
@@ -125,17 +126,18 @@ function renderInline(node: InlineNode): string {
       return `<code>${escapeHtml(node.value || '')}</code>`;
     
     case 'link': {
-      const href = node.needs_asset_conversion && node.href
+      const href = sanitizeLinkUrl(node.needs_asset_conversion && node.href
         ? convertFileSrc(node.href)
-        : escapeHtml(node.href || '');
+        : node.href || '');
       return `<a href="${href}" title="${escapeHtml(node.title || '')}" target="_blank" rel="noopener noreferrer">${(node.children || []).map(renderInline).join('')}</a>`;
     }
     
     case 'image': {
-      const src = node.needs_asset_conversion && node.src
+      const src = sanitizeImageUrl(node.needs_asset_conversion && node.src
         ? convertFileSrc(node.src)
-        : escapeHtml(node.src || '');
-      const originalSrc = node.src ? escapeHtml(node.src) : '';
+        : node.src || '');
+      if (!src) return '';
+      const originalSrc = node.src ? sanitizeImageUrl(node.src) : '';
       const originalAttr = originalSrc ? ` data-vcp-image-src="${originalSrc}"` : '';
       return `<img src="${src}"${originalAttr} alt="${escapeHtml(node.alt || '')}" title="${escapeHtml(node.title || '')}" loading="lazy" class="vcp-markdown-image" />`;
     }
@@ -178,4 +180,54 @@ function escapeHtml(text: string): string {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#039;');
+}
+
+function sanitizeMarkdownHtml(html: string): string {
+  return DOMPurify.sanitize(html, {
+    USE_PROFILES: { html: true, svg: true, mathMl: true },
+    FORBID_TAGS: ['script', 'iframe', 'object', 'embed', 'applet', 'link', 'meta'],
+    FORBID_ATTR: ['srcdoc'],
+    ALLOW_UNKNOWN_PROTOCOLS: false,
+    ALLOWED_URI_REGEXP: /^(?:(?:https?|mailto|tel|blob|asset|file|content):|data:image\/|\/|\.\/|\.\.\/|#)/i,
+  });
+}
+
+function sanitizeHighlightedCodeHtml(html: string): string {
+  return DOMPurify.sanitize(html, {
+    USE_PROFILES: { html: true },
+    ALLOWED_TAGS: ['pre', 'code', 'span'],
+    ALLOWED_ATTR: ['class', 'style'],
+  });
+}
+
+function sanitizeClassList(value: string | undefined, fallback: string): string {
+  const classList = (value || fallback)
+    .split(/\s+/)
+    .map((item) => item.trim())
+    .filter((item) => /^[A-Za-z0-9_-]+$/.test(item));
+  return escapeHtml(classList.length ? classList.join(' ') : fallback);
+}
+
+function sanitizeLinkUrl(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+  if (/^(https?:|mailto:|tel:|blob:|asset:)/i.test(trimmed)) {
+    return escapeHtml(trimmed);
+  }
+  if (/^[./#]/.test(trimmed)) {
+    return escapeHtml(trimmed);
+  }
+  return '';
+}
+
+function sanitizeImageUrl(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+  if (/^(https?:|data:image\/|blob:|asset:|file:|content:)/i.test(trimmed)) {
+    return escapeHtml(trimmed);
+  }
+  if (/^[./#]/.test(trimmed)) {
+    return escapeHtml(trimmed);
+  }
+  return '';
 }

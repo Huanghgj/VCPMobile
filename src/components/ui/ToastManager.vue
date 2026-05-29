@@ -18,11 +18,8 @@ const store = useNotificationStore();
   top: calc(var(--vcp-safe-top, env(safe-area-inset-top, 0px)) + 16px);
 }
 
-@media (pointer: coarse) {
-  .vcp-toast-stack {
-    /* Android edge-to-edge WebView often reports safe-area as 0, so keep toasts below the status bar. */
-    top: calc(max(var(--vcp-safe-top, env(safe-area-inset-top, 0px)), 24px) + 12px);
-  }
+:global(html.vcp-android-runtime) .vcp-toast-stack {
+  top: calc(var(--vcp-safe-top, env(safe-area-inset-top, 0px)) + 12px);
 }
 
 .toast-enter-active {

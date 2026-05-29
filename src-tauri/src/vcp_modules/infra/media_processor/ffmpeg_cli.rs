@@ -30,8 +30,11 @@ fn extract_android_binary(name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
     let path = cache_dir.join(name);
 
     let needs_write = match std::fs::metadata(&path) {
-        Ok(meta) => meta.len() != bytes.len() as u64,
-        Err(_) => true,
+        Ok(meta) if meta.len() == bytes.len() as u64 => match std::fs::read(&path) {
+            Ok(existing) => existing != bytes,
+            Err(_) => true,
+        },
+        Ok(_) | Err(_) => true,
     };
 
     if needs_write {

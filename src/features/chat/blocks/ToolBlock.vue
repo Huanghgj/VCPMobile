@@ -36,12 +36,17 @@ const toggleExpand = () => {
 };
 
 // 检测工具结果值是否为图片（HTTP URL 或 base64 data URI）
+const safeImageUrl = (value: string): string => {
+  const trimmed = value.trim();
+  if (/^https?:\/\/[^\s]+$/i.test(trimmed) && /\.(jpeg|jpg|png|gif|webp)([?&#]|$)/i.test(trimmed)) return trimmed;
+  if (/^data:image\/(png|jpeg|jpg|gif|webp);base64,/i.test(trimmed)) return trimmed;
+  return '';
+};
+
 const isImageValue = (key: string, value: string): boolean => {
   const imageKeys = ['可访问URL', '返回内容', 'url', 'image'];
   if (!imageKeys.includes(key)) return false;
-  const isHttpImage = /^https?:\/\/[^\s]+$/i.test(value) && /\.(jpeg|jpg|png|gif|webp)([?&#]|$)/i.test(value);
-  const isBase64Image = /^data:image\/(png|jpeg|jpg|gif|webp);base64,/i.test(value);
-  return isHttpImage || isBase64Image;
+  return !!safeImageUrl(value);
 };
 </script>
 
@@ -90,8 +95,8 @@ const isImageValue = (key: string, value: string): boolean => {
             <div class="mt-1 sm:mt-0 flex-1 min-w-0">
               <!-- 图片值直接渲染为 img，其他值走 Markdown 管线 -->
               <template v-if="item.value && isImageValue(item.key, item.value)">
-                <a :href="item.value" target="_blank" rel="noopener noreferrer" class="block">
-                  <img :src="item.value" class="max-w-full rounded-lg" loading="lazy" alt="Generated Image" />
+                <a :href="safeImageUrl(item.value)" target="_blank" rel="noopener noreferrer" class="block">
+                  <img :src="safeImageUrl(item.value)" class="max-w-full rounded-lg" loading="lazy" alt="Generated Image" />
                 </a>
               </template>
               <div v-else class="text-xs opacity-90 whitespace-pre-wrap">{{ item.value || '' }}</div>

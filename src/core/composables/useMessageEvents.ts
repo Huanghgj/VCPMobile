@@ -4,6 +4,16 @@ import { useChatHistoryStore } from "../stores/chatHistoryStore";
 import { openRenderedImageViewer } from "./useRenderedImageViewer";
 import { findRenderedImagePayload } from "../utils/renderedImage";
 
+function safeExternalHttpUrl(href: string | null): string {
+  if (!href) return "";
+  try {
+    const url = new URL(href, window.location.href);
+    return url.protocol === "http:" || url.protocol === "https:" ? url.href : "";
+  } catch {
+    return "";
+  }
+}
+
 export function useMessageEvents(containerRef: Ref<HTMLElement | null>) {
   const historyStore = useChatHistoryStore();
 
@@ -67,16 +77,7 @@ export function useMessageEvents(containerRef: Ref<HTMLElement | null>) {
       return;
     }
 
-    // 2. 外部链接
-    const externalLink = target.closest('a[href^="http"]');
-    if (externalLink) {
-      e.preventDefault();
-      const href = externalLink.getAttribute('href');
-      if (href) openExternal(href);
-      return;
-    }
-
-    // 3. 内部锚点（消息引用跳转，暂时留空或按需实现）
+    // 2. 消息引用跳转
     const messageRef = target.closest('a[href^="#msg-"]');
     if (messageRef) {
       e.preventDefault();
@@ -84,6 +85,15 @@ export function useMessageEvents(containerRef: Ref<HTMLElement | null>) {
       if (msgId) {
           // TODO: implement scrollToMessage
       }
+      return;
+    }
+
+    // 3. 外部链接只允许明确的 http/https，其他协议阻断浏览器默认行为。
+    const externalLink = target.closest('a[href]');
+    if (externalLink) {
+      e.preventDefault();
+      const href = safeExternalHttpUrl(externalLink.getAttribute('href'));
+      if (href) openExternal(href);
       return;
     }
   };

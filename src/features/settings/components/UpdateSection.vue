@@ -4,6 +4,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { getVersion } from '@tauri-apps/api/app';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { useUpdateDownloader } from '../../../core/composables/useUpdateDownloader';
+import { safeHttpUrl } from '../../../core/composables/useUpdateDownloader';
 import SettingsRow from '../../../components/settings/SettingsRow.vue';
 import SettingsActionButton from '../../../components/settings/SettingsActionButton.vue';
 import SettingsInlineStatus from '../../../components/settings/SettingsInlineStatus.vue';
@@ -70,7 +71,7 @@ const checkUpdate = async () => {
       }, 4000);
       return;
     }
-    downloadUrlRef.value = info.downloadUrl;
+    downloadUrlRef.value = safeHttpUrl(info.downloadUrl);
     status.value = { type: 'update-available', info };
   } catch (e: any) {
     status.value = { type: 'error', message: String(e) };
@@ -79,7 +80,8 @@ const checkUpdate = async () => {
 
 const downloadAndInstall = async () => {
   const info = status.value.type === 'update-available' ? status.value.info : null;
-  if (!info?.downloadUrl) {
+  const downloadUrl = safeHttpUrl(info?.downloadUrl);
+  if (!downloadUrl) {
     status.value = { type: 'error', message: '缺少下载链接' };
     return;
   }
@@ -87,17 +89,19 @@ const downloadAndInstall = async () => {
   status.value = { type: 'downloading', progress: 0, total: null };
 
   try {
-    await startDownload(info.downloadUrl);
+    await startDownload(downloadUrl);
     status.value = { type: 'idle' };
   } catch (e: any) {
     // 本地安装失败，尝试用浏览器打开直链或 Release 页面
     try {
-      if (info.downloadUrl) {
-        await openUrl(info.downloadUrl);
+      const fallbackDownloadUrl = safeHttpUrl(info?.downloadUrl);
+      const fallbackReleaseUrl = safeHttpUrl(info?.releasePageUrl);
+      if (fallbackDownloadUrl) {
+        await openUrl(fallbackDownloadUrl);
         status.value = { type: 'idle' };
         return;
-      } else if (info.releasePageUrl) {
-        await openUrl(info.releasePageUrl);
+      } else if (fallbackReleaseUrl) {
+        await openUrl(fallbackReleaseUrl);
         status.value = { type: 'idle' };
         return;
       }

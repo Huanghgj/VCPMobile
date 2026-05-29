@@ -421,18 +421,6 @@
           "markdownDescription": "Denies the set_keep_screen_on command without any pre-configured scope."
         },
         {
-          "description": "Enables the start_stream_service command without any pre-configured scope.",
-          "type": "string",
-          "const": "allow-start-stream-service",
-          "markdownDescription": "Enables the start_stream_service command without any pre-configured scope."
-        },
-        {
-          "description": "Denies the start_stream_service command without any pre-configured scope.",
-          "type": "string",
-          "const": "deny-start-stream-service",
-          "markdownDescription": "Denies the start_stream_service command without any pre-configured scope."
-        },
-        {
           "description": "Enables the start_streaming_service command without any pre-configured scope.",
           "type": "string",
           "const": "allow-start-streaming-service",
@@ -443,18 +431,6 @@
           "type": "string",
           "const": "deny-start-streaming-service",
           "markdownDescription": "Denies the start_streaming_service command without any pre-configured scope."
-        },
-        {
-          "description": "Enables the stop_stream_service command without any pre-configured scope.",
-          "type": "string",
-          "const": "allow-stop-stream-service",
-          "markdownDescription": "Enables the stop_stream_service command without any pre-configured scope."
-        },
-        {
-          "description": "Denies the stop_stream_service command without any pre-configured scope.",
-          "type": "string",
-          "const": "deny-stop-stream-service",
-          "markdownDescription": "Denies the stop_stream_service command without any pre-configured scope."
         },
         {
           "description": "Enables the stop_streaming_service command without any pre-configured scope.",

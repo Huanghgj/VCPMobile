@@ -45,7 +45,7 @@ const groupedNotifications = computed<GroupedNotifications[]>(() => {
   return Object.keys(groups).map(key => ({
     title: key,
     items: groups[key].sort((a, b) => b.timestamp - a.timestamp)
-  }));
+  })).sort((a, b) => b.items[0].timestamp - a.items[0].timestamp);
 });
 </script>
 

@@ -542,7 +542,12 @@ export function useNotificationProcessor() {
         if (!message) {
           message = stringifyCompact(data.summary || data.content || data.response || data.query || data, 260);
         }
-        type = String(data.type).toLowerCase() === 'warning' ? 'warning' : type;
+        const severity = String(data.status || data.type || '').toLowerCase();
+        if (severity === 'error' || typeof data.error !== 'undefined') {
+          type = 'error';
+        } else if (severity === 'warning') {
+          type = 'warning';
+        }
         structured = {
           kind: 'generic',
           summary: infoType,

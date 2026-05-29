@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tauri::{ipc::Channel, AppHandle, Manager};
 use tokio::io::AsyncWriteExt;
+use url::Url;
 
 const FRONTEND_DIST_PREFIX: &str = "frontend-dist-v";
 const FRONTEND_DIST_SUFFIX: &str = ".zip";
@@ -40,6 +41,32 @@ struct GitHubAsset {
     name: String,
     browser_download_url: String,
     size: u64,
+}
+
+fn validate_github_frontend_download_url(raw_url: &str) -> Result<Url, String> {
+    let parsed = Url::parse(raw_url).map_err(|e| format!("下载链接无效: {}", e))?;
+    if parsed.scheme() != "https" {
+        return Err("下载链接必须使用 HTTPS".to_string());
+    }
+    if parsed.host_str() != Some("github.com") {
+        return Err("下载链接来源不受信任".to_string());
+    }
+    let path = parsed.path();
+    if !path.starts_with("/MRiecy/VCPMobile/releases/download/") {
+        return Err("下载链接不属于 VCPMobile Release 资源".to_string());
+    }
+    let file_name = path.rsplit('/').next().unwrap_or_default();
+    if !file_name.starts_with(FRONTEND_DIST_PREFIX) || !file_name.ends_with(FRONTEND_DIST_SUFFIX) {
+        return Err("下载链接不是前端更新包".to_string());
+    }
+    Ok(parsed)
+}
+
+fn validate_frontend_version(version: &str) -> Result<(), String> {
+    if semver::Version::parse(version).is_ok() {
+        return Ok(());
+    }
+    Err("前端版本号格式无效".to_string())
 }
 
 /// =================================================================
@@ -269,6 +296,7 @@ pub(crate) async fn download_frontend_update_inner(
     url: &str,
     on_progress: Option<Channel<DownloadProgress>>,
 ) -> Result<String, String> {
+    let download_url = validate_github_frontend_download_url(url)?;
     let cache_dir = app
         .path()
         .app_cache_dir()
@@ -279,9 +307,9 @@ pub(crate) async fn download_frontend_update_inner(
         let _ = std::fs::create_dir_all(&download_dir);
     }
 
-    let file_name = url
-        .split('/')
-        .next_back()
+    let file_name = download_url
+        .path_segments()
+        .and_then(|segments| segments.last())
         .unwrap_or("frontend-update.zip")
         .to_string();
     let zip_path = download_dir.join(&file_name);
@@ -296,7 +324,7 @@ pub(crate) async fn download_frontend_update_inner(
         .map_err(|e| e.to_string())?;
 
     let res = client
-        .get(url)
+        .get(download_url)
         .header("User-Agent", "VCPMobile")
         .send()
         .await
@@ -353,9 +381,25 @@ pub async fn apply_frontend_update(
     zip_path: String,
     version: String,
 ) -> Result<(), String> {
+    validate_frontend_version(&version)?;
     let updates_dir = get_frontend_updates_dir(&app)?;
     if !updates_dir.exists() {
         std::fs::create_dir_all(&updates_dir).map_err(|e| e.to_string())?;
+    }
+
+    let download_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| format!("获取缓存目录失败: {}", e))?
+        .join("frontend_update_downloads");
+    let canonical_download_dir = download_dir
+        .canonicalize()
+        .map_err(|e| format!("前端更新下载目录无效: {}", e))?;
+    let canonical_zip_path = PathBuf::from(&zip_path)
+        .canonicalize()
+        .map_err(|e| format!("前端更新包路径无效: {}", e))?;
+    if !canonical_zip_path.starts_with(&canonical_download_dir) {
+        return Err("前端更新包路径不受信任".to_string());
     }
 
     let version_dir = updates_dir.join(&version);
@@ -365,14 +409,18 @@ pub async fn apply_frontend_update(
     std::fs::create_dir_all(&version_dir).map_err(|e| e.to_string())?;
 
     // 解压 zip
-    let file = std::fs::File::open(&zip_path).map_err(|e| format!("打开 zip 失败: {}", e))?;
+    let file =
+        std::fs::File::open(&canonical_zip_path).map_err(|e| format!("打开 zip 失败: {}", e))?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("读取 zip 失败: {}", e))?;
 
     for i in 0..archive.len() {
         let mut file_in_zip = archive
             .by_index(i)
             .map_err(|e| format!("解压条目失败: {}", e))?;
-        let out_path = version_dir.join(file_in_zip.name());
+        let enclosed_name = file_in_zip
+            .enclosed_name()
+            .ok_or_else(|| format!("zip 条目路径非法: {}", file_in_zip.name()))?;
+        let out_path = version_dir.join(enclosed_name);
 
         if file_in_zip.is_dir() {
             std::fs::create_dir_all(&out_path).map_err(|e| e.to_string())?;
@@ -402,7 +450,7 @@ pub async fn apply_frontend_update(
     // 垃圾物理清理已安全后置到冷启动 setup 阶段执行
 
     // 删除下载 of zip
-    let _ = tokio::fs::remove_file(&zip_path).await;
+    let _ = tokio::fs::remove_file(&canonical_zip_path).await;
 
     log::info!("[FrontendUpdate] Applied version {} successfully", version);
     Ok(())

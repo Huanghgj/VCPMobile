@@ -14,6 +14,17 @@ const isPreviewing = ref(false); // 默认开启代码模式，减小开销
 const isFullScreen = ref(false);
 const fullScreenTab = ref<'code' | 'preview'>('code');
 
+const createSandboxNonce = () => {
+  const bytes = new Uint8Array(16);
+  if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+  }
+  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`;
+};
+
+const sandboxImageNonce = createSandboxNonce();
+
 // 代码预览转义处理 (优先使用后端预渲染 syntect 高亮，无值时回退为安全 HTML 转义)
 const highlightedCode = computed(() => {
   if (props.highlightedContent) {
@@ -41,6 +52,8 @@ const copyCode = async () => {
 // 构造沙箱 HTML
 const getSandboxHtml = (content: string) => {
   const isDark = themeStore.isDarkResolved;
+  const noncePayload = JSON.stringify(sandboxImageNonce);
+  const targetOriginPayload = JSON.stringify(window.location.origin);
   
   const cleanHtml = DOMPurify.sanitize(content, {
     USE_PROFILES: { html: true, svg: true, mathMl: true },
@@ -149,15 +162,22 @@ const getSandboxHtml = (content: string) => {
         if (payload) {
           e.preventDefault();
           e.stopPropagation();
-          window.parent.postMessage({ source: 'vcp-mobile', type: 'rendered-image-click', image: payload }, '*');
+          window.parent.postMessage({ source: 'vcp-mobile', type: 'rendered-image-click', nonce: ${noncePayload}, image: payload }, ${targetOriginPayload});
         }
       }, true);
 
       document.addEventListener('click', function(e) {
         const target = e.target.closest('a');
         if (target) {
-          const href = target.getAttribute('href');
-          if (!href || href === '#' || href.startsWith('javascript:')) {
+          var href = target.getAttribute('href') || '';
+          var safe = false;
+          try {
+            var parsed = new URL(href, window.location.href);
+            safe = parsed.protocol === 'http:' || parsed.protocol === 'https:' || href.charAt(0) === '#';
+          } catch (err) {
+            safe = false;
+          }
+          if (!safe) {
             e.preventDefault();
           }
         }
@@ -276,6 +296,7 @@ onUnmounted(() => {
               class="vcp-fullscreen-iframe w-full h-full border-none"
               sandbox="allow-scripts allow-modals allow-forms allow-popups"
               loading="lazy"
+              :data-vcp-image-nonce="sandboxImageNonce"
               :srcdoc="getSandboxHtml(content)"
             ></iframe>
           </div>
@@ -332,6 +353,7 @@ onUnmounted(() => {
           class="vcp-inline-iframe w-full h-full border-none no-swipe"
           sandbox="allow-scripts allow-modals allow-forms"
           loading="lazy"
+          :data-vcp-image-nonce="sandboxImageNonce"
           :srcdoc="getSandboxHtml(content)"
         ></iframe>
       </div>

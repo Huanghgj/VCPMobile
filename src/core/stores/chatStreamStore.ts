@@ -19,6 +19,8 @@ export const useChatStreamStore = defineStore("chatStream", () => {
   // 无论是在前台还是后台，流式消息都从此池中获取，保证响应式链路不断裂
   const activeStreamMessages = reactive<Map<string, ChatMessage>>(new Map());
   const auroraActiveMessageIds = new Set<string>();
+  const streamBlockSignatures = new Map<string, string>();
+  const streamTailSignatures = new Map<string, string>();
   const cleanupTimers = new Set<ReturnType<typeof setTimeout>>();
 
   const sessionStore = useChatSessionStore();
@@ -132,10 +134,18 @@ export const useChatStreamStore = defineStore("chatStream", () => {
         if (!activeStreamingIds.value.has(messageId)) {
             activeStreamMessages.delete(messageId);
             auroraActiveMessageIds.delete(messageId);
+            streamBlockSignatures.delete(messageId);
+            streamTailSignatures.delete(messageId);
         }
     }, 1000);
     cleanupTimers.add(cleanupTimer);
   };
+
+  const blocksSignature = (blocks: Array<{ hash?: string; type?: string }> = []) =>
+    blocks.map((block) => block.hash || block.type || "").join("|");
+
+  const tailSignature = (tailBlock: { hash?: string; type?: string } | undefined, tail?: string) =>
+    tailBlock?.hash || `${tailBlock?.type || ""}:${tail || ""}`;
 
   /**
    * 处理流式事件的核心逻辑 (会话隔离调度器)
@@ -236,10 +246,28 @@ export const useChatStreamStore = defineStore("chatStream", () => {
       const aurora = event.aurora;
       if (aurora) {
         auroraActiveMessageIds.add(actualMessageId);
-        msg!.content = aurora.content;
-        msg!.tailContent = aurora.tail;
-        msg!.blocks = (aurora.stableBlocks || []) as any;
-        msg!.tailBlock = (aurora.tailBlock as any) || undefined;
+        if (typeof aurora.content === "string") {
+          msg!.content = aurora.content;
+        } else if (typeof aurora.contentDelta === "string") {
+          msg!.content = (msg!.content || "") + aurora.contentDelta;
+        }
+        if (aurora.stableBlocks) {
+          const nextSignature = blocksSignature(aurora.stableBlocks);
+          if (streamBlockSignatures.get(actualMessageId) !== nextSignature) {
+            msg!.blocks = aurora.stableBlocks as any;
+            streamBlockSignatures.set(actualMessageId, nextSignature);
+          }
+        }
+        if (aurora.tailChanged) {
+          const nextTail = aurora.tail || "";
+          const nextTailBlock = (aurora.tailBlock as any) || undefined;
+          const nextTailSignature = tailSignature(nextTailBlock, nextTail);
+          if (streamTailSignatures.get(actualMessageId) !== nextTailSignature) {
+            msg!.tailContent = nextTail;
+            msg!.tailBlock = nextTailBlock;
+            streamTailSignatures.set(actualMessageId, nextTailSignature);
+          }
+        }
       }
       msg!.isThinking = false;
       addSessionStream(itemId, topicId, actualMessageId);
@@ -251,6 +279,8 @@ export const useChatStreamStore = defineStore("chatStream", () => {
       msg!.tailContent = "";
       msg!.tailBlock = undefined;
       auroraActiveMessageIds.delete(actualMessageId);
+      streamBlockSignatures.delete(actualMessageId);
+      streamTailSignatures.delete(actualMessageId);
       if (finishReason) msg!.finishReason = finishReason;
 
       removeSessionStream(itemId, topicId, actualMessageId);
@@ -360,4 +390,3 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     stopGroupTurn,
   };
 });
-

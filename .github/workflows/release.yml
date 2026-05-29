@@ -39,10 +39,13 @@ jobs:
       - name: Resolve release metadata
         id: meta
         shell: bash
+        env:
+          RELEASE_TAG_NAME: ${{ github.event.release.tag_name }}
+          RELEASE_TAG_INPUT: ${{ github.event.inputs.release_tag }}
         run: |
-          TAG_NAME="${{ github.event.release.tag_name }}"
+          TAG_NAME="${RELEASE_TAG_NAME:-}"
           if [[ -z "$TAG_NAME" ]]; then
-            TAG_NAME="${{ github.event.inputs.release_tag }}"
+            TAG_NAME="${RELEASE_TAG_INPUT:-}"
           fi
           if [[ -z "$TAG_NAME" ]]; then
             TAG_NAME="${GITHUB_REF_NAME}"
@@ -98,8 +101,10 @@ jobs:
 
       - name: Restore Android keystore
         shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
         run: |
-          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 --decode > "${ANDROID_KEYSTORE_PATH}"
+          printf '%s' "${ANDROID_KEYSTORE_BASE64}" | base64 --decode > "${ANDROID_KEYSTORE_PATH}"
           test -s "${ANDROID_KEYSTORE_PATH}"
 
       - name: Build Android APKs
@@ -169,21 +174,24 @@ jobs:
       - name: Collect and rename APK artifact
         id: artifacts
         shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
+          SOURCE_APK_PATH: ${{ env.SOURCE_APK }}
         run: |
           mkdir -p release-artifacts
 
-          source_apk="${{ env.SOURCE_APK }}"
+          source_apk="${SOURCE_APK_PATH}"
           if [[ -z "$source_apk" || ! -f "$source_apk" ]]; then
             echo "SOURCE_APK not set or file missing" >&2
             exit 1
           fi
 
-          target_apk="release-artifacts/VCPMobile_v${{ steps.meta.outputs.version }}_arm64-v8a.apk"
+          target_apk="release-artifacts/VCPMobile_v${RELEASE_VERSION}_arm64-v8a.apk"
           cp "$source_apk" "$target_apk"
 
           # 打包前端热更新资源
           if [[ -d "dist" ]]; then
-            frontend_zip="release-artifacts/frontend-dist-v${{ steps.meta.outputs.version }}.zip"
+            frontend_zip="release-artifacts/frontend-dist-v${RELEASE_VERSION}.zip"
             (cd dist && zip -r "../$frontend_zip" .)
             echo "frontend_zip=$frontend_zip" >> "$GITHUB_ENV"
           fi

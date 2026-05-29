@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tauri::{ipc::Channel, AppHandle, Manager};
 use tokio::io::AsyncWriteExt;
+use url::Url;
 
 const GITHUB_API_LATEST_URL: &str = "https://api.github.com/repos/MRiecy/VCPMobile/releases/latest";
 const GITHUB_API_LIST_URL: &str =
@@ -41,6 +42,25 @@ struct GitHubAsset {
     name: String,
     browser_download_url: String,
     size: u64,
+}
+
+fn validate_github_download_url(raw_url: &str) -> Result<Url, String> {
+    let parsed = Url::parse(raw_url).map_err(|e| format!("下载链接无效: {}", e))?;
+    if parsed.scheme() != "https" {
+        return Err("下载链接必须使用 HTTPS".to_string());
+    }
+    if parsed.host_str() != Some("github.com") {
+        return Err("下载链接来源不受信任".to_string());
+    }
+    let path = parsed.path();
+    if !path.starts_with("/MRiecy/VCPMobile/releases/download/") {
+        return Err("下载链接不属于 VCPMobile Release 资源".to_string());
+    }
+    let file_name = path.rsplit('/').next().unwrap_or_default();
+    if !file_name.ends_with(APK_ASSET_SUFFIX) {
+        return Err("下载链接不是 VCPMobile arm64 APK".to_string());
+    }
+    Ok(parsed)
 }
 
 async fn fetch_latest_release(client: &Client) -> Result<GitHubRelease, String> {
@@ -139,6 +159,7 @@ pub async fn download_update(
     url: String,
     on_progress: Channel<DownloadProgress>,
 ) -> Result<String, String> {
+    let download_url = validate_github_download_url(&url)?;
     let cache_dir = app
         .path()
         .app_cache_dir()
@@ -157,7 +178,7 @@ pub async fn download_update(
         .map_err(|e| e.to_string())?;
 
     let res = client
-        .get(&url)
+        .get(download_url)
         .header("User-Agent", "VCPMobile")
         .send()
         .await
@@ -201,12 +222,30 @@ pub async fn download_update(
 
 #[tauri::command]
 pub async fn install_update(app: AppHandle, apk_path: String) -> Result<(), String> {
+    let expected_apk_path = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| format!("获取缓存目录失败: {}", e))?
+        .join(APK_FILENAME);
+    let provided_path = std::path::PathBuf::from(&apk_path);
+    let expected_canonical = expected_apk_path
+        .canonicalize()
+        .map_err(|e| format!("更新包不存在: {}", e))?;
+    let provided_canonical = provided_path
+        .canonicalize()
+        .map_err(|e| format!("更新包路径无效: {}", e))?;
+    if provided_canonical != expected_canonical {
+        return Err("更新包路径不受信任".to_string());
+    }
+
     #[cfg(target_os = "android")]
     {
-        let result =
-            tauri_plugin_vcp_mobile::system::open_file_native(app.clone(), apk_path.clone());
+        let result = tauri_plugin_vcp_mobile::system::open_file_native(
+            app.clone(),
+            expected_canonical.to_string_lossy().to_string(),
+        );
         if result.is_err() {
-            let _ = tokio::fs::remove_file(&apk_path).await;
+            let _ = tokio::fs::remove_file(&expected_canonical).await;
         }
         return result;
     }
@@ -216,15 +255,16 @@ pub async fn install_update(app: AppHandle, apk_path: String) -> Result<(), Stri
         use tauri_plugin_opener::OpenerExt;
 
         // 尝试用 opener 打开本地 APK 触发系统安装器
-        let result = app
-            .opener()
-            .open_path(&apk_path, Some("application/vnd.android.package-archive"));
+        let result = app.opener().open_path(
+            expected_canonical.to_string_lossy().to_string(),
+            Some("application/vnd.android.package-archive"),
+        );
 
         match result {
             Ok(_) => Ok(()),
             Err(e) => {
                 // 删除失败的缓存文件
-                let _ = tokio::fs::remove_file(&apk_path).await;
+                let _ = tokio::fs::remove_file(&expected_canonical).await;
                 Err(format!(
                     "无法启动安装器: {}。建议前往 GitHub Release 页面手动下载安装。",
                     e

@@ -72,9 +72,11 @@ fn derive_info_url(log_url: &Url) -> Result<Url, String> {
     let mut info_url = log_url.clone();
     let path = info_url.path();
 
-    let info_path = if path.contains("/VCPlog/") {
+    let info_path = if let Some(prefix) = path.strip_suffix("/VCPlog") {
+        format!("{prefix}/vcpinfo")
+    } else if path.contains("/VCPlog/") {
         path.replacen("/VCPlog/", "/vcpinfo/", 1)
-    } else if path.contains("/vcpinfo/") {
+    } else if path == "/vcpinfo" || path.ends_with("/vcpinfo") || path.contains("/vcpinfo/") {
         path.to_string()
     } else {
         return Err(format!("Cannot derive VCPInfo URL from path: {}", path));

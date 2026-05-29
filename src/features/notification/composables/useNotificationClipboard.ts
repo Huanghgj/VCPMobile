@@ -7,9 +7,8 @@ export const useNotificationClipboard = () => {
   let copyTimer: ReturnType<typeof setTimeout> | null = null;
 
   const buildCopyText = (item: VcpNotification) => {
-    if (item.rawPayload) return JSON.stringify(item.rawPayload, null, 2);
-
-    const lines = [item.title];
+    const lines: string[] = [];
+    if (item.title) lines.push(item.title);
     if (item.subtitle) lines.push(item.subtitle);
     if (item.message) lines.push('', item.message);
     if (item.meta?.length) {
@@ -18,7 +17,8 @@ export const useNotificationClipboard = () => {
     if (item.details?.length) {
       lines.push('', ...item.details.map((detail) => `${detail.label}:\n${detail.value}`));
     }
-    return lines.join('\n');
+    const formatted = lines.join('\n').trim();
+    return formatted || (item.rawPayload ? JSON.stringify(item.rawPayload, null, 2) : '');
   };
 
   const copyContent = async (item: VcpNotification) => {

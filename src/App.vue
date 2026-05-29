@@ -296,15 +296,13 @@ onUnmounted(() => {
   --vcp-safe-bottom: max(env(safe-area-inset-bottom, 0px), var(--vcp-android-safe-bottom-fallback));
 }
 
-@media (pointer: coarse) {
-  :root {
-    /*
-      Android edge-to-edge WebView can report env(safe-area-inset-top) as 0.
-      Keep mobile UI below the status/navigation bars even when CSS env is unavailable.
-    */
-    --vcp-android-safe-top-fallback: 24px;
-    --vcp-android-safe-bottom-fallback: 20px;
-  }
+html.vcp-android-runtime {
+  /*
+    Android edge-to-edge WebView can report env(safe-area-inset-top) as 0.
+    Keep mobile UI below the status/navigation bars even when CSS env is unavailable.
+  */
+  --vcp-android-safe-top-fallback: 24px;
+  --vcp-android-safe-bottom-fallback: 20px;
 }
 
 html,

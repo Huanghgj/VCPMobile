@@ -17,10 +17,26 @@ const state = reactive({
   sourceLabel: "",
 });
 
+export function sanitizeRenderedImageSrc(value: string): string {
+  const src = value.trim();
+  if (!src) return "";
+  if (/^https?:\/\//i.test(src)) return src;
+  if (/^data:image\//i.test(src)) return src;
+  if (/^(blob:|file:|content:|asset:)/i.test(src)) return src;
+  if (/^[./]/.test(src)) {
+    try {
+      return new URL(src, window.location.href).href;
+    } catch {
+      return "";
+    }
+  }
+  return "";
+}
+
 export function openRenderedImageViewer(
   payload: RenderedImageViewerPayload,
 ): void {
-  const src = payload.src?.trim();
+  const src = sanitizeRenderedImageSrc(payload.src || "");
   if (!src) return;
 
   state.src = src;

@@ -387,15 +387,19 @@ function formatTime(ts: number) {
 
 // === Style Block CSS Injection ===
 const { injectScopedCss, removeScopedCss } = useContentProcessor();
+let injectedStyleSignature = "";
 
 watch(
   () => props.message.blocks,
   (blocks) => {
     if (!blocks) return;
-    for (const block of blocks) {
-      if (block.type === "style" && block.content) {
-        injectScopedCss(block.content, props.message.id);
-      }
+    const styleBlocks = blocks.filter((block) => block.type === "style" && block.content);
+    const styleSignature = styleBlocks.map((block) => block.hash || block.content).join("|");
+    if (styleSignature === injectedStyleSignature) return;
+    injectedStyleSignature = styleSignature;
+
+    for (const block of styleBlocks) {
+      injectScopedCss(block.content || "", props.message.id);
     }
   },
   { immediate: true }

@@ -1,22 +1,15 @@
 import type { RenderedImageViewerPayload } from "../composables/useRenderedImageViewer";
+import { sanitizeRenderedImageSrc } from "../composables/useRenderedImageViewer";
 
 const URL_IN_CSS_RE = /url\((["']?)(.*?)\1\)/i;
 
 function absoluteUrl(url: string): string {
   const trimmed = url.trim();
   if (!trimmed) return "";
-  if (
-    trimmed.startsWith("data:") ||
-    trimmed.startsWith("blob:") ||
-    trimmed.startsWith("file:") ||
-    trimmed.startsWith("content:")
-  ) {
-    return trimmed;
-  }
   try {
-    return new URL(trimmed, window.location.href).href;
+    return sanitizeRenderedImageSrc(new URL(trimmed, window.location.href).href);
   } catch {
-    return trimmed;
+    return sanitizeRenderedImageSrc(trimmed);
   }
 }
 

@@ -12,6 +12,7 @@ import {
 interface SandboxImageMessage {
   source?: string;
   type?: string;
+  nonce?: string;
   image?: {
     src?: string;
     alt?: string;
@@ -157,7 +158,8 @@ async function fallbackBrowserDownload(
   const anchor = document.createElement("a");
   anchor.href = src;
   anchor.download = fileName;
-  anchor.rel = "noopener";
+  anchor.rel = "noopener noreferrer";
+  anchor.target = "_blank";
   document.body.appendChild(anchor);
   anchor.click();
   anchor.remove();
@@ -221,14 +223,35 @@ function close(): void {
   closeRenderedImageViewer();
 }
 
+function trustedSandboxFrame(
+  event: MessageEvent<SandboxImageMessage>,
+): HTMLIFrameElement | null {
+  if (event.origin !== "null" || !event.source) return null;
+
+  const frames = document.querySelectorAll<HTMLIFrameElement>(
+    "iframe[data-vcp-image-nonce]",
+  );
+  for (const frame of frames) {
+    if (frame.contentWindow === event.source) {
+      return frame;
+    }
+  }
+  return null;
+}
+
 function handleSandboxMessage(event: MessageEvent<SandboxImageMessage>): void {
   const data = event.data;
   if (
     !data ||
+    typeof data !== "object" ||
     data.source !== "vcp-mobile" ||
     data.type !== "rendered-image-click"
   )
     return;
+  const frame = trustedSandboxFrame(event);
+  if (!frame || !data.nonce || frame.dataset.vcpImageNonce !== data.nonce) {
+    return;
+  }
   const image = data.image;
   if (!image?.src) return;
   openRenderedImageViewer({

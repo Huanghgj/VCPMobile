@@ -2,16 +2,32 @@ use serde::{Deserialize, Serialize};
 
 use crate::vcp_modules::stream_block_parser::{StreamBlock, StreamBlockParser};
 
+const MAX_SPECULATIVE_TAIL_AST_BYTES: usize = 4096;
+
 /// Aurora 语义沉淀更新，由 Rust 流式管道推送到前端
 #[derive(Debug, Serialize, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuroraUpdate {
     /// 流式增量块：已确认闭合的语义块
-    pub stable_blocks: Vec<StreamBlock>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stable_blocks: Option<Vec<StreamBlock>>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stable_changed: bool,
     /// 推测块：当前正在增长的尾部，按 Markdown 预渲染
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tail_block: Option<StreamBlock>,
-    pub tail: String,
-    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tail: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tail_changed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_delta: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Aurora 语义沉淀缓冲区
@@ -63,13 +79,19 @@ impl AuroraBuffer {
 
         // 2. 推测渲染 (Speculative Rendering)：将 tail 视为一个临时 Markdown 块
         if !self.tail_content.is_empty() {
-            let nodes = crate::vcp_modules::pre_renderer::parse_markdown_to_ast(&self.tail_content);
+            let nodes = if self.tail_content.len() <= MAX_SPECULATIVE_TAIL_AST_BYTES {
+                Some(crate::vcp_modules::pre_renderer::parse_markdown_to_ast(
+                    &self.tail_content,
+                ))
+            } else {
+                None
+            };
             let hash = crate::vcp_modules::sync_hash::HashAggregator::compute_content_hash(
                 &self.tail_content,
             );
             self.tail_block = Some(StreamBlock::markdown(
                 self.tail_content.clone(),
-                Some(nodes),
+                nodes,
                 hash,
             ));
         } else {

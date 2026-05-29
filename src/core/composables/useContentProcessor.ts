@@ -28,15 +28,22 @@ export interface ContentBlock {
 
 const injectedStyles = new Map<string, string>();
 
+function sanitizeScopedCss(css: string): string {
+  return css
+    .replace(/@(?:import|namespace|font-face|page)\b[^;{]*(?:;|\{[\s\S]*?\})/gi, "")
+    .replace(/url\(\s*(['"]?)(?!data:image\/|#)[^)]+\1\s*\)/gi, "none")
+    .replace(/\bposition\s*:\s*(?:fixed|sticky)\s*;?/gi, "");
+}
+
 export function useContentProcessor() {
   /**
    * Escape HTML special characters
    */
   const escapeHtml = (text: string) => {
     return text
-      .replace(/&/g, "&")
-      .replace(/</g, "<")
-      .replace(/>/g, ">")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
       .replace(/"/g, "&quot;")
       .replace(/'/g, "&#039;");
   };
@@ -44,7 +51,10 @@ export function useContentProcessor() {
   const injectScopedCss = (css: string, messageId: string) => {
     if (!css || !messageId) return;
     const scopeSelector = `[data-message-id="${messageId}"]`;
-    const scopedCss = css.replace(
+    const sanitizedCss = sanitizeScopedCss(css);
+    if (!sanitizedCss.trim()) return;
+
+    const scopedCss = sanitizedCss.replace(
       /(^|\})\s*([^{]+)\s*\{/g,
       (_, prefix, selectors) => {
         const scopedSelectors = selectors
@@ -95,9 +105,9 @@ export function useContentProcessor() {
         const displayTheme = theme
           ? theme.trim().replace(/"/g, "")
           : "元思考链";
-        const statusLabel = `${displayTheme} (已完成)`;
+        const statusLabel = escapeHtml(`${displayTheme} (已完成)`);
         
-        return `\n<div class="my-2 p-3 bg-black/5 dark:bg-white/5 rounded-xl border border-black/10 dark:border-white/10 text-sm"><div class="flex items-center gap-2 mb-2 opacity-70 font-bold"><span class="grayscale">🧠</span> <span>${statusLabel}</span></div><div class="italic opacity-80">${content}</div></div>\n`;
+        return `\n<div class="my-2 p-3 bg-black/5 dark:bg-white/5 rounded-xl border border-black/10 dark:border-white/10 text-sm"><div class="flex items-center gap-2 mb-2 opacity-70 font-bold"><span class="grayscale">🧠</span> <span>${statusLabel}</span></div><div class="italic opacity-80">${escapeHtml(content)}</div></div>\n`;
       },
     );
     // THINK (Standard)
@@ -106,7 +116,7 @@ export function useContentProcessor() {
       (_, content) => {
         const statusLabel = "思索完毕";
 
-        return `\n<div class="my-2 p-3 bg-black/5 dark:bg-white/5 rounded-xl border border-black/10 dark:border-white/10 text-sm"><div class="flex items-center gap-2 mb-2 opacity-70 font-bold"><span class="grayscale">🧠</span> <span>${statusLabel}</span></div><div class="italic opacity-80">${content}</div></div>\n`;
+        return `\n<div class="my-2 p-3 bg-black/5 dark:bg-white/5 rounded-xl border border-black/10 dark:border-white/10 text-sm"><div class="flex items-center gap-2 mb-2 opacity-70 font-bold"><span class="grayscale">🧠</span> <span>${statusLabel}</span></div><div class="italic opacity-80">${escapeHtml(content)}</div></div>\n`;
       },
     );
     // 注意：MATH block 的解析已迁移至 Rust 后端 parse_content，
@@ -130,7 +140,7 @@ export function useContentProcessor() {
         if (content.includes("DailyNote") && content.includes("create")) {
           return `\n<div class="my-2 p-3 bg-amber-500/10 border border-amber-500/20 rounded-xl text-sm"><div class="font-bold text-amber-600 dark:text-amber-400 mb-1">📖 日记撰写中...</div><pre class="opacity-70 text-xs whitespace-pre-wrap">${escapeHtml(content)}</pre></div>\n`;
         }
-        return `\n<div class="my-2 p-3 bg-blue-500/5 border border-blue-500/20 rounded-xl text-sm"><div class="font-bold text-blue-500 mb-1">🛠️ 工具调用: ${toolName}</div><pre class="opacity-70 text-xs whitespace-pre-wrap">${escapeHtml(content)}</pre></div>\n`;
+        return `\n<div class="my-2 p-3 bg-blue-500/5 border border-blue-500/20 rounded-xl text-sm"><div class="font-bold text-blue-500 mb-1">🛠️ 工具调用: ${escapeHtml(toolName)}</div><pre class="opacity-70 text-xs whitespace-pre-wrap">${escapeHtml(content)}</pre></div>\n`;
       },
     );
     return processed;
