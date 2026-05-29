@@ -171,16 +171,14 @@ impl BatchDiffHandler {
                                                 &format!("Pull failed for {}: {}", tid, err),
                                             );
                                         }
-                                    } else {
-                                        if let Ok(mut l) = sync_logger_msg.lock() {
-                                            l.log_operation(
-                                                "messages",
-                                                "topic",
-                                                tid,
-                                                false,
-                                                Some("not in batch response"),
-                                            );
-                                        }
+                                    } else if let Ok(mut l) = sync_logger_msg.lock() {
+                                        l.log_operation(
+                                            "messages",
+                                            "topic",
+                                            tid,
+                                            false,
+                                            Some("not in batch response"),
+                                        );
                                     }
                                 }
                             }

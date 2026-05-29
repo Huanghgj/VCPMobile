@@ -536,31 +536,29 @@ async fn run_sync_session(
 
                                     if owners.is_empty() {
                                         let _ = tx_internal.send(SyncCommand::StartTopicValidation);
-                                    } else {
-                                        if let Ok(manifest) = Phase1Metadata::build_targeted_topic_manifest(&db.pool, &owners).await {
-                                            manifest_phase.store(2, Ordering::SeqCst);
-                                            expected_manifest_count.store(1, Ordering::SeqCst);
-                                            manifest_responses_received.store(0, Ordering::SeqCst);
-                                            pending_tasks_task.store(0, Ordering::SeqCst);
-                                            total_tasks_task.store(0, Ordering::SeqCst);
+                                    } else if let Ok(manifest) = Phase1Metadata::build_targeted_topic_manifest(&db.pool, &owners).await {
+                                        manifest_phase.store(2, Ordering::SeqCst);
+                                        expected_manifest_count.store(1, Ordering::SeqCst);
+                                        manifest_responses_received.store(0, Ordering::SeqCst);
+                                        pending_tasks_task.store(0, Ordering::SeqCst);
+                                        total_tasks_task.store(0, Ordering::SeqCst);
 
-                                            if let Ok(mut logger) = sync_logger_task.lock() {
-                                                logger.start_phase("topic_metadata", 1);
-                                                logger.log(LogLevel::Info, "topic_metadata", "=== Phase 2: Pulling Topic Metadata ===");
-                                            }
-                                            let _ = ws_stream.send(Message::Text(json!({ "type": "PHASE_START", "phase": "topic_metadata" }).to_string().into())).await;
-
-                                            let msg = json!({
-                                                "type": "SYNC_MANIFEST",
-                                                "data": manifest.items,
-                                                "dataType": manifest.data_type,
-                                                "phase": 2, // Use explicit Phase ID 2
-                                                "targetedOwners": owners
-                                            });
-                                            let _ = ws_stream.send(Message::Text(msg.to_string().into())).await;
-                                        } else {
-                                            let _ = tx_internal.send(SyncCommand::StartTopicValidation);
+                                        if let Ok(mut logger) = sync_logger_task.lock() {
+                                            logger.start_phase("topic_metadata", 1);
+                                            logger.log(LogLevel::Info, "topic_metadata", "=== Phase 2: Pulling Topic Metadata ===");
                                         }
+                                        let _ = ws_stream.send(Message::Text(json!({ "type": "PHASE_START", "phase": "topic_metadata" }).to_string().into())).await;
+
+                                        let msg = json!({
+                                            "type": "SYNC_MANIFEST",
+                                            "data": manifest.items,
+                                            "dataType": manifest.data_type,
+                                            "phase": 2, // Use explicit Phase ID 2
+                                            "targetedOwners": owners
+                                        });
+                                        let _ = ws_stream.send(Message::Text(msg.to_string().into())).await;
+                                    } else {
+                                        let _ = tx_internal.send(SyncCommand::StartTopicValidation);
                                     }
                                 },
                                 crate::vcp_modules::sync_pipeline::pipeline::PipelineCommand::StartTopicValidation => {

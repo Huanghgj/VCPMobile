@@ -35,9 +35,9 @@ impl StorageInfoTool {
                 return "存储信息不可用".to_string();
             }
 
-            let block_size = stat.f_frsize as u64;
-            let total = stat.f_blocks as u64 * block_size;
-            let available = stat.f_bavail as u64 * block_size;
+            let block_size = stat.f_frsize;
+            let total = stat.f_blocks * block_size;
+            let available = stat.f_bavail * block_size;
             let used = total.saturating_sub(available);
 
             let usage_pct = if total > 0 {

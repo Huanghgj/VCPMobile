@@ -625,8 +625,7 @@ pub async fn perform_vcp_request<R: Runtime>(
                                                     if !text_chunk.is_empty() {
                                                         aurora_buffer.append_chunk(&text_chunk);
                                                         let should_render = last_aurora_render
-                                                            .as_ref()
-                                                            .map_or(true, |last| last.elapsed() >= stream_render_interval);
+                                                            .is_none_or(|last| last.elapsed() >= stream_render_interval);
                                                         if should_render {
                                                             let (stable_changed, tail_changed) = aurora_buffer.process_queue();
                                                             if stable_changed || tail_changed {
