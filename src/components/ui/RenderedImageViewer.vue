@@ -165,17 +165,45 @@ async function fallbackBrowserDownload(
   anchor.remove();
 }
 
+function extensionFromMime(mimeType: string): string {
+  switch (mimeType.toLowerCase()) {
+    case "image/jpeg":
+      return "jpg";
+    case "image/gif":
+      return "gif";
+    case "image/webp":
+      return "webp";
+    case "image/bmp":
+      return "bmp";
+    case "image/png":
+    default:
+      return "png";
+  }
+}
+
+async function saveViaTempFile(src: string, fileName: string): Promise<void> {
+  const response = await fetch(src);
+  if (!response.ok) throw new Error(`HTTP 资源加载失败: ${response.status}`);
+  const blob = await response.blob();
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  const tempFileName = `vcp_tmp_${Date.now()}.${extensionFromMime(blob.type)}`;
+  const tempPath = await invoke<string>("plugin:vcp-mobile|write_temp_file", {
+    bytes: Array.from(bytes),
+    fileName: tempFileName,
+  });
+  await invoke("plugin:vcp-mobile|save_image_from_path", {
+    imagePath: tempPath,
+    fileName,
+  });
+}
+
 async function saveImage(): Promise<void> {
   if (!state.src || isSaving.value) return;
   isSaving.value = true;
   const fileName = guessFileName();
 
   try {
-    const sourceUrl = await sourceForNativeSave(state.src);
-    await invoke("plugin:vcp-mobile|save_image_to_gallery", {
-      sourceUrl,
-      fileName,
-    });
+    await saveViaTempFile(state.src, fileName);
     notificationStore.addNotification({
       type: "success",
       title: "保存成功",
@@ -183,9 +211,13 @@ async function saveImage(): Promise<void> {
       toastOnly: true,
     });
   } catch (error) {
-    console.error("[RenderedImageViewer] Native save failed:", error);
+    console.error("[RenderedImageViewer] Zero-IPC save failed:", error);
     try {
-      await trySaveViaWebViewFetch(state.src, fileName);
+      const sourceUrl = await sourceForNativeSave(state.src);
+      await invoke("plugin:vcp-mobile|save_image_to_gallery", {
+        sourceUrl,
+        fileName,
+      });
       notificationStore.addNotification({
         type: "success",
         title: "保存成功",
@@ -194,24 +226,38 @@ async function saveImage(): Promise<void> {
       });
     } catch (retryError) {
       console.error(
-        "[RenderedImageViewer] WebView fetch save failed:",
+        "[RenderedImageViewer] Native gallery save failed:",
         retryError,
       );
       try {
-        await fallbackBrowserDownload(state.src, fileName);
+        await trySaveViaWebViewFetch(state.src, fileName);
         notificationStore.addNotification({
           type: "success",
-          title: "已开始保存",
-          message: "当前环境已改用浏览器下载方式",
+          title: "保存成功",
+          message: "图片已保存到相册",
           toastOnly: true,
         });
-      } catch (downloadError) {
-        notificationStore.addNotification({
-          type: "error",
-          title: "保存失败",
-          message: String(downloadError || error),
-          toastOnly: true,
-        });
+      } catch (webViewError) {
+        console.error(
+          "[RenderedImageViewer] WebView fetch save failed:",
+          webViewError,
+        );
+        try {
+          await fallbackBrowserDownload(state.src, fileName);
+          notificationStore.addNotification({
+            type: "success",
+            title: "已开始保存",
+            message: "当前环境已改用浏览器下载方式",
+            toastOnly: true,
+          });
+        } catch (downloadError) {
+          notificationStore.addNotification({
+            type: "error",
+            title: "保存失败",
+            message: String(downloadError || error),
+            toastOnly: true,
+          });
+        }
       }
     }
   } finally {
@@ -291,8 +337,7 @@ onUnmounted(() => {
     <Transition name="rendered-image-viewer">
       <div
         v-if="state.isOpen"
-        class="fixed inset-0 flex flex-col bg-[#05070a] text-white pointer-events-auto select-none"
-        style="z-index: 95"
+        class="fixed inset-0 flex flex-col bg-[#05070a] text-white pointer-events-auto select-none z-viewer"
         @click.self="close"
       >
         <div

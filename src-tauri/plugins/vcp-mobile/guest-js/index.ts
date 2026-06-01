@@ -37,8 +37,8 @@ export interface PickedFile {
   thumbnailPath?: string;
 }
 
-export function pickFile(): Promise<PickedFile> {
-  return invoke<PickedFile>("plugin:vcp-mobile|pick_file");
+export function pickFile(mode = "file"): Promise<PickedFile> {
+  return invoke<PickedFile>("plugin:vcp-mobile|pick_file", { mode });
 }
 
 export function openFileNative(path: string): Promise<void> {
@@ -58,6 +58,26 @@ export function saveImageToGallery(
 ): Promise<GallerySaveResult> {
   return invoke<GallerySaveResult>("plugin:vcp-mobile|save_image_to_gallery", {
     sourceUrl,
+    fileName,
+  });
+}
+
+export function saveImageFromPath(
+  imagePath: string,
+  fileName?: string,
+): Promise<GallerySaveResult> {
+  return invoke<GallerySaveResult>("plugin:vcp-mobile|save_image_from_path", {
+    imagePath,
+    fileName,
+  });
+}
+
+export function writeTempFile(
+  bytes: Uint8Array,
+  fileName: string,
+): Promise<string> {
+  return invoke<string>("plugin:vcp-mobile|write_temp_file", {
+    bytes: Array.from(bytes),
     fileName,
   });
 }

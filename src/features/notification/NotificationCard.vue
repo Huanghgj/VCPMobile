@@ -37,23 +37,47 @@ const { formatTime, getTypeColor, copyToClipboard } = useNotificationPresentatio
 const isDetailsExpanded = ref(false);
 const isCopied = ref(false);
 const touchStartX = ref(0);
+const touchStartY = ref(0);
 const swipeOffset = ref(0);
 const isSwiping = ref(false);
+const isVerticalScroll = ref(false);
+const hasDeterminedDirection = ref(false);
 
 const presentation = computed(() => getTypeColor(props.item.type));
 
 // Swipe to delete logic
 const handleTouchStart = (e: TouchEvent) => {
   touchStartX.value = e.touches[0].clientX;
+  touchStartY.value = e.touches[0].clientY;
   isSwiping.value = true;
+  isVerticalScroll.value = false;
+  hasDeterminedDirection.value = false;
 };
 
 const handleTouchMove = (e: TouchEvent) => {
-  if (!isSwiping.value) return;
+  if (!isSwiping.value || isVerticalScroll.value) return;
   const currentX = e.touches[0].clientX;
-  const diff = currentX - touchStartX.value;
-  if (diff < 0) {
-    swipeOffset.value = Math.max(-80, diff);
+  const currentY = e.touches[0].clientY;
+  const deltaX = currentX - touchStartX.value;
+  const deltaY = currentY - touchStartY.value;
+
+  if (!hasDeterminedDirection.value) {
+    const absX = Math.abs(deltaX);
+    const absY = Math.abs(deltaY);
+    if (absX > 15 || absY > 15) {
+      hasDeterminedDirection.value = true;
+      if (absY / absX > 0.577) {
+        isVerticalScroll.value = true;
+        swipeOffset.value = 0;
+        return;
+      }
+    } else {
+      return;
+    }
+  }
+
+  if (deltaX < 0) {
+    swipeOffset.value = Math.max(-80, deltaX);
   } else {
     swipeOffset.value = 0;
   }

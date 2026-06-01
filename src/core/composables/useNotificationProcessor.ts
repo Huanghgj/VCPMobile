@@ -683,9 +683,9 @@ export function useNotificationProcessor() {
     // --- 核心引擎状态处理 (P0 级别) ---
     if (payload.type === 'vcp-core-status') {
       const { status, message } = payload;
-      
-      store.updateCoreStatus({ 
-        status: status as any, 
+
+      store.updateCoreStatus({
+        status: status as any,
         message: message || '核心状态变更',
         source: 'Core'
       });
@@ -717,7 +717,7 @@ export function useNotificationProcessor() {
     // 1. vcp_log: 核心工具调用日志 (服务端协议) 或 vcp-log-message (移动端内部兼容)
     if ((payload.type === 'vcp_log' || payload.type === 'vcp-log-message') && payload.data) {
       const vcpData = payload.data;
-      
+
       if (vcpData.id) {
         notificationId = vcpData.id;
         if (vcpData.id === 'vcp_sync_connection_status' && vcpData.status === 'error') {
@@ -726,15 +726,23 @@ export function useNotificationProcessor() {
       }
 
       if (vcpData.tool_name && vcpData.status) {
-        type = vcpData.status === 'error' 
-          ? 'error' 
+        type = vcpData.status === 'error'
+          ? 'error'
           : (vcpData.tool_name === 'DailyNote' ? 'success' : 'tool');
-        
-        title = `${vcpData.tool_name} ${vcpData.status}`;
+
+        const statusText = vcpData.status === 'success' ? '执行成功' : vcpData.status === 'error' ? '执行失败' : vcpData.status;
+        title = `${vcpData.tool_name} ${statusText}`;
 
         let rawContent = String(vcpData.content || '');
         message = rawContent;
-        isPreformatted = true;
+
+        // 智能降维渲染：如果文本内容以 Emoji ✅/❌ 开头，或者是不含有换行与大括号的单行日常提示
+        // 则设为非 Preformatted，以便采用极致自然的原生排版呈现，剔除代码框的突兀感
+        isPreformatted = !(
+          rawContent.startsWith('✅') ||
+          rawContent.startsWith('❌') ||
+          (!rawContent.includes('\n') && !rawContent.includes('{'))
+        );
 
         // 处理错误模式: "执行错误: {"plugin_error": "..."}"
         if (vcpData.status === 'error' && rawContent.includes('{')) {
@@ -841,7 +849,7 @@ export function useNotificationProcessor() {
       if (typeof payload === 'object' && payload !== null) {
         title = payload.type ? `类型: ${payload.type}` : 'VCP 消息';
         message = payload.message || (payload.data?.message) || JSON.stringify(payload, null, 2);
-        
+
         // 如果有附加数据，追加展示
         if (payload.data && !payload.message) {
           message = JSON.stringify(payload.data, null, 2);

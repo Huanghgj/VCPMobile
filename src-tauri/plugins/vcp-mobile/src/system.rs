@@ -11,6 +11,7 @@ pub struct PermissionStatus {
     pub storage: bool,
     pub battery: bool,
     pub microphone: bool,
+    pub camera: bool,
 }
 
 #[tauri::command]
@@ -34,6 +35,7 @@ pub fn check_all_permissions<R: Runtime>(app: AppHandle<R>) -> Result<Permission
             storage: true,
             battery: true,
             microphone: true,
+            camera: true,
         })
     }
 }
@@ -95,7 +97,10 @@ pub struct PickedFileInfo {
 }
 
 #[tauri::command]
-pub fn pick_file<R: Runtime>(app: AppHandle<R>) -> Result<PickedFileInfo, String> {
+pub fn pick_file<R: Runtime>(
+    app: AppHandle<R>,
+    mode: Option<String>,
+) -> Result<PickedFileInfo, String> {
     #[cfg(target_os = "android")]
     {
         let state = app.state::<VcpMobileState<R>>();
@@ -103,13 +108,19 @@ pub fn pick_file<R: Runtime>(app: AppHandle<R>) -> Result<PickedFileInfo, String
         let plugin_handle = handle.as_ref().ok_or("Plugin handle not initialized")?;
 
         let file_info = plugin_handle
-            .run_mobile_plugin::<PickedFileInfo>("pickFile", serde_json::json!({}))
+            .run_mobile_plugin::<PickedFileInfo>(
+                "pickFile",
+                serde_json::json!({
+                    "mode": mode.unwrap_or_else(|| "file".to_string())
+                }),
+            )
             .map_err(|e| format!("run_mobile_plugin failed: {}", e))?;
         Ok(file_info)
     }
     #[cfg(not(target_os = "android"))]
     {
         let _ = app;
+        let _ = mode;
         Err("该接口仅在 Android 物理端可用".to_string())
     }
 }
@@ -236,6 +247,58 @@ pub fn save_image_to_gallery<R: Runtime>(
     {
         let _ = app;
         let _ = source_url;
+        let _ = file_name;
+        Err("该接口仅在 Android 物理端可用".to_string())
+    }
+}
+
+#[tauri::command]
+pub fn save_image_from_path<R: Runtime>(
+    app: AppHandle<R>,
+    image_path: String,
+    file_name: Option<String>,
+) -> Result<GallerySaveResult, String> {
+    #[cfg(target_os = "android")]
+    {
+        let state = app.state::<VcpMobileState<R>>();
+        let handle = state.plugin_handle.lock().map_err(|e| e.to_string())?;
+        let plugin_handle = handle.as_ref().ok_or("Plugin handle not initialized")?;
+
+        let result = plugin_handle
+            .run_mobile_plugin::<GallerySaveResult>(
+                "saveImageFromPath",
+                serde_json::json!({ "imagePath": image_path, "fileName": file_name }),
+            )
+            .map_err(|e| format!("run_mobile_plugin failed: {}", e))?;
+        Ok(result)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        let _ = image_path;
+        let _ = file_name;
+        Err("该接口仅在 Android 物理端可用".to_string())
+    }
+}
+
+#[tauri::command]
+pub fn write_temp_file<R: Runtime>(
+    app: AppHandle<R>,
+    bytes: Vec<u8>,
+    file_name: String,
+) -> Result<String, String> {
+    #[cfg(target_os = "android")]
+    {
+        use tauri::Manager;
+        let cache_dir = app.path().cache_dir().map_err(|e| e.to_string())?;
+        let temp_path = cache_dir.join(&file_name);
+        std::fs::write(&temp_path, bytes).map_err(|e| e.to_string())?;
+        Ok(temp_path.to_string_lossy().to_string())
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        let _ = bytes;
         let _ = file_name;
         Err("该接口仅在 Android 物理端可用".to_string())
     }

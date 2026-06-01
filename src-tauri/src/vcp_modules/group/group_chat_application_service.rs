@@ -3,7 +3,6 @@
 
 use crate::vcp_modules::agent_service::{read_agent_config, AgentConfigState};
 use crate::vcp_modules::chat_manager::ChatMessage;
-use crate::vcp_modules::context_assembler_utils::assemble_history_for_vcp;
 use crate::vcp_modules::db_manager::DbState;
 use crate::vcp_modules::group_context_assembler::assemble_group_context;
 use crate::vcp_modules::group_service::{read_group_config, GroupManagerState};
@@ -178,6 +177,17 @@ pub async fn internal_process_group_chat_message(
                 .as_millis()
         );
 
+        // 【优化点】：此时已识别出当前轮次的发言者 agent_name，立即提前启动前台服务保活，
+        // 从而与接下来耗时的群组上下文组装、SQLite Tavern 级联编织等逻辑并行重叠。
+        if let Err(e) =
+            tauri_plugin_vcp_mobile::stream::start_stream_service_inner(&app_handle, &agent_name)
+        {
+            log::warn!(
+                "[GroupChatAppService] Failed to start streaming service early: {}",
+                e
+            );
+        }
+
         // 组装上下文
         let base_system_prompt =
             assemble_group_context(&speaker, &group_config_inner, &active_member_configs_inner)
@@ -207,23 +217,20 @@ pub async fn internal_process_group_chat_message(
             model_config["temperature"] = json!(speaker.temperature);
         }
 
-        // 组装上下文（群聊需要添加发言人前缀以消歧）
-        let mut messages = assemble_history_for_vcp(&full_history_for_context, true);
-        if let Some(invite_prompt) = &group_config_inner.invite_prompt {
-            let processed_invite = invite_prompt.replace("{{VCPChatAgentName}}", &agent_name);
-            messages.push(json!({
-                "role": "user",
-                "content": processed_invite
-            }));
-        }
-        messages.insert(0, json!({"role": "system", "content": base_system_prompt}));
+        // 组装上下文，委派上下文级联装配外观中枢，完成微观编织与宏观 Tavern 规则流水线拦截
+        let invite_prompt_processed = group_config_inner
+            .invite_prompt
+            .as_ref()
+            .map(|ip| ip.replace("{{VCPChatAgentName}}", &agent_name));
 
-        crate::vcp_modules::chat::context_injection::apply_tarven_pipeline(
+        let messages = crate::vcp_modules::context_assembler::orchestrate_chat_context(
             &db_pool,
+            &full_history_for_context,
             &topic_id,
             &agent_name,
             "group",
-            &mut messages,
+            base_system_prompt,
+            invite_prompt_processed,
         )
         .await?;
 
@@ -247,16 +254,6 @@ pub async fn internal_process_group_chat_message(
         // 发射 thinking 事件，让前端为当前接力的 Agent 创建思考占位消息
         if let Some(chan) = &stream_channel {
             let _ = chan.send(StreamEvent::thinking(message_id.clone(), context));
-        }
-
-        // 启动前台服务保活
-        if let Err(e) =
-            tauri_plugin_vcp_mobile::stream::start_stream_service_inner(&app_handle, &agent_name)
-        {
-            log::warn!(
-                "[GroupChatAppService] Failed to start streaming service: {}",
-                e
-            );
         }
 
         // 执行请求 (串行等待)
@@ -286,15 +283,33 @@ pub async fn internal_process_group_chat_message(
                     res["finishReason"].as_str().map(|s| s.to_string())
                 };
 
+                // 1. 委托流终结器落盘与发射事件
+                message_service::finalize_stream_message(
+                    app_handle.clone(),
+                    &db_pool,
+                    &group_id,
+                    "group",
+                    topic_id.clone(),
+                    message_id.clone(),
+                    full_content.to_string(),
+                    is_aborted,
+                    finish_reason.clone(),
+                    stream_channel.clone(),
+                )
+                .await?;
+
+                // 2. 将此棒生成的回复追加到内存上下文中，提供给接力赛的下一个 Agent
+                let final_ts = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+
                 let ai_msg = ChatMessage {
                     id: message_id,
                     role: "assistant".to_string(),
                     name: Some(agent_name),
                     content: full_content.to_string(),
-                    timestamp: SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_millis() as u64,
+                    timestamp: final_ts,
                     is_thinking: Some(false),
                     agent_id: Some(agent_id.clone()),
                     group_id: Some(group_id.clone()),
@@ -306,45 +321,7 @@ pub async fn internal_process_group_chat_message(
                     shell: None,
                     content_hash: None,
                 };
-
-                // 立即进行一次断点存盘 (针对单个 Agent)
-                let append_result = message_service::append_single_message(
-                    app_handle.clone(),
-                    &db_pool,
-                    &group_id,
-                    "group",
-                    topic_id.clone(),
-                    ai_msg.clone(),
-                )
-                .await;
-                let end_blocks = match &append_result {
-                    Ok(blocks) => Some(blocks.clone()),
-                    Err(e) => {
-                        log::error!(
-                            "[GroupChatAppService] Failed to append final message: {}",
-                            e
-                        );
-                        None
-                    }
-                };
-                if let Some(chan) = &stream_channel {
-                    let _ = chan.send(StreamEvent::end(
-                        ai_msg.id.clone(),
-                        Some(json!({
-                            "groupId": group_id,
-                            "topicId": topic_id,
-                            "agentId": agent_id,
-                            "isGroupMessage": true,
-                            "agentName": ai_msg.name.clone()
-                        })),
-                        ai_msg.finish_reason.clone(),
-                        end_blocks,
-                    ));
-                }
-
-                // 关键优化：将新生成的回复追加到内存上下文，提供给接力赛的下一个 Agent
                 full_history_for_context.push(ai_msg.clone());
-
                 final_new_msgs.push(ai_msg);
             }
         } else if let Err(e) = res_result {

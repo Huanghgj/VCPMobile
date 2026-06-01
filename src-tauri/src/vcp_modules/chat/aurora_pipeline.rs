@@ -2,26 +2,30 @@ use serde::{Deserialize, Serialize};
 
 use crate::vcp_modules::stream_block_parser::{StreamBlock, StreamBlockParser};
 
-const MAX_SPECULATIVE_TAIL_AST_BYTES: usize = 4096;
+/// 推测渲染的 tail 字节上限：超过此阈值跳过 AST 解析，防止流式热路径性能悬崖
+const MAX_SPECULATIVE_TAIL_AST_BYTES: usize = 8192;
 
 /// Aurora 语义沉淀更新，由 Rust 流式管道推送到前端
+/// 采用稀疏序列化：只在字段有变化时才包含在 JSON 中，减少 IPC payload
 #[derive(Debug, Serialize, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuroraUpdate {
-    /// 流式增量块：已确认闭合的语义块
+    /// 流式增量块：已确认闭合的语义块（仅 stable_changed 时发送）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stable_blocks: Option<Vec<StreamBlock>>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub stable_changed: bool,
-    /// 推测块：当前正在增长的尾部，按 Markdown 预渲染
+    /// 推测块：当前正在增长的尾部，按 Markdown 预渲染（仅 tail_changed 时发送）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tail_block: Option<StreamBlock>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tail: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub tail_changed: bool,
+    /// 全量内容的流式增量（正常流式中发送，避免依赖原始 data 事件重复渲染）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_delta: Option<String>,
+    /// 全量内容（仅终结事件时发送，正常流式中省略）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
 }
@@ -78,6 +82,8 @@ impl AuroraBuffer {
         self.tail_content = new_tail;
 
         // 2. 推测渲染 (Speculative Rendering)：将 tail 视为一个临时 Markdown 块
+        //    当 tail 超过 MAX_SPECULATIVE_TAIL_AST_BYTES 时跳过 AST 解析，
+        //    避免在流式热路径上产生性能悬崖
         if !self.tail_content.is_empty() {
             let nodes = if self.tail_content.len() <= MAX_SPECULATIVE_TAIL_AST_BYTES {
                 Some(crate::vcp_modules::pre_renderer::parse_markdown_to_ast(

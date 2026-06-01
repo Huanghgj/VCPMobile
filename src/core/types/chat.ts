@@ -190,4 +190,5 @@ export interface StreamEvent {
   error?: string;
   aurora?: AuroraUpdate;
   blocks?: ContentBlock[];
+  timestamp?: number;
 }

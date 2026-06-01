@@ -1,6 +1,5 @@
 use crate::vcp_modules::agent_service::{read_agent_config_internal, AgentConfigState};
 use crate::vcp_modules::chat_manager::ChatMessage;
-use crate::vcp_modules::context_assembler_utils::assemble_history_for_vcp;
 use crate::vcp_modules::db_manager::DbState;
 use crate::vcp_modules::message_service;
 use crate::vcp_modules::vcp_client::{
@@ -64,6 +63,17 @@ pub async fn internal_process_agent_chat_message(
     let agent_config =
         read_agent_config_internal(&app_handle, &agent_state, &agent_id, Some(true)).await?;
 
+    // 【优化点】：此时已拿到智能体配置，立即启动前台服务保活以抢先渲染通知卡片，
+    // 从而与接下来的追加消息 SQLite IO、长历史读取、Tavern上下文编织等重度异步准备并行重叠
+    if let Err(e) =
+        tauri_plugin_vcp_mobile::stream::start_stream_service_inner(&app_handle, &agent_config.name)
+    {
+        log::warn!(
+            "[AgentChatAppService] Failed to start streaming service early: {}",
+            e
+        );
+    }
+
     // 2. 只有在需要时才将用户消息追加到数据库 (重新生成时设为 false)
     if append_user_msg {
         message_service::append_single_message(
@@ -90,30 +100,21 @@ pub async fn internal_process_agent_chat_message(
     )
     .await?;
 
-    // 4. 使用公共工具组装上下文 (单聊不添加发言人前缀)
-    let mut messages = assemble_history_for_vcp(&history, false);
-
-    // 5. 注入 System Prompt (优先使用移动端专用提示词) 并调用物理上下文与 Tarven 注入系统
+    // 4. 委派上下文级联装配外观中枢，完成微观编织与宏观 Tavern 规则流水线拦截
     let effective_prompt = if !agent_config.mobile_system_prompt.is_empty() {
         agent_config.mobile_system_prompt.clone()
     } else {
         agent_config.system_prompt.clone()
     };
 
-    messages.insert(
-        0,
-        json!({
-            "role": "system",
-            "content": effective_prompt
-        }),
-    );
-
-    crate::vcp_modules::chat::context_injection::apply_tarven_pipeline(
+    let messages = crate::vcp_modules::context_assembler::orchestrate_chat_context(
         &db_state.pool,
+        &history,
         &topic_id,
         &agent_config.name,
         "agent",
-        &mut messages,
+        effective_prompt,
+        None,
     )
     .await?;
 
@@ -146,16 +147,6 @@ pub async fn internal_process_agent_chat_message(
     // 在发起 VCP 请求前，向前端发射 thinking 事件以初始化气泡
     let _ = stream_channel.send(StreamEvent::thinking(thinking_id.clone(), context));
 
-    // 7. 启动前台服务保活
-    if let Err(e) =
-        tauri_plugin_vcp_mobile::stream::start_stream_service_inner(&app_handle, &agent_config.name)
-    {
-        log::warn!(
-            "[AgentChatAppService] Failed to start streaming service: {}",
-            e
-        );
-    }
-
     // 8. 发起请求
     let result = perform_vcp_request(
         &app_handle,
@@ -175,7 +166,7 @@ pub async fn internal_process_agent_chat_message(
         );
     }
 
-    // 8. 流式结束后（含中断），将最终内容预渲染并入库
+    // 8. 流式结束后（含中断），将最终内容委派统一的 Finalizer 进行存盘与事件分发
     match result {
         Ok((res, is_aborted)) => {
             if let Some(full_content) = res["fullContent"].as_str() {
@@ -185,57 +176,19 @@ pub async fn internal_process_agent_chat_message(
                     res["finishReason"].as_str().map(|s| s.to_string())
                 };
 
-                let final_msg = ChatMessage {
-                    id: thinking_id.clone(),
-                    role: "assistant".to_string(),
-                    name: Some(agent_config.name.clone()),
-                    content: full_content.to_string(),
-                    timestamp: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64,
-                    is_thinking: Some(false),
-                    agent_id: Some(agent_id.clone()),
-                    group_id: None,
-                    topic_id: Some(topic_id.clone()),
-                    is_group_message: Some(false),
-                    finish_reason: finish_reason.clone(),
-                    attachments: None,
-                    blocks: None,
-                    shell: None,
-                    content_hash: None,
-                };
-
-                let patch_result = message_service::patch_single_message(
+                message_service::finalize_stream_message(
                     app_handle.clone(),
                     &db_state.pool,
                     &agent_id,
                     "agent",
                     topic_id.clone(),
-                    final_msg,
-                    false,
-                )
-                .await;
-                let end_blocks = match &patch_result {
-                    Ok(blocks) => Some(blocks.clone()),
-                    Err(e) => {
-                        log::error!(
-                            "[AgentChatAppService] Failed to patch final message after stream: {}",
-                            e
-                        );
-                        None
-                    }
-                };
-                let _ = stream_channel.send(StreamEvent::end(
                     thinking_id.clone(),
-                    Some(json!({
-                        "agentId": agent_id,
-                        "topicId": topic_id,
-                        "agentName": agent_config.name
-                    })),
+                    full_content.to_string(),
+                    is_aborted,
                     finish_reason,
-                    end_blocks,
-                ));
+                    Some(stream_channel),
+                )
+                .await?;
             }
         }
         Err(e) => {

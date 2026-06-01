@@ -46,11 +46,19 @@ const { isSwiping, lengthX } = useSwipe(el, {
 });
 
 const swipeStyle = computed(() => {
-  if (!isSwiping.value) return {};
-  const opacity = Math.max(0, 1 - Math.abs(lengthX.value) / 200);
+  if (isSwiping.value) {
+    const opacity = Math.max(0, 1 - Math.abs(lengthX.value) / 200);
+    return {
+      transform: `translateX(${-lengthX.value}px)`,
+      opacity,
+      transition: 'none' // 正在滑动时禁用过渡，保证实时触控跟随
+    };
+  }
+  // 松手/不在滑动时，平滑回弹归位，呈现 iOS 级别高档物理阻尼动效
   return {
-    transform: `translateX(${-lengthX.value}px)`,
-    opacity
+    transform: 'translateX(0px)',
+    opacity: 1,
+    transition: 'transform 0.25s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.25s ease-out'
   };
 });
 
@@ -62,7 +70,7 @@ const handleClick = () => {
 <template>
   <div 
     ref="el"
-    class="pointer-events-auto flex items-center justify-between gap-3 px-3.5 py-2.5 rounded-xl bg-white/90 dark:bg-zinc-900/90 backdrop-blur-md border border-black/5 dark:border-white/10 shadow-[0_8px_30px_rgba(0,0,0,0.12)] max-w-[90vw] w-[320px] overflow-hidden transition-all duration-200 active:scale-[0.98] cursor-pointer"
+    class="pointer-events-auto flex items-center justify-between gap-3 px-3.5 py-2.5 rounded-xl bg-white/90 dark:bg-zinc-900/90 backdrop-blur-md border border-black/5 dark:border-white/10 shadow-[0_8px_30px_rgba(0,0,0,0.12)] w-full max-w-[calc(100vw-32px)] sm:w-[320px] overflow-hidden transition-all active:scale-[0.98] cursor-pointer touch-none select-none"
     :style="swipeStyle"
     @click="handleClick"
   >

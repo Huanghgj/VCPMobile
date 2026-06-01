@@ -78,7 +78,7 @@ export const useAttachmentStore = defineStore("attachment", () => {
    */
   const handleAttachment = async (mode: 'camera' | 'gallery' | 'file' = 'file') => {
     const isAndroid = navigator.userAgent.toLowerCase().includes("android");
-    
+
     // ==================================================================
     // Android 端主链路：原生插件拦截直传
     //   - 不走下方的 store_file / prepare_vcp_upload 分流逻辑
@@ -89,11 +89,12 @@ export const useAttachmentStore = defineStore("attachment", () => {
     if (isAndroid) {
       console.log(`[AttachmentStore] Android environment detected. Intercepting via native picker. Mode: ${mode}`);
       const notificationStore = useNotificationStore();
-      
+
+      const stableId = `att_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+
       try {
         // 1. 调用物理端原生 File Picker (双轨事件监听 + 5分钟熔断)
-        const stableId = `att_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-        
+
         const picked = await new Promise<any>((resolve, reject) => {
           let resolved = false;
 
@@ -159,7 +160,7 @@ export const useAttachmentStore = defineStore("attachment", () => {
             }
           }, 300000);
 
-          invoke<any>("plugin:vcp-mobile|pick_file").then((res) => {
+          invoke<any>("plugin:vcp-mobile|pick_file", { mode }).then((res) => {
             if (!resolved) {
               resolved = true;
               cleanup();
@@ -174,7 +175,7 @@ export const useAttachmentStore = defineStore("attachment", () => {
              }
           });
         });
-        
+
         if (!picked || !picked.path) {
           console.log("[AttachmentStore] Pick cancelled or returned empty path.");
           const existingIdx = stagedAttachments.value.findIndex(a => a.id === stableId);
@@ -245,12 +246,22 @@ export const useAttachmentStore = defineStore("attachment", () => {
         }
       } catch (err: any) {
         console.error("[AttachmentStore] Native file pick & registration failed:", err);
-        notificationStore.addNotification({
-          type: "warning",
-          title: "选取附件失败",
-          message: `❌ 异常捕获: ${err.message || String(err)}`,
-          toastOnly: true,
-        });
+        // 清理由于取消或失败而滞留的暂存卡片
+        const existingIdx = stagedAttachments.value.findIndex(a => a.id === stableId);
+        if (existingIdx !== -1) {
+          stagedAttachments.value.splice(existingIdx, 1);
+        }
+
+        const errMsg = err?.message || String(err);
+        const isCancelled = errMsg === "Cancelled" || errMsg.includes("Cancelled") || errMsg.includes("cancel");
+        if (!isCancelled) {
+          notificationStore.addNotification({
+            type: "warning",
+            title: "选取附件失败",
+            message: `❌ 异常捕获: ${errMsg}`,
+            toastOnly: true,
+          });
+        }
       }
       return;
     }
@@ -265,7 +276,7 @@ export const useAttachmentStore = defineStore("attachment", () => {
       const input = document.createElement("input");
       input.type = "file";
       input.multiple = false;
-      
+
       // 根据模式设置 accept 和 capture
       if (mode === 'camera') {
         input.accept = "image/*";
@@ -356,7 +367,7 @@ export const useAttachmentStore = defineStore("attachment", () => {
 
               finalData = await invoke<any>("store_file", {
                 originalName: file.name,
-                fileBytes: bytes, 
+                fileBytes: bytes,
                 mimeType: file.type || "application/octet-stream",
               });
             } else {
@@ -469,7 +480,7 @@ export const useAttachmentStore = defineStore("attachment", () => {
   const preProcessDocuments = async (customList?: Attachment[]) => {
     const targetList = customList || stagedAttachments.value;
     if (targetList.length === 0) return;
-    
+
     const docProcessor = useDocumentProcessor();
     for (const att of targetList) {
       const ext = att.name.split(".").pop()?.toLowerCase();

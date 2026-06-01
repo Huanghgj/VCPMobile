@@ -43,8 +43,6 @@ import java.net.URLDecoder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -53,7 +51,8 @@ import kotlin.math.roundToInt
     Permission(strings = ["android.permission.POST_NOTIFICATIONS"], alias = "notification"),
     Permission(strings = ["android.permission.READ_MEDIA_IMAGES"], alias = "storage"),
     Permission(strings = ["android.permission.READ_EXTERNAL_STORAGE", "android.permission.WRITE_EXTERNAL_STORAGE"], alias = "storageLegacy"),
-    Permission(strings = ["android.permission.RECORD_AUDIO"], alias = "microphone")
+    Permission(strings = ["android.permission.RECORD_AUDIO"], alias = "microphone"),
+    Permission(strings = ["android.permission.CAMERA"], alias = "camera")
 ])
 class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
 
@@ -66,6 +65,7 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
     private val lifecycleBridge = LifecycleBridge()
     private val batteryStatusManager = BatteryStatusManager(activity)
     private val fileIoExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+    private var cameraTempFile: java.io.File? = null
 
     // ==================================================================
     // Permissions & App Control
@@ -73,7 +73,7 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
     @Command
     fun checkAllPermissions(invoke: Invoke) {
         val pm = activity.getSystemService(Context.POWER_SERVICE) as PowerManager
-        
+
         val notificationGranted = if (Build.VERSION.SDK_INT >= 33) {
             ContextCompat.checkSelfPermission(activity, android.Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
         } else {
@@ -94,6 +94,7 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
         }
 
         val microphoneGranted = ContextCompat.checkSelfPermission(activity, android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        val cameraGranted = ContextCompat.checkSelfPermission(activity, android.Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
 
         val batteryOptimizationIgnored = pm.isIgnoringBatteryOptimizations(activity.packageName)
 
@@ -101,8 +102,9 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
         result.put("notification", notificationGranted)
         result.put("storage", storageGranted)
         result.put("microphone", microphoneGranted)
+        result.put("camera", cameraGranted)
         result.put("battery", batteryOptimizationIgnored)
-        
+
         invoke.resolve(result)
     }
 
@@ -127,6 +129,9 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
             }
             "microphone" -> {
                 requestPermissionForAlias("microphone", invoke, "onPermissionResult")
+            }
+            "camera" -> {
+                requestPermissionForAlias("camera", invoke, "onPermissionResult")
             }
             "battery" -> {
                 try {
@@ -186,10 +191,11 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
         }
 
         val microphoneGranted = ContextCompat.checkSelfPermission(activity, android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        val cameraGranted = ContextCompat.checkSelfPermission(activity, android.Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
 
         val batteryOptimizationIgnored = pm.isIgnoringBatteryOptimizations(activity.packageName)
 
-        val json = """{"notification":$notificationGranted,"storage":$storageGranted,"microphone":$microphoneGranted,"battery":$batteryOptimizationIgnored}"""
+        val json = """{"notification":$notificationGranted,"storage":$storageGranted,"microphone":$microphoneGranted,"camera":$cameraGranted,"battery":$batteryOptimizationIgnored}"""
         val script = "window.dispatchEvent(new CustomEvent('vcp-permission-change', { detail: $json }))"
         webViewRef?.evaluateJavascript(script, null)
     }
@@ -218,76 +224,6 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
             Log.e(TAG, "getBatteryStatus failed", e)
             invoke.reject(e.message ?: "Unknown error")
         }
-    }
-
-    @Command
-    fun captureWindowSnapshot(invoke: Invoke) {
-        val args = try {
-            invoke.parseArgs(CaptureWindowSnapshotArgs::class.java)
-        } catch (_: Throwable) {
-            CaptureWindowSnapshotArgs()
-        }
-
-        val maxWidth = args.maxWidth.coerceIn(160, 420)
-        val quality = args.quality.coerceIn(45, 85)
-        val latch = CountDownLatch(1)
-        var resultObject: JSObject? = null
-        var errorMessage: String? = null
-
-        activity.runOnUiThread {
-            try {
-                val rootView = activity.window.decorView.rootView
-                val sourceWidth = rootView.width
-                val sourceHeight = rootView.height
-                if (sourceWidth <= 0 || sourceHeight <= 0) {
-                    throw IllegalStateException("View has invalid size: ${sourceWidth}x${sourceHeight}")
-                }
-
-                val scale = min(1f, maxWidth.toFloat() / sourceWidth.toFloat())
-                val outputWidth = max(1, (sourceWidth * scale).roundToInt())
-                val outputHeight = max(1, (sourceHeight * scale).roundToInt())
-                val snapshot = Bitmap.createBitmap(outputWidth, outputHeight, Bitmap.Config.RGB_565)
-                val canvas = Canvas(snapshot)
-                canvas.scale(scale, scale)
-                rootView.draw(canvas)
-
-                // Freeze-and-blur strategy: capture once at low resolution, then upscale in CSS.
-                // This avoids Android WebView's expensive live backdrop-filter sampling.
-                val encoded = ByteArrayOutputStream()
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    snapshot.compress(Bitmap.CompressFormat.WEBP_LOSSY, quality, encoded)
-                } else {
-                    @Suppress("DEPRECATION")
-                    snapshot.compress(Bitmap.CompressFormat.WEBP, quality, encoded)
-                }
-                snapshot.recycle()
-
-                val base64 = Base64.encodeToString(encoded.toByteArray(), Base64.NO_WRAP)
-                resultObject = JSObject().apply {
-                    put("dataUrl", "data:image/webp;base64,$base64")
-                    put("width", outputWidth)
-                    put("height", outputHeight)
-                }
-            } catch (e: Throwable) {
-                Log.e(TAG, "captureWindowSnapshot failed", e)
-                errorMessage = e.message ?: "captureWindowSnapshot failed"
-            } finally {
-                latch.countDown()
-            }
-        }
-
-        if (!latch.await(900, TimeUnit.MILLISECONDS)) {
-            invoke.reject("captureWindowSnapshot timed out")
-            return
-        }
-
-        val error = errorMessage
-        if (error != null) {
-            invoke.reject(error)
-            return
-        }
-
-        invoke.resolve(resultObject ?: JSObject())
     }
 
     // ==================================================================
@@ -354,17 +290,172 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
     // ==================================================================
     // Scoped Storage File Picker & Native Thumbnail Generation (Scheme B)
     // ==================================================================
+    @PermissionCallback
+    fun onCameraPermissionResult(invoke: Invoke) {
+        if (ContextCompat.checkSelfPermission(activity, android.Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+            launchCameraIntent(invoke)
+        } else {
+            Log.w(TAG, "[onCameraPermissionResult] Camera permission denied")
+            invoke.reject("Camera permission denied")
+        }
+    }
+
+    private fun launchCameraIntent(invoke: Invoke) {
+        try {
+            val tempFile = java.io.File(activity.cacheDir, "camera_${System.currentTimeMillis()}.jpg")
+            cameraTempFile = tempFile
+
+            val authority = "${activity.packageName}.fileprovider"
+            val uri = try {
+                FileProvider.getUriForFile(activity, authority, tempFile)
+            } catch (e: Exception) {
+                FileProvider.getUriForFile(activity, "${activity.packageName}.opener.fileprovider", tempFile)
+            }
+
+            val intent = Intent(android.provider.MediaStore.ACTION_IMAGE_CAPTURE).apply {
+                putExtra(android.provider.MediaStore.EXTRA_OUTPUT, uri)
+                addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+            }
+            startActivityForResult(invoke, intent, "onCameraResult")
+        } catch (e: Throwable) {
+            Log.e(TAG, "[launchCameraIntent] Failed to launch camera intent", e)
+            invoke.reject("Failed to launch camera: ${e.message}")
+        }
+    }
+
     @Command
     fun pickFile(invoke: Invoke) {
         try {
-            val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
-                type = "*/*"
-                addCategory(Intent.CATEGORY_OPENABLE)
+            val args = invoke.parseArgs(PickFileArgs::class.java)
+            val mode = args.mode
+            Log.i(TAG, "[pickFile] Invoked with mode: $mode")
+
+            when (mode) {
+                "camera" -> {
+                    if (ContextCompat.checkSelfPermission(activity, android.Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                        requestPermissionForAlias("camera", invoke, "onCameraPermissionResult")
+                        return
+                    }
+                    launchCameraIntent(invoke)
+                }
+                "gallery" -> {
+                    val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
+                        type = "image/*"
+                        addCategory(Intent.CATEGORY_OPENABLE)
+                    }
+                    startActivityForResult(invoke, intent, "onPickFileResult")
+                }
+                else -> {
+                    val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
+                        type = "*/*"
+                        addCategory(Intent.CATEGORY_OPENABLE)
+                    }
+                    startActivityForResult(invoke, intent, "onPickFileResult")
+                }
             }
-            startActivityForResult(invoke, intent, "onPickFileResult")
         } catch (e: Throwable) {
             Log.e(TAG, "[pickFile] Failed to start activity for result", e)
             invoke.reject("Failed to start native file picker: ${e.message}")
+        }
+    }
+
+    @ActivityCallback
+    fun onCameraResult(invoke: Invoke, result: ActivityResult) {
+        if (result.resultCode != Activity.RESULT_OK) {
+            Log.w(TAG, "[onCameraResult] Camera capture cancelled or failed")
+            cameraTempFile?.delete()
+            cameraTempFile = null
+            invoke.reject("Cancelled")
+            return
+        }
+
+        val photoFile = cameraTempFile
+        if (photoFile == null || !photoFile.exists()) {
+            Log.e(TAG, "[onCameraResult] Temporary photo file is null or does not exist")
+            invoke.reject("Capture failed: temp file not found")
+            return
+        }
+
+        cameraTempFile = null // reset
+
+        fileIoExecutor.execute {
+            try {
+                val context = activity
+                val originalName = "Camera_${System.currentTimeMillis()}.jpg"
+                val mimeType = "image/jpeg"
+                val size = photoFile.length()
+
+                Log.i(TAG, "[onCameraResult] Processing captured photo: $originalName (size=$size)")
+
+                // 发送预准备事件给前端，让前端立即创建进度卡片
+                val startDetail = JSObject().apply {
+                    put("name", originalName)
+                    put("size", size)
+                    put("mime", mimeType)
+                }
+                val safeStartDetail = escapeJsonForJsString(startDetail.toString())
+                activity.runOnUiThread {
+                    webViewRef?.evaluateJavascript("window.dispatchEvent(new CustomEvent('vcp-mobile-file-start', { detail: JSON.parse(\"$safeStartDetail\") }))", null)
+                }
+
+                // 计算 SHA-256 哈希
+                val digest = java.security.MessageDigest.getInstance("SHA-256")
+                java.io.FileInputStream(photoFile).use { fis ->
+                    val buffer = ByteArray(65536)
+                    var bytesRead: Int
+                    while (fis.read(buffer).also { bytesRead = it } != -1) {
+                        digest.update(buffer, 0, bytesRead)
+                    }
+                }
+                val hashBytes = digest.digest()
+                val hash = hashBytes.joinToString("") { "%02x".format(it) }
+
+                // 重命名去重
+                val finalTempFile = java.io.File(context.cacheDir, "$hash.jpg")
+                if (finalTempFile.exists()) {
+                    photoFile.delete() // 缓存去重，复用已有文件
+                } else {
+                    photoFile.renameTo(finalTempFile)
+                }
+
+                // 生成缩略图
+                val thumbnailPath = generateNativeThumbnail(context, finalTempFile, hash)
+
+                // 组装结果物理路径并回传给 Rust 桥接
+                val resultObject = JSObject()
+                resultObject.put("path", finalTempFile.absolutePath)
+                resultObject.put("name", originalName)
+                resultObject.put("mime", mimeType)
+                resultObject.put("size", finalTempFile.length())
+                resultObject.put("hash", hash)
+                if (thumbnailPath != null) {
+                    resultObject.put("thumbnailPath", thumbnailPath)
+                }
+
+                // 双轨通信：推送最终结果给前端，穿透 JNI 断裂层
+                val pickedDetail = JSObject().apply {
+                    put("path", finalTempFile.absolutePath)
+                    put("name", originalName)
+                    put("mime", mimeType)
+                    put("size", finalTempFile.length())
+                    put("hash", hash)
+                    if (thumbnailPath != null) {
+                        put("thumbnailPath", thumbnailPath)
+                    } else {
+                        put("thumbnailPath", org.json.JSONObject.NULL)
+                    }
+                }
+                val safePickedDetail = escapeJsonForJsString(pickedDetail.toString())
+                val pickedScript = "window.dispatchEvent(new CustomEvent('vcp-mobile-file-picked', { detail: JSON.parse(\"$safePickedDetail\") }))"
+                activity.runOnUiThread {
+                    webViewRef?.evaluateJavascript(pickedScript, null)
+                }
+
+                invoke.resolve(resultObject)
+            } catch (e: Throwable) {
+                Log.e(TAG, "[onCameraResult] Photo processing failed", e)
+                invoke.reject("Handling captured photo failed: ${e.message}")
+            }
         }
     }
 
@@ -418,7 +509,7 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
                 // 4. 流式安全拷贝至 cacheDir 并同步计算 SHA-256 (64KB buffer)
                 val tempFile = java.io.File(context.cacheDir, "pick_${System.currentTimeMillis()}_temp")
                 val digest = java.security.MessageDigest.getInstance("SHA-256")
-                
+
                 contentResolver.openInputStream(uri).use { inputStream ->
                     if (inputStream == null) {
                         Log.e(TAG, "[onPickFileResult] openInputStream returned null")
@@ -430,12 +521,12 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
                         var bytesRead: Int
                         var totalRead = 0L
                         var lastReportTime = System.currentTimeMillis()
-                        
+
                         while (inputStream.read(buffer).also { bytesRead = it } != -1) {
                             outputStream.write(buffer, 0, bytesRead)
                             digest.update(buffer, 0, bytesRead)
                             totalRead += bytesRead
-                            
+
                             val now = System.currentTimeMillis()
                             if (now - lastReportTime > 200) {
                                 lastReportTime = now
@@ -461,11 +552,11 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
                 val hash = hashBytes.joinToString("") { "%02x".format(it) }
 
                 // 内容寻址哈希命名重命名去重
-                val fileExtension = java.io.File(originalName).extension.let { 
-                    if (it.isEmpty()) "" else ".$it" 
+                val fileExtension = java.io.File(originalName).extension.let {
+                    if (it.isEmpty()) "" else ".$it"
                 }
                 val finalTempFile = java.io.File(context.cacheDir, "$hash$fileExtension")
-                
+
                 if (finalTempFile.exists()) {
                     tempFile.delete() // 缓存去重，复用已有文件
                 } else {
@@ -492,7 +583,7 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
                 }
 
                 Log.i(TAG, "[onPickFileResult] File copy & process complete: path=${finalTempFile.absolutePath}, hash=$hash")
-                
+
                 // 双轨通信：主动推送最终结果给前端，穿透 JNI 断裂层
                 val pickedDetail = JSObject().apply {
                     put("path", finalTempFile.absolutePath)
@@ -511,7 +602,7 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
                 activity.runOnUiThread {
                     webViewRef?.evaluateJavascript(pickedScript, null)
                 }
-                
+
                 invoke.resolve(resultObject)
             } catch (e: Throwable) {
                 Log.e(TAG, "[onPickFileResult] File pick handling failed", e)
@@ -537,7 +628,7 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
                 android.graphics.BitmapFactory.decodeFile(originalFile.absolutePath, options)
                 val width = options.outWidth
                 val height = options.outHeight
-                
+
                 var inSampleSize = 1
                 if (width > 200 || height > 200) {
                     val halfHeight = height / 2
@@ -546,11 +637,11 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
                         inSampleSize *= 2
                     }
                 }
-                
+
                 options.inJustDecodeBounds = false
                 options.inSampleSize = inSampleSize
                 val rawBitmap = android.graphics.BitmapFactory.decodeFile(originalFile.absolutePath, options) ?: return null
-                
+
                 val w = rawBitmap.width
                 val h = rawBitmap.height
                 val (newW, newH) = if (w >= h) {
@@ -583,6 +674,104 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
+    private fun escapeJsonForJsString(json: String): String {
+        return json
+            .replace("\\", "\\\\")
+            .replace("\"", "\\\"")
+            .replace("\'", "\\'")
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
+    }
+
+    @Command
+    fun openFile(invoke: Invoke) {
+        val args = invoke.parseArgs(OpenFileArgs::class.java)
+        val path = args.path
+        if (path.isEmpty()) {
+            invoke.reject("Path is empty")
+            return
+        }
+
+        fileIoExecutor.execute {
+            try {
+                val context = activity
+
+                // 💥 安全边界拦截：禁止通过 openFile 访问沙箱外部物理文件
+                if (!isSafeLocalPath(context, path)) {
+                    invoke.reject("安全拒绝：禁止打开沙箱外部的敏感文件")
+                    return@execute
+                }
+
+                val file = java.io.File(path)
+                if (!file.exists()) {
+                    invoke.reject("文件不存在: $path")
+                    return@execute
+                }
+
+                // 1. 自动提取并修正 MIME 类型
+                val ext = file.extension.lowercase()
+                val mimeType = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "*/*"
+                Log.i(TAG, "[openFile] Opening file: ${file.absolutePath} (ext=$ext, mime=$mimeType)")
+
+                // 2. 借助 FileProvider 生成临时读取授权的 content:// URI
+                val uri = try {
+                    FileProvider.getUriForFile(
+                        context,
+                        "${context.packageName}.fileprovider",
+                        file
+                    )
+                } catch (e: Exception) {
+                    Log.w(TAG, "[openFile] Fallback to opener FileProvider authority", e)
+                    FileProvider.getUriForFile(
+                        context,
+                        "${context.packageName}.opener.fileprovider",
+                        file
+                    )
+                }
+
+                // 3. 构建并分发默认的系统 ACTION_VIEW 意图
+                val intent = Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(uri, mimeType)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+
+                context.startActivity(intent)
+                invoke.resolve()
+            } catch (e: android.content.ActivityNotFoundException) {
+                val ext = java.io.File(path).extension.lowercase()
+                Log.e(TAG, "[openFile] No activity found to handle file type: .$ext", e)
+                invoke.reject("您的手机上未安装能打开此类文件 (.$ext) 的应用，请先安装相关阅读器 (如 WPS Office)。")
+            } catch (e: Throwable) {
+                Log.e(TAG, "[openFile] Native file viewing failed", e)
+                invoke.reject("打开文件失败: ${e.message}")
+            }
+        }
+    }
+
+    // ==================================================================
+    // Security Sandbox Boundary & Verification
+    // ==================================================================
+    private fun isSafeLocalPath(context: Context, path: String): Boolean {
+        return try {
+            val file = java.io.File(path).canonicalFile
+            val cacheDir = context.cacheDir.canonicalFile
+            val filesDir = context.filesDir.canonicalFile
+            val externalFilesDir = context.getExternalFilesDir(null)?.canonicalFile
+            val externalCacheDir = context.externalCacheDir?.canonicalFile
+
+            file.path.startsWith(cacheDir.path) ||
+            file.path.startsWith(filesDir.path) ||
+            (externalFilesDir != null && file.path.startsWith(externalFilesDir.path)) ||
+            (externalCacheDir != null && file.path.startsWith(externalCacheDir.path))
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    // ==================================================================
+    // Universal Media Exporter & Gallery Writer
+    // ==================================================================
     @Command
     fun saveImageToGallery(invoke: Invoke) {
         val args = invoke.parseArgs(SaveImageArgs::class.java)
@@ -623,6 +812,71 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
+    @Command
+    fun saveImageFromPath(invoke: Invoke) {
+        val args = invoke.parseArgs(SaveImageFromPathArgs::class.java)
+        if (args.imagePath.isBlank()) {
+            invoke.reject("物理文件路径为空")
+            return
+        }
+
+        // 1. 安全边界检查：强制限定临时文件必须处于沙箱缓存目录内，严防路径遍历与本地漏洞越界
+        if (!isSafeLocalPath(activity, args.imagePath)) {
+            invoke.reject("非法的本地文件读取边界，已被安全沙箱拒绝")
+            return
+        }
+
+        fileIoExecutor.execute {
+            val file = java.io.File(args.imagePath)
+            try {
+                if (!file.exists()) {
+                    invoke.reject("本地临时文件不存在")
+                    return@execute
+                }
+
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                    val writeGranted = ContextCompat.checkSelfPermission(activity, android.Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+                    if (!writeGranted) {
+                        invoke.reject("保存到相册需要储存空间权限")
+                        return@execute
+                    }
+                }
+
+                // 2. 读取图片二进制流
+                val bytes = file.readBytes()
+
+                // 3. 安全魔数嗅探：强制检测图片格式，坚决拒收假冒图片绕过的攻击
+                val mimeType = sniffImageMime(bytes, file.name, true)
+                if (!mimeType.startsWith("image/")) {
+                    invoke.reject("当前资源不是图片: $mimeType")
+                    return@execute
+                }
+
+                val displayName = buildGalleryFileName(args.fileName, file.name, mimeType)
+                val savedUri = writeImageToGallery(bytes, displayName, mimeType)
+                val result = JSObject().apply {
+                    put("uri", savedUri.toString())
+                    put("displayName", displayName)
+                    put("mimeType", mimeType)
+                    put("size", bytes.size)
+                }
+                invoke.resolve(result)
+            } catch (e: Throwable) {
+                Log.e(TAG, "saveImageFromPath failed", e)
+                invoke.reject("保存图片失败: ${e.message}")
+            } finally {
+                // 4. 秒结物理清理：无论写入成功与否，立即擦除临时物理文件，防范残留泄漏
+                try {
+                    if (file.exists()) {
+                        file.delete()
+                    }
+                } catch (ex: Exception) {
+                    Log.e(TAG, "Failed to clean up temporary save image file", ex)
+                }
+            }
+        }
+    }
+
     private data class LoadedImage(val bytes: ByteArray, val mimeType: String)
 
     private fun loadImageBytes(sourceUrl: String): LoadedImage {
@@ -636,7 +890,7 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
             val bytes = activity.contentResolver.openInputStream(uri).use { input ->
                 readBytesLimited(input ?: throw IllegalStateException("无法读取 content 图片"))
             }
-            return LoadedImage(bytes, sniffImageMime(bytes, mime))
+            return LoadedImage(bytes, sniffImageMime(bytes, mime, isLocal = true))
         }
 
         if (sourceUrl.startsWith("file:", ignoreCase = true) || sourceUrl.startsWith("/")) {
@@ -645,14 +899,24 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
             } else {
                 sourceUrl
             }
+
+            // 💥 安全防线：本地路径强制进行沙箱越权校验
+            if (!isSafeLocalPath(activity, path)) {
+                throw SecurityException("越权拒绝：禁止读取沙箱外部资源")
+            }
+
             val file = java.io.File(path)
             val bytes = file.inputStream().use { readBytesLimited(it) }
-            return LoadedImage(bytes, sniffImageMime(bytes, mimeFromSource(file.name)))
+            return LoadedImage(bytes, sniffImageMime(bytes, mimeFromSource(file.name), isLocal = true))
         }
 
+        return loadNetworkImage(sourceUrl)
+    }
+
+    private fun loadNetworkImage(sourceUrl: String): LoadedImage {
         val connection = (URL(sourceUrl).openConnection() as HttpURLConnection).apply {
-            connectTimeout = 12_000
-            readTimeout = 25_000
+            connectTimeout = 5000  // 💥 优化：降低至5秒
+            readTimeout = 10000    // 💥 优化：降低至10秒
             instanceFollowRedirects = true
             setRequestProperty("User-Agent", "VCPMobile/1.0")
         }
@@ -664,7 +928,7 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
             }
             val contentType = connection.contentType?.substringBefore(";")?.lowercase(Locale.US)
             val bytes = connection.inputStream.use { readBytesLimited(it) }
-            return LoadedImage(bytes, sniffImageMime(bytes, contentType ?: mimeFromSource(sourceUrl)))
+            return LoadedImage(bytes, sniffImageMime(bytes, contentType ?: mimeFromSource(sourceUrl), isLocal = false))
         } finally {
             connection.disconnect()
         }
@@ -682,7 +946,7 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
         } else {
             URLDecoder.decode(payload, "UTF-8").toByteArray(Charsets.UTF_8)
         }
-        return LoadedImage(bytes, sniffImageMime(bytes, mime))
+        return LoadedImage(bytes, sniffImageMime(bytes, mime, isLocal = false))
     }
 
     private fun readBytesLimited(input: InputStream, maxBytes: Int = 50 * 1024 * 1024): ByteArray {
@@ -701,17 +965,28 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
         return output.toByteArray()
     }
 
-    private fun sniffImageMime(bytes: ByteArray, fallback: String): String {
+    private fun sniffImageMime(bytes: ByteArray, fallback: String, isLocal: Boolean): String {
         val normalized = fallback.substringBefore(";").lowercase(Locale.US)
-        if (normalized.startsWith("image/")) return normalized
+
+        // 💥 安全校验：若是网络资源可信任 content-type，若是本地绝对物理路径，必须强行进行 Magic bytes 头二进制分析，防止伪造扩展名泄漏明文
+        if (!isLocal && normalized.startsWith("image/")) {
+            return normalized
+        }
+
         if (bytes.size >= 8 && bytes[0] == 0x89.toByte() && bytes[1] == 0x50.toByte() && bytes[2] == 0x4E.toByte() && bytes[3] == 0x47.toByte()) return "image/png"
         if (bytes.size >= 3 && bytes[0] == 0xFF.toByte() && bytes[1] == 0xD8.toByte() && bytes[2] == 0xFF.toByte()) return "image/jpeg"
         if (bytes.size >= 6 && String(bytes, 0, 6, Charsets.US_ASCII).startsWith("GIF")) return "image/gif"
         if (bytes.size >= 12 && String(bytes, 0, 4, Charsets.US_ASCII) == "RIFF" && String(bytes, 8, 4, Charsets.US_ASCII) == "WEBP") return "image/webp"
         if (bytes.size >= 2 && bytes[0] == 0x42.toByte() && bytes[1] == 0x4D.toByte()) return "image/bmp"
+
         val sample = bytes.take(256).toByteArray().toString(Charsets.UTF_8).trimStart()
         if (sample.startsWith("<svg", ignoreCase = true) || sample.startsWith("<?xml", ignoreCase = true)) return "image/svg+xml"
-        return "application/octet-stream"
+
+        // 本地读取兜底降级：非图片格式的敏感文件一律设为 application/octet-stream，从而在 saveImageToGallery 判定 mime.startsWith("image/") 时被拦截
+        if (isLocal) {
+            return "application/octet-stream"
+        }
+        return normalized
     }
 
     private fun mimeFromSource(source: String): String {
@@ -806,70 +1081,58 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
         return Uri.fromFile(outputFile)
     }
 
-    private fun escapeJsonForJsString(json: String): String {
-        return json
-            .replace("\\", "\\\\")
-            .replace("\"", "\\\"")
-            .replace("\'", "\\'")
-            .replace("\n", "\\n")
-            .replace("\r", "\\r")
-    }
-
+    // ==================================================================
+    // Webview High Performance Capture
+    // ==================================================================
     @Command
-    fun openFile(invoke: Invoke) {
-        val args = invoke.parseArgs(OpenFileArgs::class.java)
-        val path = args.path
-        if (path.isEmpty()) {
-            invoke.reject("Path is empty")
-            return
+    fun captureWindowSnapshot(invoke: Invoke) {
+        val args = try {
+            invoke.parseArgs(CaptureWindowSnapshotArgs::class.java)
+        } catch (_: Throwable) {
+            CaptureWindowSnapshotArgs()
         }
-        
-        fileIoExecutor.execute {
+
+        val maxWidth = args.maxWidth.coerceIn(160, 420)
+        val quality = args.quality.coerceIn(45, 85)
+
+        // 💥 去掉锁机制，采用完全异步的 resolve/reject 调用模式，避免 Tokio 核心线程被 latch.await 挂起
+        activity.runOnUiThread {
             try {
-                val context = activity
-                val file = java.io.File(path)
-                if (!file.exists()) {
-                    invoke.reject("文件不存在: $path")
-                    return@execute
+                val rootView = activity.window.decorView.rootView
+                val sourceWidth = rootView.width
+                val sourceHeight = rootView.height
+                if (sourceWidth <= 0 || sourceHeight <= 0) {
+                    invoke.reject("View has invalid size: ${sourceWidth}x${sourceHeight}")
+                    return@runOnUiThread
                 }
 
-                // 1. 自动提取并修正 MIME 类型
-                val ext = file.extension.lowercase()
-                val mimeType = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "*/*"
-                Log.i(TAG, "[openFile] Opening file: ${file.absolutePath} (ext=$ext, mime=$mimeType)")
+                val scale = min(1f, maxWidth.toFloat() / sourceWidth.toFloat())
+                val outputWidth = max(1, (sourceWidth * scale).roundToInt())
+                val outputHeight = max(1, (sourceHeight * scale).roundToInt())
+                val snapshot = Bitmap.createBitmap(outputWidth, outputHeight, Bitmap.Config.RGB_565)
+                val canvas = Canvas(snapshot)
+                canvas.scale(scale, scale)
+                rootView.draw(canvas)
 
-                // 2. 借助 FileProvider 生成临时读取授权的 content:// URI
-                val uri = try {
-                    FileProvider.getUriForFile(
-                        context,
-                        "${context.packageName}.fileprovider",
-                        file
-                    )
-                } catch (e: Exception) {
-                    Log.w(TAG, "[openFile] Fallback to opener FileProvider authority", e)
-                    FileProvider.getUriForFile(
-                        context,
-                        "${context.packageName}.opener.fileprovider",
-                        file
-                    )
+                val encoded = ByteArrayOutputStream()
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    snapshot.compress(Bitmap.CompressFormat.WEBP_LOSSY, quality, encoded)
+                } else {
+                    @Suppress("DEPRECATION")
+                    snapshot.compress(Bitmap.CompressFormat.WEBP, quality, encoded)
                 }
+                snapshot.recycle() // 及时物理释放内存，防御 WebView 渲染高频截图导致 OOM
 
-                // 3. 构建并分发默认的系统 ACTION_VIEW 意图
-                val intent = Intent(Intent.ACTION_VIEW).apply {
-                    setDataAndType(uri, mimeType)
-                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                val base64 = Base64.encodeToString(encoded.toByteArray(), Base64.NO_WRAP)
+                val resultObject = JSObject().apply {
+                    put("dataUrl", "data:image/webp;base64,$base64")
+                    put("width", outputWidth)
+                    put("height", outputHeight)
                 }
-
-                context.startActivity(intent)
-                invoke.resolve()
-            } catch (e: android.content.ActivityNotFoundException) {
-                val ext = java.io.File(path).extension.lowercase()
-                Log.e(TAG, "[openFile] No activity found to handle file type: .$ext", e)
-                invoke.reject("您的手机上未安装能打开此类文件 (.$ext) 的应用，请先安装相关阅读器 (如 WPS Office)。")
+                invoke.resolve(resultObject)
             } catch (e: Throwable) {
-                Log.e(TAG, "[openFile] Native file viewing failed", e)
-                invoke.reject("打开文件失败: ${e.message}")
+                Log.e(TAG, "captureWindowSnapshot failed", e)
+                invoke.reject(e.message ?: "captureWindowSnapshot failed")
             }
         }
     }
@@ -891,13 +1154,24 @@ class OpenFileArgs {
 }
 
 @InvokeArg
+class PickFileArgs {
+    var mode: String = "file"
+}
+
+@InvokeArg
 class SaveImageArgs {
     lateinit var sourceUrl: String
     var fileName: String? = null
 }
 
 @InvokeArg
+class SaveImageFromPathArgs {
+    lateinit var imagePath: String
+    var fileName: String? = null
+}
+
+@InvokeArg
 class CaptureWindowSnapshotArgs {
-    var maxWidth: Int = 260
-    var quality: Int = 68
+    var maxWidth: Int = 200 // 与 Rust 侧默认参数对齐
+    var quality: Int = 64  // 与 Rust 侧默认参数对齐
 }

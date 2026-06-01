@@ -113,7 +113,7 @@ async fn setup_tables(pool: &Pool<Sqlite>) -> Result<(), String> {
             context_token_limit INTEGER NOT NULL DEFAULT 0,
             max_output_tokens INTEGER NOT NULL DEFAULT 0,
             stream_output INTEGER NOT NULL DEFAULT 1,
-            use_temperature INTEGER NOT NULL DEFAULT 1,
+            use_temperature INTEGER NOT NULL DEFAULT 0,
             config_hash TEXT NOT NULL DEFAULT '',  -- 配置内容指纹
             content_hash TEXT NOT NULL DEFAULT '', -- 聚合指纹 (Config + Topics)
             updated_at BIGINT NOT NULL,
@@ -364,6 +364,11 @@ async fn setup_tables(pool: &Pool<Sqlite>) -> Result<(), String> {
     .await
     .map_err(|e| e.to_string())?;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_tarven_rules_active ON tarven_rules(rule_type, is_enabled, sort_order ASC)").execute(pool).await.map_err(|e| e.to_string())?;
+
+    // 运行系统内置高级规则的多模态无损同步器
+    crate::vcp_modules::chat::context_injection::sync_system_preset_rules(pool)
+        .await
+        .map_err(|e| format!("[DBManager] Failed to sync preset rules: {}", e))?;
 
     Ok(())
 }
