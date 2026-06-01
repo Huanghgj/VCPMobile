@@ -70,7 +70,14 @@ export function useNotificationGrouping(historyList: () => VcpNotification[]) {
     if (cat === 'dailynote' || infoType === 'daily_note_created') return 'daily';
     if (cat === 'video' || infoType === 'video_generation_status') return 'video';
     if (cat === 'tool' || type === 'tool' || infoType.startsWith('tool_')) return 'tool';
-    if (cat === 'system' || infoType === 'connection_ack' || rawType === 'vcp-core-status' || rawType === 'vcp-log-status') return 'system';
+    if (
+      cat === 'system' ||
+      infoType === 'connection_ack' ||
+      rawType === 'vcp-core-status' ||
+      rawType === 'vcp-log-status' ||
+      rawType === 'vcp-info-status' ||
+      rawType === 'vcp-info-message'
+    ) return 'system';
 
     return 'other';
   };

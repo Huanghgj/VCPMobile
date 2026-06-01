@@ -684,7 +684,7 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     @Command
-    fun openFile(invoke: Invoke) {
+    fun openFileNative(invoke: Invoke) {
         val args = invoke.parseArgs(OpenFileArgs::class.java)
         val path = args.path
         if (path.isEmpty()) {
@@ -696,7 +696,7 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
             try {
                 val context = activity
 
-                // 💥 安全边界拦截：禁止通过 openFile 访问沙箱外部物理文件
+                // 安全边界拦截：禁止通过 openFileNative 访问沙箱外部物理文件
                 if (!isSafeLocalPath(context, path)) {
                     invoke.reject("安全拒绝：禁止打开沙箱外部的敏感文件")
                     return@execute
@@ -711,7 +711,7 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
                 // 1. 自动提取并修正 MIME 类型
                 val ext = file.extension.lowercase()
                 val mimeType = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "*/*"
-                Log.i(TAG, "[openFile] Opening file: ${file.absolutePath} (ext=$ext, mime=$mimeType)")
+                Log.i(TAG, "[openFileNative] Opening file: ${file.absolutePath} (ext=$ext, mime=$mimeType)")
 
                 // 2. 借助 FileProvider 生成临时读取授权的 content:// URI
                 val uri = try {
@@ -721,7 +721,7 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
                         file
                     )
                 } catch (e: Exception) {
-                    Log.w(TAG, "[openFile] Fallback to opener FileProvider authority", e)
+                    Log.w(TAG, "[openFileNative] Fallback to opener FileProvider authority", e)
                     FileProvider.getUriForFile(
                         context,
                         "${context.packageName}.opener.fileprovider",
@@ -740,10 +740,10 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
                 invoke.resolve()
             } catch (e: android.content.ActivityNotFoundException) {
                 val ext = java.io.File(path).extension.lowercase()
-                Log.e(TAG, "[openFile] No activity found to handle file type: .$ext", e)
+                Log.e(TAG, "[openFileNative] No activity found to handle file type: .$ext", e)
                 invoke.reject("您的手机上未安装能打开此类文件 (.$ext) 的应用，请先安装相关阅读器 (如 WPS Office)。")
             } catch (e: Throwable) {
-                Log.e(TAG, "[openFile] Native file viewing failed", e)
+                Log.e(TAG, "[openFileNative] Native file viewing failed", e)
                 invoke.reject("打开文件失败: ${e.message}")
             }
         }

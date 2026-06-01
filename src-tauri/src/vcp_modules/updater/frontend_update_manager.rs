@@ -309,7 +309,7 @@ pub(crate) async fn download_frontend_update_inner(
 
     let file_name = download_url
         .path_segments()
-        .and_then(|segments| segments.last())
+        .and_then(|mut segments| segments.next_back())
         .unwrap_or("frontend-update.zip")
         .to_string();
     let zip_path = download_dir.join(&file_name);

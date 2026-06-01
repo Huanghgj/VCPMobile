@@ -327,8 +327,8 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
           updatePhaseLabel('加载本地界面资源...');
           await themeStore.initTheme();
           notificationStore.updateCoreStatus({
-            status: 'ready',
-            message: 'Web 预览模式',
+            status: 'disconnected',
+            message: 'Web 预览模式（无核心服务）',
             source: 'Core'
           });
           notificationStore.updateStatus({

@@ -16,17 +16,6 @@ const isPreviewing = ref(false); // 默认开启代码模式，减小开销
 const isFullScreen = ref(false);
 const fullScreenTab = ref<'code' | 'preview'>('code');
 
-const createSandboxNonce = () => {
-  const bytes = new Uint8Array(16);
-  if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
-    crypto.getRandomValues(bytes);
-    return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
-  }
-  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`;
-};
-
-const sandboxImageNonce = createSandboxNonce();
-
 // 代码预览转义处理 (优先使用后端预渲染 syntect 高亮，无值时回退为安全 HTML 转义)
 const highlightedCode = computed(() => {
   if (props.highlightedContent) {
@@ -54,15 +43,14 @@ const copyCode = async () => {
 // 构造沙箱 HTML
 const getSandboxHtml = (content: string) => {
   const isDark = themeStore.isDarkResolved;
-  const noncePayload = JSON.stringify(sandboxImageNonce);
-  const targetOriginPayload = JSON.stringify(window.location.origin);
 
   const cleanHtml = DOMPurify.sanitize(content, {
     USE_PROFILES: { html: true, svg: true, mathMl: true },
-    ADD_TAGS: ['style', 'iframe', 'canvas', 'script', 'link', 'meta'],
-    ADD_ATTR: ['*'],
-    FORBID_TAGS: ['applet', 'embed', 'object'],
-    ALLOW_UNKNOWN_PROTOCOLS: true,
+    ADD_TAGS: ['style', 'canvas'],
+    ADD_ATTR: ['style', 'class', 'id', 'title', 'aria-label', 'alt', 'src', 'href', 'width', 'height', 'viewBox'],
+    FORBID_TAGS: ['applet', 'embed', 'object', 'script', 'iframe', 'link', 'meta'],
+    FORBID_ATTR: ['srcdoc'],
+    ALLOW_UNKNOWN_PROTOCOLS: false,
     WHOLE_DOCUMENT: true,
     RETURN_DOM: false
   });
@@ -80,117 +68,6 @@ const getSandboxHtml = (content: string) => {
       canvas, img, video, iframe { max-width: 100% !important; }
       img, canvas, svg, [style*="background-image"] { cursor: zoom-in; }
     </style>
-    <` + `script>
-      function __vcpAbsoluteUrl(url) {
-        if (!url) return '';
-        var trimmed = String(url).trim();
-        if (!trimmed) return '';
-        if (/^(data:|blob:|file:|content:)/i.test(trimmed)) return trimmed;
-        try { return new URL(trimmed, document.baseURI || window.location.href).href; } catch (e) { return trimmed; }
-      }
-
-      function __vcpFileNameFromUrl(url) {
-        if (!url || /^(data:|blob:)/i.test(url)) return '';
-        try {
-          var parsed = new URL(url, document.baseURI || window.location.href);
-          var segment = parsed.pathname.split('/').filter(Boolean).pop() || '';
-          return decodeURIComponent(segment);
-        } catch (e) {
-          var fallback = String(url).split(/[/?#]/).filter(Boolean).pop() || '';
-          try { return decodeURIComponent(fallback); } catch (_) { return fallback; }
-        }
-      }
-
-      function __vcpSvgToDataUrl(svg) {
-        var clone = svg.cloneNode(true);
-        if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
-        return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(new XMLSerializer().serializeToString(clone));
-      }
-
-      function __vcpImagePayloadFromElement(element) {
-        if (!element) return null;
-        var tag = (element.tagName || '').toLowerCase();
-        var src = '';
-        var title = element.getAttribute('title') || element.getAttribute('aria-label') || '';
-        var alt = element.getAttribute('alt') || '';
-
-        if (tag === 'img') {
-          src = element.currentSrc || element.src || element.getAttribute('src') || '';
-        } else if (tag === 'image') {
-          src = (element.href && element.href.baseVal) || element.getAttribute('href') || element.getAttribute('xlink:href') || '';
-        } else if (tag === 'canvas') {
-          try { src = element.toDataURL('image/png'); } catch (e) { src = ''; }
-        } else if (tag === 'svg') {
-          try { src = __vcpSvgToDataUrl(element); } catch (e) { src = ''; }
-        }
-
-        src = __vcpAbsoluteUrl(src);
-        if (!src) return null;
-        return { src: src, alt: alt, title: title, fileName: __vcpFileNameFromUrl(src), sourceLabel: 'HTML 预览图片' };
-      }
-
-      function __vcpBackgroundPayloadFromElement(element) {
-        if (!element || !window.getComputedStyle) return null;
-        var bg = window.getComputedStyle(element).backgroundImage || '';
-        var match = bg.match(/url\\((["']?)(.*?)\\1\\)/i);
-        if (!match || !match[2]) return null;
-        var src = __vcpAbsoluteUrl(match[2]);
-        if (!src) return null;
-        return {
-          src: src,
-          title: element.getAttribute('title') || element.getAttribute('aria-label') || '',
-          fileName: __vcpFileNameFromUrl(src),
-          sourceLabel: 'HTML 预览背景图'
-        };
-      }
-
-      function __vcpFindImagePayload(target) {
-        if (!target || !target.closest) return null;
-        var direct = target.closest('img, image, canvas, svg');
-        var payload = __vcpImagePayloadFromElement(direct);
-        if (payload) return payload;
-
-        var current = target;
-        while (current && current !== document.documentElement) {
-          payload = __vcpBackgroundPayloadFromElement(current);
-          if (payload) return payload;
-          current = current.parentElement;
-        }
-        return null;
-      }
-
-      document.addEventListener('click', function(e) {
-        var payload = __vcpFindImagePayload(e.target);
-        if (payload) {
-          e.preventDefault();
-          e.stopPropagation();
-          window.parent.postMessage({ source: 'vcp-mobile', type: 'rendered-image-click', nonce: ${noncePayload}, image: payload }, ${targetOriginPayload});
-        }
-      }, true);
-
-      document.addEventListener('click', function(e) {
-        const target = e.target.closest('a');
-        if (target) {
-          var href = target.getAttribute('href') || '';
-          var safe = false;
-          try {
-            var parsed = new URL(href, window.location.href);
-            safe = parsed.protocol === 'http:' || parsed.protocol === 'https:' || href.charAt(0) === '#';
-          } catch (err) {
-            safe = false;
-          }
-          if (!safe) {
-            e.preventDefault();
-          }
-        }
-      }, true);
-
-      const _originalAlert = window.alert;
-      window.alert = function(msg) {
-        console.log('[VCP Sandbox Alert]:', msg);
-        try { _originalAlert(msg); } catch (e) {}
-      };
-    <` + `/script>
   `;
 
   if (/<head[^>]*>/i.test(cleanHtml)) {
@@ -301,9 +178,8 @@ onUnmounted(() => {
             <iframe
               v-show="fullScreenTab === 'preview'"
               class="vcp-fullscreen-iframe w-full h-full border-none"
-              sandbox="allow-scripts allow-modals allow-forms allow-popups"
+              sandbox=""
               loading="lazy"
-              :data-vcp-image-nonce="sandboxImageNonce"
               :srcdoc="getSandboxHtml(content)"
             ></iframe>
           </div>
@@ -364,9 +240,8 @@ onUnmounted(() => {
       <div v-if="isPreviewing" class="absolute inset-0 no-swipe" :class="themeStore.isDarkResolved ? 'bg-[#0d1117]' : 'bg-white'">
         <iframe
           class="vcp-inline-iframe w-full h-full border-none no-swipe"
-          sandbox="allow-scripts allow-modals allow-forms"
+          sandbox=""
           loading="lazy"
-          :data-vcp-image-nonce="sandboxImageNonce"
           :srcdoc="getSandboxHtml(content)"
         ></iframe>
       </div>

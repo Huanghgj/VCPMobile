@@ -1,3 +1,4 @@
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::vcp_modules::stream_block_parser::{StreamBlock, StreamBlockParser};
@@ -125,15 +126,35 @@ impl AuroraBuffer {
 
     /// 简单的 HTML 标签补全，防止流式输出截断导致 DOM 渲染异常
     pub fn balance_html_tags(html: &str) -> String {
-        let tags = ["div", "pre", "code", "p", "span", "blockquote"];
-        let mut balanced = html.to_string();
-        for tag in tags {
-            let open_count = html.matches(&format!("<{tag}>")).count()
-                + html.matches(&format!("<{tag} ")).count();
-            let close_count = html.matches(&format!("</{tag}>")).count();
-            if open_count > close_count {
-                balanced.push_str(&format!("</{tag}>").repeat(open_count - close_count));
+        lazy_static::lazy_static! {
+            static ref TAG_RE: Regex = Regex::new(r"(?is)<\s*(/?)\s*(div|pre|code|p|span|blockquote)\b[^>]*>").unwrap();
+        }
+
+        let mut stack: Vec<String> = Vec::new();
+        for captures in TAG_RE.captures_iter(html) {
+            let full_match = captures.get(0).map(|m| m.as_str()).unwrap_or_default();
+            let is_closing = captures.get(1).map(|m| m.as_str()) == Some("/");
+            let tag = captures
+                .get(2)
+                .map(|m| m.as_str().to_ascii_lowercase())
+                .unwrap_or_default();
+
+            if tag.is_empty() || full_match.trim_end().ends_with("/>") {
+                continue;
             }
+
+            if is_closing {
+                if let Some(pos) = stack.iter().rposition(|open_tag| open_tag == &tag) {
+                    stack.truncate(pos);
+                }
+            } else {
+                stack.push(tag);
+            }
+        }
+
+        let mut balanced = html.to_string();
+        for tag in stack.iter().rev() {
+            balanced.push_str(&format!("</{}>", tag));
         }
         balanced
     }

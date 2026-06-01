@@ -82,7 +82,7 @@ const handleClick = () => {
           {{ toast.subtitle }}
         </span>
         <div v-if="toast.tags && toast.tags.length > 0" class="flex gap-1 mt-1 overflow-hidden">
-          <span v-for="tag in toast.tags.slice(0, 3)" :key="tag"
+          <span v-for="(tag, idx) in toast.tags.slice(0, 3)" :key="`${tag}-${idx}`"
             class="text-[7.5px] font-bold px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-500/90 shrink-0">
             {{ tag }}
           </span>

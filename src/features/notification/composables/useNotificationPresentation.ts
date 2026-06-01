@@ -100,11 +100,13 @@ export function useNotificationPresentation() {
       textArea.style.position = 'fixed';
       textArea.style.opacity = '0';
       document.body.appendChild(textArea);
-      textArea.focus();
-      textArea.select();
-      document.execCommand('copy');
-      document.body.removeChild(textArea);
-      return true;
+      try {
+        textArea.focus();
+        textArea.select();
+        return document.execCommand('copy');
+      } finally {
+        document.body.removeChild(textArea);
+      }
     } catch (err) {
       return false;
     }

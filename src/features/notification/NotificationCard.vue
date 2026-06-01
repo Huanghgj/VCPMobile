@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue';
+import { ref, computed, onUnmounted } from 'vue';
 import {
   ChevronDown,
   ChevronUp,
@@ -42,6 +42,7 @@ const swipeOffset = ref(0);
 const isSwiping = ref(false);
 const isVerticalScroll = ref(false);
 const hasDeterminedDirection = ref(false);
+let copyResetTimer: ReturnType<typeof setTimeout> | null = null;
 
 const presentation = computed(() => getTypeColor(props.item.type));
 
@@ -105,11 +106,17 @@ const handleCopy = async () => {
   const success = await copyToClipboard(rawPayloadText.value);
   if (success) {
     isCopied.value = true;
-    setTimeout(() => {
+    if (copyResetTimer) clearTimeout(copyResetTimer);
+    copyResetTimer = setTimeout(() => {
       isCopied.value = false;
+      copyResetTimer = null;
     }, 2000);
   }
 };
+
+onUnmounted(() => {
+  if (copyResetTimer) clearTimeout(copyResetTimer);
+});
 
 const rawPayloadText = computed(() => JSON.stringify(props.item.rawPayload || props.item, null, 2));
 

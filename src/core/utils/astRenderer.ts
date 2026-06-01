@@ -86,13 +86,14 @@ function renderNode(node: MarkdownNode, messageId: string): string {
       ).join('');
       return `<${tag}>${itemsHtml}</${tag}>`;
     
-    case 'table':
+    case 'table': {
       const headerHtml = `<tr>${(node.header || []).map(cell => `<th>${(cell as any).map(renderInline).join('')}</th>`).join('')}</tr>`;
       const bodyHtml = (node.rows || []).map(row =>
         `<tr>${row.map(cell => `<td>${(cell as any).map(renderInline).join('')}</td>`).join('')}</tr>`
       ).join('');
       const wrapper = sanitizeClassList(node.wrapper_class, 'vcp-table-wrapper');
       return `<div class="${wrapper}"><table><thead>${headerHtml}</thead><tbody>${bodyHtml}</tbody></table></div>`;
+    }
     
     case 'thematic_break':
       return '<hr/>';
@@ -101,7 +102,7 @@ function renderNode(node: MarkdownNode, messageId: string): string {
       return `<div class="mermaid-placeholder">${escapeHtml(node.code || '')}</div>`;
     
     case 'raw_html':
-      return node.content || '';
+      return sanitizeMarkdownHtml(node.content || '');
     
     default:
       return '';
@@ -166,7 +167,7 @@ function renderInline(node: InlineNode): string {
       return `<span class="highlighted-alert-tag">${escapeHtml(node.value || '')}</span>`;
     
     case 'raw_html_inline':
-      return node.content || '';
+      return sanitizeMarkdownHtml(node.content || '');
     
     default:
       return '';

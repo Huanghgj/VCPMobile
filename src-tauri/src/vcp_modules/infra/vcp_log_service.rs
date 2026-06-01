@@ -7,8 +7,12 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::Request;
 use tokio_tungstenite::tungstenite::Message;
 use url::Url;
+
+const MOBILE_USER_AGENT: &str =
+    "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
 
 static HEARTBEAT_INTERVAL_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(15000);
@@ -84,6 +88,43 @@ fn derive_info_url(log_url: &Url) -> Result<Url, String> {
 
     info_url.set_path(&info_path);
     Ok(info_url)
+}
+
+fn build_ws_request(url: &Url) -> Result<Request<()>, String> {
+    let mut request = url
+        .as_str()
+        .into_client_request()
+        .map_err(|e| e.to_string())?;
+
+    if let Some(host) = url.host_str() {
+        let host_with_port = if let Some(port) = url.port() {
+            format!("{}:{}", host, port)
+        } else {
+            host.to_string()
+        };
+        if let Ok(val) = host_with_port.parse() {
+            request.headers_mut().insert("Host", val);
+        }
+
+        let origin_scheme = match url.scheme() {
+            "wss" => "https",
+            _ => "http",
+        };
+        let origin = if let Some(port) = url.port() {
+            format!("{}://{}:{}", origin_scheme, host, port)
+        } else {
+            format!("{}://{}", origin_scheme, host)
+        };
+        if let Ok(val) = origin.parse() {
+            request.headers_mut().insert("Origin", val);
+        }
+    }
+
+    if let Ok(val) = MOBILE_USER_AGENT.parse() {
+        request.headers_mut().insert("User-Agent", val);
+    }
+
+    Ok(request)
 }
 
 #[tauri::command]
@@ -180,7 +221,7 @@ async fn start_vcp_log_listener<R: tauri::Runtime>(app_handle: AppHandle<R>) {
             }),
         );
 
-        let mut request = match ws_url.as_str().into_client_request() {
+        let request = match build_ws_request(&ws_url) {
             Ok(req) => req,
             Err(e) => {
                 {
@@ -223,35 +264,6 @@ async fn start_vcp_log_listener<R: tauri::Runtime>(app_handle: AppHandle<R>) {
                 continue;
             }
         };
-
-        if let Some(host) = ws_url.host_str() {
-            let host_with_port = if let Some(port) = ws_url.port() {
-                format!("{}:{}", host, port)
-            } else {
-                host.to_string()
-            };
-            if let Ok(val) = host_with_port.parse() {
-                request.headers_mut().insert("Host", val);
-            }
-
-            let origin_scheme = match ws_url.scheme() {
-                "wss" => "https",
-                _ => "http",
-            };
-            let origin = if let Some(port) = ws_url.port() {
-                format!("{}://{}:{}", origin_scheme, host, port)
-            } else {
-                format!("{}://{}", origin_scheme, host)
-            };
-            if let Ok(val) = origin.parse() {
-                request.headers_mut().insert("Origin", val);
-            }
-        }
-
-        request.headers_mut().insert(
-            "User-Agent",
-            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36".parse().unwrap()
-        );
 
         match tokio::time::timeout(Duration::from_secs(10), connect_async(request)).await {
             Ok(connection_result) => match connection_result {
@@ -507,7 +519,7 @@ async fn start_vcp_info_listener<R: tauri::Runtime>(app_handle: AppHandle<R>) {
         };
         log::info!("[VCPInfo] Attempting to connect to {}...", masked_url);
 
-        let mut request = match info_url.as_str().into_client_request() {
+        let request = match build_ws_request(&info_url) {
             Ok(req) => req,
             Err(e) => {
                 log::error!("[VCPInfo] Failed to build request: {}", e);
@@ -528,35 +540,6 @@ async fn start_vcp_info_listener<R: tauri::Runtime>(app_handle: AppHandle<R>) {
                 continue;
             }
         };
-
-        if let Some(host) = info_url.host_str() {
-            let host_with_port = if let Some(port) = info_url.port() {
-                format!("{}:{}", host, port)
-            } else {
-                host.to_string()
-            };
-            if let Ok(val) = host_with_port.parse() {
-                request.headers_mut().insert("Host", val);
-            }
-
-            let origin_scheme = match info_url.scheme() {
-                "wss" => "https",
-                _ => "http",
-            };
-            let origin = if let Some(port) = info_url.port() {
-                format!("{}://{}:{}", origin_scheme, host, port)
-            } else {
-                format!("{}://{}", origin_scheme, host)
-            };
-            if let Ok(val) = origin.parse() {
-                request.headers_mut().insert("Origin", val);
-            }
-        }
-
-        request.headers_mut().insert(
-            "User-Agent",
-            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36".parse().unwrap()
-        );
 
         match tokio::time::timeout(Duration::from_secs(10), connect_async(request)).await {
             Ok(connection_result) => match connection_result {

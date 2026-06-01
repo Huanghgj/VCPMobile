@@ -155,8 +155,14 @@ async function fallbackBrowserDownload(
   src: string,
   fileName: string,
 ): Promise<void> {
+  const trimmedSrc = src.trim();
+  const protocol = new URL(trimmedSrc).protocol;
+  if (!["http:", "https:", "data:", "blob:"].includes(protocol)) {
+    throw new Error("Unsupported URL scheme for download");
+  }
+
   const anchor = document.createElement("a");
-  anchor.href = src;
+  anchor.href = trimmedSrc;
   anchor.download = fileName;
   anchor.rel = "noopener noreferrer";
   anchor.target = "_blank";

@@ -82,6 +82,17 @@ const downloadAndInstall = async () => {
   const info = status.value.type === 'update-available' ? status.value.info : null;
   const downloadUrl = safeHttpUrl(info?.downloadUrl);
   if (!downloadUrl) {
+    const releaseUrl = safeHttpUrl(info?.releasePageUrl);
+    if (releaseUrl) {
+      try {
+        await openUrl(releaseUrl);
+        status.value = { type: 'idle' };
+        return;
+      } catch (e: any) {
+        status.value = { type: 'error', message: `无法打开发布页面: ${e}` };
+        return;
+      }
+    }
     status.value = { type: 'error', message: '缺少下载链接' };
     return;
   }

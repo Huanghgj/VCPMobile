@@ -203,15 +203,19 @@ pub fn open_file_native<R: Runtime>(app: AppHandle<R>, path: String) -> Result<(
         let plugin_handle = handle.as_ref().ok_or("Plugin handle not initialized")?;
 
         plugin_handle
-            .run_mobile_plugin::<serde_json::Value>("openFile", serde_json::json!({ "path": path }))
+            .run_mobile_plugin::<serde_json::Value>(
+                "openFileNative",
+                serde_json::json!({ "path": path }),
+            )
             .map_err(|e| format!("run_mobile_plugin failed: {}", e))?;
+        Ok(())
     }
     #[cfg(not(target_os = "android"))]
     {
         let _ = app;
         let _ = path;
+        Err("该接口仅在 Android 物理端可用".to_string())
     }
-    Ok(())
 }
 
 #[derive(Serialize, Deserialize)]

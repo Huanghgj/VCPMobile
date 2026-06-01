@@ -6,8 +6,10 @@ import { findRenderedImagePayload } from "../utils/renderedImage";
 
 function safeExternalHttpUrl(href: string | null): string {
   if (!href) return "";
+  const trimmed = href.trim();
+  if (!/^https?:\/\//i.test(trimmed)) return "";
   try {
-    const url = new URL(href, window.location.href);
+    const url = new URL(trimmed);
     return url.protocol === "http:" || url.protocol === "https:" ? url.href : "";
   } catch {
     return "";

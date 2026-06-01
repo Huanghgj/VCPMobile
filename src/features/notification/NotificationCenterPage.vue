@@ -28,6 +28,7 @@ const emit = defineEmits<{
 
 const store = useNotificationStore();
 const showDebugPanel = ref(false);
+const isDev = import.meta.env.DEV;
 
 const {
   activeTab,
@@ -168,13 +169,16 @@ const injectMockNotification = (type: 'rag' | 'thinking' | 'approval' | 'error')
           </div>
           <div class="flex items-center gap-2">
             <button
+              v-if="isDev"
               @click="showDebugPanel = !showDebugPanel"
+              aria-label="切换调试面板"
               class="p-1.5 rounded-lg bg-pink-50/60 border border-pink-100/50 text-pink-500 hover:bg-pink-50 active:scale-95 transition-all duration-150 motion-reduce:transition-none"
             >
               <Bug class="w-3.5 h-3.5" />
             </button>
             <button
               @click="emit('close')"
+              aria-label="关闭通知中心"
               class="p-1.5 rounded-lg bg-pink-50/60 border border-pink-100/50 text-pink-500 hover:bg-pink-50 active:scale-95 transition-all duration-150 motion-reduce:transition-none"
             >
               <X class="w-3.5 h-3.5" />
@@ -188,6 +192,7 @@ const injectMockNotification = (type: 'rag' | 'thinking' | 'approval' | 'error')
           <input
             v-model="searchQuery"
             type="text"
+            aria-label="搜索通知"
             placeholder="搜索标题、内容、标签、原始数据..."
             class="w-full bg-pink-50/30 border border-pink-100/80 rounded-lg px-3 py-1.5 pl-9 text-xs text-slate-700 placeholder-pink-300 focus:outline-none focus:border-pink-300 focus:bg-white transition-all duration-200 font-sans"
           />
@@ -202,7 +207,7 @@ const injectMockNotification = (type: 'rag' | 'thinking' | 'approval' | 'error')
       </div>
 
       <!-- Debug Panel -->
-      <div v-if="showDebugPanel" class="bg-white/80 border-b border-pink-100/60 p-3 shrink-0 flex flex-col gap-2 mx-3 mt-2 rounded-xl shadow-sm">
+      <div v-if="isDev && showDebugPanel" class="bg-white/80 border-b border-pink-100/60 p-3 shrink-0 flex flex-col gap-2 mx-3 mt-2 rounded-xl shadow-sm">
         <div class="text-[9px] font-mono font-bold text-pink-400 tracking-wider">DEBUG INJECTOR</div>
         <div class="grid grid-cols-4 gap-2">
           <button @click="injectMockNotification('rag')" class="flex items-center justify-center gap-1 py-1.5 rounded-lg bg-emerald-50 border border-emerald-100 text-[10px] text-emerald-700 font-medium active:scale-95 transition-transform duration-100">
