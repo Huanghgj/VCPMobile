@@ -420,6 +420,19 @@ fn should_auto_close_before(next: &str, current: Option<&str>) -> bool {
 mod tests {
     use super::*;
 
+    fn contains_code_block(nodes: &[crate::vcp_modules::pre_renderer::MarkdownNode]) -> bool {
+        nodes.iter().any(|node| match node {
+            crate::vcp_modules::pre_renderer::MarkdownNode::CodeBlock { .. } => true,
+            crate::vcp_modules::pre_renderer::MarkdownNode::Blockquote { children, .. } => {
+                contains_code_block(children)
+            }
+            crate::vcp_modules::pre_renderer::MarkdownNode::List { items, .. } => items
+                .iter()
+                .any(|item_nodes| contains_code_block(item_nodes)),
+            _ => false,
+        })
+    }
+
     #[test]
     fn closes_raw_html_before_tool_block() {
         let input = concat!(
@@ -472,5 +485,28 @@ mod tests {
         let repaired = repair_message_content_before_persist(input);
 
         assert_eq!(repaired, input);
+    }
+
+    #[test]
+    fn dialogue_html_text_does_not_become_code_block() {
+        let input = concat!(
+            "<div style=\"box-sizing:border-box; max-width:88%; background:#fff0f7;\">\n",
+            "      『今日确是凡间的“儿童节”不假……可、可妾身都天庭八岁了，又不是凡间那种什么都不懂的三岁稚童！兄长莫要老是拿妾身当小娃娃打趣……』\n",
+            "      <br><br>\n",
+            "      『不过……既然是过节，凡间的娃娃们都有礼物拿，那妾身……妾身是不是也可以要点好吃的仙果糖酥？』\n",
+            "    </div>"
+        );
+        let blocks = crate::vcp_modules::content_parser::parse_content(input);
+
+        let has_code = blocks.iter().any(|block| {
+            matches!(
+                block,
+                crate::vcp_modules::content_parser::ContentBlock::Markdown {
+                    nodes: Some(nodes),
+                    ..
+                } if contains_code_block(nodes)
+            )
+        });
+        assert!(!has_code, "{blocks:#?}");
     }
 }

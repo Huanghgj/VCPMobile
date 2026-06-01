@@ -284,6 +284,15 @@ fn is_chinese_char(c: char) -> bool {
 }
 
 #[inline]
+fn is_natural_language_line_start(c: char) -> bool {
+    is_chinese_char(c)
+        || matches!(
+            c,
+            '『' | '「' | '“' | '‘' | '（' | '《' | '【' | '〔' | '〖' | '〈' | '…' | '—'
+        )
+}
+
+#[inline]
 fn is_vcp_marker(s: &str) -> bool {
     s.starts_with("<<<")
         || s.starts_with("[---")
@@ -343,7 +352,10 @@ pub fn de_indent_misinterpreted_code_blocks(text: &str) -> String {
             if LIST_REGEX.is_match(line) {
                 result.push_str(line);
             } else if (trimmed.starts_with('<') && HTML_TAG_REGEX.is_match(trimmed))
-                || trimmed.chars().next().is_some_and(is_chinese_char)
+                || trimmed
+                    .chars()
+                    .next()
+                    .is_some_and(is_natural_language_line_start)
                 || is_vcp_marker(trimmed)
                 || trimmed.starts_with("<!--")
             {
