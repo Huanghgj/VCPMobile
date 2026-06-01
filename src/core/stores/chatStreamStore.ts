@@ -406,6 +406,9 @@ export const useChatStreamStore = defineStore("chatStream", () => {
 
       if (msg) {
         msg!.isThinking = false;
+        if (typeof event.content === "string") {
+          msg!.content = event.content;
+        }
         if (event.timestamp) {
           msg!.timestamp = event.timestamp;
         }

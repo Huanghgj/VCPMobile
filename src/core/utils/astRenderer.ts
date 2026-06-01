@@ -102,7 +102,10 @@ function renderNode(node: MarkdownNode, messageId: string): string {
       return `<div class="mermaid-placeholder">${escapeHtml(node.code || '')}</div>`;
     
     case 'raw_html':
-      return sanitizeMarkdownHtml(node.content || '');
+      // Raw HTML nodes can be partial tags produced from a larger HTML container.
+      // Sanitizing fragments one by one makes browsers auto-close tags early; the
+      // complete HTML string is sanitized once in renderMarkdownNodes().
+      return node.content || '';
     
     default:
       return '';
@@ -167,7 +170,9 @@ function renderInline(node: InlineNode): string {
       return `<span class="highlighted-alert-tag">${escapeHtml(node.value || '')}</span>`;
     
     case 'raw_html_inline':
-      return sanitizeMarkdownHtml(node.content || '');
+      // Keep inline open/close tag fragments intact until the final full-HTML
+      // sanitization pass in renderMarkdownNodes().
+      return node.content || '';
     
     default:
       return '';

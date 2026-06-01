@@ -3,6 +3,7 @@ use crate::vcp_modules::content_parser::ContentBlock;
 use crate::vcp_modules::file_manager::get_attachments_root_dir;
 use crate::vcp_modules::message_repository::MessageRepository;
 use crate::vcp_modules::message_repository::{ContentCompressor, MessageRenderCompiler};
+use crate::vcp_modules::render_repair::repair_message_content_before_persist;
 use crate::vcp_modules::settings_manager;
 use sqlx::Row;
 use std::path::Path;
@@ -13,6 +14,22 @@ use tokio::fs;
 // =================================================================
 // vcp_modules/message_service.rs - 消息业务逻辑中心 (含附件对齐)
 // =================================================================
+
+fn repair_assistant_render_content_before_persist(message: &mut ChatMessage) {
+    if message.role != "assistant" || message.content.is_empty() {
+        return;
+    }
+
+    let repaired = repair_message_content_before_persist(&message.content);
+    if repaired != message.content {
+        log::warn!(
+            "[MessageService] Repaired unclosed render HTML before persisting message {}",
+            message.id
+        );
+        message.content = repaired;
+        message.blocks = None;
+    }
+}
 
 /// 批量加载多个 topic 的全量消息 — 一次性 SQL 查询，按 topic_id 分组
 /// 避免 push_messages_batch 场景下的 N+1 查询
@@ -477,6 +494,7 @@ pub async fn append_single_message<R: tauri::Runtime>(
     mut message: ChatMessage,
 ) -> Result<Vec<ContentBlock>, String> {
     ensure_attachments_locally(&app_handle, &mut message).await?;
+    repair_assistant_render_content_before_persist(&mut message);
 
     let blocks: Vec<ContentBlock> = if let Some(blocks_val) = &message.blocks {
         serde_json::from_value(blocks_val.clone()).map_err(|e| e.to_string())?
@@ -602,6 +620,7 @@ pub async fn patch_single_message<R: tauri::Runtime>(
     skip_bubble: bool,
 ) -> Result<Vec<ContentBlock>, String> {
     ensure_attachments_locally(&app_handle, &mut message).await?;
+    repair_assistant_render_content_before_persist(&mut message);
 
     // 优先使用传入的 blocks，如果缺失则实时编译
     let blocks: Vec<ContentBlock> = if let Some(blocks_val) = &message.blocks {
@@ -790,6 +809,9 @@ pub async fn finalize_stream_message<R: tauri::Runtime>(
         final_content = final_content.trim_end().to_string();
     }
 
+    final_content = repair_message_content_before_persist(&final_content);
+    let repaired_final_content = final_content.clone();
+
     let is_group = owner_type == "group";
     let final_msg = ChatMessage {
         id: message_id.clone(),
@@ -872,13 +894,15 @@ pub async fn finalize_stream_message<R: tauri::Runtime>(
             }))
         };
 
-        let _ = chan.send(crate::vcp_modules::vcp_client::StreamEvent::end(
+        let mut end_event = crate::vcp_modules::vcp_client::StreamEvent::end(
             message_id,
             context,
             Some(finish_reason.unwrap_or_else(|| "completed".to_string())),
             end_blocks,
             Some(final_ts),
-        ));
+        );
+        end_event.content = Some(repaired_final_content);
+        let _ = chan.send(end_event);
     }
 
     Ok(())

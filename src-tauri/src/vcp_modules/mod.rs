@@ -33,6 +33,7 @@ pub use chat::context_sanitizer;
 pub use chat::emoticon_manager;
 pub use chat::message_service;
 pub use chat::pre_renderer;
+pub use chat::render_repair;
 pub use chat::stream_block_parser;
 pub use chat::topic_service;
 pub use chat::topic_summary_service;

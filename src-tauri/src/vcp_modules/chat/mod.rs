@@ -7,6 +7,7 @@ pub mod context_sanitizer;
 pub mod emoticon_manager;
 pub mod message_service;
 pub mod pre_renderer;
+pub mod render_repair;
 pub mod stream_block_parser;
 pub mod topic_service;
 pub mod topic_summary_service;
