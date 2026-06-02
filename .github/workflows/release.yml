@@ -116,7 +116,7 @@ jobs:
           ANDROID_KEY_ALIAS: ${{ env.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ env.ANDROID_KEY_PASSWORD }}
         run: |
-          pnpm tauri android build --apk --target aarch64
+          pnpm android:arm64:release
 
       - name: Verify APK signature
         shell: bash

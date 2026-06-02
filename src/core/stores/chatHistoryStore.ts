@@ -18,6 +18,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
   const historyOffset = ref(0);        // 当前已加载的消息总数（= 下次请求的 offset 起点）
   const hasMoreHistory = ref(true);    // 是否还有更多旧消息
   const isLoadingHistory = ref(false); // 防止并发重复触发
+  let historyLoadSequence = 0;
 
   // 用于拦截重新生成时的输入框补全
   const editMessageContent = ref("");
@@ -92,17 +93,35 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     );
     loading.value = true;
     isLoadingHistory.value = true;
+    const loadSequence = ++historyLoadSequence;
     try {
-      const requestedTopicId = sessionStore.currentTopicId;
+      const requestedTopicId = topicId;
+      const isStaleLoad = () => loadSequence !== historyLoadSequence;
       const channel = new Channel<HistoryChunk>();
       const buffer: ChatMessage[] = [];
       let receivedCount = 0;
       let resolveComplete: (() => void) | null = null;
+      let isLoadCompleted = false;
+      let cancelledByTopicChange = false;
       const completePromise = new Promise<void>((resolve) => { resolveComplete = resolve; });
+      const completeLoad = () => {
+        if (isLoadCompleted) return;
+        isLoadCompleted = true;
+        if (resolveComplete) {
+          resolveComplete();
+        }
+      };
 
       channel.onmessage = (chunk) => {
+        if (isStaleLoad()) {
+          completeLoad();
+          return;
+        }
+
         // 1. 会话一致性校验：如果用户在加载中途切换了话题，丢弃后续消息
         if (sessionStore.currentTopicId !== requestedTopicId && requestedTopicId !== null) {
+          cancelledByTopicChange = true;
+          completeLoad();
           return;
         }
 
@@ -137,7 +156,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
               hasMoreHistory.value = false;
             }
           }
-          resolveComplete?.();
+          completeLoad();
         }
       };
 
@@ -150,13 +169,17 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
         onMessage: channel,
       });
 
+      if (isStaleLoad() || sessionStore.currentTopicId !== requestedTopicId || cancelledByTopicChange) {
+        completeLoad();
+      }
+
       if (total === 0) {
         if (offset === 0) {
           currentChatHistory.value = [];
           historyOffset.value = 0;
         }
         hasMoreHistory.value = false;
-        (resolveComplete as (() => void) | null)?.();
+        completeLoad();
       }
 
       await completePromise;
@@ -180,8 +203,10 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     } catch (e) {
       console.error("[ChatHistoryStore] Failed to stream history:", e);
     } finally {
-      loading.value = false;
-      isLoadingHistory.value = false;
+      if (loadSequence === historyLoadSequence) {
+        loading.value = false;
+        isLoadingHistory.value = false;
+      }
     }
   };
 

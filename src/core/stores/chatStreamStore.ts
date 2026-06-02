@@ -180,7 +180,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
       if (excess <= 0) break;
       // 只删除已完成的流（不在当前活跃会话中）
       if (!isMessageInActiveStream(id)) {
-        activeStreamMessages.delete(id);
+        cleanupInactiveStreamMessage(id);
         excess--;
       }
     }
@@ -588,8 +588,9 @@ export const useChatStreamStore = defineStore("chatStream", () => {
       streamingMessageId.value = null;
     }
 
-    const ownerId = sessionStore.currentSelectedItem?.id;
-    const topicId = sessionStore.currentTopicId;
+    const context = activeStreamContexts[messageId];
+    const ownerId = context?.itemId || sessionStore.currentSelectedItem?.id;
+    const topicId = context?.topicId || sessionStore.currentTopicId;
 
     if (ownerId && topicId) {
       removeSessionStream(ownerId, topicId, messageId);
@@ -628,6 +629,10 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     rAFPendingUpdates.clear();
     sealedStreamMessageIds.clear();
     terminalStreamMessageIds.clear();
+    if (activeStreamTotal.value > 0) {
+      activeStreamTotal.value = 0;
+      releaseScreenKeep();
+    }
     for (const id of Object.keys(activeStreamContexts)) {
       delete activeStreamContexts[id];
     }

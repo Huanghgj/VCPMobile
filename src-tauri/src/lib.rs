@@ -154,12 +154,16 @@ pub fn run() {
         .plugin(
             tauri_plugin_log::Builder::new()
                 .targets({
-                    let mut targets = vec![
+                    let targets = vec![
                         Target::new(TargetKind::Stdout),
                         Target::new(TargetKind::LogDir { file_name: None }),
                     ];
                     #[cfg(any(debug_assertions, not(mobile)))]
-                    targets.push(Target::new(TargetKind::Webview));
+                    let targets = {
+                        let mut targets = targets;
+                        targets.push(Target::new(TargetKind::Webview));
+                        targets
+                    };
                     targets
                 })
                 .level(log::LevelFilter::Info)
