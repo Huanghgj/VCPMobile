@@ -8,6 +8,7 @@ use crate::vcp_modules::group_context_assembler::assemble_group_context;
 use crate::vcp_modules::group_service::{read_group_config, GroupManagerState};
 use crate::vcp_modules::group_speaking_policy::determine_naturerandom_speakers;
 use crate::vcp_modules::message_service;
+use crate::vcp_modules::stream_service_guard::StreamServiceGuard;
 use crate::vcp_modules::vcp_client::{
     perform_vcp_request, ActiveRequests, CancelledGroupTurns, StreamEvent, VcpRequestPayload,
 };
@@ -103,6 +104,7 @@ pub async fn internal_process_group_chat_message(
         None,
         true,
         false, // include_extracted_text: 决策发言者不需要大体积的提取文本内容
+        false, // include_ui_render_data: 决策不需要 blocks/shell
     )
     .await?;
 
@@ -137,7 +139,8 @@ pub async fn internal_process_group_chat_message(
         None, // 加载全部用于 VCP 上下文
         None,
         true,
-        true, // include_extracted_text: 组装群聊上下文发送给 VCP 时需要包含附件提取文本内容
+        true,  // include_extracted_text: 组装群聊上下文发送给 VCP 时需要包含附件提取文本内容
+        false, // include_ui_render_data: 发请求不需要 blocks/shell
     )
     .await?;
 
@@ -179,14 +182,11 @@ pub async fn internal_process_group_chat_message(
 
         // 【优化点】：此时已识别出当前轮次的发言者 agent_name，立即提前启动前台服务保活，
         // 从而与接下来耗时的群组上下文组装、SQLite Tavern 级联编织等逻辑并行重叠。
-        if let Err(e) =
-            tauri_plugin_vcp_mobile::stream::start_stream_service_inner(&app_handle, &agent_name)
-        {
-            log::warn!(
-                "[GroupChatAppService] Failed to start streaming service early: {}",
-                e
-            );
-        }
+        let mut stream_service_guard = StreamServiceGuard::start(
+            app_handle.clone(),
+            agent_name.clone(),
+            "GroupChatAppService",
+        );
 
         // 组装上下文
         let base_system_prompt =
@@ -253,7 +253,7 @@ pub async fn internal_process_group_chat_message(
 
         // 发射 thinking 事件，让前端为当前接力的 Agent 创建思考占位消息
         if let Some(chan) = &stream_channel {
-            let _ = chan.send(StreamEvent::thinking(message_id.clone(), context));
+            let _ = chan.send(StreamEvent::thinking(message_id.clone(), context.clone()));
         }
 
         // 执行请求 (串行等待)
@@ -266,14 +266,7 @@ pub async fn internal_process_group_chat_message(
         .await;
 
         // 停止前台服务
-        if let Err(e) =
-            tauri_plugin_vcp_mobile::stream::stop_stream_service_inner(&app_handle, &agent_name)
-        {
-            log::warn!(
-                "[GroupChatAppService] Failed to stop streaming service: {}",
-                e
-            );
-        }
+        stream_service_guard.stop();
 
         if let Ok((res, is_aborted)) = res_result {
             if let Some(full_content) = res["fullContent"].as_str() {
@@ -294,6 +287,8 @@ pub async fn internal_process_group_chat_message(
                     full_content.to_string(),
                     is_aborted,
                     finish_reason.clone(),
+                    Some(&agent_id),
+                    Some(&agent_name),
                     stream_channel.clone(),
                 )
                 .await?;
@@ -387,7 +382,7 @@ pub async fn handle_group_chat_message(
             vcp_api_key: payload.vcp_api_key,
             stream_channel: Some(stream_channel),
         },
-        true, // append_user_msg
+        false, // frontend already persisted the user message and compiled render blocks
     )
     .await
 }

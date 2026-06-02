@@ -5,6 +5,7 @@ use crate::vcp_modules::message_repository::MessageRepository;
 use crate::vcp_modules::message_repository::{ContentCompressor, MessageRenderCompiler};
 use crate::vcp_modules::render_repair::repair_message_content_before_persist;
 use crate::vcp_modules::settings_manager;
+use crate::vcp_modules::sync_hash::HashAggregator;
 use sqlx::Row;
 use std::path::Path;
 use tauri::ipc::Channel;
@@ -29,6 +30,85 @@ fn repair_assistant_render_content_before_persist(message: &mut ChatMessage) {
         message.content = repaired;
         message.blocks = None;
     }
+}
+
+/// Writes a lightweight assistant placeholder for an active stream.
+///
+/// This intentionally skips render_cache and attachment cleanup. The final stream
+/// commit performs the full durable write, but the placeholder is still reflected
+/// in topic counts/hash so interrupted streams remain consistent after restart.
+pub async fn append_stream_skeleton_message(
+    db_pool: &sqlx::Pool<sqlx::Sqlite>,
+    topic_id: String,
+    message: ChatMessage,
+) -> Result<(), String> {
+    if topic_id.trim().is_empty() || message.id.trim().is_empty() {
+        return Err("stream skeleton requires topic_id and message.id".to_string());
+    }
+
+    let timestamp = if message.timestamp == 0 {
+        chrono::Utc::now().timestamp_millis() as u64
+    } else {
+        message.timestamp
+    };
+    let content_hash = HashAggregator::compute_message_fingerprint("", &[]);
+    let compressed_empty = ContentCompressor::compress("")?;
+
+    let mut tx = db_pool.begin().await.map_err(|e| e.to_string())?;
+
+    let result = sqlx::query(
+        "INSERT INTO messages (
+            msg_id, topic_id, role, name, agent_id, content, timestamp,
+            is_group_message, group_id, finish_reason,
+            content_hash,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(topic_id, msg_id) DO NOTHING",
+    )
+    .bind(&message.id)
+    .bind(&topic_id)
+    .bind(if message.role.is_empty() {
+        "assistant"
+    } else {
+        message.role.as_str()
+    })
+    .bind(&message.name)
+    .bind(&message.agent_id)
+    .bind(compressed_empty)
+    .bind(timestamp as i64)
+    .bind(message.is_group_message.unwrap_or(false))
+    .bind(&message.group_id)
+    .bind(&message.finish_reason)
+    .bind(content_hash)
+    .bind(timestamp as i64)
+    .bind(timestamp as i64)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if result.rows_affected() > 0 {
+        let msg_count: i32 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages WHERE topic_id = ? AND deleted_at IS NULL",
+        )
+        .bind(&topic_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?
+        .unwrap_or(0);
+
+        sqlx::query("UPDATE topics SET updated_at = ?, msg_count = ? WHERE topic_id = ?")
+            .bind(timestamp as i64)
+            .bind(msg_count)
+            .bind(&topic_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        HashAggregator::bubble_from_topic(&mut tx, &topic_id).await?;
+    }
+
+    tx.commit().await.map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// 批量加载多个 topic 的全量消息 — 一次性 SQL 查询，按 topic_id 分组
@@ -184,28 +264,43 @@ pub async fn load_chat_history_internal(
     offset: Option<usize>,
     include_content: bool,
     include_extracted_text: bool,
+    include_ui_render_data: bool,
 ) -> Result<Vec<ChatMessage>, String> {
     let db_state = _app_handle.state::<crate::vcp_modules::db_manager::DbState>();
     let pool = &db_state.pool;
 
     let offset = offset.unwrap_or(0);
 
+    let render_select = if include_ui_render_data {
+        ", r.render_content"
+    } else {
+        ""
+    };
+    let render_join = if include_ui_render_data {
+        " LEFT JOIN render_cache r ON m.topic_id = r.topic_id AND m.msg_id = r.msg_id"
+    } else {
+        ""
+    };
     let query_str = if limit.is_some() {
-        "SELECT m.msg_id, m.role, m.name, m.agent_id, m.content, m.timestamp, m.is_group_message, m.group_id, m.finish_reason, r.render_content, m.content_hash 
-         FROM messages m
-         LEFT JOIN render_cache r ON m.topic_id = r.topic_id AND m.msg_id = r.msg_id
+        format!(
+            "SELECT m.msg_id, m.role, m.name, m.agent_id, m.content, m.timestamp, m.is_group_message, m.group_id, m.finish_reason, m.content_hash{}
+         FROM messages m{}
          WHERE m.topic_id = ? AND m.deleted_at IS NULL 
          ORDER BY m.timestamp DESC, m.rowid DESC 
-         LIMIT ? OFFSET ?"
+         LIMIT ? OFFSET ?",
+            render_select, render_join
+        )
     } else {
-        "SELECT m.msg_id, m.role, m.name, m.agent_id, m.content, m.timestamp, m.is_group_message, m.group_id, m.finish_reason, r.render_content, m.content_hash 
-         FROM messages m
-         LEFT JOIN render_cache r ON m.topic_id = r.topic_id AND m.msg_id = r.msg_id
+        format!(
+            "SELECT m.msg_id, m.role, m.name, m.agent_id, m.content, m.timestamp, m.is_group_message, m.group_id, m.finish_reason, m.content_hash{}
+         FROM messages m{}
          WHERE m.topic_id = ? AND m.deleted_at IS NULL 
-         ORDER BY m.timestamp DESC, m.rowid DESC"
+         ORDER BY m.timestamp DESC, m.rowid DESC",
+            render_select, render_join
+        )
     };
 
-    let mut q = sqlx::query(query_str).bind(topic_id);
+    let mut q = sqlx::query(&query_str).bind(topic_id);
     if let Some(l) = limit {
         q = q.bind(l as i64);
         q = q.bind(offset as i64);
@@ -284,28 +379,34 @@ pub async fn load_chat_history_internal(
         }
     }
 
-    // 预计算外壳属性所需的全局数据
-    let agents =
-        crate::vcp_modules::agent_service::get_agents(_app_handle.clone(), _app_handle.state())
-            .await
-            .unwrap_or_default();
-    let settings = crate::vcp_modules::settings_manager::read_settings(
-        _app_handle.clone(),
-        _app_handle.state(),
-    )
-    .await
-    .ok();
-    let user_name = settings
-        .map(|s| s.user_name)
-        .unwrap_or_else(|| "User".to_string());
+    // 预计算外壳属性所需的全局数据，仅 UI 历史加载需要。
+    let (agents, user_name, user_avatar_color) = if include_ui_render_data {
+        let agents =
+            crate::vcp_modules::agent_service::get_agents(_app_handle.clone(), _app_handle.state())
+                .await
+                .unwrap_or_default();
+        let settings = crate::vcp_modules::settings_manager::read_settings(
+            _app_handle.clone(),
+            _app_handle.state(),
+        )
+        .await
+        .ok();
+        let user_name = settings
+            .map(|s| s.user_name)
+            .unwrap_or_else(|| "User".to_string());
 
-    let user_avatar_color: Option<String> = sqlx::query_scalar(
-        "SELECT dominant_color FROM avatars WHERE owner_type = 'user' AND owner_id = 'user_avatar'",
-    )
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten();
+        let user_avatar_color: Option<String> = sqlx::query_scalar(
+            "SELECT dominant_color FROM avatars WHERE owner_type = 'user' AND owner_id = 'user_avatar'",
+        )
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+
+        (agents, user_name, user_avatar_color)
+    } else {
+        (Vec::new(), String::new(), None)
+    };
 
     let mut history = Vec::new();
     for row in rows {
@@ -315,10 +416,21 @@ pub async fn load_chat_history_internal(
         let name: Option<String> = row.get("name");
 
         let content_bytes: Vec<u8> = row.get("content");
-        let render_content: Option<Vec<u8>> = row.get("render_content");
+        let render_content: Option<Vec<u8>> = if include_ui_render_data {
+            row.get("render_content")
+        } else {
+            None
+        };
 
         // 懒渲染策略：render_cache 命中则直接用，未命中则实时编译
-        let (blocks, content) = if let Some(ref rb) = render_content {
+        let (blocks, content) = if !include_ui_render_data {
+            let content = if include_content {
+                ContentCompressor::decompress(&content_bytes).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            (None, content)
+        } else if let Some(ref rb) = render_content {
             let blocks = parse_render_bytes(Some(rb.clone()));
             let content = if include_content {
                 ContentCompressor::decompress(&content_bytes).unwrap_or_default()
@@ -397,12 +509,14 @@ pub async fn load_chat_history_internal(
             content_hash,
         };
 
-        message.shell = Some(crate::vcp_modules::pre_renderer::precompute_shell(
-            &message,
-            &agents,
-            &user_name,
-            user_avatar_color.as_deref(),
-        ));
+        if include_ui_render_data {
+            message.shell = Some(crate::vcp_modules::pre_renderer::precompute_shell(
+                &message,
+                &agents,
+                &user_name,
+                user_avatar_color.as_deref(),
+            ));
+        }
         history.push(message);
     }
 
@@ -634,9 +748,19 @@ pub async fn patch_single_message<R: tauri::Runtime>(
     MessageRepository::upsert_message(&mut tx, &message, &topic_id, &render_bytes, skip_bubble)
         .await?;
 
+    let msg_count: i32 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM messages WHERE topic_id = ? AND deleted_at IS NULL",
+    )
+    .bind(&topic_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?
+    .unwrap_or(0);
+
     let now = chrono::Utc::now().timestamp_millis();
-    sqlx::query("UPDATE topics SET updated_at = ? WHERE topic_id = ?")
+    sqlx::query("UPDATE topics SET updated_at = ?, msg_count = ? WHERE topic_id = ?")
         .bind(now)
+        .bind(msg_count)
         .bind(&topic_id)
         .execute(&mut *tx)
         .await
@@ -779,6 +903,8 @@ pub async fn finalize_stream_message<R: tauri::Runtime>(
     full_content: String,
     _is_aborted: bool,
     finish_reason: Option<String>,
+    responder_agent_id: Option<&str>,
+    responder_name: Option<&str>,
     stream_channel: Option<Channel<crate::vcp_modules::vcp_client::StreamEvent>>,
 ) -> Result<(), String> {
     let final_ts = std::time::SystemTime::now()
@@ -813,18 +939,20 @@ pub async fn finalize_stream_message<R: tauri::Runtime>(
     let repaired_final_content = final_content.clone();
 
     let is_group = owner_type == "group";
+    let final_agent_id = if is_group {
+        responder_agent_id.map(ToString::to_string)
+    } else {
+        Some(owner_id.to_string())
+    };
+    let final_name = responder_name.map(ToString::to_string);
     let final_msg = ChatMessage {
         id: message_id.clone(),
         role: "assistant".to_string(),
-        name: None,
+        name: final_name.clone(),
         content: final_content,
         timestamp: final_ts,
         is_thinking: Some(false),
-        agent_id: if is_group {
-            None
-        } else {
-            Some(owner_id.to_string())
-        },
+        agent_id: final_agent_id.clone(),
         group_id: if is_group {
             Some(owner_id.to_string())
         } else {
@@ -885,12 +1013,15 @@ pub async fn finalize_stream_message<R: tauri::Runtime>(
             Some(serde_json::json!({
                 "groupId": owner_id,
                 "topicId": topic_id,
+                "agentId": final_agent_id,
+                "agentName": final_name,
                 "isGroupMessage": true,
             }))
         } else {
             Some(serde_json::json!({
                 "agentId": owner_id,
                 "topicId": topic_id,
+                "agentName": final_name,
             }))
         };
 

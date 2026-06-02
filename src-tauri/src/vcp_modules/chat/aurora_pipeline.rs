@@ -70,10 +70,10 @@ impl AuroraBuffer {
         }
 
         let prev_stable_count = self.stable_blocks.len();
-        let prev_tail = self.tail_content.clone();
 
         // 1. 增量解析全文，产出本次新增的已闭合块 + 尾部纯文本
         let (new_blocks, new_tail) = self.parser.process(&self.full_text);
+        let tail_changed = self.tail_content != new_tail;
 
         if !new_blocks.is_empty() {
             self.stable_blocks.extend(new_blocks);
@@ -105,7 +105,6 @@ impl AuroraBuffer {
         }
 
         let stable_changed = self.stable_blocks.len() != prev_stable_count;
-        let tail_changed = self.tail_content != prev_tail;
 
         (stable_changed, tail_changed)
     }

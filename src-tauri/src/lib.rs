@@ -9,8 +9,8 @@ use vcp_modules::agent_service::{
 };
 use vcp_modules::avatar_service::{get_avatar, save_avatar_data, store_dominant_color};
 use vcp_modules::chat_manager::{
-    append_single_message, delete_messages, load_chat_history, load_chat_history_streamed,
-    patch_single_message, truncate_history_after_timestamp,
+    append_single_message, append_stream_skeleton_message, delete_messages, load_chat_history,
+    load_chat_history_streamed, patch_single_message, truncate_history_after_timestamp,
 };
 use vcp_modules::context_injection::{
     delete_tarven_rule, get_tarven_rules, preview_tarven_injection, reorder_rules,
@@ -195,6 +195,7 @@ pub fn run() {
             handle_agent_chat_message,
             load_chat_history,
             load_chat_history_streamed,
+            append_stream_skeleton_message,
             append_single_message,
             patch_single_message,
             delete_messages,

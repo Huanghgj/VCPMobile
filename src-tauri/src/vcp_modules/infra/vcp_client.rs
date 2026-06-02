@@ -205,6 +205,7 @@ pub async fn sendToVCP<R: Runtime>(
         let ctx = context.as_ref();
         let group_id = ctx.and_then(|c| c["groupId"].as_str());
         let agent_id = ctx.and_then(|c| c["agentId"].as_str());
+        let agent_name = ctx.and_then(|c| c["agentName"].as_str());
         let topic_id = ctx
             .and_then(|c| c["topicId"].as_str())
             .unwrap_or("")
@@ -233,6 +234,8 @@ pub async fn sendToVCP<R: Runtime>(
             res["fullContent"].as_str().unwrap_or("").to_string(),
             is_aborted,
             finish_reason,
+            agent_id,
+            agent_name,
             Some(stream_channel),
         )
         .await?;

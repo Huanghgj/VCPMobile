@@ -2,6 +2,7 @@ use crate::vcp_modules::agent_service::{read_agent_config_internal, AgentConfigS
 use crate::vcp_modules::chat_manager::ChatMessage;
 use crate::vcp_modules::db_manager::DbState;
 use crate::vcp_modules::message_service;
+use crate::vcp_modules::stream_service_guard::StreamServiceGuard;
 use crate::vcp_modules::vcp_client::{
     perform_vcp_request, ActiveRequests, StreamEvent, VcpRequestPayload,
 };
@@ -35,7 +36,7 @@ pub async fn handle_agent_chat_message(
         active_requests,
         payload,
         stream_channel,
-        true, // append_user_msg
+        false, // frontend already persisted the user message and compiled render blocks
     )
     .await
 }
@@ -65,14 +66,11 @@ pub async fn internal_process_agent_chat_message(
 
     // 【优化点】：此时已拿到智能体配置，立即启动前台服务保活以抢先渲染通知卡片，
     // 从而与接下来的追加消息 SQLite IO、长历史读取、Tavern上下文编织等重度异步准备并行重叠
-    if let Err(e) =
-        tauri_plugin_vcp_mobile::stream::start_stream_service_inner(&app_handle, &agent_config.name)
-    {
-        log::warn!(
-            "[AgentChatAppService] Failed to start streaming service early: {}",
-            e
-        );
-    }
+    let mut stream_service_guard = StreamServiceGuard::start(
+        app_handle.clone(),
+        agent_config.name.clone(),
+        "AgentChatAppService",
+    );
 
     // 2. 只有在需要时才将用户消息追加到数据库 (重新生成时设为 false)
     if append_user_msg {
@@ -96,7 +94,8 @@ pub async fn internal_process_agent_chat_message(
         None, // 加载全部（或按需限制）
         None,
         true,
-        true, // include_extracted_text: 组装上下文发送给 VCP 时需要包含附件提取文本内容
+        true,  // include_extracted_text: 组装上下文发送给 VCP 时需要包含附件提取文本内容
+        false, // include_ui_render_data: 发请求不需要 blocks/shell
     )
     .await?;
 
@@ -145,7 +144,7 @@ pub async fn internal_process_agent_chat_message(
     };
 
     // 在发起 VCP 请求前，向前端发射 thinking 事件以初始化气泡
-    let _ = stream_channel.send(StreamEvent::thinking(thinking_id.clone(), context));
+    let _ = stream_channel.send(StreamEvent::thinking(thinking_id.clone(), context.clone()));
 
     // 8. 发起请求
     let result = perform_vcp_request(
@@ -157,14 +156,7 @@ pub async fn internal_process_agent_chat_message(
     .await;
 
     // 9. 停止前台服务
-    if let Err(e) =
-        tauri_plugin_vcp_mobile::stream::stop_stream_service_inner(&app_handle, &agent_config.name)
-    {
-        log::warn!(
-            "[AgentChatAppService] Failed to stop streaming service: {}",
-            e
-        );
-    }
+    stream_service_guard.stop();
 
     // 8. 流式结束后（含中断），将最终内容委派统一的 Finalizer 进行存盘与事件分发
     match result {
@@ -186,6 +178,8 @@ pub async fn internal_process_agent_chat_message(
                     full_content.to_string(),
                     is_aborted,
                     finish_reason,
+                    Some(&agent_id),
+                    Some(&agent_config.name),
                     Some(stream_channel),
                 )
                 .await?;

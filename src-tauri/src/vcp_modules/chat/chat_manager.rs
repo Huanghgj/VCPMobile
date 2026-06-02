@@ -102,6 +102,7 @@ pub async fn load_chat_history_streamed(
         offset,
         false,
         false, // include_extracted_text: 前端列表加载不需要大体积的提取文本内容
+        true,  // include_ui_render_data: 前端列表需要预渲染 blocks 与 shell
     )
     .await?;
     let total = messages.len();
@@ -134,8 +135,18 @@ pub async fn load_chat_history(
         offset,
         false,
         false, // include_extracted_text: 前端历史加载不需要大体积的提取文本内容
+        true,  // include_ui_render_data: 前端历史加载需要预渲染 blocks 与 shell
     )
     .await
+}
+
+#[tauri::command]
+pub async fn append_stream_skeleton_message(
+    db_state: tauri::State<'_, crate::vcp_modules::db_manager::DbState>,
+    topic_id: String,
+    message: ChatMessage,
+) -> Result<(), String> {
+    message_service::append_stream_skeleton_message(&db_state.pool, topic_id, message).await
 }
 
 #[tauri::command]

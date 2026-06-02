@@ -48,27 +48,18 @@ const shell = computed(() => props.message.shell);
 
 // 数据层面：消息是否处于任意活跃流中（不依赖当前话题）
 const isMessageInActiveStream = computed(() => {
-  for (const streams of Object.values(streamStore.sessionActiveStreams || {})) {
-    if (streams.includes(props.message.id)) return true;
-  }
-  return false;
+  return streamStore.isMessageInActiveStream(props.message.id);
 });
 
 // UI 层面：消息是否在当前视口中显示流式状态
 const isStreaming = computed(() => {
   if (shell.value?.isUser) return false;
 
-  const isGroup = !!props.message.isGroupMessage || !!props.message.groupId || sessionStore.currentSelectedItem?.type === "group";
-  const itemId = isGroup
-    ? (props.message.groupId || sessionStore.currentSelectedItem?.id)
-    : (props.message.agentId || props.agentId);
-
-  const topicId = sessionStore.currentTopicId;
-  if (!itemId || !topicId) return false;
-
-  const key = `${itemId}:${topicId}`;
-  const streams = streamStore.sessionActiveStreams?.[key];
-  return streams ? streams.includes(props.message.id) : false;
+  return streamStore.isMessageStreamingInSession(
+    props.message.id,
+    sessionStore.currentSelectedItem?.id,
+    sessionStore.currentTopicId,
+  );
 });
 
 const shouldRenderRawContentFallback = computed(() => {

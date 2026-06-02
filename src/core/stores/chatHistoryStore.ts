@@ -8,7 +8,6 @@ import { useAssistantStore } from "./assistant";
 import { useSettingsStore } from "./settings";
 import { useTopicStore } from "./topicListManager";
 import { clearMessageCache } from "../utils/astRenderer";
-import { acquireScreenKeep } from "../composables/useScreenKeeper";
 import type { ChatMessage, HistoryChunk, ContentBlock } from "../types/chat";
 
 export const useChatHistoryStore = defineStore("chatHistory", () => {
@@ -217,8 +216,6 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
 
     const agentId = sessionStore.currentSelectedItem.id;
     const topicId = sessionStore.currentTopicId;
-    acquireScreenKeep();
-
     try {
       const compiledBlocks = await invoke<ContentBlock[]>("append_single_message", {
         ownerId: sessionStore.currentSelectedItem.id,
@@ -436,8 +433,6 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     const countToDelete = currentChatHistory.value.length - (lastUserMsgIndex + 1);
     currentChatHistory.value = currentChatHistory.value.slice(0, lastUserMsgIndex + 1);
     topicStore.decrementTopicMsgCount(topicId, countToDelete);
-
-    acquireScreenKeep();
 
     // 3. 调用后端重构后的重生接口
     try {

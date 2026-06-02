@@ -6,5 +6,6 @@ pub mod maintenance_manager;
 pub mod media_processor;
 pub mod model_manager;
 pub mod settings_manager;
+pub mod stream_service_guard;
 pub mod vcp_client;
 pub mod vcp_log_service;

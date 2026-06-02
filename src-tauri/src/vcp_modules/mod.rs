@@ -61,6 +61,7 @@ pub use infra::maintenance_manager;
 pub use infra::media_processor;
 pub use infra::model_manager;
 pub use infra::settings_manager;
+pub use infra::stream_service_guard;
 pub use infra::vcp_client;
 pub use infra::vcp_log_service;
 

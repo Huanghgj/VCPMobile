@@ -42,6 +42,7 @@ pub async fn summarize_topic(
         None,
         true,
         false, // include_extracted_text: 总结话题不需要大体积的提取文本内容
+        false, // include_ui_render_data: 标题总结不需要 blocks/shell
     )
     .await?;
 
