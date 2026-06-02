@@ -1,5 +1,11 @@
-import { defineAsyncComponent } from 'vue';
 import { AttachmentType } from './types/AttachmentType';
+import ImageAttachment from './types/ImageAttachment.vue';
+import VideoAttachment from './types/VideoAttachment.vue';
+import AudioAttachment from './types/AudioAttachment.vue';
+import DocumentAttachment from './types/DocumentAttachment.vue';
+import CodeAttachment from './types/CodeAttachment.vue';
+import TextAttachment from './types/TextAttachment.vue';
+import OtherAttachment from './types/OtherAttachment.vue';
 import type { Component } from 'vue';
 
 /**
@@ -82,25 +88,11 @@ export class AttachmentRegistry {
 
 // Register default components on import
 AttachmentRegistry.registerMultiple({
-  [AttachmentType.IMAGE]: defineAsyncComponent(() => 
-    import('./types/ImageAttachment.vue')
-  ),
-  [AttachmentType.VIDEO]: defineAsyncComponent(() => 
-    import('./types/VideoAttachment.vue')
-  ),
-  [AttachmentType.AUDIO]: defineAsyncComponent(() => 
-    import('./types/AudioAttachment.vue')
-  ),
-  [AttachmentType.DOCUMENT]: defineAsyncComponent(() => 
-    import('./types/DocumentAttachment.vue')
-  ),
-  [AttachmentType.CODE]: defineAsyncComponent(() => 
-    import('./types/CodeAttachment.vue')
-  ),
-  [AttachmentType.TEXT]: defineAsyncComponent(() => 
-    import('./types/TextAttachment.vue')
-  ),
-  [AttachmentType.OTHER]: defineAsyncComponent(() => 
-    import('./types/OtherAttachment.vue')
-  ),
+  [AttachmentType.IMAGE]: ImageAttachment,
+  [AttachmentType.VIDEO]: VideoAttachment,
+  [AttachmentType.AUDIO]: AudioAttachment,
+  [AttachmentType.DOCUMENT]: DocumentAttachment,
+  [AttachmentType.CODE]: CodeAttachment,
+  [AttachmentType.TEXT]: TextAttachment,
+  [AttachmentType.OTHER]: OtherAttachment,
 });

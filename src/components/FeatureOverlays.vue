@@ -13,7 +13,7 @@
  * 注意：此组件内的视图通过 SlidePage 管理滑入/滑出动画，
  * 物理上它们会渲染在 GlobalOverlayManager 提供的容器中。
  */
-import { ref, onMounted, defineAsyncComponent } from 'vue';
+import { ref, onMounted } from 'vue';
 import { useOverlayStore } from '../core/stores/overlay';
 import SettingsView from '../features/settings/SettingsView.vue';
 import AgentSettingsView from '../features/agent/AgentSettingsView.vue';
@@ -21,10 +21,8 @@ import GroupSettingsView from '../features/agent/GroupSettingsView.vue';
 import TarvenSettingsView from '../features/chat/components/TarvenSettings.vue';
 import SensorCollector from '../features/distributed/SensorCollector.vue';
 import ToolInteractionOverlay from '../features/distributed/ToolInteractionOverlay.vue';
-
-// SyncSessionView / RebuildSessionView 按需异步加载，状态由 Store 完全托管
-const SyncSessionView = defineAsyncComponent(() => import('../features/sync/SyncSessionView.vue'));
-const RebuildSessionView = defineAsyncComponent(() => import('../features/settings/components/RebuildSessionView.vue'));
+import SyncSessionView from '../features/sync/SyncSessionView.vue';
+import RebuildSessionView from '../features/settings/components/RebuildSessionView.vue';
 
 const overlayStore = useOverlayStore();
 const isMounted = ref(false);

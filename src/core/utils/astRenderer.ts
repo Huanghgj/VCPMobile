@@ -143,7 +143,7 @@ function renderInline(node: InlineNode): string {
       if (!src) return '';
       const originalSrc = node.src ? sanitizeImageUrl(node.src) : '';
       const originalAttr = originalSrc ? ` data-vcp-image-src="${originalSrc}"` : '';
-      return `<img src="${src}"${originalAttr} alt="${escapeHtml(node.alt || '')}" title="${escapeHtml(node.title || '')}" loading="lazy" class="vcp-markdown-image" />`;
+      return `<img src="${src}"${originalAttr} alt="${escapeHtml(node.alt || '')}" title="${escapeHtml(node.title || '')}" loading="eager" decoding="async" class="vcp-markdown-image" />`;
     }
     
     case 'line_break':

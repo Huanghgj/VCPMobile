@@ -8,6 +8,7 @@ import { useAssistantStore } from "./assistant";
 import { useSettingsStore } from "./settings";
 import { useTopicStore } from "./topicListManager";
 import { clearMessageCache } from "../utils/astRenderer";
+import { preloadMessageImages } from "../utils/messageAssetPreloader";
 import type { ChatMessage, HistoryChunk, ContentBlock } from "../types/chat";
 
 export const useChatHistoryStore = defineStore("chatHistory", () => {
@@ -200,6 +201,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
           attachmentStore.resolveMessageAssets(msg);
         }),
       );
+      await preloadMessageImages(messagesToResolve);
     } catch (e) {
       console.error("[ChatHistoryStore] Failed to stream history:", e);
     } finally {

@@ -98,7 +98,6 @@ export const useSyncSessionStore = defineStore('syncSession', () => {
 
   const copyLogs = async () => {
     try {
-      const { invoke } = await import('@tauri-apps/api/core');
       const files = await invoke<Array<{ filename: string }>>('list_sync_log_files');
       if (files && files.length > 0) {
         const content = await invoke<string>('read_sync_log_file', { filename: files[0].filename });

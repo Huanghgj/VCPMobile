@@ -2,6 +2,7 @@ import { defineStore, acceptHMRUpdate } from 'pinia';
 import { onScopeDispose, ref, watch } from 'vue';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { isTauriRuntime } from '../utils/runtime';
+import { preloadImages } from '../utils/resourcePreloader';
 
 export type ThemeMode = 'light' | 'dark' | 'system';
 
@@ -38,29 +39,64 @@ interface ThemeModule {
   extraCss?: string;
 }
 
-// Vite dynamic imports for TS theme modules (one per theme, lazy-loaded)
-const themeModules = import.meta.glob('../../assets/themes/*.ts') as Record<string, () => Promise<ThemeModule>>;
+// 主题模块属于内置界面资源，启动时一次性载入，避免设置页/切换主题时再触发懒加载。
+const themeModules = import.meta.glob('../../assets/themes/*.ts', { eager: true }) as Record<string, ThemeModule>;
+const BUILT_IN_IMAGE_URLS = ['/vcpmobile.svg'];
 
-const fileNameToLoader = new Map<string, () => Promise<ThemeModule>>();
+const normalizeThemeFileName = (fileName: string): string => {
+  const mapped = LEGACY_THEME_MAP[fileName] || fileName;
+  return mapped.endsWith('.ts') ? mapped.replace(/\.ts$/, '.css') : mapped;
+};
 
-const findThemeLoader = (fileName: string): (() => Promise<ThemeModule>) | undefined => {
-  const tsFileName = fileName.replace('.css', '.ts');
+const themeModuleEntries = Object.entries(themeModules)
+  .map(([path, mod]) => {
+    const pathFileName = (path.split(/[\\/]/).pop() || '').replace(/\.ts$/, '.css');
+    const fileName = normalizeThemeFileName(mod.meta?.fileName || pathFileName);
+    return { fileName, module: mod };
+  })
+  .sort((a, b) => a.fileName.localeCompare(b.fileName));
 
-  // Dev mode: always scan fresh — Vite may have swapped the loader under the hood
-  if (!import.meta.hot) {
-    const cached = fileNameToLoader.get(tsFileName);
-    if (cached) return cached;
-  }
+const themeModuleMap = new Map(themeModuleEntries.map((entry) => [entry.fileName, entry.module]));
 
-  for (const [path, loader] of Object.entries(themeModules)) {
-    const keyFileName = path.split(/[\\/]/).pop() || '';
-    if (keyFileName === tsFileName) {
-      fileNameToLoader.set(tsFileName, loader);
-      return loader;
+const resolveWallpaperUrl = (rawValue?: string): string | null => {
+  if (!rawValue || rawValue === 'none') return null;
+  const match = rawValue.match(/url\(['"]?(.*?)['"]?\)/);
+  let filename = match ? match[1] : rawValue;
+  filename = filename.replace(/^.*[\\/]/, '').replace(/['"]/g, '').trim();
+  if (!filename) return null;
+  filename = filename.replace(/\.[^.]+$/, '') + '.webp';
+  return `/wallpaper/${filename}`;
+};
+
+const collectWallpaperUrls = (theme: ThemeInfo): string[] => {
+  const values = [
+    theme.variables.dark?.['--chat-wallpaper-dark'],
+    theme.variables.light?.['--chat-wallpaper-light'],
+  ];
+  return values
+    .map(resolveWallpaperUrl)
+    .filter((url): url is string => !!url);
+};
+
+const buildThemeInfoList = (): ThemeInfo[] => themeModuleEntries.map(({ fileName, module }) => ({
+  fileName,
+  name: module.meta.name,
+  variables: module.variables,
+}));
+
+const buildThemeThumbnailMap = (themes: ThemeInfo[]): Record<string, string> => {
+  const thumbs: Record<string, string> = {};
+  for (const theme of themes) {
+    const [firstWallpaper] = collectWallpaperUrls(theme);
+    if (firstWallpaper) {
+      thumbs[theme.fileName] = firstWallpaper;
     }
   }
+  return thumbs;
+};
 
-  return undefined;
+const buildThemeWallpaperList = (themes: ThemeInfo[]): string[] => {
+  return Array.from(new Set(themes.flatMap(collectWallpaperUrls)));
 };
 
 export const useThemeStore = defineStore('theme', () => {
@@ -78,6 +114,7 @@ export const useThemeStore = defineStore('theme', () => {
 
   const availableThemes = ref<ThemeInfo[]>([]);
   const themeThumbnails = ref<Record<string, string>>({});
+  const themeWallpapers = ref<string[]>([]);
   const currentThemeInfo = ref<ThemeInfo | null>(null);
   const lastAppliedVarKeys = ref<string[]>([]);
   let currentThemeModule: ThemeModule | null = null;
@@ -93,68 +130,36 @@ export const useThemeStore = defineStore('theme', () => {
     lastAppliedVarKeys.value = Object.keys(vars);
   };
 
-  const fetchThemes = async () => {
-    const themes: ThemeInfo[] = [];
-
-    for (const [path, loadModule] of Object.entries(themeModules)) {
-      try {
-        const mod = await loadModule();
-        const fileName = path.split(/[\\/]/).pop() || '';
-
-        if (fileName) {
-          fileNameToLoader.set(fileName, loadModule);
-        }
-
-        themes.push({
-          fileName,
-          name: mod.meta.name,
-          variables: mod.variables,
-        });
-      } catch (e) {
-        console.error(`Failed to load theme module: ${path}`, e);
-      }
-    }
-
+  const fetchThemes = async (): Promise<ThemeInfo[]> => {
+    const themes = buildThemeInfoList();
     availableThemes.value = themes;
-
-    // Build thumbnail URL cache once after themes are loaded
-    const thumbs: Record<string, string> = {};
-    for (const theme of themes) {
-      const darkWp = theme.variables?.dark?.['--chat-wallpaper-dark'];
-      const lightWp = theme.variables?.light?.['--chat-wallpaper-light'];
-      let rawPath = darkWp || lightWp;
-      if (rawPath && rawPath !== 'none') {
-        try {
-          const match = rawPath.match(/url\(['"]?(.*?)['"]?\)/);
-          let filename = match ? match[1] : rawPath;
-          filename = filename.replace(/^.*[\\\/]/, '').replace(/['"]/g, '');
-          filename = filename.split('.')[0] + '.webp';
-          thumbs[theme.fileName] = `/wallpaper/${filename}`;
-        } catch (e) {
-          console.error('[themeStore] Failed to resolve thumbnail for', theme.fileName, e);
-        }
-      }
-    }
-    themeThumbnails.value = thumbs;
+    themeThumbnails.value = buildThemeThumbnailMap(themes);
+    themeWallpapers.value = buildThemeWallpaperList(themes);
+    return themes;
   };
 
   const applyThemeFile = async (fileName: string) => {
     try {
-      currentTheme.value = fileName;
-      localStorage.setItem('vcp-theme-name', fileName);
+      let normalizedFileName = normalizeThemeFileName(fileName);
+      let mod = themeModuleMap.get(normalizedFileName);
 
-      const loadModule = findThemeLoader(fileName);
-      if (!loadModule) {
-        console.warn('Theme module not found:', fileName);
-        return;
+      if (!mod) {
+        console.warn('Theme module not found:', normalizedFileName);
+        normalizedFileName = DEFAULT_THEME;
+        mod = themeModuleMap.get(DEFAULT_THEME);
       }
 
-      const mod = await loadModule();
-      console.log('[themeStore] Loaded module for', fileName, mod.meta.name);
+      if (!mod) {
+        throw new Error(`Default theme module not found: ${DEFAULT_THEME}`);
+      }
+
+      currentTheme.value = normalizedFileName;
+      localStorage.setItem('vcp-theme-name', normalizedFileName);
+      console.log('[themeStore] Applying module for', normalizedFileName, mod.meta.name);
 
       currentThemeModule = mod;
       currentThemeInfo.value = {
-        fileName,
+        fileName: normalizedFileName,
         name: mod.meta.name,
         variables: mod.variables,
       };
@@ -177,16 +182,16 @@ export const useThemeStore = defineStore('theme', () => {
   };
 
   const initTheme = async () => {
-    const savedTheme = localStorage.getItem('vcp-theme-name') || DEFAULT_THEME;
-    
-    // 1. 优先只加载当前主题，确保背景和基础样式瞬间呈现
+    const savedTheme = normalizeThemeFileName(localStorage.getItem('vcp-theme-name') || DEFAULT_THEME);
+    await fetchThemes();
     await applyThemeFile(savedTheme);
+  };
 
-    // 2. 优雅地在浏览器空闲时再扫描全量主题元数据
-    const idleCallback = (window as any).requestIdleCallback || ((cb: any) => setTimeout(cb, 1000));
-    idleCallback(() => {
-      fetchThemes().catch(console.error);
-    });
+  const preloadBuiltInAssets = async () => {
+    if (availableThemes.value.length === 0) {
+      await fetchThemes();
+    }
+    await preloadImages([...themeWallpapers.value, ...BUILT_IN_IMAGE_URLS]);
   };
 
   const applyTheme = (newMode: ThemeMode) => {
@@ -275,9 +280,11 @@ export const useThemeStore = defineStore('theme', () => {
     currentThemeInfo,
     availableThemes,
     themeThumbnails,
+    themeWallpapers,
     fetchThemes,
     applyThemeFile,
     initTheme,
+    preloadBuiltInAssets,
     toggleTheme,
     setMode,
   };

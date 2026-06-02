@@ -9,13 +9,13 @@ import { useNotificationStore } from "../../core/stores/notification";
 import { useMessageEvents } from "../../core/composables/useMessageEvents";
 import { useEmoticonFixer } from "../../core/composables/useEmoticonFixer";
 import { renderMarkdownNodes } from "../../core/utils/astRenderer";
+import { getKatexRenderer, getMermaidRenderer } from "../../core/utils/renderLibraryPreloader";
 import { useContentProcessor } from "../../core/composables/useContentProcessor";
 import { Copy, Edit2, RotateCcw, Trash2, StopCircle } from "lucide-vue-next";
 
 const { processEmoticonsInContainer } = useEmoticonFixer();
 const mermaidCache = new Map<string, string>();
 const renderingMermaids = new Set<string>();
-let mermaidInitialized = false;
 
 // UI Components
 import ChatBubble from "./components/ChatBubble.vue";
@@ -172,8 +172,7 @@ const renderHeavyContent = async () => {
   const mathElements = messageContentRef.value.querySelectorAll('.vcp-math-inline[data-latex], .vcp-math-block[data-latex]');
   if (mathElements.length > 0) {
     try {
-      const katexModule = await import('katex');
-      const katex = katexModule.default;
+      const katex = getKatexRenderer();
       mathElements.forEach((el) => {
         if (el.querySelector('.katex')) return; // already rendered
         const latex = el.getAttribute('data-latex');
@@ -194,12 +193,7 @@ const renderHeavyContent = async () => {
   const mermaidPlaceholders = messageContentRef.value.querySelectorAll('.mermaid-placeholder');
   if (mermaidPlaceholders.length > 0) {
     try {
-      const mermaidModule = await import('mermaid');
-      const mermaid = mermaidModule.default;
-      if (!mermaidInitialized) {
-        mermaid.initialize({ startOnLoad: false, theme: 'dark' });
-        mermaidInitialized = true;
-      }
+      const mermaid = getMermaidRenderer();
       for (const el of Array.from(mermaidPlaceholders)) {
         const placeholder = el as HTMLElement;
         if (placeholder.querySelector('svg')) continue; // already rendered

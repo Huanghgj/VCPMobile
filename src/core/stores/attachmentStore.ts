@@ -4,6 +4,7 @@ import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useDocumentProcessor } from "../composables/useDocumentProcessor";
 import { useNotificationStore } from "./notification";
+import { preloadImage } from "../utils/resourcePreloader";
 import type { Attachment } from "../types/chat";
 
 /**
@@ -29,6 +30,13 @@ const checkImageDimensions = (file: File): Promise<{ width: number; height: numb
 export const useAttachmentStore = defineStore("attachment", () => {
   // 暂存的附件列表，准备随下一条消息发送
   const stagedAttachments = ref<Attachment[]>([]);
+
+  const preloadAttachmentImage = (source: string) => {
+    if (!source) return;
+    preloadImage(source).catch((err) => {
+      console.warn("[AttachmentStore] Failed to preload image asset:", err);
+    });
+  };
 
   // 全局监听 Rust 端发出的注册进度，用于大文件哈希/移动等Phase 2流程
   listen<any>("vcp-file-register-progress", (event) => {
@@ -62,6 +70,7 @@ export const useAttachmentStore = defineStore("attachment", () => {
         ) {
           try {
             att.resolvedSrc = convertFileSrc(sourcePath);
+            preloadAttachmentImage(att.resolvedSrc);
           } catch (err) {
             console.warn(
               `[AttachmentStore] Failed to convert attachment image path ${att.name}:`,
@@ -214,6 +223,7 @@ export const useAttachmentStore = defineStore("attachment", () => {
           if (finalIdx !== -1) {
             stagedAttachments.value[finalIdx].src = displaySrc;
           }
+          preloadAttachmentImage(displaySrc);
         }
 
         await nextTick();
@@ -349,6 +359,9 @@ export const useAttachmentStore = defineStore("attachment", () => {
             size: file.size,
             status: "loading",
           });
+          if (isImage) {
+            preloadAttachmentImage(blobUrl);
+          }
 
           await nextTick();
           window.dispatchEvent(new Event("resize"));

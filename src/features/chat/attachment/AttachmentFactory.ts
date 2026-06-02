@@ -1,44 +1,22 @@
-import { defineAsyncComponent } from 'vue';
 import { AttachmentType } from './types/AttachmentType';
+import ImageAttachment from './types/ImageAttachment.vue';
+import VideoAttachment from './types/VideoAttachment.vue';
+import AudioAttachment from './types/AudioAttachment.vue';
+import DocumentAttachment from './types/DocumentAttachment.vue';
+import CodeAttachment from './types/CodeAttachment.vue';
+import TextAttachment from './types/TextAttachment.vue';
+import OtherAttachment from './types/OtherAttachment.vue';
 import type { Component } from 'vue';
 
-// Lazy load all attachment components
 const componentMap = new Map<AttachmentType, Component>();
 
-// Image component
-componentMap.set(AttachmentType.IMAGE, defineAsyncComponent(() => 
-  import('./types/ImageAttachment.vue')
-));
-
-// Video component
-componentMap.set(AttachmentType.VIDEO, defineAsyncComponent(() => 
-  import('./types/VideoAttachment.vue')
-));
-
-// Audio component
-componentMap.set(AttachmentType.AUDIO, defineAsyncComponent(() => 
-  import('./types/AudioAttachment.vue')
-));
-
-// Document component
-componentMap.set(AttachmentType.DOCUMENT, defineAsyncComponent(() => 
-  import('./types/DocumentAttachment.vue')
-));
-
-// Code component
-componentMap.set(AttachmentType.CODE, defineAsyncComponent(() => 
-  import('./types/CodeAttachment.vue')
-));
-
-// Text component
-componentMap.set(AttachmentType.TEXT, defineAsyncComponent(() => 
-  import('./types/TextAttachment.vue')
-));
-
-// Other component
-componentMap.set(AttachmentType.OTHER, defineAsyncComponent(() => 
-  import('./types/OtherAttachment.vue')
-));
+componentMap.set(AttachmentType.IMAGE, ImageAttachment);
+componentMap.set(AttachmentType.VIDEO, VideoAttachment);
+componentMap.set(AttachmentType.AUDIO, AudioAttachment);
+componentMap.set(AttachmentType.DOCUMENT, DocumentAttachment);
+componentMap.set(AttachmentType.CODE, CodeAttachment);
+componentMap.set(AttachmentType.TEXT, TextAttachment);
+componentMap.set(AttachmentType.OTHER, OtherAttachment);
 
 export class AttachmentFactory {
   /**

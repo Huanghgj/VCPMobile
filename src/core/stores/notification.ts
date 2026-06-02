@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia';
 import { onScopeDispose, ref } from 'vue';
+import { invoke } from '@tauri-apps/api/core';
 
 export interface VcpNotification {
   id: string;
@@ -182,7 +183,6 @@ export const useNotificationStore = defineStore('notification', () => {
       };
 
       try {
-        const { invoke } = await import('@tauri-apps/api/core');
         // 通过 vcp_log_service 接口回传
         await invoke('send_vcp_log_message', { payload: response });
 

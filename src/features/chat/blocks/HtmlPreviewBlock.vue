@@ -179,7 +179,7 @@ onUnmounted(() => {
               v-show="fullScreenTab === 'preview'"
               class="vcp-fullscreen-iframe w-full h-full border-none"
               sandbox=""
-              loading="lazy"
+              loading="eager"
               :srcdoc="getSandboxHtml(content)"
             ></iframe>
           </div>
@@ -241,7 +241,7 @@ onUnmounted(() => {
         <iframe
           class="vcp-inline-iframe w-full h-full border-none no-swipe"
           sandbox=""
-          loading="lazy"
+          loading="eager"
           :srcdoc="getSandboxHtml(content)"
         ></iframe>
       </div>

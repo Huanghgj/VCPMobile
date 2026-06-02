@@ -6,6 +6,8 @@ import { useSettingsStore } from './settings';
 import { useThemeStore } from './theme';
 import { useNotificationStore } from './notification';
 import { isTauriRuntime } from '../utils/runtime';
+import { useAvatarStore } from './avatar';
+import { preloadRenderLibraries } from '../utils/renderLibraryPreloader';
 
 export type AppState = 'PERMISSIONS' | 'BOOTING' | 'CONNECTING' | 'PRELOADING' | 'READY' | 'ERROR';
 
@@ -32,6 +34,7 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
   const assistantStore = useAssistantStore();
   const settingsStore = useSettingsStore();
   const themeStore = useThemeStore();
+  const avatarStore = useAvatarStore();
   const notificationStore = useNotificationStore();
 
   let bootstrapPromise: Promise<void> | null = null;
@@ -202,9 +205,29 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
       }
     ];
 
+    const frontendParallelTasks: PreloadTask[] = [
+      {
+        label: 'RenderLibraries',
+        run: async () => {
+          await preloadRenderLibraries();
+        }
+      },
+      {
+        label: 'Avatars',
+        run: async () => {
+          await avatarStore.preloadAvatars([
+            { ownerType: 'user', ownerId: 'user_avatar' },
+            ...assistantStore.agents.map((agent) => ({ ownerType: 'agent' as const, ownerId: agent.id })),
+            ...assistantStore.groups.map((group) => ({ ownerType: 'group' as const, ownerId: group.id })),
+          ]);
+        }
+      }
+    ];
+
     try {
       await runSequentialTask(settingsTask);
       await runParallelTasks(assistantParallelTasks);
+      await runParallelTasks(frontendParallelTasks);
 
       updatePhaseLabel('核心数据预加载完成');
 
@@ -326,6 +349,8 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
           setState('BOOTING', 'Web 预览模式初始化');
           updatePhaseLabel('加载本地界面资源...');
           await themeStore.initTheme();
+          await themeStore.preloadBuiltInAssets();
+          await preloadRenderLibraries();
           notificationStore.updateCoreStatus({
             status: 'disconnected',
             message: 'Web 预览模式（无核心服务）',
@@ -344,6 +369,10 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
         }
 
         setState('PERMISSIONS', '检查系统权限完整性');
+        updatePhaseLabel('预加载前端静态资源...');
+        await themeStore.initTheme();
+        await themeStore.preloadBuiltInAssets();
+
         const pStatus = await invoke<{ notification: boolean; storage: boolean; battery: boolean }>('plugin:vcp-mobile|check_all_permissions');
         if (!pStatus.notification || !pStatus.storage || !pStatus.battery) {
           console.log('[Lifecycle] Missing permissions, waiting for user action');
@@ -359,7 +388,6 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
         await hydrateSystemStatus();
 
         updatePhaseLabel('初始化主题资源...');
-        await themeStore.initTheme();
         console.log('[Lifecycle] Theme initialization complete');
 
         setState('CONNECTING', '等待后端核心服务就绪');

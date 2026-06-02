@@ -1,6 +1,7 @@
 import { defineStore } from "pinia";
 import { invoke } from "@tauri-apps/api/core";
 import { reactive } from "vue";
+import { preloadImage } from "../utils/resourcePreloader";
 
 interface AvatarCache {
   blobUrl: string;
@@ -207,6 +208,7 @@ export const useAvatarStore = defineStore("avatar", () => {
             blobUrl, 
             version: Math.max(result.updated_at, version) 
           });
+          preloadImage(blobUrl).catch(() => {});
           return blobUrl;
         }
       } catch (err) {
@@ -241,10 +243,31 @@ export const useAvatarStore = defineStore("avatar", () => {
     return dominantColors.get(`${ownerType}:${ownerId}`);
   };
 
+  const preloadAvatars = async (items: Array<{ ownerType: "user" | "agent" | "group"; ownerId: string }>) => {
+    const uniqueItems = Array.from(
+      new Map(items.filter((item) => item.ownerId).map((item) => [`${item.ownerType}:${item.ownerId}`, item])).values(),
+    );
+
+    const results = await Promise.allSettled(
+      uniqueItems.map(async (item) => {
+        const url = await getAvatarUrl(item.ownerType, item.ownerId);
+        if (url) {
+          await preloadImage(url);
+        }
+      }),
+    );
+
+    const failed = results.filter((result) => result.status === "rejected").length;
+    if (failed > 0) {
+      console.warn(`[AvatarStore] ${failed}/${uniqueItems.length} avatars failed to preload`);
+    }
+  };
+
   return {
     cache, // 暴露 cache 以供同步检查
     getAvatarUrl,
     clearCache,
     getDominantColor,
+    preloadAvatars,
   };
 });

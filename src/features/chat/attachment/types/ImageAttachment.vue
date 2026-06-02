@@ -12,7 +12,8 @@
         :src="safeSrc" 
         :alt="file.name"
         class="w-full h-full object-cover"
-        loading="lazy"
+        loading="eager"
+        decoding="async"
       />
     </div>
   </AttachmentPreviewBase>

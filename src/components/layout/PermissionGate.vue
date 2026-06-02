@@ -52,14 +52,31 @@ const goNext = () => {
   }
 };
 
-let checkTimer: any = null;
+let checkTimer: ReturnType<typeof setInterval> | null = null;
 
 const onPermissionChange = (e: Event) => {
   status.value = (e as CustomEvent).detail;
 };
 
 const onVisibilityChange = () => {
-  if (!document.hidden) check();
+  if (document.hidden) {
+    stopPermissionPolling();
+    return;
+  }
+
+  check();
+  startPermissionPolling();
+};
+
+const startPermissionPolling = () => {
+  if (checkTimer || document.hidden) return;
+  checkTimer = setInterval(check, 10000);
+};
+
+const stopPermissionPolling = () => {
+  if (!checkTimer) return;
+  clearInterval(checkTimer);
+  checkTimer = null;
 };
 
 onMounted(() => {
@@ -68,12 +85,11 @@ onMounted(() => {
   window.addEventListener('visibilitychange', onVisibilityChange);
   // Kotlin 侧主动推送的权限变更事件
   window.addEventListener('vcp-permission-change', onPermissionChange);
-  // 低频兜底轮询，防止极端情况下事件丢失
-  checkTimer = setInterval(check, 10000);
+  startPermissionPolling();
 });
 
 onUnmounted(() => {
-  if (checkTimer) clearInterval(checkTimer);
+  stopPermissionPolling();
   window.removeEventListener('visibilitychange', onVisibilityChange);
   window.removeEventListener('vcp-permission-change', onPermissionChange);
 });
