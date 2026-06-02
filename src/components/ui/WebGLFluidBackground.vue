@@ -10,8 +10,14 @@ const canvasRef = ref<HTMLCanvasElement | null>(null);
 let gl: WebGLRenderingContext | null = null;
 let program: WebGLProgram | null = null;
 let animationFrameId = 0;
+let initTimer: ReturnType<typeof setTimeout> | null = null;
 let startTime = 0;
 let resizeObserver: ResizeObserver | null = null;
+let renderUntil = 0;
+
+const INITIAL_RENDER_BURST_MS = 1200;
+const INTERACTION_RENDER_BURST_MS = 1400;
+const RESIZE_RENDER_BURST_MS = 500;
 
 // WebGL uniform locations
 let uResolutionLoc: WebGLUniformLocation | null = null;
@@ -29,6 +35,7 @@ let targetActiveValue = 0.0;
 const shouldRender = () => !layoutStore.rightDrawerOpen && !document.hidden;
 
 const stopRenderLoop = () => {
+  renderUntil = 0;
   if (animationFrameId) {
     cancelAnimationFrame(animationFrameId);
     animationFrameId = 0;
@@ -38,6 +45,17 @@ const stopRenderLoop = () => {
 const startRenderLoop = () => {
   if (animationFrameId || !shouldRender()) return;
   animationFrameId = requestAnimationFrame(renderLoop);
+};
+
+const requestRenderBurst = (durationMs = INTERACTION_RENDER_BURST_MS) => {
+  renderUntil = Math.max(renderUntil, performance.now() + durationMs);
+  startRenderLoop();
+};
+
+const hasTransientMotion = () => {
+  return Math.abs(activeValue - targetActiveValue) > 0.003
+    || Math.abs(mousePos.x - targetMousePos.x) > 0.003
+    || Math.abs(mousePos.y - targetMousePos.y) > 0.003;
 };
 
 // Vertex Shader: Renders a screen-filling quad
@@ -218,7 +236,7 @@ const initWebGL = () => {
   uIsDarkLoc = gl.getUniformLocation(program, 'u_is_dark');
 
   startTime = performance.now();
-  startRenderLoop();
+  requestRenderBurst(INITIAL_RENDER_BURST_MS);
 };
 
 const renderLoop = () => {
@@ -242,7 +260,8 @@ const renderLoop = () => {
 
   // Upload uniform parameters to GPU
   gl.uniform2f(uResolutionLoc, canvas.width, canvas.height);
-  gl.uniform1f(uTimeLoc, (performance.now() - startTime) / 1000.0);
+  const now = performance.now();
+  gl.uniform1f(uTimeLoc, (now - startTime) / 1000.0);
   gl.uniform2f(uMouseLoc, mousePos.x, mousePos.y);
   gl.uniform1f(uActiveLoc, activeValue);
   gl.uniform1f(uIsDarkLoc, themeStore.isDarkResolved ? 1.0 : 0.0);
@@ -250,7 +269,11 @@ const renderLoop = () => {
   // Draw full viewport quad
   gl.drawArrays(gl.TRIANGLES, 0, 6);
 
-  animationFrameId = requestAnimationFrame(renderLoop);
+  if (now < renderUntil || hasTransientMotion()) {
+    animationFrameId = requestAnimationFrame(renderLoop);
+  } else {
+    renderUntil = 0;
+  }
 };
 
 // Input event tracking helpers
@@ -280,17 +303,19 @@ const trackInteraction = (e: Event) => {
   targetMousePos.x = Math.max(0.0, Math.min(1.0, normalizedX));
   targetMousePos.y = Math.max(0.0, Math.min(1.0, normalizedY));
   targetActiveValue = 1.0; // Trigger physical warp force
+  requestRenderBurst();
 };
 
 const releaseInteraction = () => {
   targetActiveValue = 0.0; // Slowly decay warp force
+  requestRenderBurst();
 };
 
 let boundParent: HTMLElement | null = null;
 
 const syncRenderLoop = () => {
   if (shouldRender()) {
-    startRenderLoop();
+    requestRenderBurst(RESIZE_RENDER_BURST_MS);
   } else {
     stopRenderLoop();
   }
@@ -300,7 +325,8 @@ onMounted(() => {
   document.addEventListener('visibilitychange', syncRenderLoop);
 
   // Let the browser settle before compiling shader
-  setTimeout(() => {
+  initTimer = setTimeout(() => {
+    initTimer = null;
     initWebGL();
 
     const canvas = canvasRef.value;
@@ -315,6 +341,7 @@ onMounted(() => {
           if (gl) {
             gl.viewport(0, 0, canvas.width, canvas.height);
           }
+          requestRenderBurst(RESIZE_RENDER_BURST_MS);
         }
       });
       resizeObserver.observe(canvas.parentElement || canvas);
@@ -336,6 +363,10 @@ onMounted(() => {
 onUnmounted(() => {
   document.removeEventListener('visibilitychange', syncRenderLoop);
   stopRenderLoop();
+  if (initTimer) {
+    clearTimeout(initTimer);
+    initTimer = null;
+  }
   
   if (resizeObserver) {
     resizeObserver.disconnect();
@@ -366,6 +397,7 @@ watch(() => themeStore.isDarkResolved, (isDark) => {
   if (gl && program && uIsDarkLoc) {
     gl.useProgram(program);
     gl.uniform1f(uIsDarkLoc, isDark ? 1.0 : 0.0);
+    requestRenderBurst(RESIZE_RENDER_BURST_MS);
   }
 });
 

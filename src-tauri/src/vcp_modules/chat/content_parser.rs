@@ -565,7 +565,7 @@ pub fn parse_content(raw_text: &str) -> Vec<ContentBlock> {
                     let nodes =
                         crate::vcp_modules::pre_renderer::parse_markdown_to_ast(inner_content);
                     ContentBlock::thought(
-                        "思维链".to_string(),
+                        "思考过程".to_string(),
                         inner_content.to_string(),
                         is_complete,
                         Some(nodes),

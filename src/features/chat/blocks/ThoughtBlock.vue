@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { ref } from "vue";
-import { ChevronDown, ChevronUp, Loader2 } from "lucide-vue-next";
+import { computed, ref } from "vue";
+import { Brain, ChevronDown, ChevronUp, Loader2 } from "lucide-vue-next";
 import { renderMarkdownNodes } from "../../../core/utils/astRenderer";
 import type { ContentBlock } from "../../../core/types/chat";
 
-defineProps<{
+const props = defineProps<{
   block: ContentBlock;
   messageId: string;
 }>();
@@ -14,6 +14,15 @@ const isExpanded = ref(false);
 const toggleExpand = () => {
   isExpanded.value = !isExpanded.value;
 };
+
+const title = computed(() => props.block.theme || "思考过程");
+
+const summary = computed(() => {
+  const raw = props.block.content || "";
+  const compact = raw.replace(/\s+/g, " ").trim();
+  if (!compact) return props.block.is_complete ? "已折叠" : "正在整理思路";
+  return compact.length > 36 ? `${compact.slice(0, 36)}...` : compact;
+});
 
 function escapeHtml(text: string): string {
   return text
@@ -27,14 +36,19 @@ function escapeHtml(text: string): string {
 
 <template>
   <div class="vcp-thought-block">
-    <div class="vcp-thought-header" @click="toggleExpand">
-      <span class="vcp-thought-icon">🧠</span>
-      <span class="vcp-thought-label flex items-center gap-1">
-        {{ block.theme || "元思考链" }}
-        <Loader2 v-if="!block.is_complete" :size="10" class="animate-spin" />
+    <button class="vcp-thought-header" type="button" @click="toggleExpand">
+      <span class="vcp-thought-icon">
+        <Brain :size="14" :stroke-width="2.2" />
+      </span>
+      <span class="vcp-thought-title">
+        <span class="vcp-thought-label">
+          {{ title }}
+          <Loader2 v-if="!block.is_complete" :size="10" class="animate-spin" />
+        </span>
+        <span v-if="!isExpanded" class="vcp-thought-summary">{{ summary }}</span>
       </span>
       <component :is="isExpanded ? ChevronUp : ChevronDown" :size="14" class="opacity-40 ml-auto" />
-    </div>
+    </button>
 
     <div v-show="isExpanded" class="vcp-thought-content animate-slide-down">
       <div
@@ -51,32 +65,38 @@ function escapeHtml(text: string): string {
 
 <style scoped>
 .vcp-thought-block {
-  background: rgba(0, 0, 0, 0.03) !important;
-  border-radius: 12px !important;
-  border: 1px solid rgba(0, 0, 0, 0.1);
-  margin: 10px 0 !important;
+  background: color-mix(in srgb, var(--secondary-bg) 80%, transparent) !important;
+  border-radius: 10px !important;
+  border: 1px solid color-mix(in srgb, var(--primary-text) 10%, transparent);
+  margin: 8px 0 !important;
   position: relative;
-  font-size: 0.92em !important;
-  line-height: 1.6;
-  width: fit-content;
-  max-width: 98%;
-  transition: background-color 0.3s ease, border-color 0.3s ease;
+  font-size: 0.9em !important;
+  line-height: 1.5;
+  width: 100%;
+  max-width: 100%;
+  overflow: hidden;
+  transition: background-color 0.2s ease, border-color 0.2s ease;
 }
 
 html.dark .vcp-thought-block {
-  background: rgba(120, 120, 128, 0.05) !important;
-  border-color: rgba(120, 120, 128, 0.2);
+  background: rgba(120, 120, 128, 0.08) !important;
+  border-color: rgba(120, 120, 128, 0.22);
 }
 
 .vcp-thought-header {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  width: 100%;
   display: flex;
   align-items: center;
   gap: 8px;
   cursor: pointer;
   user-select: none;
-  opacity: 0.8;
+  color: inherit;
+  text-align: left;
   transition: opacity 0.2s;
-  padding: 10px 15px !important;
+  padding: 9px 11px !important;
 }
 
 .vcp-thought-header:hover {
@@ -84,25 +104,50 @@ html.dark .vcp-thought-block {
 }
 
 .vcp-thought-icon {
-  font-size: 1.1em;
-  filter: grayscale(0.5);
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #6366f1;
+  background: rgba(99, 102, 241, 0.1);
+  flex: 0 0 auto;
+}
+
+.vcp-thought-title {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
 
 .vcp-thought-label {
-  font-weight: 600;
-  font-size: 0.95em;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-weight: 700;
+  font-size: 0.86em;
+}
+
+.vcp-thought-summary {
+  font-size: 0.76em;
+  opacity: 0.55;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .vcp-thought-content {
-  padding: 0 15px 10px 15px;
+  padding: 0 11px 10px 43px;
   border-top: 1px dashed rgba(120, 120, 128, 0.2);
-  margin-top: 5px;
-  padding-top: 10px;
+  padding-top: 9px;
 }
 
 .thought-body {
-  font-style: italic;
-  opacity: 0.8;
+  opacity: 0.82;
+  font-size: 0.9em;
+  user-select: text;
 }
 
 .animate-slide-down {

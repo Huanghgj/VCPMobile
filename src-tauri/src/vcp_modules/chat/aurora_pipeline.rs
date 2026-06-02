@@ -85,21 +85,24 @@ impl AuroraBuffer {
         //    当 tail 超过 MAX_SPECULATIVE_TAIL_AST_BYTES 时跳过 AST 解析，
         //    避免在流式热路径上产生性能悬崖
         if !self.tail_content.is_empty() {
-            let nodes = if self.tail_content.len() <= MAX_SPECULATIVE_TAIL_AST_BYTES {
-                Some(crate::vcp_modules::pre_renderer::parse_markdown_to_ast(
-                    &self.tail_content,
-                ))
-            } else {
-                None
-            };
-            let hash = crate::vcp_modules::sync_hash::HashAggregator::compute_content_hash(
-                &self.tail_content,
-            );
-            self.tail_block = Some(StreamBlock::markdown(
-                self.tail_content.clone(),
-                nodes,
-                hash,
-            ));
+            self.tail_block = StreamBlockParser::build_incomplete_tail_block(&self.tail_content)
+                .or_else(|| {
+                    let nodes = if self.tail_content.len() <= MAX_SPECULATIVE_TAIL_AST_BYTES {
+                        Some(crate::vcp_modules::pre_renderer::parse_markdown_to_ast(
+                            &self.tail_content,
+                        ))
+                    } else {
+                        None
+                    };
+                    let hash = crate::vcp_modules::sync_hash::HashAggregator::compute_content_hash(
+                        &self.tail_content,
+                    );
+                    Some(StreamBlock::markdown(
+                        self.tail_content.clone(),
+                        nodes,
+                        hash,
+                    ))
+                });
         } else {
             self.tail_block = None;
         }
@@ -115,6 +118,7 @@ impl AuroraBuffer {
             return;
         }
         self.is_finishing = true;
+        self.close_unclosed_thinking_block();
         let final_new_blocks = self.parser.finalize(&self.full_text);
 
         self.stable_blocks.extend(final_new_blocks);
@@ -122,8 +126,49 @@ impl AuroraBuffer {
         self.tail_block = None;
     }
 
+    fn close_unclosed_thinking_block(&mut self) {
+        let lower = self.full_text.to_lowercase();
+        let last_open = lower.rfind("<think").or_else(|| lower.rfind("<thinking"));
+        let last_close = lower.rfind("</think").or_else(|| lower.rfind("</thinking"));
+
+        if let Some(open_pos) = last_open {
+            if last_close.is_none_or(|close_pos| close_pos < open_pos) {
+                self.full_text.push_str("</think>");
+            }
+        }
+    }
+
     /// 简单的 HTML 标签补全，防止流式输出截断导致 DOM 渲染异常
     pub fn balance_html_tags(html: &str) -> String {
         crate::vcp_modules::render_repair::repair_html_fragment(html)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finalize_closes_incomplete_think_block() {
+        let mut buffer = AuroraBuffer::new();
+        buffer.append_chunk("<think>正在分析");
+        buffer.finalize();
+
+        assert_eq!(buffer.full_text, "<think>正在分析</think>");
+        assert_eq!(buffer.stable_blocks.len(), 1);
+
+        match &buffer.stable_blocks[0] {
+            StreamBlock::Thought {
+                theme,
+                content,
+                is_complete,
+                ..
+            } => {
+                assert_eq!(theme, "思考过程");
+                assert_eq!(content, "正在分析");
+                assert!(*is_complete);
+            }
+            other => panic!("expected thought block, got {:?}", other),
+        }
     }
 }

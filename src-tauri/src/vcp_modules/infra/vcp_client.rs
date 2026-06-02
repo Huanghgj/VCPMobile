@@ -498,6 +498,7 @@ pub async fn perform_vcp_request<R: Runtime>(
         let stream_render_interval = Duration::from_millis(180);
         let mut last_aurora_render: Option<std::time::Instant> = None;
         let mut last_aurora_content_len = 0usize;
+        let mut reasoning_block_open = false;
 
         // 辅助闭包：发送 Aurora 更新事件（稀疏序列化 + 正文增量）
         let mut send_aurora_update = |buffer: &AuroraBuffer,
@@ -584,10 +585,32 @@ pub async fn perform_vcp_request<R: Runtime>(
                                                     break;
                                                 }
                                                 if let Ok(chunk) = serde_json::from_str::<Value>(data) {
-                                                    // 累加全量内容并驱动 Aurora 沉淀
+                                                    // 累加全量内容并驱动 Aurora 沉淀。
+                                                    // 部分模型将思考过程放在 reasoning_content 中，不会出现在 delta.content。
+                                                    // 将其包装成现有 <think> 语义块，交给前端折叠渲染。
                                                     let mut text_chunk = String::new();
                                                     if let Some(choice) = chunk["choices"].as_array().and_then(|a| a.first()) {
-                                                        if let Some(text) = choice["delta"]["content"].as_str() {
+                                                        let delta = &choice["delta"];
+                                                        let reasoning_text = delta["reasoning_content"]
+                                                            .as_str()
+                                                            .or_else(|| delta["reasoningContent"].as_str())
+                                                            .or_else(|| delta["reasoning"].as_str())
+                                                            .unwrap_or("");
+                                                        if !reasoning_text.is_empty() {
+                                                            if !reasoning_block_open {
+                                                                full_content.push_str("<think>");
+                                                                text_chunk.push_str("<think>");
+                                                                reasoning_block_open = true;
+                                                            }
+                                                            full_content.push_str(reasoning_text);
+                                                            text_chunk.push_str(reasoning_text);
+                                                        }
+                                                        if let Some(text) = delta["content"].as_str() {
+                                                            if !text.is_empty() && reasoning_block_open {
+                                                                full_content.push_str("</think>");
+                                                                text_chunk.push_str("</think>");
+                                                                reasoning_block_open = false;
+                                                            }
                                                             full_content.push_str(text);
                                                             text_chunk.push_str(text);
                                                         }

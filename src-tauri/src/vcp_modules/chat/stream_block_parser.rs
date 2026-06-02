@@ -10,6 +10,8 @@ use crate::vcp_modules::content_parser::{
 use crate::vcp_modules::pre_renderer::MarkdownNode;
 use crate::vcp_modules::sync_hash::HashAggregator;
 
+const MAX_INCOMPLETE_TAIL_AST_BYTES: usize = 8192;
+
 /// 流式模式下轻量解析的块类型，前端增量渲染
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -278,6 +280,66 @@ impl StreamBlockParser {
     pub fn reset(&mut self) {
         self.processed_len = 0;
     }
+
+    pub fn build_incomplete_tail_block(tail: &str) -> Option<StreamBlock> {
+        let trimmed_start = tail.trim_start();
+        let leading_offset = tail.len().saturating_sub(trimmed_start.len());
+
+        if let Some(m) = THINK_START.find(trimmed_start).filter(|m| m.start() == 0) {
+            let content = trimmed_start[m.end()..].trim_start().to_string();
+            let nodes = parse_incomplete_tail_nodes(&content);
+            let hash = HashAggregator::compute_content_hash(&format!("thinking:{}", content));
+            return Some(StreamBlock::thought(
+                "思考过程".to_string(),
+                content,
+                false,
+                nodes,
+                hash,
+            ));
+        }
+
+        if let Some(caps) = THOUGHT_START.captures(trimmed_start) {
+            if let Some(marker) = caps.get(0).filter(|m| m.start() == 0) {
+                let theme = caps
+                    .get(1)
+                    .map(|m| m.as_str().trim().replace("\"", ""))
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "元思考链".to_string());
+                let content = trimmed_start[marker.end()..].trim_start().to_string();
+                let nodes = parse_incomplete_tail_nodes(&content);
+                let hash = HashAggregator::compute_content_hash(&format!("{}:{}", theme, content));
+                return Some(StreamBlock::thought(theme, content, false, nodes, hash));
+            }
+        }
+
+        if let Some(m) = TOOL_START.find(trimmed_start).filter(|m| m.start() == 0) {
+            let content = trimmed_start[m.end()..].trim_start().to_string();
+            let tool_name = extract_tool_name(&content);
+            let hash = HashAggregator::compute_content_hash(&format!("{}:{}", tool_name, content));
+            return Some(StreamBlock::tool(tool_name, content, hash));
+        }
+
+        if let Some(m) = TOOL_RESULT_START
+            .find(trimmed_start)
+            .filter(|m| m.start() == 0)
+        {
+            let content = trimmed_start[m.end()..].trim_start().to_string();
+            let (tool_name, status, details, footer) = parse_tool_result(&content);
+            let hash = HashAggregator::compute_content_hash(&format!(
+                "{}:{}:{:?}:{}",
+                tool_name, status, details, footer
+            ));
+            return Some(StreamBlock::tool_result(
+                tool_name, status, details, footer, hash,
+            ));
+        }
+
+        if leading_offset > 0 && trimmed_start.len() != tail.len() {
+            return Self::build_incomplete_tail_block(trimmed_start);
+        }
+
+        None
+    }
 }
 
 // ── 内部辅助函数 ──────────────────────────────────────────────────────
@@ -311,6 +373,15 @@ fn find_earliest_start_marker(text: &str) -> Option<(usize, usize, BlockType)> {
         }
     }
     earliest
+}
+
+fn parse_incomplete_tail_nodes(content: &str) -> Option<Vec<MarkdownNode>> {
+    if content.is_empty() || content.len() > MAX_INCOMPLETE_TAIL_AST_BYTES {
+        return None;
+    }
+    Some(crate::vcp_modules::pre_renderer::parse_markdown_to_ast(
+        content,
+    ))
 }
 
 /// 寻找对应块的结束标记
@@ -416,7 +487,7 @@ fn build_stream_block(
                 crate::vcp_modules::chat::pre_renderer::parse_markdown_to_ast(inner_content);
             let hash = HashAggregator::compute_content_hash(inner_content);
             StreamBlock::thought(
-                "思维链".to_string(),
+                "思考过程".to_string(),
                 inner_content.to_string(),
                 true,
                 Some(nodes),
@@ -829,5 +900,25 @@ mod tests {
         // 应该成功闭合代码块并将其沉淀，且 tail 为空
         assert_eq!(blocks_3.len(), 1);
         assert!(tail_3.is_empty());
+    }
+
+    #[test]
+    fn test_incomplete_think_tail_builds_thought_block() {
+        let block = StreamBlockParser::build_incomplete_tail_block("<think>正在分析工具结果")
+            .expect("incomplete think tail should build a thought block");
+
+        match block {
+            StreamBlock::Thought {
+                theme,
+                content,
+                is_complete,
+                ..
+            } => {
+                assert_eq!(theme, "思考过程");
+                assert_eq!(content, "正在分析工具结果");
+                assert!(!is_complete);
+            }
+            other => panic!("expected thought block, got {:?}", other),
+        }
     }
 }

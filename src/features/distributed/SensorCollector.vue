@@ -62,6 +62,7 @@ function startLocation() {
 
 let motionHandler: ((e: DeviceMotionEvent) => void) | null = null;
 let burstTimer: ReturnType<typeof setInterval> | null = null;
+let burstStopTimer: ReturnType<typeof setTimeout> | null = null;
 const BURST_ACTIVE_DURATION = 2000; // 2s sampling
 const BURST_SLEEP_DURATION = 28000; // 28s sleep
 const MOTION_PROCESS_INTERVAL = 100; // 10Hz within burst
@@ -90,7 +91,8 @@ function startMotion() {
     motionHandler = handler;
 
     // Step 2: Stop listening after 2s and process
-    setTimeout(() => {
+    burstStopTimer = setTimeout(() => {
+      burstStopTimer = null;
       window.removeEventListener("devicemotion", handler);
       motionHandler = null;
       if (import.meta.env.DEV) {
@@ -126,6 +128,10 @@ function stopMotion() {
   if (burstTimer) {
     clearInterval(burstTimer);
     burstTimer = null;
+  }
+  if (burstStopTimer) {
+    clearTimeout(burstStopTimer);
+    burstStopTimer = null;
   }
 }
 

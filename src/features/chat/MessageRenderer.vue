@@ -474,10 +474,24 @@ onUnmounted(() => {
             v-if="isPlainBlock(message.tailBlock.type)"
             v-html="renderBlockHtml(message.tailBlock)"
           />
+          <ToolBlock
+            v-else-if="message.tailBlock.type === 'tool-use' || message.tailBlock.type === 'tool-result'"
+            :type="message.tailBlock.type"
+            :content="message.tailBlock.content"
+            :block="message.tailBlock"
+          />
           <ThoughtBlock
             v-else-if="message.tailBlock.type === 'thought'"
             :block="message.tailBlock"
             :message-id="message.id"
+          />
+          <HtmlPreviewBlock
+            v-else-if="message.tailBlock.type === 'html-preview'"
+            :content="message.tailBlock.content || ''"
+            :highlighted-content="message.tailBlock.highlighted_content"
+            :message-id="message.id"
+            :is-streaming="isStreaming"
+            :is-active-stream="isMessageInActiveStream"
           />
         </div>
         <div v-else-if="isStreaming && message.tailContent" class="opacity-70 italic animate-pulse">
