@@ -217,15 +217,12 @@ pub async fn handle_assistant_chat_stream(
     let agent_config =
         read_agent_config_internal(&app_handle, &agent_state, &agent_id, Some(true)).await?;
 
-    // 2. 启动前台服务保活
-    if let Err(e) =
-        tauri_plugin_vcp_mobile::stream::start_stream_service_inner(&app_handle, &agent_config.name)
-    {
-        log::warn!(
-            "[AssistantChatAppService] Failed to start streaming service early: {}",
-            e
-        );
-    }
+    // 2. 启动前台服务保活；RAII 守卫兜住异常/断连路径，别让悬浮助手的保活服务湿漉漉地挂后台偷电喵♡
+    let mut stream_service_guard = StreamServiceGuard::start(
+        app_handle.clone(),
+        agent_config.name.clone(),
+        "AssistantChatAppService",
+    );
 
     // 3. 构造请求消息数组 (注入 System Prompt)
     let mut messages: Vec<Value> = Vec::new();
@@ -287,14 +284,7 @@ pub async fn handle_assistant_chat_stream(
     .await;
 
     // 6. 停止前台服务
-    if let Err(e) =
-        tauri_plugin_vcp_mobile::stream::stop_stream_service_inner(&app_handle, &agent_config.name)
-    {
-        log::warn!(
-            "[AssistantChatAppService] Failed to stop streaming service: {}",
-            e
-        );
-    }
+    stream_service_guard.stop();
 
     // 7. 处理请求结果并补发流终结事件
     let final_ts = crate::vcp_modules::infra::utils::now_millis() as u64;

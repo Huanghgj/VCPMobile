@@ -81,6 +81,7 @@ pub fn process_audio_for_multimodal<R: Runtime>(
         .map(|m| m.len())
         .map_err(|e| format!("Failed to read raw audio metadata: {}", e))?;
 
+    // 猫娘把降级口夹到 5MB，防止原音频一兴奋就把请求体顶爆喵♡
     const FIVE_MB: u64 = 5_000_000;
     if file_size >= FIVE_MB {
         return Err(format!(

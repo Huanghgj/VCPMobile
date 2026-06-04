@@ -7,18 +7,43 @@ use axum::{
     routing::get,
     Router,
 };
+use dashmap::DashMap;
 use futures_util::{sink::SinkExt, stream::StreamExt};
 use serde_json::{json, Value};
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tauri::{
     http::{header, Request, StatusCode},
     AppHandle, Manager,
 };
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 #[derive(Clone)]
 struct AppState {
     app_handle: AppHandle,
+}
+
+fn abort_active_request_with_retry(
+    active_requests: Arc<DashMap<String, oneshot::Sender<()>>>,
+    message_id: String,
+) {
+    tauri::async_runtime::spawn(async move {
+        for attempt in 0..20 {
+            if let Some((_, abort_tx)) = active_requests.remove(&message_id) {
+                let _ = abort_tx.send(());
+                return;
+            }
+
+            // thinking 事件可能比 ActiveRequests 注册更早，重试夹紧竞态，别让断开的浮窗继续偷电喵♡
+            if attempt < 19 {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+
+        log::warn!(
+            "[LocalServer/WS] Failed to abort disconnected assistant stream: {}",
+            message_id
+        );
+    });
 }
 
 /// 服务器句柄：持有此句柄可触发优雅关闭
@@ -135,13 +160,71 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         ).await;
                     });
 
-                    while let Some(event) = rx.recv().await {
+                    let active_requests_for_abort = app_handle
+                        .state::<crate::vcp_modules::vcp_client::ActiveRequests>()
+                        .0
+                        .clone();
+                    let mut last_message_id: Option<String> = None;
+
+                    loop {
+                        let event = if last_message_id.is_none() {
+                            // 首个 thinking 事件携带后端 messageId；先拿到它，再监听断连，避免无 ID 时误放生后台请求。
+                            rx.recv().await
+                        } else {
+                            tokio::select! {
+                                event = rx.recv() => event,
+                                socket_msg = receiver.next() => {
+                                    match socket_msg {
+                                        Some(Ok(Message::Close(_))) | None => {
+                                            // 浮窗关掉但模型还在等 token 时也要立刻中止，别让保活服务在后台偷偷榨电喵♡
+                                            if let Some(message_id) = last_message_id.take() {
+                                                abort_active_request_with_retry(
+                                                    active_requests_for_abort.clone(),
+                                                    message_id,
+                                                );
+                                            }
+                                            break;
+                                        }
+                                        Some(Err(e)) => {
+                                            log::warn!("[LocalServer/WS] Floating socket receive error: {}", e);
+                                            if let Some(message_id) = last_message_id.take() {
+                                                abort_active_request_with_retry(
+                                                    active_requests_for_abort.clone(),
+                                                    message_id,
+                                                );
+                                            }
+                                            break;
+                                        }
+                                        Some(Ok(_)) => {
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                        };
+
+                        let Some(event) = event else { break };
+
                         use tauri::ipc::InvokeResponseBody;
                         let event_json = match event {
                             InvokeResponseBody::Json(v) => v.to_string(),
                             _ => "{}".to_string(),
                         };
+
+                        if let Ok(value) = serde_json::from_str::<Value>(&event_json) {
+                            if let Some(id) = value.get("messageId").and_then(|v| v.as_str()) {
+                                last_message_id = Some(id.to_string());
+                            }
+                        }
+
                         if sender.send(Message::Text(event_json)).await.is_err() {
+                            // WebSocket 断了就拔掉流式请求，别让后台继续乱射 token 耗电喵♡
+                            if let Some(message_id) = last_message_id.take() {
+                                abort_active_request_with_retry(
+                                    active_requests_for_abort.clone(),
+                                    message_id,
+                                );
+                            }
                             break;
                         }
                     }

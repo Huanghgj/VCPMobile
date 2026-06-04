@@ -1,4 +1,4 @@
-import { ref } from 'vue';
+import { computed } from 'vue';
 import { invoke, Channel } from '@tauri-apps/api/core';
 import { useNotificationStore } from '../stores/notification';
 import { useUpdateStore } from '../stores/update';
@@ -143,6 +143,6 @@ export function useUpdateDownloader() {
 
   return {
     downloadAndInstall,
-    isDownloading: ref(updateStore.status === 'downloading'),
+    isDownloading: computed(() => updateStore.status === 'downloading'),
   };
 }

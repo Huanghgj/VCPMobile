@@ -78,6 +78,7 @@ pub fn convert_local_image_for_multimodal<R: Runtime>(
         .map(|m| m.len())
         .map_err(|e| format!("Failed to read raw image metadata: {}", e))?;
 
+    // 猫娘把降级口夹到 5MB，防止原图无码直塞把内存和 token 榨干喵♡
     const FIVE_MB: u64 = 5_000_000;
     if file_size >= FIVE_MB {
         return Err(format!(

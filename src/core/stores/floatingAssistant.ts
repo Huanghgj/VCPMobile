@@ -69,8 +69,13 @@ export const useFloatingAssistantStore = defineStore("floatingAssistant", () => 
     };
 
     socket.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      handleWsMessage(data);
+      try {
+        // 猫娘先验包，坏 JSON 不许硬塞进悬浮助手状态机喵♡
+        const data = JSON.parse(event.data);
+        handleWsMessage(data);
+      } catch (err) {
+        console.error("[FloatingAssistantStore] Invalid WS message:", err);
+      }
     };
 
     socket.onerror = (err) => {
@@ -215,18 +220,22 @@ export const useFloatingAssistantStore = defineStore("floatingAssistant", () => 
     const agentId = await resolveAgentId();
     if (!agentId) return null;
 
-    if (isFloatingMode.value && ws.value) {
-      ws.value.send(
-        JSON.stringify({
-          action: "archive_assistant_chat",
-          payload: {
-            ownerId: agentId,
-            ownerType: "agent",
-            tempMessages: validMessages,
-          },
-        }),
-      );
-      return "WS_PENDING";
+    if (isFloatingMode.value) {
+      if (ws.value?.readyState === WebSocket.OPEN) {
+        ws.value.send(
+          JSON.stringify({
+            action: "archive_assistant_chat",
+            payload: {
+              ownerId: agentId,
+              ownerType: "agent",
+              tempMessages: validMessages,
+            },
+          }),
+        );
+        return "WS_PENDING";
+      }
+      addToast("error", "连接未就绪", "悬浮助手 WebSocket 尚未连接，稍后再试");
+      return null;
     }
 
     try {
@@ -307,14 +316,22 @@ export const useFloatingAssistantStore = defineStore("floatingAssistant", () => 
 
     const payload = { agentId, tempMessages, vcpUrl, vcpApiKey };
 
-    if (isFloatingMode.value && ws.value) {
-      console.log("[FloatingAssistantStore] Sending via WS:", { agentId, vcpUrl, msgCount: tempMessages.length });
-      ws.value.send(
-        JSON.stringify({
-          action: "handle_assistant_chat_stream",
-          payload,
-        }),
-      );
+    if (isFloatingMode.value) {
+      if (ws.value?.readyState === WebSocket.OPEN) {
+        console.log("[FloatingAssistantStore] Sending via WS:", { agentId, vcpUrl, msgCount: tempMessages.length });
+        ws.value.send(
+          JSON.stringify({
+            action: "handle_assistant_chat_stream",
+            payload,
+          }),
+        );
+        return;
+      }
+
+      // WS 没插稳就别让消息射出去，避免假生成状态白白耗电喵♡
+      addToast("error", "连接未就绪", "悬浮助手 WebSocket 尚未连接，稍后再试");
+      isGenerating.value = false;
+      currentStreamingMessageId.value = null;
       return;
     }
 

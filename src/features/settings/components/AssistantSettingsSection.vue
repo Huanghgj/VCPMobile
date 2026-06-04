@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from "vue";
+import { ref, onMounted, onUnmounted } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import type { AppSettings } from "../../../core/stores/settings";
 import { useAssistantStore } from "../../../core/stores/assistant";
@@ -30,6 +30,7 @@ const checkPermission = async () => {
 
 const handleToggle = async (val: boolean) => {
   if (val) {
+    // 猫娘先夹紧悬浮窗权限，没过系统门禁不准硬顶进前台喵♡
     await checkPermission();
     if (!hasOverlayPermission.value) {
       // 引导用户去系统设置开启权限
@@ -70,17 +71,24 @@ onMounted(async () => {
   }
 });
 
-// 监听生命周期 resume 事件以刷新权限状态
-window.addEventListener("vcp-lifecycle", async (e: any) => {
-  if (e.detail?.state === "resume") {
-    await checkPermission();
-    if (props.settings.enableAssistant && hasOverlayPermission.value) {
-      try {
-        await invoke("plugin:vcp-mobile|toggle_floating_ball", { show: true });
-        await invoke("reconcile_local_server_cmd", { enable: true });
-      } catch (_) {}
-    }
+const handleLifecycleResume = async (e: Event) => {
+  const detail = (e as CustomEvent).detail;
+  if (detail?.state !== "resume") return;
+
+  await checkPermission();
+  if (props.settings.enableAssistant && hasOverlayPermission.value) {
+    try {
+      await invoke("plugin:vcp-mobile|toggle_floating_ball", { show: true });
+      await invoke("reconcile_local_server_cmd", { enable: true });
+    } catch (_) {}
   }
+};
+
+// 生命周期监听要温柔收尾，别让重复 handler 在后台骚骚耗电喵♡
+window.addEventListener("vcp-lifecycle", handleLifecycleResume);
+
+onUnmounted(() => {
+  window.removeEventListener("vcp-lifecycle", handleLifecycleResume);
 });
 </script>
 
