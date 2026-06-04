@@ -301,6 +301,18 @@
           "markdownDescription": "Allow all commands in vcp-mobile plugin"
         },
         {
+          "description": "Enables the cancel_download_notification command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-cancel-download-notification",
+          "markdownDescription": "Enables the cancel_download_notification command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cancel_download_notification command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-cancel-download-notification",
+          "markdownDescription": "Denies the cancel_download_notification command without any pre-configured scope."
+        },
+        {
           "description": "Enables the capture_window_snapshot command without any pre-configured scope.",
           "type": "string",
           "const": "allow-capture-window-snapshot",
@@ -385,6 +397,18 @@
           "markdownDescription": "Denies the pick_file command without any pre-configured scope."
         },
         {
+          "description": "Enables the register_shared_files command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-register-shared-files",
+          "markdownDescription": "Enables the register_shared_files command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the register_shared_files command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-register-shared-files",
+          "markdownDescription": "Denies the register_shared_files command without any pre-configured scope."
+        },
+        {
           "description": "Enables the request_android_permission command without any pre-configured scope.",
           "type": "string",
           "const": "allow-request-android-permission",
@@ -395,6 +419,30 @@
           "type": "string",
           "const": "deny-request-android-permission",
           "markdownDescription": "Denies the request_android_permission command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the request_overlay_permission command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-request-overlay-permission",
+          "markdownDescription": "Enables the request_overlay_permission command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the request_overlay_permission command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-request-overlay-permission",
+          "markdownDescription": "Denies the request_overlay_permission command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the save_image_from_path command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-save-image-from-path",
+          "markdownDescription": "Enables the save_image_from_path command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the save_image_from_path command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-save-image-from-path",
+          "markdownDescription": "Denies the save_image_from_path command without any pre-configured scope."
         },
         {
           "description": "Enables the save_image_to_gallery command without any pre-configured scope.",
@@ -421,6 +469,18 @@
           "markdownDescription": "Denies the set_keep_screen_on command without any pre-configured scope."
         },
         {
+          "description": "Enables the start_download_notification command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-start-download-notification",
+          "markdownDescription": "Enables the start_download_notification command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the start_download_notification command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-start-download-notification",
+          "markdownDescription": "Denies the start_download_notification command without any pre-configured scope."
+        },
+        {
           "description": "Enables the start_streaming_service command without any pre-configured scope.",
           "type": "string",
           "const": "allow-start-streaming-service",
@@ -443,6 +503,42 @@
           "type": "string",
           "const": "deny-stop-streaming-service",
           "markdownDescription": "Denies the stop_streaming_service command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the toggle_floating_ball command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-toggle-floating-ball",
+          "markdownDescription": "Enables the toggle_floating_ball command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the toggle_floating_ball command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-toggle-floating-ball",
+          "markdownDescription": "Denies the toggle_floating_ball command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the update_download_notification command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-update-download-notification",
+          "markdownDescription": "Enables the update_download_notification command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the update_download_notification command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-update-download-notification",
+          "markdownDescription": "Denies the update_download_notification command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the write_temp_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-write-temp-file",
+          "markdownDescription": "Enables the write_temp_file command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the write_temp_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-write-temp-file",
+          "markdownDescription": "Denies the write_temp_file command without any pre-configured scope."
         },
         {
           "description": "Default permission for VCP Mobile plugin",

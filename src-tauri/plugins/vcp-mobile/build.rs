@@ -11,6 +11,14 @@ const COMMANDS: &[&str] = &[
     "capture_window_snapshot",
     "open_file_native",
     "save_image_to_gallery",
+    "save_image_from_path",
+    "write_temp_file",
+    "start_download_notification",
+    "update_download_notification",
+    "cancel_download_notification",
+    "request_overlay_permission",
+    "register_shared_files",
+    "toggle_floating_ball",
 ];
 
 fn main() {

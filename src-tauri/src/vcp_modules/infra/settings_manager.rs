@@ -4,7 +4,7 @@
 use crate::vcp_modules::db_manager::DbState;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+
 use tauri::{AppHandle, Manager, Runtime, State};
 use tokio::sync::Mutex;
 
@@ -67,6 +67,12 @@ pub struct Settings {
     #[serde(default)]
     pub sync_prerender_enabled: bool,
 
+    #[serde(default)]
+    pub enable_assistant: bool,
+
+    #[serde(default)]
+    pub assistant_agent_id: String,
+
     /// 仅保留此字段用于前端未来扩展的透参
     #[serde(flatten)]
     #[serde(default)]
@@ -103,6 +109,8 @@ pub fn create_default_settings() -> Settings {
         topic_summary_model: "gemini-2.5-flash".to_string(),
         sync_log_level: "INFO".to_string(),
         sync_prerender_enabled: false,
+        enable_assistant: false,
+        assistant_agent_id: "".to_string(),
         agent_order: vec![],
         group_order: vec![],
         current_theme_mode: Some("dark".to_string()),
@@ -183,10 +191,7 @@ async fn internal_write_settings<R: Runtime>(
     let pool = &db_state.pool;
 
     let content = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
+    let now = crate::vcp_modules::infra::utils::now_millis();
 
     sqlx::query("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('global', ?, ?)")
         .bind(&content)

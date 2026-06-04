@@ -26,9 +26,19 @@ app.mount("#app");
 
 // 标记前端启动成功（用于 OTA 回滚保护）
 import { invoke } from '@tauri-apps/api/core';
+import { getCurrentWindow } from '@tauri-apps/api/window';
+
 if (isTauriRuntime()) {
   if (/android/i.test(navigator.userAgent)) {
     document.documentElement.classList.add("vcp-android-runtime");
   }
-  invoke('confirm_frontend_boot').catch(() => {});
+
+  try {
+    const currentWin = getCurrentWindow();
+    if (currentWin.label === 'main') {
+      invoke('confirm_frontend_boot').catch(() => {});
+    }
+  } catch {
+    // Web preview / floating HTML 没有 Tauri 窗口对象，启动确认只给主窗口做。
+  }
 }

@@ -12,6 +12,7 @@ pub struct PermissionStatus {
     pub battery: bool,
     pub microphone: bool,
     pub camera: bool,
+    pub overlay: bool,
 }
 
 #[tauri::command]
@@ -36,6 +37,7 @@ pub fn check_all_permissions<R: Runtime>(app: AppHandle<R>) -> Result<Permission
             battery: true,
             microphone: true,
             camera: true,
+            overlay: true,
         })
     }
 }
@@ -294,8 +296,15 @@ pub fn write_temp_file<R: Runtime>(
     #[cfg(target_os = "android")]
     {
         use tauri::Manager;
+
+        let safe_name = std::path::Path::new(&file_name)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty() && *name == file_name)
+            .ok_or_else(|| "Invalid temp file name".to_string())?;
+
         let cache_dir = app.path().cache_dir().map_err(|e| e.to_string())?;
-        let temp_path = cache_dir.join(&file_name);
+        let temp_path = cache_dir.join(safe_name);
         std::fs::write(&temp_path, bytes).map_err(|e| e.to_string())?;
         Ok(temp_path.to_string_lossy().to_string())
     }
@@ -305,5 +314,171 @@ pub fn write_temp_file<R: Runtime>(
         let _ = bytes;
         let _ = file_name;
         Err("该接口仅在 Android 物理端可用".to_string())
+    }
+}
+
+#[tauri::command]
+pub fn start_download_notification<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let state = app.state::<VcpMobileState<R>>();
+        let handle = state.plugin_handle.lock().map_err(|e| e.to_string())?;
+        let plugin_handle = handle.as_ref().ok_or("Plugin handle not initialized")?;
+
+        plugin_handle
+            .run_mobile_plugin::<serde_json::Value>(
+                "startDownloadNotification",
+                serde_json::json!({}),
+            )
+            .map_err(|e| format!("run_mobile_plugin failed: {}", e))?;
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn update_download_notification<R: Runtime>(
+    app: AppHandle<R>,
+    progress: i32,
+    text: Option<String>,
+) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let state = app.state::<VcpMobileState<R>>();
+        let handle = state.plugin_handle.lock().map_err(|e| e.to_string())?;
+        let plugin_handle = handle.as_ref().ok_or("Plugin handle not initialized")?;
+
+        plugin_handle
+            .run_mobile_plugin::<serde_json::Value>(
+                "updateDownloadNotification",
+                serde_json::json!({ "progress": progress, "text": text }),
+            )
+            .map_err(|e| format!("run_mobile_plugin failed: {}", e))?;
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        let _ = progress;
+        let _ = text;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn cancel_download_notification<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let state = app.state::<VcpMobileState<R>>();
+        let handle = state.plugin_handle.lock().map_err(|e| e.to_string())?;
+        let plugin_handle = handle.as_ref().ok_or("Plugin handle not initialized")?;
+
+        plugin_handle
+            .run_mobile_plugin::<serde_json::Value>(
+                "cancelDownloadNotification",
+                serde_json::json!({}),
+            )
+            .map_err(|e| format!("run_mobile_plugin failed: {}", e))?;
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn request_overlay_permission<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let state = app.state::<VcpMobileState<R>>();
+        let handle = state.plugin_handle.lock().map_err(|e| e.to_string())?;
+        let plugin_handle = handle.as_ref().ok_or("Plugin handle not initialized")?;
+
+        plugin_handle
+            .run_mobile_plugin::<serde_json::Value>(
+                "requestOverlayPermission",
+                serde_json::json!({}),
+            )
+            .map_err(|e| format!("run_mobile_plugin failed: {}", e))?;
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+    }
+    Ok(())
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SharedFileItem {
+    pub cache_path: String,
+    pub mime_type: String,
+    pub file_name: String,
+}
+
+#[tauri::command]
+pub fn register_shared_files<R: Runtime>(
+    app: AppHandle<R>,
+    files: Vec<SharedFileItem>,
+) -> Result<Vec<PickedFileInfo>, String> {
+    #[cfg(target_os = "android")]
+    {
+        let state = app.state::<VcpMobileState<R>>();
+        let handle = state.plugin_handle.lock().map_err(|e| e.to_string())?;
+        let plugin_handle = handle.as_ref().ok_or("Plugin handle not initialized")?;
+
+        let mut results = Vec::new();
+        for file in files {
+            let file_info = plugin_handle
+                .run_mobile_plugin::<PickedFileInfo>(
+                    "processSharedFile",
+                    serde_json::json!({
+                        "cachePath": file.cache_path,
+                        "mimeType": file.mime_type,
+                        "fileName": file.file_name,
+                    }),
+                )
+                .map_err(|e| format!("run_mobile_plugin processSharedFile failed: {}", e))?;
+            results.push(file_info);
+        }
+        Ok(results)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        let _ = files;
+        Err("该接口仅在 Android 物理端可用".to_string())
+    }
+}
+
+#[tauri::command]
+pub fn toggle_floating_ball<R: Runtime>(app: AppHandle<R>, show: bool) -> Result<bool, String> {
+    #[cfg(target_os = "android")]
+    {
+        let state = app.state::<VcpMobileState<R>>();
+        let handle = state.plugin_handle.lock().map_err(|e| e.to_string())?;
+        let plugin_handle = handle.as_ref().ok_or("Plugin handle not initialized")?;
+
+        #[derive(Deserialize)]
+        struct ToggleResult {
+            success: bool,
+        }
+
+        let res = plugin_handle
+            .run_mobile_plugin::<ToggleResult>(
+                "toggleFloatingBall",
+                serde_json::json!({ "show": show }),
+            )
+            .map_err(|e| format!("run_mobile_plugin failed: {}", e))?;
+        Ok(res.success)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        let _ = show;
+        Ok(false)
     }
 }

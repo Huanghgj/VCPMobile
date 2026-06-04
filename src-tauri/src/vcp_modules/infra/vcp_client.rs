@@ -54,6 +54,30 @@ pub struct StreamEvent {
     pub timestamp: Option<u64>, // ⚡ 新增物理落笔时间戳
 }
 
+// 猫娘把 data URL 外衣剥开，只把干净 base64 喂给 VCP 喵♡
+fn split_audio_data_url(audio_url: &str) -> (String, &'static str) {
+    if let Some((meta, data)) = audio_url.split_once(',') {
+        let format = if meta.contains("audio/aac") {
+            "aac"
+        } else if meta.contains("audio/wav") {
+            "wav"
+        } else if meta.contains("audio/ogg") {
+            "ogg"
+        } else if meta.contains("audio/flac") {
+            "flac"
+        } else if meta.contains("audio/mp4") || meta.contains("audio/m4a") {
+            "mp4"
+        } else if meta.contains("audio/opus") {
+            "opus"
+        } else {
+            "mp3"
+        };
+        return (data.to_string(), format);
+    }
+
+    (audio_url.to_string(), "mp3")
+}
+
 impl StreamEvent {
     pub fn data(message_id: String, chunk: Value, context: Option<Value>) -> Self {
         Self {
@@ -327,8 +351,12 @@ pub async fn perform_vcp_request<R: Runtime>(
                                 if media_kind == "image" {
                                     // 图片类型：长边 > 1120px 时缩放，避免多模态 payload 过大
                                     let path_buf_clone = path_buf.clone();
+                                    let app_clone = app.clone();
                                     match tokio::task::spawn_blocking(move || {
-                                        convert_local_image_for_multimodal(&path_buf_clone)
+                                        convert_local_image_for_multimodal(
+                                            &app_clone,
+                                            &path_buf_clone,
+                                        )
                                     })
                                     .await
                                     {
@@ -356,8 +384,9 @@ pub async fn perform_vcp_request<R: Runtime>(
                                 } else if media_kind == "video" {
                                     // 视频：抽帧 → 每张帧作为 image_url
                                     let path_clone = path_buf.clone();
+                                    let app_clone = app.clone();
                                     match tokio::task::spawn_blocking(move || {
-                                        crate::vcp_modules::media_processor::process_video_for_multimodal(&path_clone)
+                                        crate::vcp_modules::media_processor::process_video_for_multimodal(&app_clone, &path_clone)
                                     }).await {
                                         Ok(Ok(frames)) => {
                                             for frame_url in frames {
@@ -376,17 +405,19 @@ pub async fn perform_vcp_request<R: Runtime>(
                                         }
                                     }
                                 } else if media_kind == "audio" {
-                                    // 音频：提取为 WAV -> input_audio
+                                    // 音频：原生转码为 AAC，失败时仅允许小文件安全兜底 -> input_audio
                                     let path_clone = path_buf.clone();
+                                    let app_clone = app.clone();
                                     match tokio::task::spawn_blocking(move || {
-                                        crate::vcp_modules::media_processor::process_audio_for_multimodal(&path_clone)
+                                        crate::vcp_modules::media_processor::process_audio_for_multimodal(&app_clone, &path_clone)
                                     }).await {
-                                        Ok(Ok(audio)) => {
+                                        Ok(Ok(audio_url)) => {
+                                            let (audio_data, format_str) = split_audio_data_url(&audio_url);
                                             new_parts.push(json!({
                                                 "type": "input_audio",
-                                                "input_audio": { 
-                                                    "data": audio.data,
-                                                    "format": audio.format
+                                                "input_audio": {
+                                                    "data": audio_data,
+                                                    "format": format_str
                                                 }
                                             }));
                                             converted = true;

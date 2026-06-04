@@ -1,8 +1,8 @@
-import { ref, watch } from 'vue';
+import { ref, watch, computed } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import { useAppLifecycleStore } from '../stores/appLifecycle';
-import { useUpdateDownloader } from './useUpdateDownloader';
-import { safeHttpUrl } from './useUpdateDownloader';
+import { useUpdateDownloader, safeHttpUrl } from './useUpdateDownloader';
+import { useUpdateStore } from '../stores/update';
 
 const LAST_CHECK_KEY = 'vcp_last_update_check';
 const COOLDOWN_MS = 24 * 60 * 60 * 1000;
@@ -19,10 +19,19 @@ export interface UpdateInfo {
 
 export function useAutoUpdate() {
   const lifecycleStore = useAppLifecycleStore();
+  const updateStore = useUpdateStore();
   const { downloadAndInstall } = useUpdateDownloader();
 
-  const isPromptOpen = ref(false);
-  const updateInfo = ref<UpdateInfo | null>(null);
+  const isPromptOpen = computed({
+    get: () => updateStore.isPromptOpen,
+    set: (val) => { updateStore.isPromptOpen = val; }
+  });
+
+  const updateInfo = computed<UpdateInfo | null>({
+    get: () => updateStore.updateInfo,
+    set: (val) => { updateStore.updateInfo = val; }
+  });
+
   const hasCheckedThisSession = ref(false);
 
   const shouldCheck = () => {
@@ -44,9 +53,9 @@ export function useAutoUpdate() {
       const info: UpdateInfo = await invoke('check_for_update');
       localStorage.setItem(LAST_CHECK_KEY, Date.now().toString());
 
-      if (info.hasUpdate && safeHttpUrl(info.downloadUrl)) {
-        updateInfo.value = info;
-        isPromptOpen.value = true;
+      const downloadUrl = safeHttpUrl(info.downloadUrl);
+      if (info.hasUpdate && downloadUrl) {
+        updateStore.openPrompt({ ...info, downloadUrl });
       }
     } catch (e) {
       console.error('[AutoUpdate] Check failed:', e);
@@ -66,16 +75,17 @@ export function useAutoUpdate() {
   const handleConfirm = async () => {
     const downloadUrl = safeHttpUrl(updateInfo.value?.downloadUrl);
     if (!downloadUrl) return;
-    isPromptOpen.value = false;
+
     try {
       await downloadAndInstall(downloadUrl);
+      updateStore.closePrompt();
     } catch {
-      // error already handled by useUpdateDownloader
+      // 错误已由 useUpdateDownloader 记录并存入 store，此处不关闭弹窗
     }
   };
 
   const handleDismiss = () => {
-    isPromptOpen.value = false;
+    updateStore.closePrompt();
   };
 
   return {

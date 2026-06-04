@@ -1,78 +1,117 @@
 use base64::Engine as _;
-use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, GenericImageView, ImageReader};
 use std::path::Path;
+use tauri::{AppHandle, Runtime};
 
-fn convert_with_image_crate(path: &Path) -> Result<Vec<u8>, String> {
-    let image = ImageReader::open(path)
-        .map_err(|e| format!("Failed to open image: {}", e))?
-        .with_guessed_format()
-        .map_err(|e| format!("Failed to detect image format: {}", e))?
-        .decode()
-        .map_err(|e| format!("Failed to decode image: {}", e))?;
+/// 将本地图片转换为多模态 Base64 data URL
+/// 优先使用 Android Kotlin 原生硬件/高保真缩放（Android）
+/// 如果在 Android 平台压制失败或在非 Android 平台，
+/// 当且仅当文件大小 < 5MB 时允许直接无处理读取原图字节转 Base64 传输，超过 5MB 则禁止回退直接报错。
+pub fn convert_local_image_for_multimodal<R: Runtime>(
+    app: &AppHandle<R>,
+    path: &Path,
+) -> Result<String, String> {
+    let process_err: Option<String>;
 
-    let (width, height) = image.dimensions();
-    let resized = if width > 1120 || height > 1120 {
-        image.resize(1120, 1120, FilterType::Lanczos3)
-    } else {
-        image
-    };
+    #[cfg(target_os = "android")]
+    {
+        use tauri::Manager;
+        use tauri_plugin_vcp_mobile::VcpMobileState;
 
-    let rgba = resized.to_rgba8();
-    let (width, height) = rgba.dimensions();
-    let mut flattened = image::RgbImage::new(width, height);
-    for (x, y, pixel) in rgba.enumerate_pixels() {
-        let alpha = pixel[3] as u16;
-        let inverse_alpha = 255 - alpha;
-        let r = ((pixel[0] as u16 * alpha + 255 * inverse_alpha) / 255) as u8;
-        let g = ((pixel[1] as u16 * alpha + 255 * inverse_alpha) / 255) as u8;
-        let b = ((pixel[2] as u16 * alpha + 255 * inverse_alpha) / 255) as u8;
-        flattened.put_pixel(x, y, image::Rgb([r, g, b]));
+        let state = app.state::<VcpMobileState<R>>();
+        match (|| -> Result<String, String> {
+            let handle = state.plugin_handle.lock().map_err(|e| e.to_string())?;
+            let plugin_handle = handle
+                .as_ref()
+                .ok_or("VCP Mobile Plugin handle not initialized")?;
+
+            #[derive(serde::Deserialize)]
+            struct ProcessImageResult {
+                path: String,
+            }
+
+            let input_str = path.to_str().ok_or("Invalid image path")?;
+            log::info!(
+                "[ImageExtractor] Invoking Kotlin processImage for: {}",
+                input_str
+            );
+
+            let res = plugin_handle
+                .run_mobile_plugin::<ProcessImageResult>(
+                    "processImage",
+                    serde_json::json!({ "path": input_str }),
+                )
+                .map_err(|e| format!("Kotlin processImage failed: {}", e))?;
+
+            log::info!(
+                "[ImageExtractor] Kotlin processImage success, output: {}",
+                res.path
+            );
+            let output_path = Path::new(&res.path);
+
+            let webp_bytes = std::fs::read(output_path)
+                .map_err(|e| format!("Failed to read processed image: {}", e))?;
+
+            let _ = std::fs::remove_file(output_path);
+
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&webp_bytes);
+            Ok(format!("data:image/webp;base64,{}", b64))
+        })() {
+            Ok(data_url) => return Ok(data_url),
+            Err(e) => {
+                log::warn!(
+                    "[ImageExtractor] Native processing failed: {}. Falling back if < 5MB.",
+                    e
+                );
+                process_err = Some(e);
+            }
+        }
     }
 
-    let mut jpeg_bytes = Vec::new();
-    let mut encoder = JpegEncoder::new_with_quality(&mut jpeg_bytes, 85);
-    encoder
-        .encode_image(&flattened)
-        .map_err(|e| format!("Failed to encode JPEG: {}", e))?;
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        process_err = Some("非 Android 物理端不支持原生硬件缩放".to_string());
+    }
 
-    Ok(jpeg_bytes)
-}
+    // 共享的严格大小受限降级兜底逻辑
+    let file_size = std::fs::metadata(path)
+        .map(|m| m.len())
+        .map_err(|e| format!("Failed to read raw image metadata: {}", e))?;
 
-fn convert_with_ffmpeg(path: &Path) -> Result<Vec<u8>, String> {
-    use super::ffmpeg_cli::run_ffmpeg;
+    const FIVE_MB: u64 = 5_000_000;
+    if file_size >= FIVE_MB {
+        return Err(format!(
+            "Image processing failed ({:?}), and raw size ({} bytes) >= 5MB. Direct fallback prohibited.",
+            process_err, file_size
+        ));
+    }
 
-    run_ffmpeg(&[
-        "-i",
-        path.to_str().ok_or("Invalid image path")?,
-        "-vf",
-        "scale='min(1120,iw)':'min(1120,ih)':force_original_aspect_ratio=decrease:flags=lanczos",
-        "-c:v",
-        "mjpeg",
-        "-q:v",
-        "3",
-        "-f",
-        "image2pipe",
-        "pipe:1",
-    ])
-}
+    log::info!(
+        "[ImageExtractor] Processing failed ({:?}), falling back to direct byte read for small image: {} bytes",
+        process_err, file_size
+    );
 
-/// 将本地图片转换为多模态 Base64 data URL。
-/// 常见格式走纯 Rust 解码/缩放；HEIC/AVIF 等格式再降级到 ffmpeg。
-pub fn convert_local_image_for_multimodal(path: &Path) -> Result<String, String> {
-    let jpeg_bytes = convert_with_image_crate(path).or_else(|image_err| {
-        log::warn!(
-            "[MediaProcessor] Rust image conversion failed for {:?}: {}. Falling back to ffmpeg.",
-            path,
-            image_err
-        );
-        convert_with_ffmpeg(path).map_err(|ffmpeg_err| {
-            format!(
-                "Rust image conversion failed: {}; ffmpeg fallback failed: {}",
-                image_err, ffmpeg_err
-            )
-        })
-    })?;
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("Failed to read raw image bytes: {}", e))?;
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("jpeg")
+        .to_lowercase();
 
-    let b64 = base64::engine::general_purpose::STANDARD.encode(jpeg_bytes);
-    Ok(format!("data:image/jpeg;base64,{}", b64))
+    // 规范化 MIME 类型子类型
+    let subtype = match ext.as_str() {
+        "png" => "png",
+        "webp" => "webp",
+        "gif" => "gif",
+        "bmp" => "bmp",
+        "ico" => "x-icon",
+        "svg" => "svg+xml",
+        "avif" => "avif",
+        "heic" | "heif" => "heic",
+        _ => "jpeg", // 兜底使用 jpeg
+    };
+
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(format!("data:image/{};base64,{}", subtype, b64))
 }

@@ -106,3 +106,47 @@ export function captureWindowSnapshot(
     args,
   );
 }
+
+// ==================================================================
+// Floating Assistant & Update Notifications
+// ==================================================================
+
+export function requestOverlayPermission(): Promise<void> {
+  return invoke("plugin:vcp-mobile|request_overlay_permission");
+}
+
+export function toggleFloatingBall(show: boolean): Promise<boolean> {
+  return invoke<boolean>("plugin:vcp-mobile|toggle_floating_ball", { show });
+}
+
+export function startDownloadNotification(): Promise<void> {
+  return invoke("plugin:vcp-mobile|start_download_notification");
+}
+
+export function updateDownloadNotification(
+  progress: number,
+  text?: string,
+): Promise<void> {
+  return invoke("plugin:vcp-mobile|update_download_notification", {
+    progress,
+    text,
+  });
+}
+
+export function cancelDownloadNotification(): Promise<void> {
+  return invoke("plugin:vcp-mobile|cancel_download_notification");
+}
+
+export interface SharedFileItem {
+  cachePath: string;
+  mimeType: string;
+  fileName: string;
+}
+
+export function registerSharedFiles(
+  files: SharedFileItem[],
+): Promise<PickedFile[]> {
+  return invoke<PickedFile[]>("plugin:vcp-mobile|register_shared_files", {
+    files,
+  });
+}

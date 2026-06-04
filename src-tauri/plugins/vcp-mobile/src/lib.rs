@@ -34,6 +34,12 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             system::save_image_to_gallery,
             system::save_image_from_path,
             system::write_temp_file,
+            system::start_download_notification,
+            system::update_download_notification,
+            system::cancel_download_notification,
+            system::request_overlay_permission,
+            system::register_shared_files,
+            system::toggle_floating_ball,
         ])
         .setup(|app, _api| {
             #[cfg(target_os = "android")]
