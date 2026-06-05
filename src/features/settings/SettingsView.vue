@@ -10,6 +10,7 @@ import SyncSettingsSection from "./components/SyncSettingsSection.vue";
 import VcpCoreSettingsSection from "./components/VcpCoreSettingsSection.vue";
 import TopicSummarySection from "./components/TopicSummarySection.vue";
 import AssistantSettingsSection from "./components/AssistantSettingsSection.vue";
+import AiLogicSettingsSection from "./components/AiLogicSettingsSection.vue";
 import MaintenanceSection from "./components/MaintenanceSection.vue";
 import AboutSection from "./components/AboutSection.vue";
 import ThemePicker from "./ThemePicker.vue";
@@ -274,6 +275,12 @@ watch(currentSubPage, (val) => {
                     <h3 class="text-[11px] font-black uppercase tracking-[0.15em] opacity-50 mb-3 px-1">划词悬浮助手</h3>
                     <SettingsCard>
                       <AssistantSettingsSection :settings="settings" />
+                    </SettingsCard>
+                  </div>
+                  <div>
+                    <h3 class="text-[11px] font-black uppercase tracking-[0.15em] opacity-50 mb-3 px-1">AI 注入逻辑</h3>
+                    <SettingsCard>
+                      <AiLogicSettingsSection :settings="settings" />
                     </SettingsCard>
                   </div>
                   <div>

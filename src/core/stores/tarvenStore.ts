@@ -6,7 +6,7 @@ import { invoke } from '@tauri-apps/api/core';
 export interface TarvenRule {
   id: string;
   name: string;
-  ruleType: 'system_suffix' | 'user_suffix' | 'context_inject';
+  ruleType: 'system_suffix' | 'user_suffix' | 'context_inject' | 'system_meta_injection' | 'time_anchoring_v2';
   isEnabled: boolean;
   content: string;
   scope: 'global' | 'agent' | 'group';
@@ -73,6 +73,25 @@ export const useTarvenStore = defineStore('tarven', () => {
     }
   };
 
+  const setRuleEnabled = async (id: string, enabled: boolean) => {
+    let target = rules.value.find(r => r.id === id);
+    if (!target) {
+      await fetchRules();
+      target = rules.value.find(r => r.id === id);
+    }
+    if (!target) return;
+    if (target.isEnabled === enabled) return;
+
+    const previousState = target.isEnabled;
+    try {
+      target.isEnabled = enabled;
+      await invoke('toggle_rule_enabled', { id, enabled });
+    } catch (e) {
+      console.error('Failed to set rule state:', e);
+      target.isEnabled = previousState;
+    }
+  };
+
   // 5. 保存拖拽重排后的顺序
   const saveOrder = async (orderedIds: string[]) => {
     try {
@@ -103,6 +122,7 @@ export const useTarvenStore = defineStore('tarven', () => {
     saveRule,
     deleteRule,
     toggleRule,
+    setRuleEnabled,
     saveOrder,
     previewInjection,
   };

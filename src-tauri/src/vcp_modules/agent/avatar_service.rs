@@ -63,6 +63,7 @@ pub async fn save_avatar_data<R: Runtime>(
             data_type: SyncDataType::Avatar,
             hash: avatar_hash.clone(),
             ts: now,
+            owner_type: None,
         });
     }
 

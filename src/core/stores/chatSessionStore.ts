@@ -2,6 +2,7 @@ import { defineStore } from "pinia";
 import { ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { useAssistantStore } from "./assistant";
+import { createDefaultTopicTitle } from "../utils/topicTitle";
 
 export interface PickedFileInfo {
   path: string;
@@ -39,11 +40,7 @@ export const useChatSessionStore = defineStore("chatSession", () => {
     }
 
     // 2. 创建新话题（复用 TopicCreator 默认命名逻辑）
-    const newTopicName = `新话题 ${new Date().toLocaleTimeString([], {
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-    })}`;
+    const newTopicName = createDefaultTopicTitle();
 
     const newTopic = await invoke<any>("create_topic", {
       ownerId: agentId,

@@ -268,6 +268,7 @@ pub async fn update_topic_title(
             id: topic_id,
             hash,
             ts: now,
+            owner_type: Some(_owner_type),
         });
     }
 
@@ -332,6 +333,7 @@ pub async fn toggle_topic_lock(
             id: topic_id,
             hash,
             ts: now,
+            owner_type: Some(_owner_type),
         });
     }
 

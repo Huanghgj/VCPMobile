@@ -1033,5 +1033,26 @@ pub async fn finalize_stream_message<R: tauri::Runtime>(
         let _ = chan.send(end_event);
     }
 
+    if !owner_id.is_empty() && !topic_id.is_empty() {
+        let summary_app = app_handle.clone();
+        let summary_pool = pool.clone();
+        let summary_owner_id = owner_id.to_string();
+        let summary_owner_type = owner_type.to_string();
+        let summary_topic_id = topic_id.clone();
+        let summary_agent_name = final_name.unwrap_or_else(|| "AI".to_string());
+
+        tauri::async_runtime::spawn(async move {
+            crate::vcp_modules::chat::topic_summary_service::summarize_topic_if_needed(
+                summary_app,
+                summary_pool,
+                summary_owner_id,
+                summary_owner_type,
+                summary_topic_id,
+                summary_agent_name,
+            )
+            .await;
+        });
+    }
+
     Ok(())
 }

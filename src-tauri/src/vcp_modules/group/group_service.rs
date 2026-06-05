@@ -345,6 +345,7 @@ async fn internal_write_group_config<R: Runtime>(
                     data_type: SyncDataType::Group,
                     hash: config_hash.clone(),
                     ts: now,
+                    owner_type: None,
                 });
             }
         }

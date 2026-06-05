@@ -4,7 +4,6 @@ import { invoke, Channel } from "@tauri-apps/api/core";
 import { useChatSessionStore } from "./chatSessionStore";
 import { useChatStreamStore } from "./chatStreamStore";
 import { useAttachmentStore } from "./attachmentStore";
-import { useAssistantStore } from "./assistant";
 import { useSettingsStore } from "./settings";
 import { useTopicStore } from "./topicListManager";
 import { clearMessageCache } from "../utils/astRenderer";
@@ -29,54 +28,8 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
   const sessionStore = useChatSessionStore();
   const streamStore = useChatStreamStore();
   const attachmentStore = useAttachmentStore();
-  const assistantStore = useAssistantStore();
   const settingsStore = useSettingsStore();
   const topicStore = useTopicStore();
-
-  /**
-   * 尝试为话题生成 AI 总结标题
-   * 触发条件：消息数 >= 4 且标题仍为初始的 "新话题 HH:MM:SS" 格式
-   */
-  const summarizeTopic = async () => {
-    if (!sessionStore.currentTopicId || !sessionStore.currentSelectedItem?.id) return;
-
-    const topicId = sessionStore.currentTopicId;
-    const ownerId = sessionStore.currentSelectedItem.id;
-    const ownerType = sessionStore.currentSelectedItem.type;
-
-    const topic = topicStore.topics.find((t) => t.id === topicId);
-    const isDefaultName = topic && /^(新话题|新会话) \d{2}:\d{2}:\d{2}$/.test(topic.name);
-    const messageCount = currentChatHistory.value.filter(
-      (m) => m.role !== "system",
-    ).length;
-
-    if (isDefaultName && messageCount >= 4) {
-      console.log(`[ChatHistoryStore] Triggering AI summary for topic: ${topicId}`);
-      try {
-        const agentName =
-          assistantStore.agents.find((a: any) => a.id === ownerId)?.name ||
-          "AI";
-        const newTitle = await invoke<string>("summarize_topic", {
-          ownerId,
-          ownerType,
-          topicId,
-          agentName,
-        });
-
-        if (newTitle) {
-          console.log(`[ChatHistoryStore] AI Summarized Title: ${newTitle}`);
-          await topicStore.updateTopicTitle(
-            ownerId,
-            ownerType,
-            topicId,
-            newTitle,
-          );
-        }
-      } catch (e) {
-        console.error("[ChatHistoryStore] AI Summary failed:", e);
-      }
-    }
-  };
 
   /**
    * 加载聊天历史
@@ -272,11 +225,6 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
             currentChatHistory.value.push(msg);
             currentChatHistory.value.sort((a, b) => a.timestamp - b.timestamp);
           }
-        },
-        onStreamFinished: (_mid, tid) => {
-          if (tid === sessionStore.currentTopicId) {
-            summarizeTopic();
-          }
         }
       });
 
@@ -470,11 +418,6 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
             currentChatHistory.value.push(msg);
             currentChatHistory.value.sort((a, b) => a.timestamp - b.timestamp);
           }
-        },
-        onStreamFinished: (_mid, tid) => {
-          if (tid === sessionStore.currentTopicId) {
-            summarizeTopic();
-          }
         }
       });
 
@@ -554,7 +497,6 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     sendMessage,
     deleteMessage,
     triggerGeneration,
-    summarizeTopic,
     updateMessageContent,
     regenerateResponse,
     fetchRawContent,

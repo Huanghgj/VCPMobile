@@ -232,12 +232,12 @@ watch(currentView, (val) => {
 
 const enableSystemMetadata = computed({
   get: () => tarvenStore.rules.find(r => r.id === 'system_meta_injection')?.isEnabled ?? true,
-  set: () => tarvenStore.toggleRule('system_meta_injection')
+  set: (value: boolean) => tarvenStore.setRuleEnabled('system_meta_injection', value)
 });
 
 const enableTimeAnchoring = computed({
   get: () => tarvenStore.rules.find(r => r.id === 'time_anchoring_v2')?.isEnabled ?? false,
-  set: () => tarvenStore.toggleRule('time_anchoring_v2')
+  set: (value: boolean) => tarvenStore.setRuleEnabled('time_anchoring_v2', value)
 });
 
 onMounted(() => {

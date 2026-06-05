@@ -9,7 +9,7 @@ const props = defineProps<{
   messageId: string;
 }>();
 
-const isExpanded = ref(false);
+const isExpanded = ref(!props.block.is_complete);
 
 const toggleExpand = () => {
   isExpanded.value = !isExpanded.value;
@@ -36,7 +36,12 @@ function escapeHtml(text: string): string {
 
 <template>
   <div class="vcp-thought-block">
-    <button class="vcp-thought-header" type="button" @click="toggleExpand">
+    <button
+      class="vcp-thought-header"
+      type="button"
+      data-vcp-ui-control="thought-toggle"
+      @click.stop="toggleExpand"
+    >
       <span class="vcp-thought-icon">
         <Brain :size="14" :stroke-width="2.2" />
       </span>
@@ -55,7 +60,7 @@ function escapeHtml(text: string): string {
         class="thought-body"
         v-html="
           block.nodes && block.nodes.length > 0
-            ? renderMarkdownNodes(block.nodes, messageId)
+            ? renderMarkdownNodes(block.nodes, messageId, block.hash)
             : escapeHtml(block.content || '')
         "
       />
@@ -148,6 +153,20 @@ html.dark .vcp-thought-block {
   opacity: 0.82;
   font-size: 0.9em;
   user-select: text;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.thought-body :deep(p),
+.thought-body :deep(ul),
+.thought-body :deep(ol),
+.thought-body :deep(blockquote) {
+  white-space: normal;
+}
+
+.thought-body :deep(pre) {
+  overflow-x: auto;
+  white-space: pre;
 }
 
 .animate-slide-down {

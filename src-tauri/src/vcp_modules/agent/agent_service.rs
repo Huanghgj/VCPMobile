@@ -263,6 +263,7 @@ async fn internal_write_agent_config<R: Runtime>(
                     data_type: SyncDataType::Agent,
                     hash: config_hash.clone(),
                     ts: now,
+                    owner_type: None,
                 });
             }
         }

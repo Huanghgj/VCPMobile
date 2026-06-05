@@ -5,6 +5,7 @@ import { useTopicStore } from "../../core/stores/topicListManager";
 import { useChatSessionStore } from "../../core/stores/chatSessionStore";
 import { useAssistantStore } from "../../core/stores/assistant";
 import { useLayoutStore } from "../../core/stores/layout";
+import { createDefaultTopicTitle } from "../../core/utils/topicTitle";
 
 const topicStore = useTopicStore();
 const sessionStore = useChatSessionStore();
@@ -57,11 +58,7 @@ const handleCreateTopic = async () => {
 
   isCreating.value = true;
 
-  const newTopicName = `新话题 ${new Date().toLocaleTimeString([], {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  })}`;
+  const newTopicName = createDefaultTopicTitle();
 
   try {
     const ownerType = assistantStore.agents.some((a) => a.id === currentItemId.value)

@@ -123,6 +123,7 @@ pub enum SyncCommand {
         data_type: SyncDataType,
         hash: String,
         ts: i64,
+        owner_type: Option<String>,
     },
     StartTopicMetadata,   // Phase 2 start
     StartTopicValidation, // Phase 2.5 start
@@ -697,8 +698,11 @@ async fn run_sync_session(
                                     let _ = ws_stream.close(None).await;
                                     break;
                                 },
-                                SyncCommand::NotifyLocalChange { id, data_type, hash, ts } => {
-                                    let msg = json!({ "type": "SYNC_ENTITY_UPDATE", "id": id, "dataType": data_type, "hash": hash, "ts": ts });
+                                SyncCommand::NotifyLocalChange { id, data_type, hash, ts, owner_type } => {
+                                    let mut msg = json!({ "type": "SYNC_ENTITY_UPDATE", "id": id, "dataType": data_type, "hash": hash, "ts": ts });
+                                    if let Some(owner_type) = owner_type {
+                                        msg["ownerType"] = json!(owner_type);
+                                    }
                                     let _ = ws_stream.send(Message::Text(msg.to_string().into())).await;
                                 },
                                 SyncCommand::StartTopicMetadata => {

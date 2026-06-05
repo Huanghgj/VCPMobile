@@ -23,6 +23,11 @@ export function useMessageEvents(containerRef: Ref<HTMLElement | null>) {
     if (!(e.target instanceof Element)) return;
     const target = e.target;
 
+    // 消息渲染器自身的控件只处理 UI 状态，不能落入 AI 生成按钮的发送逻辑。
+    if (target.closest('[data-vcp-ui-control]')) {
+      return;
+    }
+
     // 1. VCP 按钮点击 (e.g., [[点击按钮:xxx]])
     const vcpButton = target.closest('[data-vcp-button]');
     if (vcpButton) {

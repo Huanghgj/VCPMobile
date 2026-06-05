@@ -1,9 +1,11 @@
 import { defineStore } from "pinia";
 import { ref, computed } from "vue";
 import { invoke, Channel } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useChatSessionStore } from "./chatSessionStore";
 
 import { useNotificationStore } from "./notification";
+import { isTauriRuntime } from "../utils/runtime";
 
 /**
  * 话题接口定义
@@ -35,6 +37,31 @@ export const useTopicStore = defineStore("topic", () => {
 
   // --- 事件监听 (Event Listeners) ---
   // 注意：topic-index-updated 事件当前在 Rust 侧未被 emit，已移除死代码
+  let topicTitleUpdatedUnlisten: Promise<UnlistenFn> | null = null;
+
+  const applyTopicTitleUpdate = (topicId: string, title: string) => {
+    const index = topics.value.findIndex((t) => t.id === topicId);
+    if (index === -1 || !title) return;
+
+    topics.value[index] = { ...topics.value[index], name: title };
+    topics.value = [...topics.value];
+  };
+
+  const ensureTopicTitleListener = () => {
+    if (!isTauriRuntime() || topicTitleUpdatedUnlisten) return;
+
+    topicTitleUpdatedUnlisten = listen<{
+      topicId?: string;
+      title?: string;
+    }>("topic-title-updated", (event) => {
+      const { topicId, title } = event.payload || {};
+      if (topicId && title) {
+        applyTopicTitleUpdate(topicId, title);
+      }
+    });
+  };
+
+  ensureTopicTitleListener();
 
   /**
    * 使所有话题列表缓存失效
@@ -249,9 +276,7 @@ export const useTopicStore = defineStore("topic", () => {
 
       const index = topics.value.findIndex((t) => t.id === topicId);
       if (index !== -1) {
-        topics.value[index] = { ...topics.value[index], name: newTitle };
-        // 强制触发虚拟列表重绘
-        topics.value = [...topics.value];
+        applyTopicTitleUpdate(topicId, newTitle);
       }
     } catch (e) {
       console.error("[TopicStore] Failed to update topic title:", e);
