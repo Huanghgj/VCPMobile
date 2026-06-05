@@ -11,7 +11,7 @@ const statusConfig = computed(() => {
       return {
         color: 'bg-green-500',
         shadow: 'shadow-green-500/50',
-        animate: 'vcp-core-pulse',
+        animate: 'vcp-core-pulse vcp-decorative-motion',
         text: 'Core Active'
       };
     case 'initializing':

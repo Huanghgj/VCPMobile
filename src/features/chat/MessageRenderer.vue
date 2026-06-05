@@ -172,7 +172,7 @@ const renderHeavyContent = async () => {
   const mathElements = messageContentRef.value.querySelectorAll('.vcp-math-inline[data-latex], .vcp-math-block[data-latex]');
   if (mathElements.length > 0) {
     try {
-      const katex = getKatexRenderer();
+      const katex = await getKatexRenderer();
       mathElements.forEach((el) => {
         if (el.querySelector('.katex')) return; // already rendered
         const latex = el.getAttribute('data-latex');
@@ -193,7 +193,7 @@ const renderHeavyContent = async () => {
   const mermaidPlaceholders = messageContentRef.value.querySelectorAll('.mermaid-placeholder');
   if (mermaidPlaceholders.length > 0) {
     try {
-      const mermaid = getMermaidRenderer();
+      const mermaid = await getMermaidRenderer();
       for (const el of Array.from(mermaidPlaceholders)) {
         const placeholder = el as HTMLElement;
         if (placeholder.querySelector('svg')) continue; // already rendered

@@ -1,41 +1,23 @@
-import katex from "katex";
-import mermaid from "mermaid";
-
 let mermaidInitialized = false;
+let katexModulePromise: Promise<typeof import("katex")> | null = null;
+let mermaidModulePromise: Promise<typeof import("mermaid")> | null = null;
 
-const MERMAID_PRELOAD_SAMPLES = [
-  "flowchart TD\nA-->B",
-  "sequenceDiagram\nAlice->>Bob: Hi",
-  "classDiagram\nclass Animal",
-  "stateDiagram-v2\n[*] --> Still",
-  "erDiagram\nCUSTOMER ||--o{ ORDER : places",
-  "gantt\ntitle Demo\ndateFormat YYYY-MM-DD\nsection Work\nTask :a1, 2024-01-01, 1d",
-  'pie title Demo\n"Dogs" : 40\n"Cats" : 60',
-  "gitGraph\ncommit",
-  "journey\ntitle Day\nsection Work\nMake tea: 5: Me",
-  "C4Context\ntitle Demo\nPerson(user, \"User\")\nSystem(system, \"System\")\nRel(user, system, \"Uses\")",
-  "quadrantChart\ntitle Demo\nx-axis Low --> High\ny-axis Low --> High\nquadrant-1 Expand\nA: [0.3, 0.6]",
-  'xychart-beta\ntitle "Sales"\nx-axis [Jan, Feb]\ny-axis "Revenue" 0 --> 100\nbar [10, 20]',
-  "timeline\ntitle Demo\nsection Phase\n2024 : Event",
-  "mindmap\n  root((Demo))\n    Branch",
-  "sankey-beta\nA,B,1\nB,C,2",
-  "block-beta\ncolumns 1\nA",
-  "kanban\n  todo[Todo]\n    id1[Task]",
-  "requirementDiagram\nrequirement test_req {\nid: 1\ntext: demo\nrisk: high\nverifymethod: test\n}",
-  "architecture-beta\ngroup api(cloud)[API]\nservice server(server)[Server] in api",
-  "packet-beta\n0-7: Byte",
-  "radar-beta\naxis A\ncurve c{1}",
-  "ishikawa-beta\nroot((Problem))\n  Cause",
-  "venn-beta\nA, B: 1",
-  "treemap\nRoot\n  Child: 1",
-  "wardley-beta\ntitle Demo",
-];
+const loadKatexModule = () => {
+  katexModulePromise ||= import("katex");
+  return katexModulePromise;
+};
 
-export function getKatexRenderer() {
-  return katex;
+const loadMermaidModule = () => {
+  mermaidModulePromise ||= import("mermaid");
+  return mermaidModulePromise;
+};
+
+export async function getKatexRenderer() {
+  return (await loadKatexModule()).default;
 }
 
-export function getMermaidRenderer() {
+export async function getMermaidRenderer() {
+  const mermaid = (await loadMermaidModule()).default;
   if (!mermaidInitialized) {
     mermaid.initialize({ startOnLoad: false, theme: "dark" });
     mermaidInitialized = true;
@@ -44,14 +26,7 @@ export function getMermaidRenderer() {
 }
 
 export async function preloadRenderLibraries(): Promise<void> {
-  const renderer = getMermaidRenderer();
-  const mermaidResults = await Promise.allSettled(
-    MERMAID_PRELOAD_SAMPLES.map((sample) => renderer.parse(sample, { suppressErrors: true })),
-  );
-  const failedMermaidSamples = mermaidResults.filter((result) => result.status === "rejected").length;
-  if (failedMermaidSamples > 0) {
-    console.warn(`[RenderLibraryPreloader] ${failedMermaidSamples} Mermaid diagram samples failed to preload`);
-  }
+  await Promise.allSettled([loadKatexModule(), loadMermaidModule()]);
 
   if (document.fonts) {
     await Promise.allSettled([

@@ -7,7 +7,6 @@ import { useThemeStore } from './theme';
 import { useNotificationStore } from './notification';
 import { isTauriRuntime } from '../utils/runtime';
 import { useAvatarStore } from './avatar';
-import { preloadRenderLibraries } from '../utils/renderLibraryPreloader';
 
 export type AppState = 'PERMISSIONS' | 'BOOTING' | 'CONNECTING' | 'PRELOADING' | 'READY' | 'ERROR';
 
@@ -207,12 +206,6 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
 
     const frontendParallelTasks: PreloadTask[] = [
       {
-        label: 'RenderLibraries',
-        run: async () => {
-          await preloadRenderLibraries();
-        }
-      },
-      {
         label: 'Avatars',
         run: async () => {
           await avatarStore.preloadAvatars([
@@ -349,8 +342,7 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
           setState('BOOTING', 'Web 预览模式初始化');
           updatePhaseLabel('加载本地界面资源...');
           await themeStore.initTheme();
-          await themeStore.preloadBuiltInAssets();
-          await preloadRenderLibraries();
+          await themeStore.preloadCurrentThemeAssets();
           notificationStore.updateCoreStatus({
             status: 'disconnected',
             message: 'Web 预览模式（无核心服务）',
@@ -371,7 +363,7 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
         setState('PERMISSIONS', '检查系统权限完整性');
         updatePhaseLabel('预加载前端静态资源...');
         await themeStore.initTheme();
-        await themeStore.preloadBuiltInAssets();
+        await themeStore.preloadCurrentThemeAssets();
 
         const pStatus = await invoke<{ notification: boolean; storage: boolean; battery: boolean }>('plugin:vcp-mobile|check_all_permissions');
         if (!pStatus.notification || !pStatus.storage || !pStatus.battery) {

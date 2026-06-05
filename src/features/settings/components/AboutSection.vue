@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue';
+import { defineAsyncComponent, ref, onMounted, onUnmounted } from 'vue';
 import { getVersion } from '@tauri-apps/api/app';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import SettingsCard from '../../../components/settings/SettingsCard.vue';
@@ -7,7 +7,7 @@ import SettingsRow from '../../../components/settings/SettingsRow.vue';
 import UpdateSection from './UpdateSection.vue';
 import { useNotificationStore } from '../../../core/stores/notification';
 import { useThemeStore } from '../../../core/stores/theme';
-import WebGLFluidBackground from '../../../components/ui/WebGLFluidBackground.vue';
+const WebGLFluidBackground = defineAsyncComponent(() => import('../../../components/ui/WebGLFluidBackground.vue'));
 
 const themeStore = useThemeStore();
 
@@ -26,14 +26,49 @@ onMounted(async () => {
   }
 });
 
+onUnmounted(() => {
+  if (fluidIdleTimer) {
+    clearTimeout(fluidIdleTimer);
+    fluidIdleTimer = null;
+  }
+  fluidIdleDeadline = 0;
+});
+
 // 3D Parallax & Animation logic
 const hitboxRef = ref<HTMLElement | null>(null);
 const rotation = ref({ x: 0, y: 0 });
-const glowPos = ref({ x: 50, y: 50 });
 const isMixing = ref(false);
+const isFluidBackgroundActive = ref(false);
 const transitionStyle = ref('transform 0.2s ease-out');
 
 let animSessionId = 0;
+let fluidIdleTimer: ReturnType<typeof setTimeout> | null = null;
+let fluidIdleDeadline = 0;
+
+const armFluidIdleTimer = () => {
+  if (fluidIdleTimer) {
+    clearTimeout(fluidIdleTimer);
+  }
+
+  const remainingMs = Math.max(0, fluidIdleDeadline - Date.now());
+  fluidIdleTimer = setTimeout(() => {
+    if (Date.now() < fluidIdleDeadline) {
+      armFluidIdleTimer();
+      return;
+    }
+    isFluidBackgroundActive.value = false;
+    fluidIdleTimer = null;
+    fluidIdleDeadline = 0;
+  }, remainingMs);
+};
+
+const wakeFluidBackground = (durationMs = 1800) => {
+  isFluidBackgroundActive.value = true;
+  const nextDeadline = Date.now() + durationMs;
+  if (nextDeadline <= fluidIdleDeadline && fluidIdleTimer) return;
+  fluidIdleDeadline = nextDeadline;
+  armFluidIdleTimer();
+};
 
 const startAnimationSequence = async () => {
   animSessionId++;
@@ -95,10 +130,12 @@ const startAnimationSequence = async () => {
   await sleep(50);
   if (!checkAbort()) {
     transitionStyle.value = 'transform 0.2s ease-out';
+    isMixing.value = false;
   }
 };
 
 const handlePress = () => {
+  wakeFluidBackground(14000);
   if (!isMixing.value) {
     isMixing.value = true;
     startAnimationSequence();
@@ -106,6 +143,8 @@ const handlePress = () => {
 };
 
 const handleMove = (e: MouseEvent | TouchEvent) => {
+  if (e instanceof MouseEvent && !isMixing.value) return;
+  wakeFluidBackground(1800);
   if (!hitboxRef.value) return;
   
   // Intervene: Cancel sequence and track mouse/finger instantly
@@ -132,22 +171,25 @@ const handleMove = (e: MouseEvent | TouchEvent) => {
   const centerY = rect.height / 2;
   
   // Calculate target rotation with tuned sensitivity
-  let targetRotY = ((x - centerX) / centerX) * 150;
-  let targetRotX = ((centerY - y) / centerY) * 80;
+  const targetRotY = ((x - centerX) / centerX) * 150;
+  const targetRotX = ((centerY - y) / centerY) * 80;
   
   // Hard clamp to prevent flipping out or gimbal lock if dragged far off-center
   rotation.value.y = Math.max(-180, Math.min(180, targetRotY));
   rotation.value.x = Math.max(-90, Math.min(90, targetRotX));
-  
-  // Update glow position (0-100%)
-  glowPos.value.x = (x / rect.width) * 100;
-  glowPos.value.y = (y / rect.height) * 100;
+
 };
 
 const resetRotation = () => {
   animSessionId++;
+  isMixing.value = false;
   transitionStyle.value = 'transform 0.5s ease-out';
   rotation.value = { x: 0, y: 0 };
+  wakeFluidBackground(700);
+};
+
+const handleLogoTap = () => {
+  wakeFluidBackground(1800);
 };
 
 const showFeatures = () => {
@@ -173,8 +215,13 @@ const openFeedback = () => {
     class="flex flex-col flex-1 h-full relative bg-transparent overflow-hidden transition-colors duration-300"
     :class="themeStore.isDarkResolved ? 'theme-dark' : 'theme-light'"
   >
-    <!-- WebGL Fluid Background promoted to fullscreen backdrop (Z-0) -->
-    <WebGLFluidBackground class="absolute inset-0 w-full h-full pointer-events-none z-0" />
+    <!-- 静态低功耗底图常驻；WebGL 只在点击/拖动 Logo 时懒加载并短暂运行。 -->
+    <div class="fluid-static-background absolute inset-0 pointer-events-none z-0" />
+    <WebGLFluidBackground
+      v-if="isFluidBackgroundActive"
+      class="absolute inset-0 w-full h-full pointer-events-none z-0"
+      :active="true"
+    />
 
     <!-- Immersive Back Button -->
     <button 
@@ -211,6 +258,7 @@ const openFeedback = () => {
       @mouseleave="resetRotation"
       @touchmove.prevent="handleMove"
       @touchend="resetRotation"
+      @click="handleLogoTap"
       @mousedown="handlePress"
       @touchstart.passive="handlePress"
     >
@@ -239,11 +287,11 @@ const openFeedback = () => {
 
     <!-- Actions List -->
     <div class="px-4 space-y-4 relative z-10">
-      <SettingsCard class="!py-1.5 !backdrop-blur-3xl shadow-2xl transition-all duration-300">
+      <SettingsCard class="!py-1.5 shadow-lg transition-colors duration-200">
         <UpdateSection />
       </SettingsCard>
 
-      <SettingsCard class="!backdrop-blur-3xl shadow-2xl transition-all duration-300">
+      <SettingsCard class="shadow-lg transition-colors duration-200">
         <div class="divide-y transition-colors duration-300" :class="themeStore.isDarkResolved ? 'divide-white/10' : 'divide-black/5'">
           <SettingsRow 
             title="功能介绍" 
@@ -294,6 +342,21 @@ const openFeedback = () => {
 
 <style scoped>
 
+.fluid-static-background {
+  background:
+    radial-gradient(circle at 18% 80%, rgba(0, 229, 255, 0.34), transparent 42%),
+    radial-gradient(circle at 82% 76%, rgba(255, 51, 102, 0.28), transparent 46%),
+    radial-gradient(circle at 58% 78%, rgba(59, 130, 246, 0.30), transparent 50%),
+    linear-gradient(180deg, #f8fafc 0%, #eef6ff 100%);
+}
+
+.theme-dark .fluid-static-background {
+  background:
+    radial-gradient(circle at 18% 80%, rgba(0, 229, 255, 0.24), transparent 42%),
+    radial-gradient(circle at 82% 76%, rgba(255, 51, 102, 0.20), transparent 46%),
+    radial-gradient(circle at 58% 78%, rgba(59, 130, 246, 0.24), transparent 50%),
+    linear-gradient(180deg, #0f172a 0%, #111827 100%);
+}
 
 /* 胶片颗粒噪点层，使用 0KB 纯 SVG 分形噪声物理抹除大渐变色带 */
 .noise-overlay {
@@ -320,7 +383,7 @@ const openFeedback = () => {
 }
 
 .theme-dark :deep(.settings-card) {
-  background-color: rgba(255, 255, 255, 0.1) !important;
+  background-color: rgba(15, 23, 42, 0.82) !important;
   border-color: rgba(255, 255, 255, 0.1) !important;
   color: #ffffff !important;
 }
@@ -341,10 +404,10 @@ const openFeedback = () => {
 
 /* 亮色半透明毛玻璃卡片 */
 .theme-light :deep(.settings-card) {
-  background-color: rgba(255, 255, 255, 0.65) !important;
+  background-color: rgba(255, 255, 255, 0.88) !important;
   border-color: rgba(0, 0, 0, 0.05) !important;
-  backdrop-filter: blur(24px) !important;
-  box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.06), 0 1px 3px rgba(0, 0, 0, 0.02) !important;
+  backdrop-filter: none !important;
+  box-shadow: 0 8px 22px -12px rgba(0, 0, 0, 0.12), 0 1px 3px rgba(0, 0, 0, 0.02) !important;
   color: #1e293b !important;
 }
 

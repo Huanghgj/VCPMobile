@@ -15,6 +15,17 @@ const thumbnails = computed(() => themeStore.themeThumbnails);
 onMounted(async () => {
   try {
     await themeStore.fetchThemes();
+    window.requestIdleCallback
+      ? window.requestIdleCallback(() => {
+          themeStore.preloadThemeGalleryAssets().catch((e) => {
+            console.warn('[ThemePicker] Gallery preload failed:', e);
+          });
+        })
+      : window.setTimeout(() => {
+          themeStore.preloadThemeGalleryAssets().catch((e) => {
+            console.warn('[ThemePicker] Gallery preload failed:', e);
+          });
+        }, 600);
   } catch (e) {
     console.error('[ThemePicker] Initialization failed:', e);
   }

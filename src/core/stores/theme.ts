@@ -187,12 +187,26 @@ export const useThemeStore = defineStore('theme', () => {
     await applyThemeFile(savedTheme);
   };
 
-  const preloadBuiltInAssets = async () => {
+  const preloadCurrentThemeAssets = async () => {
     if (availableThemes.value.length === 0) {
       await fetchThemes();
     }
-    await preloadImages([...themeWallpapers.value, ...BUILT_IN_IMAGE_URLS]);
+
+    const theme = currentThemeInfo.value
+      || availableThemes.value.find((item) => item.fileName === currentTheme.value);
+    const currentWallpaperUrls = theme ? collectWallpaperUrls(theme) : [];
+    await preloadImages([...currentWallpaperUrls, ...BUILT_IN_IMAGE_URLS]);
   };
+
+  const preloadThemeGalleryAssets = async () => {
+    if (availableThemes.value.length === 0) {
+      await fetchThemes();
+    }
+    await preloadImages(themeWallpapers.value);
+  };
+
+  // Backward-compatible alias: keep startup callers cheap by preloading only the active theme.
+  const preloadBuiltInAssets = preloadCurrentThemeAssets;
 
   const applyTheme = (newMode: ThemeMode) => {
     const isDark =
@@ -285,6 +299,8 @@ export const useThemeStore = defineStore('theme', () => {
     applyThemeFile,
     initTheme,
     preloadBuiltInAssets,
+    preloadCurrentThemeAssets,
+    preloadThemeGalleryAssets,
     toggleTheme,
     setMode,
   };

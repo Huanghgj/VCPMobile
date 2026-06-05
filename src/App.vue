@@ -353,6 +353,9 @@ onMounted(async () => {
     }
   }
 
+  // Android WebView 省电默认档：装饰性无限动画不自动跑，点击/加载态再动。
+  document.documentElement.classList.add("vcp-battery-static");
+
   // 1. 同步挂载基础物理按键与系统事件监听 (混合应用黄金铁律：物理拦截最优先挂载，杜绝初始化阻塞失效)
   window.addEventListener("vcp-exit-requested", handleExitRequest);
   window.addEventListener("vcp-hardware-back", handleExitRequest);
@@ -392,6 +395,7 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
+  document.documentElement.classList.remove("vcp-battery-static");
   if (unlistenLog) unlistenLog();
   window.removeEventListener("vcp-exit-requested", handleExitRequest);
   window.removeEventListener("vcp-hardware-back", handleExitRequest);
@@ -557,6 +561,31 @@ body,
 .vcp-paused-animations *::before,
 .vcp-paused-animations *::after {
   animation-play-state: paused !important;
+}
+
+/* Android WebView 省电护栏：默认停掉装饰性无限动画，只保留加载/流式等有状态反馈。 */
+.vcp-battery-static .vcp-decorative-motion,
+.vcp-battery-static .vcp-decorative-motion::before,
+.vcp-battery-static .vcp-decorative-motion::after {
+  animation: none !important;
+  transition-duration: 0.01ms !important;
+}
+
+
+.vcp-battery-static .streaming .vcp-bubble-container::before {
+  animation: none !important;
+  opacity: 0.35 !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
 }
 
 

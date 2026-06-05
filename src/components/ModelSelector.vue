@@ -279,10 +279,10 @@ onUnmounted(() => {
               class="relative overflow-hidden flex items-center gap-3 px-4 py-3.5 rounded-2xl border border-black/5 dark:border-white/5 bg-gray-50/30 dark:bg-zinc-800/10">
               <div class="w-1 h-6 bg-gray-200 dark:bg-zinc-800 rounded-r-md"></div>
               <div class="flex-1 space-y-2">
-                <div class="h-4 w-1/2 bg-gray-200 dark:bg-zinc-800 rounded-md shimmer-bar"></div>
-                <div class="h-3 w-1/4 bg-gray-150 dark:bg-zinc-850 rounded-md shimmer-bar"></div>
+                <div class="h-4 w-1/2 bg-gray-200 dark:bg-zinc-800 rounded-md shimmer-bar vcp-decorative-motion"></div>
+                <div class="h-3 w-1/4 bg-gray-150 dark:bg-zinc-850 rounded-md shimmer-bar vcp-decorative-motion"></div>
               </div>
-              <div class="w-8 h-8 rounded-full bg-gray-200 dark:bg-zinc-800 shimmer-bar shrink-0"></div>
+              <div class="w-8 h-8 rounded-full bg-gray-200 dark:bg-zinc-800 shimmer-bar vcp-decorative-motion shrink-0"></div>
             </div>
           </div>
 

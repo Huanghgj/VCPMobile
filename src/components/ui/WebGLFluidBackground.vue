@@ -1,11 +1,18 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, watch } from 'vue';
+import { nextTick, ref, onMounted, onUnmounted, watch } from 'vue';
 import { useThemeStore } from '../../core/stores/theme';
 import { useLayoutStore } from '../../core/stores/layout';
+
+const props = withDefaults(defineProps<{
+  active?: boolean;
+}>(), {
+  active: false,
+});
 
 const themeStore = useThemeStore();
 const layoutStore = useLayoutStore();
 const canvasRef = ref<HTMLCanvasElement | null>(null);
+const isCanvasReady = ref(false);
 
 let gl: WebGLRenderingContext | null = null;
 let program: WebGLProgram | null = null;
@@ -14,10 +21,11 @@ let initTimer: ReturnType<typeof setTimeout> | null = null;
 let startTime = 0;
 let resizeObserver: ResizeObserver | null = null;
 let renderUntil = 0;
+let lastRenderTimeSeconds = 0;
 
-const INITIAL_RENDER_BURST_MS = 1200;
-const INTERACTION_RENDER_BURST_MS = 1400;
-const RESIZE_RENDER_BURST_MS = 500;
+const INTERACTION_RENDER_BURST_MS = 1200;
+const RELEASE_RENDER_BURST_MS = 450;
+const RESIZE_RENDER_BURST_MS = 0;
 
 // WebGL uniform locations
 let uResolutionLoc: WebGLUniformLocation | null = null;
@@ -32,7 +40,7 @@ const targetMousePos = { x: 0.5, y: 0.5 };
 let activeValue = 0.0;
 let targetActiveValue = 0.0;
 
-const shouldRender = () => !layoutStore.rightDrawerOpen && !document.hidden;
+const shouldRender = () => props.active && !layoutStore.rightDrawerOpen && !document.hidden;
 
 const stopRenderLoop = () => {
   renderUntil = 0;
@@ -48,6 +56,7 @@ const startRenderLoop = () => {
 };
 
 const requestRenderBurst = (durationMs = INTERACTION_RENDER_BURST_MS) => {
+  if (!props.active) return;
   renderUntil = Math.max(renderUntil, performance.now() + durationMs);
   startRenderLoop();
 };
@@ -175,9 +184,71 @@ const createShader = (gl: WebGLRenderingContext, type: number, source: string): 
   return shader;
 };
 
-const initWebGL = () => {
+
+const resizeCanvasToElement = () => {
   const canvas = canvasRef.value;
   if (!canvas) return;
+  const host = canvas.parentElement || canvas;
+  const rect = host.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return;
+
+  const dpr = Math.min(window.devicePixelRatio || 1, 1.25);
+  const width = Math.max(1, Math.floor(rect.width * dpr));
+  const height = Math.max(1, Math.floor(rect.height * dpr));
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+  }
+  if (gl) {
+    gl.viewport(0, 0, canvas.width, canvas.height);
+  }
+};
+
+const drawFrame = (now = performance.now(), advanceTime = true) => {
+  if (!gl || !program) return;
+
+  const canvas = canvasRef.value;
+  if (!canvas) return;
+
+  if (advanceTime) {
+    lastRenderTimeSeconds = (now - startTime) / 1000.0;
+  }
+
+  // Smooth Interpolation of physical interactions (Ease-out logic)
+  mousePos.x += (targetMousePos.x - mousePos.x) * 0.15;
+  mousePos.y += (targetMousePos.y - mousePos.y) * 0.15;
+  activeValue += (targetActiveValue - activeValue) * 0.12;
+
+  // Clear & Setup uniforms
+  gl.clearColor(0.0, 0.0, 0.0, 1.0);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
+  gl.useProgram(program);
+
+  // Upload uniform parameters to GPU
+  gl.uniform2f(uResolutionLoc, canvas.width, canvas.height);
+  gl.uniform1f(uTimeLoc, lastRenderTimeSeconds);
+  gl.uniform2f(uMouseLoc, mousePos.x, mousePos.y);
+  gl.uniform1f(uActiveLoc, activeValue);
+  gl.uniform1f(uIsDarkLoc, themeStore.isDarkResolved ? 1.0 : 0.0);
+
+  // Draw full viewport quad
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+  if (!isCanvasReady.value) {
+    isCanvasReady.value = true;
+  }
+};
+
+const renderStaticFrame = () => {
+  if (!shouldRender()) return;
+  resizeCanvasToElement();
+  drawFrame(performance.now(), false);
+};
+
+const initWebGL = () => {
+  const canvas = canvasRef.value;
+  if (!canvas || !props.active) return;
+  isCanvasReady.value = false;
 
   gl = canvas.getContext('webgl', { 
     alpha: false, 
@@ -194,17 +265,28 @@ const initWebGL = () => {
 
   const vs = createShader(gl, gl.VERTEX_SHADER, vsSource);
   const fs = createShader(gl, gl.FRAGMENT_SHADER, fsSource);
-  if (!vs || !fs) return;
+  if (!vs || !fs) {
+    gl = null;
+    return;
+  }
 
   program = gl.createProgram();
-  if (!program) return;
+  if (!program) {
+    gl = null;
+    return;
+  }
 
   gl.attachShader(program, vs);
   gl.attachShader(program, fs);
   gl.linkProgram(program);
+  gl.deleteShader(vs);
+  gl.deleteShader(fs);
 
   if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
     console.error('[WebGL] Link error:', gl.getProgramInfoLog(program));
+    gl.deleteProgram(program);
+    program = null;
+    gl = null;
     return;
   }
 
@@ -236,7 +318,11 @@ const initWebGL = () => {
   uIsDarkLoc = gl.getUniformLocation(program, 'u_is_dark');
 
   startTime = performance.now();
-  requestRenderBurst(INITIAL_RENDER_BURST_MS);
+  lastRenderTimeSeconds = 0;
+  renderStaticFrame();
+  if (props.active) {
+    requestRenderBurst(INTERACTION_RENDER_BURST_MS);
+  }
 };
 
 const renderLoop = () => {
@@ -244,44 +330,26 @@ const renderLoop = () => {
   if (!shouldRender()) return;
   if (!gl || !program) return;
 
-  const canvas = canvasRef.value;
-  if (!canvas) return;
-
-  // Smooth Interpolation of physical interactions (Ease-out logic)
-  mousePos.x += (targetMousePos.x - mousePos.x) * 0.15;
-  mousePos.y += (targetMousePos.y - mousePos.y) * 0.15;
-  activeValue += (targetActiveValue - activeValue) * 0.12;
-
-  // Clear & Setup uniforms
-  gl.clearColor(0.0, 0.0, 0.0, 1.0);
-  gl.clear(gl.COLOR_BUFFER_BIT);
-
-  gl.useProgram(program);
-
-  // Upload uniform parameters to GPU
-  gl.uniform2f(uResolutionLoc, canvas.width, canvas.height);
   const now = performance.now();
-  gl.uniform1f(uTimeLoc, (now - startTime) / 1000.0);
-  gl.uniform2f(uMouseLoc, mousePos.x, mousePos.y);
-  gl.uniform1f(uActiveLoc, activeValue);
-  gl.uniform1f(uIsDarkLoc, themeStore.isDarkResolved ? 1.0 : 0.0);
-
-  // Draw full viewport quad
-  gl.drawArrays(gl.TRIANGLES, 0, 6);
+  drawFrame(now, true);
 
   if (now < renderUntil || hasTransientMotion()) {
     animationFrameId = requestAnimationFrame(renderLoop);
   } else {
     renderUntil = 0;
+    targetActiveValue = 0.0;
+    renderStaticFrame();
   }
 };
 
 // Input event tracking helpers
 const trackInteraction = (e: Event) => {
+  if (!props.active) return;
   const canvas = canvasRef.value;
   if (!canvas) return;
 
   const rect = canvas.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return;
   let clientX = 0;
   let clientY = 0;
 
@@ -308,56 +376,76 @@ const trackInteraction = (e: Event) => {
 
 const releaseInteraction = () => {
   targetActiveValue = 0.0; // Slowly decay warp force
-  requestRenderBurst();
+  requestRenderBurst(RELEASE_RENDER_BURST_MS);
 };
 
-let boundParent: HTMLElement | null = null;
+let hasGlobalInteractionListeners = false;
+
+const setupCanvasRuntime = () => {
+  const canvas = canvasRef.value;
+  if (!canvas) return;
+
+  if (!resizeObserver) {
+    resizeObserver = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const { width, height } = entry.contentRect;
+        if (width <= 0 || height <= 0) continue;
+        renderStaticFrame();
+        if (props.active && RESIZE_RENDER_BURST_MS > 0) {
+          requestRenderBurst(RESIZE_RENDER_BURST_MS);
+        }
+      }
+    });
+    resizeObserver.observe(canvas.parentElement || canvas);
+  }
+
+  if (!hasGlobalInteractionListeners) {
+    hasGlobalInteractionListeners = true;
+    window.addEventListener('mousemove', trackInteraction, { passive: true });
+    window.addEventListener('mouseleave', releaseInteraction);
+    window.addEventListener('touchmove', trackInteraction, { passive: true });
+    window.addEventListener('touchend', releaseInteraction);
+    window.addEventListener('mousedown', trackInteraction);
+    window.addEventListener('touchstart', trackInteraction, { passive: true });
+  }
+};
+
+const scheduleInit = async () => {
+  if (!props.active || gl || initTimer) return;
+
+  await nextTick();
+  if (!props.active || !canvasRef.value) return;
+
+  initTimer = setTimeout(() => {
+    initTimer = null;
+    if (!props.active) return;
+    initWebGL();
+    setupCanvasRuntime();
+    requestRenderBurst(INTERACTION_RENDER_BURST_MS);
+  }, 120);
+};
 
 const syncRenderLoop = () => {
-  if (shouldRender()) {
+  if (!shouldRender()) {
+    stopRenderLoop();
+    return;
+  }
+
+  if (!gl) {
+    void scheduleInit();
+    return;
+  }
+
+  if (RESIZE_RENDER_BURST_MS > 0) {
     requestRenderBurst(RESIZE_RENDER_BURST_MS);
   } else {
-    stopRenderLoop();
+    renderStaticFrame();
   }
 };
 
 onMounted(() => {
   document.addEventListener('visibilitychange', syncRenderLoop);
-
-  // Let the browser settle before compiling shader
-  initTimer = setTimeout(() => {
-    initTimer = null;
-    initWebGL();
-
-    const canvas = canvasRef.value;
-    if (canvas) {
-      // 坚如磐石的 ResizeObserver，完美解决 SlidePage 缓动滑入期间宽度/高度动态变更导致的尺寸锁定问题
-      resizeObserver = new ResizeObserver((entries) => {
-        for (const entry of entries) {
-          const { width, height } = entry.contentRect;
-          const dpr = Math.min(window.devicePixelRatio || 1, 2);
-          canvas.width = Math.floor(width * dpr);
-          canvas.height = Math.floor(height * dpr);
-          if (gl) {
-            gl.viewport(0, 0, canvas.width, canvas.height);
-          }
-          requestRenderBurst(RESIZE_RENDER_BURST_MS);
-        }
-      });
-      resizeObserver.observe(canvas.parentElement || canvas);
-
-      // Zero-intrusive Parent Interaction Listener
-      if (canvas.parentElement) {
-        boundParent = canvas.parentElement;
-        boundParent.addEventListener('mousemove', trackInteraction);
-        boundParent.addEventListener('mouseleave', releaseInteraction);
-        boundParent.addEventListener('touchmove', trackInteraction, { passive: false });
-        boundParent.addEventListener('touchend', releaseInteraction);
-        boundParent.addEventListener('mousedown', trackInteraction);
-        boundParent.addEventListener('touchstart', trackInteraction, { passive: true });
-      }
-    }
-  }, 100);
+  void scheduleInit();
 });
 
 onUnmounted(() => {
@@ -372,14 +460,14 @@ onUnmounted(() => {
     resizeObserver.disconnect();
   }
 
-  // Clean up event listeners on parent
-  if (boundParent) {
-    boundParent.removeEventListener('mousemove', trackInteraction);
-    boundParent.removeEventListener('mouseleave', releaseInteraction);
-    boundParent.removeEventListener('touchmove', trackInteraction);
-    boundParent.removeEventListener('touchend', releaseInteraction);
-    boundParent.removeEventListener('mousedown', trackInteraction);
-    boundParent.removeEventListener('touchstart', trackInteraction);
+  if (hasGlobalInteractionListeners) {
+    window.removeEventListener('mousemove', trackInteraction);
+    window.removeEventListener('mouseleave', releaseInteraction);
+    window.removeEventListener('touchmove', trackInteraction);
+    window.removeEventListener('touchend', releaseInteraction);
+    window.removeEventListener('mousedown', trackInteraction);
+    window.removeEventListener('touchstart', trackInteraction);
+    hasGlobalInteractionListeners = false;
   }
 
   if (gl && program) {
@@ -392,12 +480,27 @@ onUnmounted(() => {
   program = null;
 });
 
+watch(() => props.active, (active) => {
+  if (active) {
+    targetActiveValue = 1.0;
+    void scheduleInit();
+    requestRenderBurst(INTERACTION_RENDER_BURST_MS);
+  } else {
+    targetActiveValue = 0.0;
+    stopRenderLoop();
+  }
+});
+
 // Proactively update dark mode value inside running loop when theme changes
 watch(() => themeStore.isDarkResolved, (isDark) => {
   if (gl && program && uIsDarkLoc) {
     gl.useProgram(program);
     gl.uniform1f(uIsDarkLoc, isDark ? 1.0 : 0.0);
-    requestRenderBurst(RESIZE_RENDER_BURST_MS);
+    if (props.active && RESIZE_RENDER_BURST_MS > 0) {
+      requestRenderBurst(RESIZE_RENDER_BURST_MS);
+    } else {
+      renderStaticFrame();
+    }
   }
 });
 
@@ -405,8 +508,63 @@ watch(() => layoutStore.rightDrawerOpen, syncRenderLoop);
 </script>
 
 <template>
-  <canvas 
-    ref="canvasRef" 
-    class="w-full h-full block bg-transparent pointer-events-none"
-  />
+  <div class="vcp-fluid-bg">
+    <div class="vcp-fluid-static"></div>
+    <canvas
+      ref="canvasRef"
+      class="vcp-fluid-canvas"
+      :class="{ 'is-ready': active && isCanvasReady }"
+    />
+  </div>
 </template>
+
+<style scoped>
+.vcp-fluid-bg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #f8fafc;
+}
+
+.vcp-fluid-static,
+.vcp-fluid-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.vcp-fluid-static {
+  background:
+    radial-gradient(circle at 18% 81%, rgba(0, 224, 255, 0.34), transparent 34%),
+    radial-gradient(circle at 82% 77%, rgba(255, 51, 102, 0.30), transparent 38%),
+    radial-gradient(circle at 42% 72%, rgba(104, 77, 244, 0.30), transparent 36%),
+    linear-gradient(180deg, #f8fafc 0%, #eef6ff 100%);
+}
+
+.vcp-fluid-canvas {
+  display: block;
+  background: transparent;
+  opacity: 0;
+  transition: opacity 0.18s ease-out;
+}
+
+.vcp-fluid-canvas.is-ready {
+  opacity: 1;
+}
+
+:global(html.dark) .vcp-fluid-bg {
+  background: #0f172a;
+}
+
+:global(html.dark) .vcp-fluid-static {
+  background:
+    radial-gradient(circle at 18% 81%, rgba(0, 224, 255, 0.24), transparent 34%),
+    radial-gradient(circle at 82% 77%, rgba(255, 51, 102, 0.22), transparent 38%),
+    radial-gradient(circle at 42% 72%, rgba(104, 77, 244, 0.28), transparent 36%),
+    linear-gradient(180deg, #0f172a 0%, #111827 100%);
+}
+</style>

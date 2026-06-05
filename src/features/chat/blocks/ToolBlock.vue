@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue';
+import { computed, ref, onMounted, onUnmounted } from 'vue';
 import { ChevronDown, ChevronUp, Settings, Loader2 } from 'lucide-vue-next';
 import type { ContentBlock } from '../../../core/types/chat';
 
-defineProps<{
+const props = defineProps<{
   type: 'tool-use' | 'tool-result';
   content?: string;
   block: ContentBlock;
@@ -12,6 +12,8 @@ defineProps<{
 const isExpanded = ref(false);
 const toolBlockRef = ref<HTMLElement | null>(null);
 let observer: IntersectionObserver | null = null;
+
+const isToolAnimating = computed(() => props.type === 'tool-use' && !props.block.is_complete);
 
 onMounted(() => {
   if (!toolBlockRef.value) return;
@@ -53,6 +55,7 @@ const isImageValue = (key: string, value: string): boolean => {
 <template>
   <div ref="toolBlockRef" class="vcp-tool-block my-2 rounded-xl transition-all duration-300 overflow-hidden" :class="[
     type === 'tool-use' ? 'is-tool-use' : 'is-tool-result tool-bubble',
+    isToolAnimating ? 'is-tool-animating' : '',
     isExpanded ? 'shadow-md' : 'shadow-sm'
   ]">
     <!-- Header -->
@@ -168,9 +171,9 @@ const isImageValue = (key: string, value: string): boolean => {
 }
 
 /* 离屏时暂停无限动画以节省 GPU */
-.vcp-tool-block.vcp-animation-paused.is-tool-use,
-.vcp-tool-block.vcp-animation-paused.is-tool-use::after,
-.vcp-tool-block.vcp-animation-paused.is-tool-use .tool-icon-container {
+.vcp-tool-block.vcp-animation-paused.is-tool-animating,
+.vcp-tool-block.vcp-animation-paused.is-tool-animating::after,
+.vcp-tool-block.vcp-animation-paused.is-tool-animating .tool-icon-container {
   animation-play-state: paused !important;
 }
 
@@ -178,10 +181,13 @@ const isImageValue = (key: string, value: string): boolean => {
 .vcp-tool-block.is-tool-use {
   background: linear-gradient(145deg, #3a7bd5 0%, #00d2ff 100%) !important;
   background-size: 200% 200% !important;
-  animation: vcp-bubble-background-flow-kf 20s ease-in-out infinite;
   color: #ffffff !important;
   border: none !important;
   position: relative;
+}
+
+.vcp-tool-block.is-tool-animating {
+  animation: vcp-bubble-background-flow-kf 20s ease-in-out infinite;
 }
 
 .vcp-tool-block.is-tool-use::after {
@@ -196,7 +202,6 @@ const isImageValue = (key: string, value: string): boolean => {
   padding: 2px;
   background: linear-gradient(60deg, #76c4f7, #00d2ff, #3a7bd5, #ffffff, #3a7bd5, #00d2ff, #76c4f7);
   background-size: 300% 300%;
-  animation: vcp-bubble-border-flow-kf 7s linear infinite;
   -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
   mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
   -webkit-mask-composite: xor;
@@ -213,6 +218,13 @@ const isImageValue = (key: string, value: string): boolean => {
 .vcp-tool-block.is-tool-use .tool-icon-container {
   background: transparent !important;
   color: rgba(255, 255, 255, 0.9) !important;
+}
+
+.vcp-tool-block.is-tool-animating::after {
+  animation: vcp-bubble-border-flow-kf 7s linear infinite;
+}
+
+.vcp-tool-block.is-tool-animating .tool-icon-container {
   animation: vcp-icon-rotate 4s linear infinite;
 }
 
