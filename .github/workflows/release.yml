@@ -1,15 +1,12 @@
 name: Android Release
 
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
       release_tag:
         description: 'Release tag to build and publish assets to'
         required: true
-        default: 'v1.0.1'
+        default: 'v1.0.3'
   release:
     types:
       - published
@@ -33,9 +30,6 @@ jobs:
       ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
       - name: Resolve release metadata
         id: meta
         shell: bash
@@ -59,6 +53,11 @@ jobs:
           VERSION="${TAG_NAME#v}"
           echo "tag=${TAG_NAME}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.meta.outputs.tag }}
 
       - name: Setup Java
         uses: actions/setup-java@v4

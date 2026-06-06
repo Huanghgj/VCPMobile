@@ -379,10 +379,24 @@ let injectedStyleSignature = "";
 watch(
   () => props.message.blocks,
   (blocks) => {
-    if (!blocks) return;
+    if (!blocks) {
+      if (injectedStyleSignature) {
+        removeScopedCss(props.message.id);
+        injectedStyleSignature = "";
+      }
+      return;
+    }
     const styleBlocks = blocks.filter((block) => block.type === "style" && block.content);
     const styleSignature = styleBlocks.map((block) => block.hash || block.content).join("|");
+    if (!styleSignature) {
+      if (injectedStyleSignature) {
+        removeScopedCss(props.message.id);
+        injectedStyleSignature = "";
+      }
+      return;
+    }
     if (styleSignature === injectedStyleSignature) return;
+    removeScopedCss(props.message.id);
     injectedStyleSignature = styleSignature;
 
     for (const block of styleBlocks) {

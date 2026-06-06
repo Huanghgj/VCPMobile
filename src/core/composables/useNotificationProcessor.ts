@@ -218,7 +218,8 @@ export function useNotificationProcessor() {
   ].filter(Boolean) as { label: string; value: string }[];
 
   const buildRagRows = (results: any[]) => results.slice(0, 6).map((result, index) => {
-    const sourceFile = compactFileName(result?.sourceFile || result?.fullPath || result?.file);
+    const sourcePath = result?.sourceFile || result?.fullPath || result?.file || result?.path;
+    const sourceFile = compactFileName(sourcePath);
     const chips = [
       result?.source ? String(result.source) : 'memory',
       typeof result?.retrieval_rank !== 'undefined' ? `retrieval#${result.retrieval_rank}` : '',
@@ -233,6 +234,11 @@ export function useNotificationProcessor() {
       body: resultText(result, 260),
       chips,
       metrics: resultStructuredMetrics(result),
+      source: result?.source ? String(result.source) : undefined,
+      path: sourcePath ? String(sourcePath) : undefined,
+      snippet: result?.snippet ? stringifyCompact(result.snippet, 260) : undefined,
+      metadata: result?.metadata || result?.meta,
+      raw: result,
     };
   });
 

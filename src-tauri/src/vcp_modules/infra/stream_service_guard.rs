@@ -46,6 +46,7 @@ impl<R: Runtime> StreamServiceGuard<R> {
                 self.log_prefix,
                 e
             );
+            return;
         }
         self.active = false;
     }

@@ -25,15 +25,27 @@ export function useNotificationPresentation() {
   const getDistance = (item: any): { value: string; isEstimated: boolean } | null => {
     if (!item) return null;
 
-    if (typeof item.distance === 'number') {
-      return { value: item.distance.toFixed(4), isEstimated: false };
-    }
-    if (typeof item.normalized_geo === 'number') {
-      return { value: item.normalized_geo.toFixed(4), isEstimated: false };
+    const parseMetricNumber = (value: unknown): number | null => {
+      if (typeof value === 'number' && Number.isFinite(value)) return value;
+      if (typeof value === 'string' && value.trim()) {
+        const parsed = Number.parseFloat(value);
+        return Number.isFinite(parsed) ? parsed : null;
+      }
+      return null;
+    };
+
+    const distance = parseMetricNumber(item.distance);
+    if (distance !== null) {
+      return { value: distance.toFixed(4), isEstimated: false };
     }
 
-    const score = item.score ?? item.rerank_score ?? item.original_score ?? item.rrf_score;
-    if (typeof score === 'number' && score > 0) {
+    const normalizedGeo = parseMetricNumber(item.normalized_geo);
+    if (normalizedGeo !== null) {
+      return { value: normalizedGeo.toFixed(4), isEstimated: false };
+    }
+
+    const score = parseMetricNumber(item.score ?? item.rerank_score ?? item.original_score);
+    if (score !== null && score > 0) {
       const est = (1 / score) - 1;
       return { value: est.toFixed(4), isEstimated: true };
     }

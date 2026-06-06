@@ -54,7 +54,7 @@ pub struct StreamEvent {
     pub timestamp: Option<u64>, // ⚡ 新增物理落笔时间戳
 }
 
-// 猫娘把 data URL 外衣剥开，只把干净 base64 喂给 VCP 喵♡
+// 将 data URL 拆成模型 API 需要的裸 base64 与格式字段。
 fn split_audio_data_url(audio_url: &str) -> (String, &'static str) {
     if let Some((meta, data)) = audio_url.split_once(',') {
         let format = if meta.contains("audio/aac") {
@@ -312,7 +312,13 @@ pub async fn perform_vcp_request<R: Runtime>(
                                 .get("name")
                                 .and_then(|n| n.as_str())
                                 .filter(|n| !n.is_empty())
-                                .unwrap_or(&clean_path);
+                                .or_else(|| {
+                                    std::path::Path::new(&clean_path)
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .filter(|n| !n.is_empty())
+                                })
+                                .unwrap_or("附件文件");
                             let path_buf = std::path::PathBuf::from(&clean_path);
 
                             let mut converted = false;

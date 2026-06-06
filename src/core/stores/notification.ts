@@ -23,6 +23,11 @@ export interface VcpNotification {
       body?: string;
       chips?: string[];
       metrics?: { label: string; value: string }[];
+      source?: string;
+      path?: string;
+      snippet?: string;
+      metadata?: Record<string, unknown>;
+      raw?: unknown;
     }[];
   };
   timestamp: number;

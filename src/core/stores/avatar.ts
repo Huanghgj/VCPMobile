@@ -251,9 +251,10 @@ export const useAvatarStore = defineStore("avatar", () => {
     const results = await Promise.allSettled(
       uniqueItems.map(async (item) => {
         const url = await getAvatarUrl(item.ownerType, item.ownerId);
-        if (url) {
-          await preloadImage(url);
+        if (!url) {
+          throw new Error(`No avatar URL for ${item.ownerType}:${item.ownerId}`);
         }
+        await preloadImage(url);
       }),
     );
 

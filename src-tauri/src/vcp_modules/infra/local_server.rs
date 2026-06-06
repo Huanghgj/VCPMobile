@@ -33,7 +33,7 @@ fn abort_active_request_with_retry(
                 return;
             }
 
-            // thinking 事件可能比 ActiveRequests 注册更早，重试夹紧竞态，别让断开的浮窗继续偷电喵♡
+            // thinking 事件可能比 ActiveRequests 注册更早，短暂重试可覆盖注册竞态。
             if attempt < 19 {
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
@@ -130,7 +130,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 "handle_assistant_chat_stream" => {
                     log::info!("[LocalServer/WS] Handling assistant chat stream...");
                     let payload_val = req["payload"].clone();
-                    let payload: crate::vcp_modules::agent_chat_application_service::AssistantChatPayload =
+                    let mut payload: crate::vcp_modules::agent_chat_application_service::AssistantChatPayload =
                         match serde_json::from_value(payload_val) {
                             Ok(p) => p,
                             Err(e) => {
@@ -138,6 +138,19 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 continue;
                             }
                         };
+
+                    let fallback_message_id = format!(
+                        "msg_{}_{}",
+                        payload.agent_id,
+                        crate::vcp_modules::infra::utils::now_millis()
+                    );
+                    let request_message_id = payload
+                        .message_id
+                        .clone()
+                        .unwrap_or_else(|| fallback_message_id.clone());
+                    if payload.message_id.is_none() {
+                        payload.message_id = Some(fallback_message_id);
+                    }
 
                     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
                     let channel = tauri::ipc::Channel::new(move |event| {
@@ -164,40 +177,34 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         .state::<crate::vcp_modules::vcp_client::ActiveRequests>()
                         .0
                         .clone();
-                    let mut last_message_id: Option<String> = None;
+                    let mut last_message_id: Option<String> = Some(request_message_id);
 
                     loop {
-                        let event = if last_message_id.is_none() {
-                            // 首个 thinking 事件携带后端 messageId；先拿到它，再监听断连，避免无 ID 时误放生后台请求。
-                            rx.recv().await
-                        } else {
-                            tokio::select! {
-                                event = rx.recv() => event,
-                                socket_msg = receiver.next() => {
-                                    match socket_msg {
-                                        Some(Ok(Message::Close(_))) | None => {
-                                            // 浮窗关掉但模型还在等 token 时也要立刻中止，别让保活服务在后台偷偷榨电喵♡
-                                            if let Some(message_id) = last_message_id.take() {
-                                                abort_active_request_with_retry(
-                                                    active_requests_for_abort.clone(),
-                                                    message_id,
-                                                );
-                                            }
-                                            break;
+                        let event = tokio::select! {
+                            event = rx.recv() => event,
+                            socket_msg = receiver.next() => {
+                                match socket_msg {
+                                    Some(Ok(Message::Close(_))) | None => {
+                                        if let Some(message_id) = last_message_id.take() {
+                                            abort_active_request_with_retry(
+                                                active_requests_for_abort.clone(),
+                                                message_id,
+                                            );
                                         }
-                                        Some(Err(e)) => {
-                                            log::warn!("[LocalServer/WS] Floating socket receive error: {}", e);
-                                            if let Some(message_id) = last_message_id.take() {
-                                                abort_active_request_with_retry(
-                                                    active_requests_for_abort.clone(),
-                                                    message_id,
-                                                );
-                                            }
-                                            break;
+                                        break;
+                                    }
+                                    Some(Err(e)) => {
+                                        log::warn!("[LocalServer/WS] Floating socket receive error: {}", e);
+                                        if let Some(message_id) = last_message_id.take() {
+                                            abort_active_request_with_retry(
+                                                active_requests_for_abort.clone(),
+                                                message_id,
+                                            );
                                         }
-                                        Some(Ok(_)) => {
-                                            continue;
-                                        }
+                                        break;
+                                    }
+                                    Some(Ok(_)) => {
+                                        continue;
                                     }
                                 }
                             }
@@ -218,7 +225,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         }
 
                         if sender.send(Message::Text(event_json)).await.is_err() {
-                            // WebSocket 断了就拔掉流式请求，别让后台继续乱射 token 耗电喵♡
+                            // WebSocket 断开后立即中止对应流式请求，避免后台继续耗电。
                             if let Some(message_id) = last_message_id.take() {
                                 abort_active_request_with_retry(
                                     active_requests_for_abort.clone(),

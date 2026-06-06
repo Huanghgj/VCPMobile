@@ -125,6 +125,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
 
       if (isStaleLoad() || sessionStore.currentTopicId !== requestedTopicId || cancelledByTopicChange) {
         completeLoad();
+        return;
       }
 
       if (total === 0) {
@@ -134,6 +135,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
         }
         hasMoreHistory.value = false;
         completeLoad();
+        return;
       }
 
       await completePromise;

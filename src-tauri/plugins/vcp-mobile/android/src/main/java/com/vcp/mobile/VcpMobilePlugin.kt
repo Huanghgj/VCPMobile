@@ -931,16 +931,16 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
     // ==================================================================
     private fun isSafeLocalPath(context: Context, path: String): Boolean {
         return try {
-            val file = java.io.File(path).canonicalFile
-            val cacheDir = context.cacheDir.canonicalFile
-            val filesDir = context.filesDir.canonicalFile
-            val externalFilesDir = context.getExternalFilesDir(null)?.canonicalFile
-            val externalCacheDir = context.externalCacheDir?.canonicalFile
+            val file = java.io.File(path).canonicalFile.toPath()
+            val cacheDir = context.cacheDir.canonicalFile.toPath()
+            val filesDir = context.filesDir.canonicalFile.toPath()
+            val externalFilesDir = context.getExternalFilesDir(null)?.canonicalFile?.toPath()
+            val externalCacheDir = context.externalCacheDir?.canonicalFile?.toPath()
 
-            file.path.startsWith(cacheDir.path) ||
-            file.path.startsWith(filesDir.path) ||
-            (externalFilesDir != null && file.path.startsWith(externalFilesDir.path)) ||
-            (externalCacheDir != null && file.path.startsWith(externalCacheDir.path))
+            file.startsWith(cacheDir) ||
+            file.startsWith(filesDir) ||
+            (externalFilesDir != null && file.startsWith(externalFilesDir)) ||
+            (externalCacheDir != null && file.startsWith(externalCacheDir))
         } catch (e: Exception) {
             false
         }

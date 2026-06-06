@@ -197,6 +197,8 @@ pub struct AssistantChatPayload {
     pub temp_messages: Vec<crate::vcp_modules::chat::topic_service::TempMessage>,
     pub vcp_url: String,
     pub vcp_api_key: String,
+    #[serde(default)]
+    pub message_id: Option<String>,
 }
 
 #[tauri::command]
@@ -211,13 +213,15 @@ pub async fn handle_assistant_chat_stream(
     let temp_messages = payload.temp_messages;
 
     let timestamp = crate::vcp_modules::infra::utils::now_millis();
-    let thinking_id = format!("msg_{}_{}", agent_id, timestamp);
+    let thinking_id = payload
+        .message_id
+        .unwrap_or_else(|| format!("msg_{}_{}", agent_id, timestamp));
 
     // 1. 读取 Agent 配置
     let agent_config =
         read_agent_config_internal(&app_handle, &agent_state, &agent_id, Some(true)).await?;
 
-    // 2. 启动前台服务保活；RAII 守卫兜住异常/断连路径，别让悬浮助手的保活服务湿漉漉地挂后台偷电喵♡
+    // 2. 启动前台服务保活；RAII 守卫兜住异常/断连路径，避免保活服务残留。
     let mut stream_service_guard = StreamServiceGuard::start(
         app_handle.clone(),
         agent_config.name.clone(),

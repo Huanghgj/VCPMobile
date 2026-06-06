@@ -31,6 +31,7 @@ const emit = defineEmits<{
 
 type StructuredRow = NonNullable<NonNullable<VcpNotification['structured']>['rows']>[number];
 type StructuredMetric = NonNullable<StructuredRow['metrics']>[number];
+type DetailChip = { label: string; value: string };
 
 const { formatTime, getTypeColor, copyToClipboard } = useNotificationPresentation();
 
@@ -120,6 +121,12 @@ onUnmounted(() => {
 
 const rawPayloadText = computed(() => JSON.stringify(props.item.rawPayload || props.item, null, 2));
 
+const stringifyCompactValue = (value: unknown, maxLength = 180) => {
+  const text = typeof value === 'string' ? value : JSON.stringify(value);
+  if (!text) return '';
+  return text.length > maxLength ? `${text.substring(0, maxLength)}...` : text;
+};
+
 const getCategoryIcon = (item: VcpNotification) => {
   const cat = (item.category || '').toLowerCase();
   const infoType = (item.infoType || '').toLowerCase();
@@ -141,7 +148,7 @@ const ragResults = computed(() => {
   if (props.item.structured?.kind === 'rag' && props.item.structured.rows) {
     return props.item.structured.rows.map((row: StructuredRow) => {
       const distMetric = row.metrics?.find((m: StructuredMetric) => m.label.toLowerCase().includes('dist') || m.label.toLowerCase().includes('geo'));
-      const scoreMetric = row.metrics?.find((m: StructuredMetric) => m.label.toLowerCase().includes('score') || m.label.toLowerCase().includes('rrf'));
+      const scoreMetric = row.metrics?.find((m: StructuredMetric) => m.label.toLowerCase().includes('score'));
 
       let distanceStr = '';
       let isEst = false;
@@ -156,13 +163,28 @@ const ragResults = computed(() => {
         }
       }
 
+      const detailChips: DetailChip[] = [
+        row.source ? { label: 'source', value: row.source } : null,
+        row.path ? { label: 'path', value: row.path } : null,
+        row.snippet ? { label: 'snippet', value: row.snippet } : null,
+        ...(row.metrics || []),
+      ].filter(Boolean) as DetailChip[];
+
+      const metadata = row.metadata ?? (row as any).meta;
+      if (metadata) {
+        for (const [label, value] of Object.entries(metadata)) {
+          detailChips.push({ label, value: stringifyCompactValue(value) });
+        }
+      }
+
       return {
         title: row.title,
         subtitle: row.subtitle,
         body: row.body,
         chips: row.chips || [],
         distance: distanceStr,
-        isEstimated: isEst
+        isEstimated: isEst,
+        details: detailChips
       };
     });
   }
@@ -254,13 +276,23 @@ const ragResults = computed(() => {
                   v-if="row.distance"
                   class="text-[9px] font-mono px-1.5 py-0.2 rounded bg-emerald-100 border border-emerald-200 text-emerald-800 font-semibold shrink-0"
                 >
-                  dist: {{ row.distance }}{{ row.isEstimated ? '≈' : '' }}
+                  {{ row.isEstimated ? `dist≈${row.distance}` : `dist: ${row.distance}` }}
                 </span>
               </div>
               <p v-if="row.subtitle" class="text-slate-400 text-[9px] truncate">{{ row.subtitle }}</p>
               <p v-if="row.body" class="text-slate-600 text-[10px] mt-1 bg-white/80 p-1.5 rounded border border-emerald-100/40 font-mono leading-relaxed">{{ row.body }}</p>
               <div class="flex flex-wrap gap-1 mt-1" v-if="row.chips.length">
                 <span v-for="c in row.chips" :key="c" class="text-[8px] px-1 bg-emerald-100/50 text-emerald-700 rounded border border-emerald-100/30 font-medium">{{ c }}</span>
+              </div>
+              <div v-if="row.details.length" class="mt-1 grid gap-1">
+                <div
+                  v-for="detail in row.details"
+                  :key="`${detail.label}-${detail.value}`"
+                  class="text-[8.5px] font-mono text-slate-500 bg-white/70 border border-emerald-100/40 rounded px-1 py-0.5 break-all"
+                >
+                  <span class="font-bold text-emerald-700">{{ detail.label }}:</span>
+                  {{ detail.value }}
+                </div>
               </div>
             </div>
           </div>

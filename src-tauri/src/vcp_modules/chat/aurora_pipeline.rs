@@ -128,12 +128,27 @@ impl AuroraBuffer {
 
     fn close_unclosed_thinking_block(&mut self) {
         let lower = self.full_text.to_lowercase();
-        let last_open = lower.rfind("<think").or_else(|| lower.rfind("<thinking"));
-        let last_close = lower.rfind("</think").or_else(|| lower.rfind("</thinking"));
+        let last_think_open = lower.rfind("<think");
+        let last_thinking_open = lower.rfind("<thinking");
+        let last_open = match (last_think_open, last_thinking_open) {
+            (Some(think_pos), Some(thinking_pos)) if thinking_pos >= think_pos => {
+                Some(("thinking", thinking_pos))
+            }
+            (Some(think_pos), _) => Some(("think", think_pos)),
+            (_, Some(thinking_pos)) => Some(("thinking", thinking_pos)),
+            _ => None,
+        };
 
-        if let Some(open_pos) = last_open {
+        if let Some((tag, open_pos)) = last_open {
+            let last_close = match tag {
+                "thinking" => lower.rfind("</thinking"),
+                _ => lower.rfind("</think"),
+            };
             if last_close.is_none_or(|close_pos| close_pos < open_pos) {
-                self.full_text.push_str("</think>");
+                self.full_text.push_str(match tag {
+                    "thinking" => "</thinking>",
+                    _ => "</think>",
+                });
             }
         }
     }
@@ -170,5 +185,15 @@ mod tests {
             }
             other => panic!("expected thought block, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn finalize_closes_incomplete_thinking_block_with_matching_tag() {
+        let mut buffer = AuroraBuffer::new();
+        buffer.append_chunk("<thinking>正在分析");
+        buffer.finalize();
+
+        assert_eq!(buffer.full_text, "<thinking>正在分析</thinking>");
+        assert_eq!(buffer.stable_blocks.len(), 1);
     }
 }

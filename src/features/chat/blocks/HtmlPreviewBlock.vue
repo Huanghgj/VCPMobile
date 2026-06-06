@@ -15,6 +15,8 @@ const themeStore = useThemeStore();
 const isPreviewing = ref(false); // 默认开启代码模式，减小开销
 const isFullScreen = ref(false);
 const fullScreenTab = ref<'code' | 'preview'>('code');
+const inlineIframeRef = ref<HTMLIFrameElement | null>(null);
+const fullscreenIframeRef = ref<HTMLIFrameElement | null>(null);
 
 // 代码预览转义处理 (优先使用后端预渲染 syntect 高亮，无值时回退为安全 HTML 转义)
 const highlightedCode = computed(() => {
@@ -85,9 +87,7 @@ const openFullScreen = () => {
 let refreshTimer: ReturnType<typeof setTimeout> | null = null;
 
 const refreshPreview = () => {
-  const iframe = isFullScreen.value
-    ? document.querySelector('.vcp-fullscreen-iframe') as HTMLIFrameElement
-    : document.querySelector('.vcp-inline-iframe') as HTMLIFrameElement;
+  const iframe = isFullScreen.value ? fullscreenIframeRef.value : inlineIframeRef.value;
 
   if (iframe) {
     const currentSrc = iframe.srcdoc;
@@ -176,6 +176,7 @@ onUnmounted(() => {
               <pre v-else><code class="hljs" v-html="highlightedCode"></code></pre>
             </div>
             <iframe
+              ref="fullscreenIframeRef"
               v-show="fullScreenTab === 'preview'"
               class="vcp-fullscreen-iframe w-full h-full border-none"
               sandbox=""
@@ -239,6 +240,7 @@ onUnmounted(() => {
 
       <div v-if="isPreviewing" class="absolute inset-0 no-swipe" :class="themeStore.isDarkResolved ? 'bg-[#0d1117]' : 'bg-white'">
         <iframe
+          ref="inlineIframeRef"
           class="vcp-inline-iframe w-full h-full border-none no-swipe"
           sandbox=""
           loading="eager"

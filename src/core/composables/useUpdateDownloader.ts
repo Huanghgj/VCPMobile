@@ -20,7 +20,7 @@ export const safeHttpUrl = (value: string | null | undefined): string => {
   if (!value) return '';
   try {
     const url = new URL(value);
-    return url.protocol === 'https:' || url.protocol === 'http:' ? url.href : '';
+    return url.protocol === 'https:' ? url.href : '';
   } catch {
     return '';
   }
@@ -31,7 +31,7 @@ export function useUpdateDownloader() {
   const updateStore = useUpdateStore();
 
   const downloadAndInstall = async (url: string) => {
-    // 猫娘先把下载 URL 夹紧校验，坏链接不准蹭进安装器喵♡
+    // 先校验下载 URL，拒绝不可信链接进入安装流程。
     const safeUrl = safeHttpUrl(url);
     if (!safeUrl) throw new Error('更新下载链接无效');
 

@@ -1003,6 +1003,14 @@ pub async fn finalize_stream_message<R: tauri::Runtime>(
         }
     };
 
+    let should_auto_summarize = !owner_id.is_empty()
+        && !topic_id.is_empty()
+        && !_is_aborted
+        && !matches!(
+            finish_reason.as_deref(),
+            Some("cancelled_by_user") | Some("error")
+        );
+
     if let Some(chan) = stream_channel {
         let context = if owner_id.is_empty() || topic_id.is_empty() {
             None
@@ -1033,7 +1041,7 @@ pub async fn finalize_stream_message<R: tauri::Runtime>(
         let _ = chan.send(end_event);
     }
 
-    if !owner_id.is_empty() && !topic_id.is_empty() {
+    if should_auto_summarize {
         let summary_app = app_handle.clone();
         let summary_pool = pool.clone();
         let summary_owner_id = owner_id.to_string();
