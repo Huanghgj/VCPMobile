@@ -58,12 +58,88 @@ pub async fn reconcile_local_server(
         (false, true) => {
             log::info!("[Lifecycle] enableAssistant=false, stopping local server...");
             if let Some(h) = handle_lock.take() {
-                h.shutdown();
+                h.shutdown().await;
             }
         }
         _ => {
             // 无需变更
         }
+    }
+}
+
+/// 根据设置决定启动或停止分布式节点连接
+pub async fn reconcile_distributed_node(
+    app_handle: &AppHandle,
+    distributed_enabled: bool,
+    force_reconnect: bool,
+) {
+    let distributed_state = match app_handle.try_state::<crate::distributed::DistributedState>() {
+        Some(s) => s,
+        None => {
+            log::warn!("[Lifecycle] DistributedState not registered, skipping reconciliation");
+            return;
+        }
+    };
+    let client = distributed_state.client.read().await;
+
+    // 读取全局 settings，获取连接参数
+    let settings_state = app_handle.state::<SettingsState>();
+    let settings = match read_settings(app_handle.clone(), settings_state).await {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!(
+                "[Lifecycle] Failed to read settings for distributed reconnect: {}",
+                e
+            );
+            return;
+        }
+    };
+
+    let ws_url = settings.distributed_ws_url.clone();
+    let vcp_key = settings.distributed_vcp_key.clone();
+    let device_name = if settings.distributed_device_name.is_empty() {
+        "VCPMobile".to_string()
+    } else {
+        settings.distributed_device_name.clone()
+    };
+
+    let mut is_running = client.is_running().await;
+    if force_reconnect && is_running {
+        log::info!("[Lifecycle] Connection settings changed, stopping existing connection for reconnect...");
+        client.stop(app_handle).await;
+        is_running = false;
+    }
+
+    match (distributed_enabled, is_running) {
+        (true, false) => {
+            if ws_url.is_empty() || vcp_key.is_empty() {
+                log::warn!("[Lifecycle] distributedEnabled=true but ws_url/vcp_key is empty, skipping auto-connect");
+                return;
+            }
+            log::info!(
+                "[Lifecycle] distributedEnabled=true, starting distributed node connection..."
+            );
+            distributed_state.registry.load_disabled_config(app_handle);
+            if let Err(e) = client
+                .start(
+                    app_handle.clone(),
+                    ws_url,
+                    vcp_key,
+                    device_name,
+                    distributed_state.registry.clone(),
+                )
+                .await
+            {
+                log::error!("[Lifecycle] Auto-start distributed node failed: {}", e);
+            }
+        }
+        (false, true) => {
+            log::info!(
+                "[Lifecycle] distributedEnabled=false, stopping distributed node connection..."
+            );
+            client.stop(app_handle).await;
+        }
+        _ => {}
     }
 }
 
@@ -145,6 +221,16 @@ pub async fn bootstrap(app: &AppHandle) -> Result<(), String> {
         reconcile_local_server(&handle, &lifecycle, enable).await;
     }
 
+    // 3.6 根据设置决定是否启动分布式节点 (自动重连)
+    {
+        let enable_dist = settings.distributed_enabled;
+        log::info!(
+            "[Lifecycle] distributedEnabled={}, reconciling distributed node...",
+            enable_dist
+        );
+        reconcile_distributed_node(&handle, enable_dist, false).await;
+    }
+
     // 初始化同步服务
     let sync_state = init_sync_service(handle.clone());
     handle.manage(sync_state);
@@ -220,6 +306,18 @@ pub async fn bootstrap(app: &AppHandle) -> Result<(), String> {
 
     info!("[Lifecycle] Bootstrap complete. Core is READY.");
 
+    // 6. 核心就绪后，安全地激活安卓原生网络监听，彻底规避冷启动 JNI WebView 未就绪的死锁与崩塌
+    let handle_net = handle.clone();
+    tauri::async_runtime::spawn(async move {
+        log::info!("[Lifecycle] Activating Android native network status monitoring...");
+        if let Err(e) = tauri_plugin_vcp_mobile::system::start_network_monitoring(handle_net) {
+            log::error!(
+                "[Lifecycle] Failed to start native network status monitoring: {}",
+                e
+            );
+        }
+    });
+
     // 6. 后台静默检查前端热更新（完全非阻塞）
     {
         let h = handle.clone();
@@ -284,6 +382,7 @@ pub struct SystemSnapshot {
     pub core: CoreStatus,
     pub log: String,
     pub sync: String,
+    pub distributed: String,
 }
 
 #[tauri::command]
@@ -302,7 +401,26 @@ pub async fn get_system_snapshot(
         None => "closed".to_string(),
     };
 
-    Ok(SystemSnapshot { core, log, sync })
+    // 获取分布式连接状态
+    let distributed = match app.try_state::<crate::distributed::DistributedState>() {
+        Some(s) => {
+            let client = s.client.read().await;
+            let status = client.get_status().await;
+            serde_json::to_value(status.state)
+                .unwrap_or_else(|_| serde_json::json!("disconnected"))
+                .as_str()
+                .unwrap_or("disconnected")
+                .to_string()
+        }
+        None => "disconnected".to_string(),
+    };
+
+    Ok(SystemSnapshot {
+        core,
+        log,
+        sync,
+        distributed,
+    })
 }
 
 /// 前端保存设置后调用，即时生效启用/停用划词助手本地服务器
@@ -318,6 +436,19 @@ pub async fn reconcile_local_server_cmd(
     );
     let lifecycle = &*state;
     reconcile_local_server(&app_handle, lifecycle, enable).await;
+    Ok(enable)
+}
+
+#[tauri::command]
+pub async fn reconcile_distributed_node_cmd(
+    app_handle: AppHandle,
+    enable: bool,
+) -> Result<bool, String> {
+    log::info!(
+        "[Lifecycle] reconcile_distributed_node_cmd called: enable={}",
+        enable
+    );
+    reconcile_distributed_node(&app_handle, enable, false).await;
     Ok(enable)
 }
 

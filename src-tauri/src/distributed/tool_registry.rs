@@ -3,12 +3,15 @@
 // Mirrors VCPChat/VCPDistributedServer/Plugin.js (class PluginManager)
 // Self-contained — does NOT import anything from vcp_modules/.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::{Read, Write};
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde_json::Value;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 use super::types::ToolManifest;
 
@@ -47,7 +50,7 @@ pub trait StreamingTool: Send + Sync {
     #[allow(dead_code)]
     fn poll_interval_secs(&self) -> u64;
     /// Read current snapshot value (must be fast/non-blocking)
-    fn read_current(&self) -> Result<String, String>;
+    fn read_current(&self, app: &AppHandle) -> Result<String, String>;
 }
 
 // ============================================================
@@ -78,12 +81,45 @@ impl ToolEntry {
 
 pub struct ToolRegistry {
     tools: HashMap<String, ToolEntry>,
+    disabled_names: RwLock<HashSet<String>>,
+    placeholder_cache: RwLock<HashMap<String, CachedPlaceholder>>,
+}
+
+struct CachedPlaceholder {
+    value: String,
+    refreshed_at: Instant,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
+            disabled_names: RwLock::new(HashSet::new()),
+            placeholder_cache: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Sync disabled tools list from frontend. Returns true if the set changed.
+    pub fn update_disabled(&self, names: Vec<String>) -> bool {
+        if let Ok(mut guard) = self.disabled_names.write() {
+            let new_set: HashSet<String> = names.into_iter().collect();
+            if *guard != new_set {
+                *guard = new_set;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Check if a tool is enabled.
+    pub fn is_enabled(&self, name: &str) -> bool {
+        if let Ok(guard) = self.disabled_names.read() {
+            !guard.contains(name)
+        } else {
+            true
         }
     }
 
@@ -110,18 +146,87 @@ impl ToolRegistry {
 
     /// Get all tool manifests for register_tools message.
     /// Mirrors Plugin.js getAllPluginManifests()
+    /// 上报全部已注册工具（OneShot/Interactive/Streaming），
+    /// 服务端通过 pluginType 字段区分可执行与静态占位符类型。
     pub fn get_all_manifests(&self) -> Vec<ToolManifest> {
-        self.tools.values().map(|e| e.manifest()).collect()
+        self.tools
+            .iter()
+            .filter(|(name, _)| self.is_enabled(name))
+            .map(|(_, e)| e.manifest())
+            .collect()
+    }
+
+    /// Get all tool metadata with categories and placeholders for the frontend config.
+    pub fn get_tools_metadata(&self) -> Vec<serde_json::Value> {
+        self.tools
+            .iter()
+            .map(|(name, entry)| {
+                let manifest = entry.manifest();
+                let mut val = serde_json::to_value(&manifest).unwrap_or(serde_json::Value::Null);
+                if let Some(obj) = val.as_object_mut() {
+                    let category = match entry {
+                        ToolEntry::OneShot(_) => "oneshot",
+                        ToolEntry::Interactive(_) => "interactive",
+                        ToolEntry::Streaming(_) => "streaming",
+                    };
+                    obj.insert("category".to_string(), serde_json::json!(category));
+                    obj.insert(
+                        "enabled".to_string(),
+                        serde_json::json!(self.is_enabled(name)),
+                    );
+                    if let Some(ref p) = manifest.placeholder {
+                        obj.insert("placeholder".to_string(), serde_json::json!(p));
+                    }
+                    obj.insert(
+                        "display_name".to_string(),
+                        serde_json::json!(manifest.display_name),
+                    );
+                }
+                val
+            })
+            .collect()
     }
 
     /// Get all streaming placeholder values for update_static_placeholders.
-    /// Mirrors Plugin.js getAllPlaceholderValues()
-    pub fn get_all_placeholder_values(&self) -> HashMap<String, String> {
+    /// Mirrors Plugin.js getAllPlaceholderValues(), with per-tool cache intervals
+    /// so expensive mobile sensors are not polled on every 30s push tick.
+    pub fn get_all_placeholder_values(&self, app: &AppHandle) -> HashMap<String, String> {
         let mut map = HashMap::new();
-        for entry in self.tools.values() {
+        let now = Instant::now();
+
+        for (name, entry) in self.tools.iter() {
+            if !self.is_enabled(name) {
+                continue;
+            }
+
             if let ToolEntry::Streaming(tool) = entry {
-                if let Ok(value) = tool.read_current() {
-                    map.insert(tool.placeholder_key().to_string(), value);
+                let key = tool.placeholder_key().to_string();
+                let refresh_interval = Duration::from_secs(tool.poll_interval_secs().max(1));
+
+                if let Ok(cache) = self.placeholder_cache.read() {
+                    if let Some(cached) = cache.get(&key) {
+                        if now.duration_since(cached.refreshed_at) < refresh_interval {
+                            map.insert(key, cached.value.clone());
+                            continue;
+                        }
+                    }
+                }
+
+                if let Ok(value) = tool.read_current(app) {
+                    if let Ok(mut cache) = self.placeholder_cache.write() {
+                        cache.insert(
+                            key.clone(),
+                            CachedPlaceholder {
+                                value: value.clone(),
+                                refreshed_at: now,
+                            },
+                        );
+                    }
+                    map.insert(key, value);
+                } else if let Ok(cache) = self.placeholder_cache.read() {
+                    if let Some(cached) = cache.get(&key) {
+                        map.insert(key, cached.value.clone());
+                    }
                 }
             }
         }
@@ -136,6 +241,13 @@ impl ToolRegistry {
         args: Value,
         app: &AppHandle,
     ) -> Result<Value, String> {
+        if !self.is_enabled(tool_name) {
+            return Err(format!(
+                "Tool '{}' is currently disabled on this mobile node.",
+                tool_name
+            ));
+        }
+
         let entry = self
             .tools
             .get(tool_name)
@@ -146,7 +258,7 @@ impl ToolRegistry {
             ToolEntry::Interactive(tool) => tool.execute(args, app).await,
             ToolEntry::Streaming(tool) => {
                 // For streaming tools, execute_tool returns a current snapshot.
-                tool.read_current().map(serde_json::Value::String)
+                tool.read_current(app).map(serde_json::Value::String)
             }
         }
     }
@@ -154,5 +266,55 @@ impl ToolRegistry {
     /// Number of registered tools.
     pub fn tool_count(&self) -> usize {
         self.tools.len()
+    }
+
+    /// Load disabled tools list from local JSON config file and populate memory state.
+    pub fn load_disabled_config(&self, app: &AppHandle) {
+        if let Ok(config_dir) = app.path().app_config_dir() {
+            let config_path = config_dir.join("distributed_tools.json");
+            if config_path.exists() {
+                if let Ok(mut file) = File::open(&config_path) {
+                    let mut content = String::new();
+                    if file.read_to_string(&mut content).is_ok() {
+                        if let Ok(names) = serde_json::from_str::<Vec<String>>(&content) {
+                            if let Ok(mut guard) = self.disabled_names.write() {
+                                *guard = names.into_iter().collect();
+                                log::info!(
+                                    "[Distributed] Loaded disabled tools config: {:?}",
+                                    guard
+                                );
+                            }
+                        }
+                    }
+                }
+            } else {
+                // 如果配置文件不存在（通常是首次运行），默认将所有已注册的工具标记为禁用（关闭），符合默认禁用插件的要求
+                if let Ok(mut guard) = self.disabled_names.write() {
+                    *guard = self.tools.keys().cloned().collect();
+                    log::info!("[Distributed] Config file not found, defaulting all tools to disabled: {:?}", guard);
+                }
+                let _ = self.save_disabled_config(app);
+            }
+        }
+    }
+
+    /// Save current disabled tools list to local JSON config file.
+    pub fn save_disabled_config(&self, app: &AppHandle) -> Result<(), String> {
+        if let Ok(config_dir) = app.path().app_config_dir() {
+            // Ensure directory exists
+            let _ = std::fs::create_dir_all(&config_dir);
+            let config_path = config_dir.join("distributed_tools.json");
+            let names: Vec<String> = if let Ok(guard) = self.disabled_names.read() {
+                guard.iter().cloned().collect()
+            } else {
+                Vec::new()
+            };
+            let content = serde_json::to_string_pretty(&names).map_err(|e| e.to_string())?;
+            let mut file = File::create(&config_path).map_err(|e| e.to_string())?;
+            file.write_all(content.as_bytes())
+                .map_err(|e| e.to_string())?;
+            log::info!("[Distributed] Saved disabled tools config: {:?}", names);
+        }
+        Ok(())
     }
 }

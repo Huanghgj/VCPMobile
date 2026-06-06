@@ -89,7 +89,7 @@ function renderBlockHtml(block: ContentBlock): string {
         return `<div class="vcp-markdown-block">${renderMarkdownNodes(block.nodes, props.message.id, block.hash)}</div>`;
       }
       return `<div class="vcp-markdown-block"><p>${escapeHtml(block.content || "")}</p></div>`;
-    
+
     case "diary": {
       const diaryContent = (block.nodes && block.nodes.length > 0)
         ? renderMarkdownNodes(block.nodes, props.message.id, block.hash)
@@ -110,14 +110,14 @@ function renderBlockHtml(block: ContentBlock): string {
         </div>
       `;
     }
-    
+
     case "role-divider":
       const role = block.role || "unknown";
       const roleDisplay = role.charAt(0).toUpperCase() + role.slice(1);
       const actionText = block.is_end ? "[结束]" : "[起始]";
       const roleClass = `role-${role.toLowerCase()}`;
       const typeClass = block.is_end ? "type-end" : "type-start";
-      
+
       return `
         <div class="vcp-role-divider ${roleClass} ${typeClass}">
           <span class="divider-text">角色分界: ${roleDisplay} ${actionText}</span>
@@ -145,7 +145,7 @@ function renderBlockHtml(block: ContentBlock): string {
 
 function getBlockKey(block: ContentBlock, index: number): string {
   if (block.hash !== undefined && block.hash !== null) {
-    return `${block.type}-${String(block.hash)}`;
+    return `${block.type}-${String(block.hash)}-${index}`;
   }
   // Fallback for legacy data (index-based)
   return `${block.type}-idx-${index}`;
@@ -415,7 +415,7 @@ onUnmounted(() => {
   <div v-longpress="showMessageContextMenu"
     class="vcp-message-item flex flex-col w-full mb-6 animate-fade-in px-1 min-w-0" :data-message-id="message.id"
     :data-role="message.role">
-    
+
     <MessageHeader
       v-if="shell"
       :is-user="shell.isUser"
@@ -426,10 +426,10 @@ onUnmounted(() => {
       :avatar-dominant-color="shell.avatarColor"
     />
 
-    <ChatBubble 
+    <ChatBubble
       v-if="shell"
-      :is-user="shell.isUser" 
-      :is-streaming="isStreaming" 
+      :is-user="shell.isUser"
+      :is-streaming="isStreaming"
       :bubble-style="{
         '--dynamic-color': shell.avatarColor,
       }"
@@ -475,7 +475,7 @@ onUnmounted(() => {
             <p>{{ message.content }}</p>
           </div>
         </template>
-        
+
         <!-- 流式尾部高画质推测渲染 (Speculative Rendering) -->
         <div v-if="isStreaming && message.tailBlock" class="streaming-tail opacity-90">
           <div
@@ -502,15 +502,15 @@ onUnmounted(() => {
             :is-active-stream="isMessageInActiveStream"
           />
         </div>
-        <div v-else-if="isStreaming && message.tailContent" class="opacity-70 italic animate-pulse">
+        <div v-else-if="isStreaming && message.tailContent && message.blocks && message.blocks.length > 0" class="opacity-70 italic animate-pulse">
           {{ message.tailContent }}
         </div>
       </div>
 
-      <AttachmentPreview 
-        v-if="message.attachments && message.attachments.length > 0" 
+      <AttachmentPreview
+        v-if="message.attachments && message.attachments.length > 0"
         :attachments="message.attachments"
-        class="pt-3 border-t border-black/5 dark:border-white/5" 
+        class="pt-3 border-t border-black/5 dark:border-white/5"
       />
 
       <StreamingTag v-if="isStreaming" />

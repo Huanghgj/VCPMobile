@@ -13,24 +13,29 @@ interface ToolUiRequest {
 }
 
 const activeRequest = ref<ToolUiRequest | null>(null);
-let unlisten: UnlistenFn | null = null;
+const unlisteners: UnlistenFn[] = [];
+let isUnmounted = false;
 
-onMounted(async () => {
+async function registerListener<T>(
+  eventName: string,
+  handler: Parameters<typeof listen<T>>[1],
+) {
+  const unlisten = await listen<T>(eventName, handler);
+  if (isUnmounted) {
+    unlisten();
+    return;
+  }
+  unlisteners.push(unlisten);
+}
+
+onMounted(() => {
   // Listen for tool UI requests from the Rust backend
-  unlisten = await listen<ToolUiRequest>("tool-ui-request", (event) => {
+  registerListener<ToolUiRequest>("tool-ui-request", (event) => {
     activeRequest.value = event.payload;
   });
-});
 
-onUnmounted(() => {
-  unlisten?.();
-});
-
-// Notification handler — listens for distributed-notification events
-let unlistenNotification: UnlistenFn | null = null;
-
-onMounted(async () => {
-  unlistenNotification = await listen<{ title: string; body: string }>(
+  // Notification handler — listens for distributed-notification events
+  registerListener<{ title: string; body: string }>(
     "distributed-notification",
     (event) => {
       // Use browser Notification API or fallback
@@ -43,17 +48,9 @@ onMounted(async () => {
       }
     },
   );
-});
 
-onUnmounted(() => {
-  unlistenNotification?.();
-});
-
-// Clipboard write handler
-let unlistenClipboard: UnlistenFn | null = null;
-
-onMounted(async () => {
-  unlistenClipboard = await listen<{ content: string }>(
+  // Clipboard write handler
+  registerListener<{ content: string }>(
     "distributed-clipboard-write",
     async (event) => {
       try {
@@ -67,7 +64,8 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
-  unlistenClipboard?.();
+  isUnmounted = true;
+  unlisteners.splice(0).forEach((unlisten) => unlisten());
 });
 </script>
 

@@ -2,8 +2,8 @@
 id: MOD-TARVEN-016
 title: Tarven 上下文注入引擎
 description: 结构化提示词注入规则——system_suffix、user_suffix、context_inject 的解析、排序与注入流水线
-version: 0.9.14
-date: 2026-05-27
+version: 1.0.3
+date: 2026-06-05
 ---
 
 # 16. Tarven 上下文注入引擎
@@ -113,14 +113,14 @@ pub struct TarvenRule {
     pub content: String,
     pub scope: String,     // 'global' | 'agent' | 'group'
     pub wrap: bool,
-    
+
     // context_inject 专用
     pub role: Option<String>, // 'user' | 'assistant'
     pub depth: Option<i32>,
-    
+
     // system_suffix / user_suffix 专用
     pub position: Option<String>, // 'prepend' | 'append'
-    
+
     pub sort_order: i32,
 }
 ```
@@ -248,7 +248,7 @@ let insert_index = if non_system_msgs.len() > depth {
 > 过滤逻辑实现位置：`src-tauri/src/vcp_modules/chat/context_injection.rs` 第 43–76 行
 
 ```sql
-SELECT ... FROM tarven_rules 
+SELECT ... FROM tarven_rules
 WHERE is_enabled = 1 AND (scope = 'global' OR scope = ?)
 ORDER BY sort_order ASC
 ```
@@ -351,7 +351,7 @@ pub async fn fetch_active_rules(
 async fn inject_base_environment(pool, topic_id, system_prompt) {
     let now = Local::now().format("%Y-%m-%d %H:%M:%S %Z");
     let mut prepend = format!(
-        "当前系统时间: {}\n运行环境: VCP Mobile (Android 移动端)\n", 
+        "当前系统时间: {}\n运行环境: VCP Mobile (Android 移动端)\n",
         now
     );
     // 若 topic 存在，追加话题创建时间
@@ -419,7 +419,7 @@ let user_rules: Vec<&TarvenRule> = rules
 if !user_rules.is_empty() {
     if let Some(user_idx) = messages.iter().rposition(|m| m["role"].as_str() == Some("user")) {
         let mut user_content = messages[user_idx]["content"].as_str().unwrap_or("").to_string();
-        
+
         let mut user_prepend_parts = Vec::new();
         let mut user_append_parts = Vec::new();
 
@@ -544,16 +544,16 @@ sorted_context_rules.sort_by(|a, b| {
 ```
 步骤 4: assemble_history_for_vcp(&history)
     ──> 将本地 ChatMessage[] 转为 VCP API 兼容的 messages[]
-        
+
 步骤 5: 插入 System Prompt
     ──> effective_prompt = mobile_system_prompt ?? system_prompt
     ──> messages.insert(0, { role: "system", content: effective_prompt })
-        
+
 步骤 5.5: Tarven 上下文注入 ★
     ──> apply_tarven_pipeline(pool, topic_id, agent_name, "agent", &mut messages)
     ──> 系统后缀拼接 / 用户后缀追加 / 上下文节点插入
     ──> 占位符替换: {{AgentName}} → agent_config.name
-        
+
 步骤 6: 后端生成 Thinking ID
 步骤 7: 构造 VCP 请求载荷
 ...
@@ -582,7 +582,7 @@ crate::vcp_modules::chat::context_injection::apply_tarven_pipeline(
 
 ### 4.2 与 assemble_history_for_vcp 的协作
 
-> 文件位置：`src-tauri/src/vcp_modules/chat/context_assembler_utils.rs`
+> 文件位置：`src-tauri/src/vcp_modules/chat/context_assembler.rs`
 
 `assemble_history_for_vcp` 负责将本地 `ChatMessage` 历史转换为 VCP API 格式的 `Vec<Value>`，其输出是 Tarven 注入的**输入前提**：
 
@@ -695,7 +695,7 @@ CREATE TABLE IF NOT EXISTS tarven_rules (
 > 定义位置：`src-tauri/src/vcp_modules/persistence/db_manager.rs` 第 344 行
 
 ```sql
-CREATE INDEX IF NOT EXISTS idx_tarven_rules_active 
+CREATE INDEX IF NOT EXISTS idx_tarven_rules_active
 ON tarven_rules(rule_type, is_enabled, sort_order ASC);
 ```
 
@@ -708,9 +708,9 @@ ON tarven_rules(rule_type, is_enabled, sort_order ASC);
 `save_tarven_rule` 使用 SQLite `INSERT ... ON CONFLICT(id) DO UPDATE SET ...` 实现原子化 UPSERT：
 
 ```sql
-INSERT INTO tarven_rules (id, name, ..., created_at, updated_at) 
+INSERT INTO tarven_rules (id, name, ..., created_at, updated_at)
 VALUES (?, ?, ..., ?, ?)
-ON CONFLICT(id) DO UPDATE SET 
+ON CONFLICT(id) DO UPDATE SET
     name = excluded.name,
     rule_type = excluded.rule_type,
     is_enabled = excluded.is_enabled,
@@ -930,4 +930,4 @@ Rust 侧 `TarvenRule.rule_type` 使用 `String` 而非 `enum RuleType`，原因�
 *交叉引用：详见 [Tarven 规则系统（前端视角）](../vue_docs/features/chat/22_Tarven规则系统.md)*
 
 ---
-*最后更新：2026-05-27 | VCP Mobile v0.9.14*
+*最后更新：2026-06-05 | VCP Mobile v1.0.3*

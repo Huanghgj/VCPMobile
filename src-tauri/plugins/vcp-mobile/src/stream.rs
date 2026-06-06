@@ -85,8 +85,8 @@ pub fn stop_stream_service_inner<R: Runtime>(
         if _should_stop {
             plugin_handle
                 .run_mobile_plugin::<serde_json::Value>(
-                    "stopStreamingService",
-                    serde_json::json!({}),
+                    "startStreamingService",
+                    serde_json::json!({ "agentName": "" }),
                 )
                 .map_err(|e| format!("run_mobile_plugin failed: {}", e))?;
         } else {
@@ -123,4 +123,43 @@ pub fn stop_streaming_service<R: Runtime>(
     agent_name: String,
 ) -> Result<(), String> {
     stop_stream_service_inner(&app, &agent_name)
+}
+
+/// 设置分布式保活模式
+pub fn set_keepalive_mode<R: Runtime>(
+    app: &AppHandle<R>,
+    is_keepalive: bool,
+) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let state = app.state::<VcpMobileState<R>>();
+        let active_names = {
+            let streams = state.active_streams.lock().map_err(|e| e.to_string())?;
+            let names: Vec<&str> = streams.iter().map(|(name, _)| name.as_str()).collect();
+            if names.len() > 3 {
+                format!("{}...", names[..3].join("、"))
+            } else {
+                names.join("、")
+            }
+        };
+        let handle = state.plugin_handle.lock().map_err(|e| e.to_string())?;
+        let plugin_handle = handle.as_ref().ok_or("Plugin handle not initialized")?;
+        plugin_handle
+            .run_mobile_plugin::<serde_json::Value>(
+                "startStreamingService",
+                serde_json::json!({
+                    "agentName": active_names,
+                    "isKeepaliveMode": is_keepalive
+                }),
+            )
+            .map_err(|e| format!("run_mobile_plugin failed: {}", e))?;
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+    }
+
+    log::info!("[VcpMobilePlugin] Keepalive mode set to {}", is_keepalive);
+
+    Ok(())
 }

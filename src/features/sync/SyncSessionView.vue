@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch, nextTick } from 'vue';
+import { computed, ref, watch, nextTick, onUnmounted } from 'vue';
 import { X, Copy, Play } from 'lucide-vue-next';
 import SlidePage from '../../components/ui/SlidePage.vue';
 import SyncLogBrowserCore from '../../features/settings/components/SyncLogBrowserCore.vue';
@@ -107,6 +107,7 @@ const settingsStore = useSettingsStore();
 
 const scrollContainer = ref<HTMLElement | null>(null);
 const isUserScrolling = ref(false);
+let userScrollResetTimer: ReturnType<typeof setTimeout> | null = null;
 
 // 监听 Tab 变化，驱动滚动
 watch(() => store.activeTab, (newTab) => {
@@ -132,10 +133,21 @@ const handleScroll = (e: Event) => {
   }
 
   // 延时重置用户滚动标志，防止 watch 导致的循环滚动
-  setTimeout(() => {
+  if (userScrollResetTimer) {
+    clearTimeout(userScrollResetTimer);
+  }
+  userScrollResetTimer = setTimeout(() => {
     isUserScrolling.value = false;
+    userScrollResetTimer = null;
   }, 100);
 };
+
+onUnmounted(() => {
+  if (userScrollResetTimer) {
+    clearTimeout(userScrollResetTimer);
+    userScrollResetTimer = null;
+  }
+});
 
 const prerenderEnabled = computed(() =>
   settingsStore.settings?.syncPrerenderEnabled ?? false

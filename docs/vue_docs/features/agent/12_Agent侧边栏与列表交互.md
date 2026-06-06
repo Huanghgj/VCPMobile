@@ -2,8 +2,8 @@
 id: VUE-AGEN-012
 title: Agent侧边栏与列表交互
 description: VCP Mobile 前端 AgentSidebar 布局、AgentList 拖拽排序、Swipe 手势与搜索过滤的交互设计
-version: 0.9.14
-date: 2026-05-27
+version: 1.0.3
+date: 2026-06-05
 ---
 
 # 12. Agent侧边栏与列表交互
@@ -124,7 +124,7 @@ date: 2026-05-27
 侧边栏可见性通过 `layoutStore.leftDrawerOpen` 进行**单向数据流 + CSS class 响应**：
 
 ```vue
-<aside ref="sidebarRef" class="vcp-drawer vcp-drawer-left flex flex-col" 
+<aside ref="sidebarRef" class="vcp-drawer vcp-drawer-left flex flex-col"
        :class="{ 'is-open': layoutStore.leftDrawerOpen }">
 ```
 
@@ -262,7 +262,7 @@ useSidebarSwipe(sidebarRef, {
 `SidebarSearch.vue` 采用**极简的 v-model 双向绑定**，未引入 `@vueuse/useDebounce` 等外部防抖逻辑。过滤的实时响应由 Vue 的响应式系统天然保证。
 
 ```vue
-<input :value="modelValue" 
+<input :value="modelValue"
        @input="emit('update:modelValue', ($event.target as HTMLInputElement).value)"
        :placeholder="placeholderText" />
 ```
@@ -397,18 +397,18 @@ Agent 卡片与 Group 卡片结构高度对称，采用**玻璃拟态（Glassmor
 卡片 DOM 结构要点：
 
 ```vue
-<div class="relative p-3 glass-panel rounded-xl flex items-center gap-3 
+<div class="relative p-3 glass-panel rounded-xl flex items-center gap-3
             border shadow-sm cursor-pointer z-10 w-full">
   <!-- 未读角标 -->
-  <div v-if="assistantStore.unreadCounts[agent.id] === -1 || 
+  <div v-if="assistantStore.unreadCounts[agent.id] === -1 ||
               assistantStore.unreadCounts[agent.id] > 0"
-       class="absolute -top-1 -right-1 w-3 h-3 rounded-full 
+       class="absolute -top-1 -right-1 w-3 h-3 rounded-full
               border-2 border-white dark:border-gray-900 z-10 ..."
        style="background: #ff6b6b">
   </div>
 
-  <VcpAvatar owner-type="agent" :owner-id="agent.id" 
-             :fallback-name="agent.name" size="w-10 h-10" 
+  <VcpAvatar owner-type="agent" :owner-id="agent.id"
+             :fallback-name="agent.name" size="w-10 h-10"
              rounded="rounded-full" class="pointer-events-none" />
 
   <div class="flex flex-col overflow-hidden flex-1 pointer-events-none">
@@ -1007,4 +1007,4 @@ SortableJS onEnd
 | ToastOnly | — | 通知配置项，仅显示 Toast 浮层，不写入通知中心历史 | `notificationStore.ts` |
 
 ---
-*最后更新：2026-05-27 | VCP Mobile v0.9.14*
+*最后更新：2026-06-05 | VCP Mobile v1.0.3*

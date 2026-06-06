@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from "vue";
+import { ref, onMounted, watch, onUnmounted } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import type { AppSettings } from "../../../core/stores/settings";
+import { useSettingsStore, type AppSettings } from "../../../core/stores/settings";
 import { useAssistantStore } from "../../../core/stores/assistant";
 import SettingsSwitch from "../../../components/settings/SettingsSwitch.vue";
 import SettingsRow from "../../../components/settings/SettingsRow.vue";
@@ -10,6 +10,11 @@ const props = defineProps<{
   settings: AppSettings;
 }>();
 
+const emit = defineEmits<{
+  (e: "save-request"): void;
+}>();
+
+const settingsStore = useSettingsStore();
 const assistantStore = useAssistantStore();
 const hasOverlayPermission = ref(false);
 
@@ -42,6 +47,10 @@ const handleToggle = async (val: boolean) => {
       props.settings.enableAssistant = false;
       return;
     }
+    // 开启时懒加载 Agent 列表
+    try {
+      await assistantStore.fetchAgents();
+    } catch (_) {}
   }
 
   props.settings.enableAssistant = val;
@@ -54,41 +63,53 @@ const handleToggle = async (val: boolean) => {
   } catch (e) {
     console.error("[AssistantSettings] Failed to toggle assistant:", e);
   }
+
+  emit("save-request");
+};
+
+watch(
+  () => props.settings.assistantAgentId,
+  () => {
+    emit("save-request");
+  }
+);
+
+const handleLifecycleEvent = async (e: any) => {
+  if (e.detail?.state === "resume") {
+    await checkPermission();
+    if (props.settings.enableAssistant && hasOverlayPermission.value) {
+      try {
+        await assistantStore.fetchAgents();
+      } catch (_) {}
+      try {
+        await invoke("plugin:vcp-mobile|toggle_floating_ball", { show: true });
+        await invoke("reconcile_local_server_cmd", { enable: true });
+      } catch (_) {}
+    }
+  }
 };
 
 onMounted(async () => {
-  try {
-    await assistantStore.fetchAgents();
-  } catch (_) {}
   await checkPermission();
 
-  // 若用户手动设置了开启且有权限，则在 mounted 时确保拉起悬浮球和本地服务器
+  // 若用户手动设置了开启且有权限，则在 mounted 时确保拉起悬浮球并懒加载 Agent 列表
   if (props.settings.enableAssistant && hasOverlayPermission.value) {
+    try {
+      await assistantStore.fetchAgents();
+    } catch (_) {}
     try {
       await invoke("plugin:vcp-mobile|toggle_floating_ball", { show: true });
       await invoke("reconcile_local_server_cmd", { enable: true });
     } catch (_) {}
   }
+
+  // 监听生命周期 resume 事件以刷新权限状态
+  window.addEventListener("vcp-lifecycle", handleLifecycleEvent);
 });
 
-const handleLifecycleResume = async (e: Event) => {
-  const detail = (e as CustomEvent).detail;
-  if (detail?.state !== "resume") return;
-
-  await checkPermission();
-  if (props.settings.enableAssistant && hasOverlayPermission.value) {
-    try {
-      await invoke("plugin:vcp-mobile|toggle_floating_ball", { show: true });
-      await invoke("reconcile_local_server_cmd", { enable: true });
-    } catch (_) {}
-  }
-};
-
-// 生命周期监听要温柔收尾，别让重复 handler 在后台骚骚耗电喵♡
-window.addEventListener("vcp-lifecycle", handleLifecycleResume);
-
 onUnmounted(() => {
-  window.removeEventListener("vcp-lifecycle", handleLifecycleResume);
+  // 组件解卸时必须销毁全局监听器，以防内存泄露和重复挂载
+  window.removeEventListener("vcp-lifecycle", handleLifecycleEvent);
 });
 </script>
 
@@ -104,6 +125,7 @@ onUnmounted(() => {
       <template #action>
         <SettingsSwitch
           :modelValue="props.settings.enableAssistant || false"
+          :disabled="settingsStore.loading"
           @update:modelValue="handleToggle"
         />
       </template>

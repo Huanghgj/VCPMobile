@@ -8,6 +8,7 @@ const COMMANDS: &[&str] = &[
     "move_task_to_back",
     "pick_file",
     "get_battery_status",
+    "get_network_status",
     "capture_window_snapshot",
     "open_file_native",
     "save_image_to_gallery",
@@ -19,6 +20,17 @@ const COMMANDS: &[&str] = &[
     "request_overlay_permission",
     "register_shared_files",
     "toggle_floating_ball",
+    "start_sensor_collection",
+    "stop_sensor_collection",
+    "get_sensor_data",
+    "get_cpu_thermal_status",
+    "get_gpu_status",
+    "check_root_access",
+    "run_root_command",
+    "launch_root_manager",
+    "acquire_wake_lock",
+    "release_wake_lock",
+    "start_network_monitoring",
 ];
 
 fn main() {

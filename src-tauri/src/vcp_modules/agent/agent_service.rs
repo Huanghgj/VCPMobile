@@ -80,7 +80,7 @@ pub async fn read_agent_config_internal<R: Runtime>(
     let pool = &db_state.pool;
 
     let agent_row = sqlx::query(
-        "SELECT a.name, a.system_prompt, a.mobile_system_prompt, a.model, a.temperature, a.context_token_limit, a.max_output_tokens, a.stream_output, a.use_temperature, av.dominant_color 
+        "SELECT a.name, a.system_prompt, a.mobile_system_prompt, a.model, a.temperature, a.context_token_limit, a.max_output_tokens, a.stream_output, a.use_temperature, av.dominant_color
          FROM agents a
          LEFT JOIN avatars av ON av.owner_id = a.agent_id AND av.owner_type = 'agent'
          WHERE a.agent_id = ? AND a.deleted_at IS NULL"
@@ -95,7 +95,7 @@ pub async fn read_agent_config_internal<R: Runtime>(
         let avatar_calculated_color: Option<String> = row.get("dominant_color");
 
         let topic_rows = sqlx::query(
-            "SELECT topic_id, title, created_at, locked, unread, unread_count, msg_count 
+            "SELECT topic_id, title, created_at, locked, unread, unread_count, msg_count
              FROM topics WHERE owner_type = 'agent' AND owner_id = ? AND deleted_at IS NULL ORDER BY updated_at DESC"
         )
         .bind(agent_id)
@@ -167,24 +167,66 @@ pub async fn get_agents(
     app_handle: AppHandle,
     state: State<'_, AgentConfigState>,
 ) -> Result<Vec<AgentConfig>, String> {
+    let start_total = std::time::Instant::now();
     let db_state = app_handle.state::<DbState>();
     let pool = &db_state.pool;
 
-    let rows = sqlx::query("SELECT agent_id FROM agents WHERE deleted_at IS NULL")
-        .fetch_all(pool)
-        .await
-        .map_err(|e| e.to_string())?;
+    let start_agents = std::time::Instant::now();
+    // 1. 一次性查询所有未删除的 agents 基础配置 (包括 avatars 主色)
+    let agent_rows = sqlx::query(
+        "SELECT a.agent_id, a.name, a.system_prompt, a.mobile_system_prompt, a.model, a.temperature, a.context_token_limit, a.max_output_tokens, a.stream_output, a.use_temperature, av.dominant_color
+         FROM agents a
+         LEFT JOIN avatars av ON av.owner_id = a.agent_id AND av.owner_type = 'agent'
+         WHERE a.deleted_at IS NULL"
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let duration_agents = start_agents.elapsed();
 
+    if agent_rows.is_empty() {
+        log::info!(
+            "[Profile] get_agents total: {}ms (empty)",
+            start_total.elapsed().as_millis()
+        );
+        return Ok(Vec::new());
+    }
+
+    let start_mapping = std::time::Instant::now();
+    // 2. 组装并预存缓存
     let mut agents = Vec::new();
-    for row in rows {
+    for row in agent_rows {
         use sqlx::Row;
         let agent_id: String = row.get("agent_id");
-        if let Ok(config) =
-            read_agent_config(app_handle.clone(), state.clone(), agent_id, None).await
-        {
-            agents.push(config);
-        }
+        let avatar_calculated_color: Option<String> = row.get("dominant_color");
+
+        let config = AgentConfig {
+            id: agent_id.clone(),
+            name: row.get("name"),
+            system_prompt: row.get("system_prompt"),
+            mobile_system_prompt: row.get("mobile_system_prompt"),
+            model: row.get("model"),
+            temperature: row.get("temperature"),
+            context_token_limit: row.get("context_token_limit"),
+            max_output_tokens: row.get("max_output_tokens"),
+            stream_output: row.get::<i32, _>("stream_output") != 0,
+            use_temperature: row.get::<i32, _>("use_temperature") != 0,
+            avatar_calculated_color,
+            topics: vec![], // 优化：不加载 topics 列表，改由前端点击时流式按需懒加载
+        };
+
+        // 预热内存缓存，供后续 read_agent_config 内存级调用
+        state.caches.insert(agent_id, config.clone());
+        agents.push(config);
     }
+    let duration_mapping = start_mapping.elapsed();
+
+    log::info!(
+        "[Profile] get_agents finished. Total: {}ms | SQL Agents: {}ms | Map & Cache: {}ms",
+        start_total.elapsed().as_millis(),
+        duration_agents.as_millis(),
+        duration_mapping.as_millis()
+    );
 
     Ok(agents)
 }
@@ -271,19 +313,19 @@ async fn internal_write_agent_config<R: Runtime>(
 
     sqlx::query(
         "INSERT INTO agents (
-            agent_id, name, system_prompt, mobile_system_prompt, model, temperature, 
-            context_token_limit, max_output_tokens, 
+            agent_id, name, system_prompt, mobile_system_prompt, model, temperature,
+            context_token_limit, max_output_tokens,
             stream_output, use_temperature, config_hash, updated_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(agent_id) DO UPDATE SET
-            name = excluded.name, 
-            system_prompt = excluded.system_prompt, 
+            name = excluded.name,
+            system_prompt = excluded.system_prompt,
             mobile_system_prompt = excluded.mobile_system_prompt,
-            model = excluded.model, 
-            temperature = excluded.temperature, 
-            context_token_limit = excluded.context_token_limit, 
-            max_output_tokens = excluded.max_output_tokens, 
-            stream_output = excluded.stream_output, 
+            model = excluded.model,
+            temperature = excluded.temperature,
+            context_token_limit = excluded.context_token_limit,
+            max_output_tokens = excluded.max_output_tokens,
+            stream_output = excluded.stream_output,
             use_temperature = excluded.use_temperature,
             config_hash = excluded.config_hash,
             updated_at = excluded.updated_at",
@@ -442,7 +484,7 @@ pub async fn create_agent(
     let dto = AgentSyncDTO::from(&config);
     let config_hash = HashAggregator::compute_agent_config_hash(&dto);
     sqlx::query(
-        "INSERT INTO agents (agent_id, name, system_prompt, mobile_system_prompt, model, temperature, context_token_limit, max_output_tokens, stream_output, use_temperature, config_hash, updated_at) 
+        "INSERT INTO agents (agent_id, name, system_prompt, mobile_system_prompt, model, temperature, context_token_limit, max_output_tokens, stream_output, use_temperature, config_hash, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(&agent_id)
@@ -463,7 +505,7 @@ pub async fn create_agent(
 
     for topic in &config.topics {
         sqlx::query(
-            "INSERT INTO topics (topic_id, owner_type, owner_id, title, created_at, updated_at) 
+            "INSERT INTO topics (topic_id, owner_type, owner_id, title, created_at, updated_at)
              VALUES (?, 'agent', ?, ?, ?, ?)",
         )
         .bind(&topic.id)

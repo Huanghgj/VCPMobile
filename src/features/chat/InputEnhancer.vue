@@ -29,6 +29,7 @@ const emit = defineEmits<{
   (e: 'send', content: string): void;
   (e: 'attach'): void;
   (e: 'toggle-menu', visible: boolean): void;
+  (e: 'focus-input'): void;
 }>();
 
 const input = ref('');
@@ -75,9 +76,9 @@ let iconLongPressTimeout: number | null = null;
 // 切换语音模式与普通文本模式
 const toggleAudioMode = () => {
   if (props.disabled) return;
-  
+
   showAttachMenu.value = false;
-  
+
   // 如果当前正处于某种语音输入状态中，先彻底释放
   if (isSTTActive.value) {
     cancelListening();
@@ -87,12 +88,12 @@ const toggleAudioMode = () => {
     cancelRecording();
     isLongPressRecording.value = false;
   }
-  
+
   isAudioMode.value = !isAudioMode.value;
   isSwipeCancel.value = false;
-  
+
   if (navigator.vibrate) navigator.vibrate(35);
-  
+
   if (!isAudioMode.value) {
     nextTick(() => {
       if (textareaRef.value) {
@@ -163,7 +164,7 @@ const handleSTTTouchEnd = async (e: TouchEvent) => {
     const recognizedText = await stopListening();
     if (recognizedText && !recognizedText.startsWith('[')) {
       input.value += recognizedText;
-      
+
       // 自动切回键盘并聚焦，方便用户在键盘上微调！
       isAudioMode.value = false;
       await nextTick();
@@ -171,7 +172,7 @@ const handleSTTTouchEnd = async (e: TouchEvent) => {
         textareaRef.value.focus();
         autoResize();
       }
-      
+
       if (navigator.vibrate) navigator.vibrate([40, 40]);
     }
   }
@@ -192,7 +193,7 @@ const handleSTTTouchCancel = (e: TouchEvent) => {
 // ----------------------------------------------------
 const handleIconTouchStart = (e: TouchEvent) => {
   if (props.disabled) return;
-  
+
   // 核心修复：如果当前已经处于“按住说话”模式，点击此按钮是为了切回键盘，直接触发 Tap 切换！
   // 彻底解决了由于 touchstart.prevent 导致 click 无法触发的“点不回去”手势缺陷！
   if (isAudioMode.value) {
@@ -200,7 +201,7 @@ const handleIconTouchStart = (e: TouchEvent) => {
     toggleAudioMode();
     return;
   }
-  
+
   if (e.cancelable) e.preventDefault(); // 阻止 WebView 的震动和菜单弹起
 
   iconTouchStartTime = Date.now();
@@ -238,7 +239,7 @@ const handleIconTouchMove = (e: TouchEvent) => {
 
 const handleIconTouchEnd = async (e: TouchEvent) => {
   if (e.cancelable) e.preventDefault();
-  
+
   if (iconLongPressTimeout) {
     clearTimeout(iconLongPressTimeout);
     iconLongPressTimeout = null;
@@ -251,7 +252,7 @@ const handleIconTouchEnd = async (e: TouchEvent) => {
     toggleAudioMode();
   } else if (isLongPressRecording.value) {
     isLongPressRecording.value = false;
-    
+
     if (isSwipeCancel.value) {
       cancelRecording();
       notificationStore.addNotification({
@@ -285,7 +286,7 @@ const handleIconTouchEnd = async (e: TouchEvent) => {
             });
 
             if (navigator.vibrate) navigator.vibrate([40, 40]);
-            
+
             // 松手直接以附件形式发送
             await nextTick();
             handleSend();
@@ -318,6 +319,13 @@ const handleIconTouchCancel = (e: TouchEvent) => {
     isSwipeCancel.value = false;
   }
   isIconLongPress = false;
+};
+
+const handleFocus = () => {
+  showAttachMenu.value = false;
+  if (!props.disabled && historyStore.currentChatHistory.length > 0) {
+    emit('focus-input');
+  }
 };
 
 // 自动调整输入框高度
@@ -430,10 +438,10 @@ onUnmounted(() => {
     <!-- 暂存附件预览区 -->
     <div v-if="attachmentStore.stagedAttachments.length > 0" class="flex items-center gap-2 mb-2 px-2 overflow-x-auto pb-1 pt-2">
       <TransitionGroup name="list">
-        <StagedAttachmentPreview 
-          v-for="(file, idx) in attachmentStore.stagedAttachments" 
-          :key="file.id || idx" 
-          :file="file" 
+        <StagedAttachmentPreview
+          v-for="(file, idx) in attachmentStore.stagedAttachments"
+          :key="file.id || idx"
+          :file="file"
           :index="idx"
           @remove="removeStagedAttachment"
         />
@@ -443,20 +451,20 @@ onUnmounted(() => {
     <!-- 框体主容器 -->
     <div class="flex items-end gap-2 px-1">
       <div class="flex-1 flex items-end gap-1.5 bg-[var(--secondary-bg)] border border-[var(--border-color)] rounded-2xl px-2 py-1 shadow-sm relative overflow-visible transition-all duration-300"
-        :class="{ 
-          'ring-1 ring-blue-500/30 border-blue-500/50': isSTTActive || isLongPressRecording, 
-          'ring-1 ring-red-500/30 border-red-500/50': isSwipeCancel 
+        :class="{
+          'ring-1 ring-blue-500/30 border-blue-500/50': isSTTActive || isLongPressRecording,
+          'ring-1 ring-red-500/30 border-red-500/50': isSwipeCancel
         }"
       >
-        
+
         <!-- 左侧：语音/键盘切换及长按附件录制按钮 -->
-        <button 
+        <button
           @touchstart.prevent="handleIconTouchStart"
           @touchmove="handleIconTouchMove"
           @touchend="handleIconTouchEnd"
           @touchcancel="handleIconTouchCancel"
           class="w-9 h-9 mb-0.5 flex items-center justify-center shrink-0 rounded-full hover:bg-black/5 dark:hover:bg-white/5 text-[var(--primary-text)] opacity-90 active:scale-90 transition-all relative select-none touch-none"
-          :class="{ 
+          :class="{
             'bg-blue-500/10 text-blue-500': isAudioMode || isLongPressRecording,
             'bg-red-500/10 text-red-500': isSwipeCancel && isLongPressRecording
           }"
@@ -474,7 +482,7 @@ onUnmounted(() => {
             <line x1="18" y1="12" x2="18" y2="12"></line>
             <line x1="7" y1="16" x2="17" y2="16"></line>
           </svg>
-          
+
           <!-- 麦克风图标 -->
           <svg v-else width="26" height="26" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg" class="shrink-0" :class="{ 'animate-pulse text-blue-500': isLongPressRecording }">
             <circle cx="24" cy="24" r="19.5" stroke="currentColor" stroke-width="3.5" fill="none"/>
@@ -486,26 +494,26 @@ onUnmounted(() => {
 
         <!-- 核心输入/按住说话极简交互区 (极致自然：仅原 textarea 区域变化，右侧按钮完全正常静止显示) -->
         <div class="flex-1 flex flex-col justify-end relative min-h-[36px] py-[1px] overflow-visible">
-          
+
           <!-- 情况 1：普通文本输入键盘状态 -->
-          <textarea 
+          <textarea
             v-if="!isAudioMode && !isLongPressRecording"
-            ref="textareaRef" 
-            v-model="input" 
-            @focus="showAttachMenu = false"
-            @keydown="handleKeydown" 
-            @paste="handlePaste" 
-            @beforeinput="handleBeforeInput" 
+            ref="textareaRef"
+            v-model="input"
+            @focus="handleFocus"
+            @keydown="handleKeydown"
+            @paste="handlePaste"
+            @beforeinput="handleBeforeInput"
             rows="1"
             class="w-full bg-transparent border-none focus:outline-none focus:ring-0 text-[var(--primary-text)] text-[15px] placeholder-opacity-40 resize-none leading-[1.25] py-[8px] scrollbar-hide vcp-textarea"
             style="max-height: 114px;"
-            :placeholder="disabled ? '请先选择话题以开启对话' : '说点什么...'" 
+            :placeholder="disabled ? '请先选择话题以开启对话' : '说点什么...'"
             :disabled="disabled"
           ></textarea>
-          
+
           <!-- 情况 2：语音模式 - “按住 说话” 大条状态 (仅静默填入原本 textarea 的位置，右侧加号/发送正常显示) -->
-          <div 
-            v-else-if="isAudioMode && !isSTTActive" 
+          <div
+            v-else-if="isAudioMode && !isSTTActive"
             @touchstart.prevent="handleSTTTouchStart"
             @touchmove="handleSTTTouchMove"
             @touchend="handleSTTTouchEnd"
@@ -536,7 +544,7 @@ onUnmounted(() => {
               录音时长: {{ recordingDuration }} 秒
             </div>
           </div>
-          
+
           <div class="absolute top-0 left-0 right-0 h-4 pointer-events-none bg-gradient-to-b from-[var(--secondary-bg)] to-transparent opacity-90"></div>
         </div>
 
@@ -550,7 +558,7 @@ onUnmounted(() => {
           >
             <div class="i-heroicons-plus-circle text-2xl transition-transform duration-300 ease-out" :class="{ 'rotate-45': showAttachMenu }"></div>
             <!-- 当有激活规则时显示绿色指示点 -->
-            <div v-if="tarvenStore.rules.some(r => r.isEnabled)" 
+            <div v-if="tarvenStore.rules.some(r => r.isEnabled)"
               class="absolute top-1.5 right-1.5 w-2 h-2 bg-emerald-500 rounded-full border-2 border-[var(--secondary-bg)] shadow-[0_0_8px_rgba(16,185,129,0.5)]">
             </div>
           </button>
@@ -571,17 +579,17 @@ onUnmounted(() => {
     </div>
 
     <!-- 往上平滑弹起的百搭扩展面板 -->
-    <div 
+    <div
       class="overflow-hidden transition-all duration-300 ease-[cubic-bezier(0.34,1.56,0.64,1)]"
       :class="showAttachMenu ? 'opacity-100' : 'opacity-0 pointer-events-none'"
       :style="{ height: showAttachMenu ? '112px' : '0px' }"
     >
-      <div 
+      <div
         class="w-full h-full border-t border-[var(--border-color)]/20 pt-3 pb-2 flex justify-around items-center transition-all duration-300"
         :class="showAttachMenu ? 'translate-y-0 opacity-100 scale-100' : 'translate-y-4 opacity-0 scale-95'"
       >
         <!-- 拍摄按钮 -->
-        <button @click="triggerFilePick('camera')" 
+        <button @click="triggerFilePick('camera')"
           class="group flex flex-col items-center gap-1.5 active:scale-95 transition-all outline-none"
         >
           <div class="w-13 h-13 flex items-center justify-center rounded-2xl bg-black/5 dark:bg-white/5 border border-[var(--border-color)]/30 group-hover:border-[var(--highlight-text)]/40 transition-all shadow-inner">
@@ -591,7 +599,7 @@ onUnmounted(() => {
         </button>
 
         <!-- 相册按钮 -->
-        <button @click="triggerFilePick('gallery')" 
+        <button @click="triggerFilePick('gallery')"
           class="group flex flex-col items-center gap-1.5 active:scale-95 transition-all outline-none"
         >
           <div class="w-13 h-13 flex items-center justify-center rounded-2xl bg-black/5 dark:bg-white/5 border border-[var(--border-color)]/30 group-hover:border-[var(--highlight-text)]/40 transition-all shadow-inner">
@@ -601,7 +609,7 @@ onUnmounted(() => {
         </button>
 
         <!-- 文件按钮 -->
-        <button @click="triggerFilePick('file')" 
+        <button @click="triggerFilePick('file')"
           class="group flex flex-col items-center gap-1.5 active:scale-95 transition-all outline-none"
         >
           <div class="w-13 h-13 flex items-center justify-center rounded-2xl bg-black/5 dark:bg-white/5 border border-[var(--border-color)]/30 group-hover:border-[var(--highlight-text)]/40 transition-all shadow-inner">

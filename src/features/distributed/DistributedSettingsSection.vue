@@ -1,11 +1,11 @@
 <script setup lang="ts">
-import { computed, watch } from "vue";
-import type { AppSettings } from "../../core/stores/settings";
+import { computed, onMounted, onUnmounted } from "vue";
+import { useSettingsStore, type AppSettings } from "../../core/stores/settings";
 import { useDistributed } from "./composables/useDistributed";
+import { useNotificationStore } from "../../core/stores/notification";
 
 import SettingsTextField from "../../components/settings/SettingsTextField.vue";
 import SettingsSwitch from "../../components/settings/SettingsSwitch.vue";
-import SettingsActionButton from "../../components/settings/SettingsActionButton.vue";
 import SettingsInlineStatus from "../../components/settings/SettingsInlineStatus.vue";
 import SettingsRow from "../../components/settings/SettingsRow.vue";
 
@@ -17,7 +17,16 @@ const emit = defineEmits<{
   (e: "save-request"): void;
 }>();
 
-const { status, loading, start, stop } = useDistributed();
+const settingsStore = useSettingsStore();
+const { status, activate, deactivate } = useDistributed();
+
+onMounted(() => {
+  activate();
+});
+
+onUnmounted(() => {
+  deactivate();
+});
 
 // Local toggle state — bound to settings for persistence
 const enabled = computed({
@@ -46,7 +55,8 @@ const derivedVcpKey = computed(() => {
 });
 
 const statusDisplay = computed(() => {
-  if (loading.value) return { type: "loading" as const, message: "连接中..." };
+  if (status.value.state === "connecting") return { type: "loading" as const, message: "连接中..." };
+  if (status.value.state === "disconnecting") return { type: "loading" as const, message: "断开中..." };
   if (status.value.connected) {
     return {
       type: "success" as const,
@@ -67,48 +77,36 @@ const configMessage = computed(() => {
 
 const rowDescription = computed(() => {
   if (configMessage.value) return configMessage.value;
-  if (enabled.value && !status.value.connected && !loading.value) {
+  if (enabled.value && !status.value.connected && status.value.state !== "connecting") {
     return status.value.last_error || "已启用，等待连接";
   }
   return statusDisplay.value.message;
 });
 
-const toggleConnection = async (nextEnabled?: boolean) => {
-  const shouldEnable = nextEnabled ?? !status.value.connected;
+const notificationStore = useNotificationStore();
 
-  if (shouldEnable && configMessage.value) {
-    return;
-  }
-
-  enabled.value = shouldEnable;
-  emit("save-request");
-  try {
-    if (shouldEnable && !status.value.connected) {
-      await start(derivedWsUrl.value, derivedVcpKey.value, deviceName.value);
-    } else if (!shouldEnable && status.value.connected) {
-      await stop();
+const toggleConnection = async () => {
+  if (enabled.value) {
+    enabled.value = false;
+    emit("save-request");
+  } else {
+    if (!derivedWsUrl.value || !derivedVcpKey.value) {
+      notificationStore.addNotification({
+        type: "warning",
+        title: "配置缺失",
+        message: "请先在服务器连接中配置 VCPLog/WebSocket 地址和密钥",
+        toastOnly: true
+      });
+      return;
     }
-  } catch (e) {
-    enabled.value = status.value.connected;
-    console.error("[Distributed] Connection toggle failed:", e);
+    // 同步到设置的分布式专用字段，让后端能拿到最新配置并连接
+    props.settings.distributedWsUrl = derivedWsUrl.value;
+    props.settings.distributedVcpKey = derivedVcpKey.value;
+    props.settings.distributedDeviceName = deviceName.value;
+    enabled.value = true;
     emit("save-request");
   }
 };
-
-// Auto-connect on mount if enabled was persisted
-watch(
-  () => props.settings.distributedEnabled,
-  async (val) => {
-    if (val && !status.value.connected && derivedWsUrl.value && derivedVcpKey.value) {
-      try {
-        await start(derivedWsUrl.value, derivedVcpKey.value, deviceName.value);
-      } catch (e) {
-        console.error("[Distributed] Auto-connect failed:", e);
-      }
-    }
-  },
-  { immediate: true },
-);
 </script>
 
 <template>
@@ -119,7 +117,7 @@ watch(
         <SettingsSwitch
           :model-value="enabled"
           active-color="bg-purple-500"
-          :disabled="loading || (!enabled && !!configMessage)"
+          :disabled="settingsStore.loading || (!enabled && !!configMessage)"
           @update:model-value="toggleConnection"
         />
       </template>
@@ -137,6 +135,7 @@ watch(
       v-model="deviceName"
       label="节点名称"
       placeholder="VCPMobile"
+      @blur="emit('save-request')"
     />
 
     <!-- 连接信息（只读，派生自 VCPLog 配置） -->
@@ -147,19 +146,6 @@ watch(
       <div class="font-mono">
         Key: {{ derivedVcpKey ? "●●●●●●●●" : "未配置" }}
       </div>
-    </div>
-
-    <!-- 手动重连按钮 -->
-    <div class="pt-2 flex justify-end">
-      <SettingsActionButton
-        variant="secondary"
-        size="sm"
-        :loading="loading"
-        :disabled="!status.connected && !!configMessage"
-        @click="toggleConnection(!status.connected)"
-      >
-        {{ status.connected ? "断开连接" : "连接" }}
-      </SettingsActionButton>
     </div>
   </div>
 </template>

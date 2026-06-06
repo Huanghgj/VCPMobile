@@ -25,33 +25,73 @@ import androidx.core.app.NotificationCompat
  * - 流结束立即自毁，绝不空占
  */
 class StreamKeepaliveService : Service() {
-
     companion object {
         const val CHANNEL_ID = "vcp_stream_keepalive"
         const val NOTIFICATION_ID = 0x53545201 // "STR" + 01
         const val EXTRA_AGENT_NAME = "agent_name"
+        const val EXTRA_IS_KEEPALIVE_MODE = "is_keepalive_mode"
         private const val TAG = "VcpMobileService"
+
+        @Volatile
+        var isServiceRunning = false
+
+        @Volatile
+        var isKeepaliveModeActive = false
+
+        @Volatile
+        var currentStreamName = ""
 
         /**
          * 构造启动该服务的 Intent
          */
         @JvmStatic
-        fun createIntent(context: Context, agentName: String): Intent {
+        fun createIntent(context: Context, agentName: String, isKeepaliveMode: Boolean? = null): Intent {
             return Intent(context, StreamKeepaliveService::class.java).apply {
                 putExtra(EXTRA_AGENT_NAME, agentName)
+                if (isKeepaliveMode != null) {
+                    putExtra(EXTRA_IS_KEEPALIVE_MODE, isKeepaliveMode)
+                }
             }
         }
     }
 
     override fun onCreate() {
         super.onCreate()
+        isServiceRunning = true
         createNotificationChannel()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val agentName = intent?.getStringExtra(EXTRA_AGENT_NAME) ?: "Agent"
+        if (intent != null) {
+            if (intent.hasExtra(EXTRA_IS_KEEPALIVE_MODE)) {
+                isKeepaliveModeActive = intent.getBooleanExtra(EXTRA_IS_KEEPALIVE_MODE, false)
+            }
+            if (intent.hasExtra(EXTRA_AGENT_NAME)) {
+                currentStreamName = intent.getStringExtra(EXTRA_AGENT_NAME) ?: ""
+            }
+        }
 
-        val notification = buildNotification(agentName)
+        if (!isKeepaliveModeActive && currentStreamName.isEmpty()) {
+            Log.i(TAG, "No active streams and keepalive mode is inactive. Stopping service safely.")
+            val notification = buildNotification("", false)
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    startForeground(
+                        NOTIFICATION_ID,
+                        notification,
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING
+                    )
+                } else {
+                    startForeground(NOTIFICATION_ID, notification)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to startForeground during shutdown fallback", e)
+            }
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        val notification = buildNotification(currentStreamName, isKeepaliveModeActive)
 
         // Android 14+ 必须声明前台服务类型，且加 try-catch 兜底，防止 ForegroundServiceStartNotAllowedException
         try {
@@ -65,10 +105,25 @@ class StreamKeepaliveService : Service() {
                 startForeground(NOTIFICATION_ID, notification)
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to startForeground, falling back to basic background service", e)
+            Log.e(TAG, "Failed to startForeground. Stopping keepalive service to avoid background drain.", e)
+            stopSelf()
+            return START_NOT_STICKY
         }
 
         return START_STICKY
+    }
+
+    override fun onDestroy() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } else {
+            @Suppress("DEPRECATION")
+            stopForeground(true)
+        }
+        isServiceRunning = false
+        isKeepaliveModeActive = false
+        currentStreamName = ""
+        super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -80,7 +135,7 @@ class StreamKeepaliveService : Service() {
                 "后台服务增强通道",
                 NotificationManager.IMPORTANCE_HIGH
             ).apply {
-                description = "Agent 流式响应保活"
+                description = "Agent 流式响应与后台保活"
                 setShowBadge(false)
                 enableVibration(false)
                 setSound(null, null)
@@ -90,7 +145,7 @@ class StreamKeepaliveService : Service() {
         }
     }
 
-    private fun buildNotification(agentName: String): Notification {
+    private fun buildNotification(agentName: String, isKeepalive: Boolean): Notification {
         // 点击通知：打开应用（通过反射获取主 Activity，避免跨包编译依赖）
         val openIntent = try {
             val mainActivityClass = Class.forName("com.vcp.avatar.MainActivity")
@@ -111,7 +166,9 @@ class StreamKeepaliveService : Service() {
         val contentText = when {
             agentName.contains("[数据同步]") -> "正在与云端服务器进行高精度同步..."
             agentName.contains("[预渲染重建]") -> "正在优化与加速本地响应缓存..."
-            else -> "思考中……"
+            agentName.isNotEmpty() -> "思考中……"
+            isKeepalive -> "分布式后台连接维系中..."
+            else -> "已连接"
         }
         val cleanTitle = agentName.replace("[数据同步]", "").replace("[预渲染重建]", "").trim()
 

@@ -98,7 +98,7 @@ const fsSource = `
     vec2 aspect_mouse = vec2(mouse.x, mouse.y * aspect);
     vec2 to_p = aspect_p - aspect_mouse;
     float dist = length(to_p);
-    
+
     // Interactive force field: 25% screen width radius, 15% screen width max push displacement
     float force = 0.15 * active * exp(-(dist * dist) / (0.25 * 0.25));
     if (dist > 0.001) {
@@ -139,10 +139,10 @@ const fsSource = `
     float w4 = anisotropic_gaussian(warped_uv - p4, aspect, 0.58, 0.20);
 
     // Brand Fluid Colors definition
-    vec3 col_cyan = vec3(0.0, 0.88, 1.0);    
+    vec3 col_cyan = vec3(0.0, 0.88, 1.0);
     vec3 col_magenta = vec3(1.0, 0.20, 0.45);
     vec3 col_violet = vec3(0.66, 0.33, 0.97);
-    vec3 col_blue = vec3(0.11, 0.30, 0.85);  
+    vec3 col_blue = vec3(0.11, 0.30, 0.85);
 
     // 5. Blend background depending on Light/Dark active mode
     vec3 bg_light = vec3(0.97, 0.98, 0.99); // #f8fafc slate-50
@@ -250,8 +250,8 @@ const initWebGL = () => {
   if (!canvas || !props.active) return;
   isCanvasReady.value = false;
 
-  gl = canvas.getContext('webgl', { 
-    alpha: false, 
+  gl = canvas.getContext('webgl', {
+    alpha: false,
     antialias: false,
     depth: false,
     stencil: false,
@@ -455,7 +455,7 @@ onUnmounted(() => {
     clearTimeout(initTimer);
     initTimer = null;
   }
-  
+
   if (resizeObserver) {
     resizeObserver.disconnect();
   }
@@ -470,12 +470,6 @@ onUnmounted(() => {
     hasGlobalInteractionListeners = false;
   }
 
-  if (gl && program) {
-    const ext = gl.getExtension('WEBGL_lose_context');
-    if (ext) {
-      ext.loseContext(); // Release GPU memory instantly
-    }
-  }
   gl = null;
   program = null;
 });

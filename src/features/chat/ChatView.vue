@@ -151,6 +151,12 @@ watch(keyboardHeight, (height) => {
     `${height}px`,
   );
 
+  // 只有当焦点确实处于主界面的输入框中时，键盘高度变化才执行置底
+  const isMainInputFocused = document.activeElement?.classList.contains("vcp-textarea");
+  if (!isMainInputFocused) {
+    return;
+  }
+
   if (height > 0 && historyStore.currentChatHistory.length > 0) {
     scrollToBottom(true);
   }
@@ -194,10 +200,10 @@ onUnmounted(() => {
         </button>
 
         <!-- 头像展示 -->
-        <VcpAvatar 
+        <VcpAvatar
           v-if="sessionStore.currentSelectedItem"
-          :owner-type="sessionStore.currentSelectedItem.type" 
-          :owner-id="sessionStore.currentSelectedItem.id" 
+          :owner-type="sessionStore.currentSelectedItem.type"
+          :owner-id="sessionStore.currentSelectedItem.id"
           :fallback-name="sessionStore.currentSelectedItem.name"
           :dominant-color="sessionStore.currentSelectedItem.avatarCalculatedColor"
           size="w-10 h-10"
@@ -206,7 +212,7 @@ onUnmounted(() => {
         />
 
         <div class="flex flex-col min-w-0 flex-1">
-          <span 
+          <span
             class="font-bold text-sm truncate transition-colors duration-500"
             :style="{ color: sessionStore.currentSelectedItem?.avatarCalculatedColor || 'var(--primary-text)' }"
           >
@@ -304,7 +310,12 @@ onUnmounted(() => {
 
     <!-- 3. 输入增强区 (固定底部) -->
     <footer class="vcp-input-footer px-4 py-1.5 border-t border-white/5 shrink-0">
-      <InputEnhancer :disabled="!sessionStore.currentTopicId" @send="historyStore.sendMessage" @toggle-menu="handleMenuToggle" />
+      <InputEnhancer
+        :disabled="!sessionStore.currentTopicId"
+        @send="historyStore.sendMessage"
+        @toggle-menu="handleMenuToggle"
+        @focus-input="scrollToBottom(true)"
+      />
       <div class="h-[calc(var(--vcp-safe-bottom,20px)+var(--keyboard-offset,0px))] no-swipe pointer-events-none"></div>
     </footer>
 

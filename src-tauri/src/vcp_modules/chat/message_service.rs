@@ -285,8 +285,8 @@ pub async fn load_chat_history_internal(
         format!(
             "SELECT m.msg_id, m.role, m.name, m.agent_id, m.content, m.timestamp, m.is_group_message, m.group_id, m.finish_reason, m.content_hash{}
          FROM messages m{}
-         WHERE m.topic_id = ? AND m.deleted_at IS NULL 
-         ORDER BY m.timestamp DESC, m.rowid DESC 
+         WHERE m.topic_id = ? AND m.deleted_at IS NULL
+         ORDER BY m.timestamp DESC, m.rowid DESC
          LIMIT ? OFFSET ?",
             render_select, render_join
         )
@@ -294,7 +294,7 @@ pub async fn load_chat_history_internal(
         format!(
             "SELECT m.msg_id, m.role, m.name, m.agent_id, m.content, m.timestamp, m.is_group_message, m.group_id, m.finish_reason, m.content_hash{}
          FROM messages m{}
-         WHERE m.topic_id = ? AND m.deleted_at IS NULL 
+         WHERE m.topic_id = ? AND m.deleted_at IS NULL
          ORDER BY m.timestamp DESC, m.rowid DESC",
             render_select, render_join
         )
@@ -330,7 +330,7 @@ pub async fn load_chat_history_internal(
                     ma.msg_id, ma.display_name, ma.src, ma.status
              FROM message_attachments ma
              JOIN attachments a ON ma.hash = a.hash
-             WHERE ma.topic_id = ? AND ma.msg_id IN ({}) 
+             WHERE ma.topic_id = ? AND ma.msg_id IN ({})
              ORDER BY ma.msg_id, ma.attachment_order ASC",
             extracted_text_column, placeholders
         );
@@ -379,12 +379,40 @@ pub async fn load_chat_history_internal(
         }
     }
 
-    // 预计算外壳属性所需的全局数据，仅 UI 历史加载需要。
+    // 预计算外壳属性所需的全局数据，仅 UI 历史加载需要，且避免 get_agents 的额外 topics 联表查询。
     let (agents, user_name, user_avatar_color) = if include_ui_render_data {
-        let agents =
-            crate::vcp_modules::agent_service::get_agents(_app_handle.clone(), _app_handle.state())
-                .await
-                .unwrap_or_default();
+        let agents = match sqlx::query(
+            "SELECT a.agent_id, a.name, av.dominant_color
+             FROM agents a
+             LEFT JOIN avatars av ON av.owner_id = a.agent_id AND av.owner_type = 'agent'
+             WHERE a.deleted_at IS NULL",
+        )
+        .fetch_all(pool)
+        .await
+        {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|row| {
+                    use sqlx::Row;
+                    crate::vcp_modules::agent_types::AgentConfig {
+                        id: row.get("agent_id"),
+                        name: row.get("name"),
+                        avatar_calculated_color: row.get("dominant_color"),
+                        system_prompt: String::new(),
+                        mobile_system_prompt: String::new(),
+                        model: String::new(),
+                        temperature: 0.0,
+                        context_token_limit: 0,
+                        max_output_tokens: 0,
+                        stream_output: false,
+                        use_temperature: false,
+                        topics: vec![],
+                    }
+                })
+                .collect::<Vec<_>>(),
+            Err(_) => Vec::new(),
+        };
+
         let settings = crate::vcp_modules::settings_manager::read_settings(
             _app_handle.clone(),
             _app_handle.state(),

@@ -1,5 +1,5 @@
 import { defineStore } from "pinia";
-import { ref } from "vue";
+import { onScopeDispose, ref } from "vue";
 import type { ChatMessage } from "../types/chat";
 
 interface Toast {
@@ -36,6 +36,27 @@ export const useFloatingAssistantStore = defineStore("floatingAssistant", () => 
   const ws = ref<WebSocket | null>(null);
   const wsReady = ref(false);
   const wsConfigured = ref(false); // true when initial_config received and settings loaded
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  const toastTimers = new Set<ReturnType<typeof setTimeout>>();
+  let reconnectAttempts = 0;
+  let intentionalClose = false;
+
+  const clearReconnectTimer = () => {
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+  };
+
+  const scheduleReconnect = () => {
+    if (!isFloatingMode.value || intentionalClose || reconnectTimer) return;
+    const delay = Math.min(30000, 1000 * 2 ** Math.min(reconnectAttempts, 5));
+    reconnectAttempts++;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      initWebSocket();
+    }, delay);
+  };
 
   const addToast = (
     type: Toast["type"],
@@ -51,20 +72,25 @@ export const useFloatingAssistantStore = defineStore("floatingAssistant", () => 
     };
     toasts.value.push(toast);
     if (toasts.value.length > 5) toasts.value.shift();
-    setTimeout(() => {
+    const timer = setTimeout(() => {
       toasts.value = toasts.value.filter((t) => t.id !== toast.id);
+      toastTimers.delete(timer);
     }, 3000);
+    toastTimers.add(timer);
   };
 
   const initWebSocket = () => {
     if (!isFloatingMode.value || ws.value) return;
 
     console.log("[FloatingAssistantStore] Initializing WebSocket IPC...");
+    intentionalClose = false;
+    clearReconnectTimer();
     const socket = new WebSocket(`ws://127.0.0.1:14202/ws`);
 
     socket.onopen = () => {
       console.log("[FloatingAssistantStore] WebSocket connected.");
       wsReady.value = true;
+      reconnectAttempts = 0;
       socket.send(JSON.stringify({ action: "get_initial_config" }));
     };
 
@@ -85,10 +111,24 @@ export const useFloatingAssistantStore = defineStore("floatingAssistant", () => 
     socket.onclose = () => {
       console.warn("[FloatingAssistantStore] WebSocket closed.");
       wsReady.value = false;
+      wsConfigured.value = false;
       ws.value = null;
+      scheduleReconnect();
     };
 
     ws.value = socket;
+  };
+
+  const closeWebSocket = () => {
+    intentionalClose = true;
+    clearReconnectTimer();
+    wsReady.value = false;
+    wsConfigured.value = false;
+    const socket = ws.value;
+    ws.value = null;
+    if (socket && socket.readyState !== WebSocket.CLOSED) {
+      socket.close();
+    }
   };
 
   const handleWsMessage = (data: any) => {
@@ -182,6 +222,12 @@ export const useFloatingAssistantStore = defineStore("floatingAssistant", () => 
     isGenerating.value = false;
     currentStreamingMessageId.value = null;
   };
+
+  onScopeDispose(() => {
+    closeWebSocket();
+    toastTimers.forEach(clearTimeout);
+    toastTimers.clear();
+  });
 
   /** Resolve settings: floating mode uses internal state, main app fetches via Tauri */
   const resolveSettings = async (): Promise<AppSettings | null> => {
@@ -281,6 +327,12 @@ export const useFloatingAssistantStore = defineStore("floatingAssistant", () => 
       return;
     }
 
+    const floatingSocket = isFloatingMode.value ? ws.value : null;
+    if (isFloatingMode.value && floatingSocket?.readyState !== WebSocket.OPEN) {
+      addToast("error", "连接未就绪", "悬浮助手 WebSocket 尚未连接，稍后再试");
+      return;
+    }
+
     const now = Date.now();
     const userMsg: ChatMessage = {
       id: `msg_${now}_user_temp`,
@@ -317,22 +369,25 @@ export const useFloatingAssistantStore = defineStore("floatingAssistant", () => 
     const payload = { agentId, tempMessages, vcpUrl, vcpApiKey };
 
     if (isFloatingMode.value) {
-      if (ws.value?.readyState === WebSocket.OPEN) {
+      try {
         console.log("[FloatingAssistantStore] Sending via WS:", { agentId, vcpUrl, msgCount: tempMessages.length });
-        ws.value.send(
+        floatingSocket!.send(
           JSON.stringify({
             action: "handle_assistant_chat_stream",
             payload,
           }),
         );
         return;
+      } catch (e) {
+        console.error("[FloatingAssistantStore] Failed to send via WS:", e);
+        messages.value = messages.value.filter(
+          (m) => m.id !== userMsg.id && m.id !== aiMsg.id,
+        );
+        addToast("error", "发送失败", "悬浮助手 WebSocket 发送失败，请稍后重试");
+        isGenerating.value = false;
+        currentStreamingMessageId.value = null;
+        return;
       }
-
-      // WS 没插稳就别让消息射出去，避免假生成状态白白耗电喵♡
-      addToast("error", "连接未就绪", "悬浮助手 WebSocket 尚未连接，稍后再试");
-      isGenerating.value = false;
-      currentStreamingMessageId.value = null;
-      return;
     }
 
     try {
@@ -361,6 +416,7 @@ export const useFloatingAssistantStore = defineStore("floatingAssistant", () => 
     wsConfigured,
     toasts,
     initWebSocket,
+    closeWebSocket,
     clearSession,
     archiveSession,
     sendMessage,

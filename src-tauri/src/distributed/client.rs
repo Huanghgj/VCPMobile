@@ -9,12 +9,16 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use tauri::{AppHandle, Emitter};
-use tokio::sync::{watch, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock};
 use tokio::time;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_util::sync::CancellationToken;
 
 use super::tool_registry::ToolRegistry;
 use super::types::*;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const WAKE_LOCKED_IO_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Type alias for the WebSocket sink to avoid excessive complexity in signatures.
 type WsSink = Arc<
@@ -28,23 +32,42 @@ type WsSink = Arc<
     >,
 >;
 
+/// Immutable configuration for a single connection lifecycle.
+struct ConnectionConfig {
+    ws_url: String,
+    vcp_key: String,
+    device_name: String,
+}
+
+/// Runtime context for a single connection lifecycle (channel receivers).
+struct SessionContext {
+    status: Arc<RwLock<DistributedStatus>>,
+    registry: Arc<ToolRegistry>,
+    re_register_rx: tokio::sync::mpsc::Receiver<()>,
+    reconnect_rx: tokio::sync::mpsc::Receiver<()>,
+}
+
+/// Handle to an active connection session — created by start(), dropped by stop().
+struct ConnectionSession {
+    cancel_token: CancellationToken,
+    re_register_tx: tokio::sync::mpsc::Sender<()>,
+    reconnect_tx: tokio::sync::mpsc::Sender<()>,
+    task_handle: tokio::task::JoinHandle<()>,
+}
+
 /// Distributed node state, shared across async tasks.
 pub struct DistributedClient {
-    /// Signal to stop all background tasks.
-    shutdown_tx: watch::Sender<bool>,
     /// Current connection status.
     status: Arc<RwLock<DistributedStatus>>,
-    /// Handle to the background connection task.
-    task_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Active session handle — None when disconnected.
+    session: Mutex<Option<ConnectionSession>>,
 }
 
 impl DistributedClient {
     pub fn new() -> Self {
-        let (shutdown_tx, _) = watch::channel(false);
         Self {
-            shutdown_tx,
             status: Arc::new(RwLock::new(DistributedStatus::default())),
-            task_handle: Mutex::new(None),
+            session: Mutex::new(None),
         }
     }
 
@@ -60,51 +83,140 @@ impl DistributedClient {
         device_name: String,
         registry: Arc<ToolRegistry>,
     ) -> Result<(), String> {
-        // If already running, stop first.
-        self.stop().await;
+        // Prevent duplicate activation using ConnectionState.
+        {
+            let mut s = self.status.write().await;
+            if s.state == ConnectionState::Connected || s.state == ConnectionState::Connecting {
+                log::info!(
+                    "[Distributed] Connection is already running or connecting ({:?}), skipping start request.",
+                    s.state
+                );
+                return Ok(());
+            }
+            s.state = ConnectionState::Connecting;
+            s.connected = false;
+            s.server_id = None;
+            s.client_id = None;
+            s.last_error = None;
+        }
 
-        // Reset shutdown signal.
-        let _ = self.shutdown_tx.send(false);
-        let shutdown_rx = self.shutdown_tx.subscribe();
+        // Gracefully shut down any existing session before creating a new one.
+        if let Some(old_session) = self.session.lock().await.take() {
+            old_session.cancel_token.cancel();
+            let _ = old_session.task_handle.await;
+        }
+
+        // Create fresh channels and cancellation token — no state reuse from previous cycles.
+        let cancel_token = CancellationToken::new();
+        let (re_register_tx, re_register_rx) = tokio::sync::mpsc::channel(1);
+        let (reconnect_tx, reconnect_rx) = tokio::sync::mpsc::channel(1);
         let status = self.status.clone();
 
-        // Clear any previous error
-        {
-            let mut s = status.write().await;
-            *s = DistributedStatus::default();
-        }
         Self::emit_status(&app, &status).await;
 
-        let handle = tokio::spawn(Self::connection_loop(
-            app,
+        #[cfg(target_os = "android")]
+        if let Err(e) = tauri_plugin_vcp_mobile::stream::set_keepalive_mode(&app, true) {
+            log::warn!(
+                "[Distributed] Failed to start keepalive foreground service: {}",
+                e
+            );
+        }
+
+        let config = ConnectionConfig {
             ws_url,
             vcp_key,
             device_name,
-            shutdown_rx,
+        };
+        let ctx = SessionContext {
             status,
             registry,
-        ));
+            re_register_rx,
+            reconnect_rx,
+        };
+        let loop_token = cancel_token.clone();
 
-        *self.task_handle.lock().await = Some(handle);
+        let task_handle = tokio::spawn(Self::connection_loop(app, config, loop_token, ctx));
+
+        *self.session.lock().await = Some(ConnectionSession {
+            cancel_token,
+            re_register_tx,
+            reconnect_tx,
+            task_handle,
+        });
         Ok(())
     }
 
     /// Stop the distributed node.
-    pub async fn stop(&self) {
-        let _ = self.shutdown_tx.send(true);
-        if let Some(handle) = self.task_handle.lock().await.take() {
-            handle.abort();
-            let _ = handle.await;
+    pub async fn stop(&self, _app: &AppHandle) {
+        #[cfg(target_os = "android")]
+        if let Err(e) = tauri_plugin_vcp_mobile::stream::set_keepalive_mode(_app, false) {
+            log::warn!(
+                "[Distributed] Failed to stop keepalive foreground service: {}",
+                e
+            );
         }
-        let mut s = self.status.write().await;
-        s.connected = false;
-        s.server_id = None;
-        s.client_id = None;
+
+        {
+            let mut s = self.status.write().await;
+            if s.state == ConnectionState::Disconnected || s.state == ConnectionState::Disconnecting
+            {
+                log::info!(
+                    "[Distributed] Already disconnected or disconnecting, skipping stop request."
+                );
+                return;
+            }
+            s.state = ConnectionState::Disconnecting;
+        }
+
+        // Take the session out and gracefully shut it down.
+        // cancel() signals the connection_loop to exit; task_handle.await waits for
+        // the loop's tail cleanup (which sets Disconnected + emits status).
+        if let Some(session) = self.session.lock().await.take() {
+            session.cancel_token.cancel();
+            let _ = session.task_handle.await;
+            // session drops here → re_register_tx, reconnect_tx naturally close
+        }
+
+        // Safety net: ensure final Disconnected state if loop didn't clean up properly.
+        {
+            let mut s = self.status.write().await;
+            if s.state == ConnectionState::Disconnecting {
+                s.state = ConnectionState::Disconnected;
+                s.connected = false;
+                s.server_id = None;
+                s.client_id = None;
+            }
+        }
+        Self::emit_status(_app, &self.status).await;
     }
 
     /// Get current status snapshot.
     pub async fn get_status(&self) -> DistributedStatus {
         self.status.read().await.clone()
+    }
+
+    /// Check if the distributed client is connected.
+    pub async fn is_connected(&self) -> bool {
+        self.status.read().await.connected
+    }
+
+    /// Check if the connection task is running (connecting, connected, or disconnecting).
+    pub async fn is_running(&self) -> bool {
+        self.status.read().await.state != ConnectionState::Disconnected
+    }
+
+    /// Trigger re-registration of tools.
+    pub async fn re_register_tools(&self) {
+        if let Some(session) = self.session.lock().await.as_ref() {
+            let _ = session.re_register_tx.send(()).await;
+        }
+    }
+
+    /// Trigger immediate reconnection.
+    pub async fn trigger_reconnect(&self) {
+        if let Some(session) = self.session.lock().await.as_ref() {
+            let _ = session.reconnect_tx.send(()).await;
+        }
     }
 
     // ================================================================
@@ -113,72 +225,111 @@ impl DistributedClient {
 
     async fn connection_loop(
         app: AppHandle,
-        ws_url: String,
-        vcp_key: String,
-        device_name: String,
-        mut shutdown_rx: watch::Receiver<bool>,
-        status: Arc<RwLock<DistributedStatus>>,
-        registry: Arc<ToolRegistry>,
+        config: ConnectionConfig,
+        cancel_token: CancellationToken,
+        ctx: SessionContext,
     ) {
         let mut reconnect_interval = Duration::from_secs(5);
         let max_reconnect_interval = Duration::from_secs(60);
+        let re_register_rx = Arc::new(Mutex::new(ctx.re_register_rx));
+        let mut reconnect_rx = ctx.reconnect_rx;
+        let status = ctx.status;
+        let registry = ctx.registry;
 
         loop {
-            // Check shutdown before connecting.
-            if *shutdown_rx.borrow() {
+            // Check cancellation before connecting.
+            if cancel_token.is_cancelled() {
                 break;
             }
 
             // Build connection URL: ws://host:port/vcp-distributed-server/VCP_Key=<key>
             let connection_url = format!(
                 "{}/vcp-distributed-server/VCP_Key={}",
-                ws_url.trim_end_matches('/'),
-                vcp_key
+                config.ws_url.trim_end_matches('/'),
+                config.vcp_key
             );
 
             log::info!(
                 "[Distributed] Connecting to main server: {}",
-                connection_url.replace(&vcp_key, "***")
+                connection_url.replace(&config.vcp_key, "***")
             );
 
-            match tokio_tungstenite::connect_async(&connection_url).await {
-                Ok((ws_stream, _response)) => {
+            // Connect with cancellation support — avoids blocking on TCP timeout during shutdown.
+            acquire_wake_lock_helper(&app);
+            let connect_result = tokio::select! {
+                result = time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(&connection_url)) => Some(result),
+                _ = cancel_token.cancelled() => None,
+            };
+            release_wake_lock_helper(&app);
+
+            match connect_result {
+                Some(Ok(Ok((ws_stream, _response)))) => {
                     log::info!("[Distributed] WebSocket connected.");
                     reconnect_interval = Duration::from_secs(5); // Reset backoff on success.
 
                     // Run the session until it ends.
-                    Self::run_session(
+                    let exit_reason = Self::run_session(
                         &app,
                         ws_stream,
-                        &device_name,
-                        &mut shutdown_rx,
+                        &config.device_name,
+                        &cancel_token,
                         &status,
                         &registry,
+                        re_register_rx.clone(),
                     )
                     .await;
 
                     // Session ended — update status.
                     {
                         let mut s = status.write().await;
+                        if s.state != ConnectionState::Disconnecting {
+                            s.state = ConnectionState::Connecting;
+                        }
                         s.connected = false;
                         s.server_id = None;
                         s.client_id = None;
+                        s.last_error = Some(exit_reason);
                     }
                     Self::emit_status(&app, &status).await;
                 }
-                Err(e) => {
+                Some(Ok(Err(e))) => {
                     log::warn!("[Distributed] Connection failed: {}", e);
                     {
                         let mut s = status.write().await;
+                        if s.state != ConnectionState::Disconnecting {
+                            s.state = ConnectionState::Connecting;
+                        }
                         s.connected = false;
                         s.last_error = Some(format!("Connection failed: {}", e));
                     }
                     Self::emit_status(&app, &status).await;
                 }
+                Some(Err(_)) => {
+                    log::warn!(
+                        "[Distributed] Connection attempt timed out after {}s.",
+                        CONNECT_TIMEOUT.as_secs()
+                    );
+                    {
+                        let mut s = status.write().await;
+                        if s.state != ConnectionState::Disconnecting {
+                            s.state = ConnectionState::Connecting;
+                        }
+                        s.connected = false;
+                        s.last_error = Some(format!(
+                            "Connection timed out after {}s",
+                            CONNECT_TIMEOUT.as_secs()
+                        ));
+                    }
+                    Self::emit_status(&app, &status).await;
+                }
+                None => {
+                    // Cancelled during connect — exit loop immediately.
+                    break;
+                }
             }
 
-            // Check shutdown before waiting.
-            if *shutdown_rx.borrow() {
+            // Check cancellation before waiting.
+            if cancel_token.is_cancelled() {
                 break;
             }
 
@@ -190,7 +341,10 @@ impl DistributedClient {
 
             tokio::select! {
                 _ = time::sleep(reconnect_interval) => {},
-                _ = shutdown_rx.changed() => {
+                _ = reconnect_rx.recv() => {
+                    log::info!("[Distributed] Triggering immediate reconnect due to network restore event.");
+                }
+                _ = cancel_token.cancelled() => {
                     break;
                 }
             }
@@ -198,6 +352,14 @@ impl DistributedClient {
             reconnect_interval = std::cmp::min(reconnect_interval * 2, max_reconnect_interval);
         }
 
+        {
+            let mut s = status.write().await;
+            s.state = ConnectionState::Disconnected;
+            s.connected = false;
+            s.server_id = None;
+            s.client_id = None;
+        }
+        Self::emit_status(&app, &status).await;
         log::info!("[Distributed] Connection loop exited.");
     }
 
@@ -211,11 +373,15 @@ impl DistributedClient {
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
         >,
         device_name: &str,
-        shutdown_rx: &mut watch::Receiver<bool>,
+        cancel_token: &CancellationToken,
         status: &Arc<RwLock<DistributedStatus>>,
         registry: &Arc<ToolRegistry>,
-    ) {
+        re_register_rx: Arc<Mutex<tokio::sync::mpsc::Receiver<()>>>,
+    ) -> String {
         use tokio_tungstenite::tungstenite::Message;
+
+        // Keep distributed sessions battery-friendly: sensor tools read cached or short
+        // on-demand snapshots instead of keeping Android sensors active for the whole WS session.
 
         let (ws_tx, mut ws_rx) = ws_stream.split();
 
@@ -226,6 +392,9 @@ impl DistributedClient {
         let mut placeholder_interval = time::interval(Duration::from_secs(30));
         // Skip the first immediate tick; we do an initial push below after registration.
         placeholder_interval.tick().await;
+
+        #[allow(unused_assignments)]
+        let mut exit_reason = "Connection closed normally".to_string();
 
         loop {
             tokio::select! {
@@ -246,38 +415,63 @@ impl DistributedClient {
                             let mut tx = ws_tx.lock().await;
                             let _ = tx.send(Message::Pong(data)).await;
                         }
-                        Some(Ok(Message::Close(_))) => {
-                            log::info!("[Distributed] Server sent close frame.");
+                        Some(Ok(Message::Close(reason))) => {
+                            let r_str = reason.map(|r| format!("{} (code: {})", r.reason, r.code)).unwrap_or_else(|| "No reason provided".to_string());
+                            log::info!("[Distributed] Server sent close frame: {}", r_str);
+                            exit_reason = format!("Server closed connection: {}", r_str);
                             break;
                         }
                         Some(Err(e)) => {
                             log::warn!("[Distributed] WS error: {}", e);
+                            exit_reason = format!("WebSocket error: {}", e);
                             break;
                         }
                         None => {
                             log::info!("[Distributed] WS stream ended.");
+                            exit_reason = "WS stream ended (server disconnected)".to_string();
                             break;
                         }
                         _ => {} // Binary, Pong — ignore
                     }
                 }
 
-                // --- Periodic static placeholder push ---
-                _ = placeholder_interval.tick() => {
-                    Self::push_static_placeholders(device_name, &ws_tx, registry).await;
+                // --- Out-of-band re-registration request ---
+                opt = async {
+                    let mut rx = re_register_rx.lock().await;
+                    rx.recv().await
+                } => {
+                    if opt.is_some() {
+                        log::info!("[Distributed] Re-registering tools due to configuration change.");
+                        Self::register_tools(device_name, &ws_tx, registry, status).await;
+                        Self::emit_status_with_app(app, status).await;
+                    }
                 }
 
-                // --- Shutdown signal ---
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
-                        log::info!("[Distributed] Shutdown signal received, closing session.");
-                        let mut tx = ws_tx.lock().await;
-                        let _ = tx.close().await;
-                        break;
+                // --- Periodic static placeholder push ---
+                _ = placeholder_interval.tick() => {
+                    if let Err(e) = Self::with_native_wake_lock_timeout(
+                        app,
+                        "static placeholder push",
+                        async {
+                            Self::push_static_placeholders(app, device_name, &ws_tx, registry).await;
+                        },
+                    ).await {
+                        log::warn!("[Distributed] Static placeholder push skipped: {}", e);
                     }
+                }
+
+                // --- Cancellation signal ---
+                _ = cancel_token.cancelled() => {
+                    log::info!("[Distributed] Shutdown signal received, closing session.");
+                    let mut tx = ws_tx.lock().await;
+                    let _ = tx.close().await;
+                    exit_reason = "Client requested shutdown".to_string();
+                    break;
                 }
             }
         }
+
+        exit_reason
     }
 
     // ================================================================
@@ -314,6 +508,7 @@ impl DistributedClient {
                 // Update status
                 {
                     let mut s = status.write().await;
+                    s.state = ConnectionState::Connected;
                     s.connected = true;
                     s.server_id = Some(server_id.clone());
                     s.client_id = Some(client_id.clone());
@@ -323,12 +518,30 @@ impl DistributedClient {
 
                 // Register tools — mirrors registerTools()
                 Self::register_tools(device_name, ws_tx, registry, status).await;
+                Self::emit_status_with_app(app, status).await;
 
                 // Report IP — mirrors reportIPAddress()
-                Self::report_ip(device_name, ws_tx).await;
+                let device_name_clone = device_name.to_string();
+                let ws_tx_clone = ws_tx.clone();
+                tokio::spawn(async move {
+                    Self::report_ip(&device_name_clone, &ws_tx_clone).await;
+                });
 
                 // Initial static placeholder push (2s delay in VCPChat, do it immediately here)
-                Self::push_static_placeholders(device_name, ws_tx, registry).await;
+                if let Err(e) = Self::with_native_wake_lock_timeout(
+                    app,
+                    "initial static placeholder push",
+                    async {
+                        Self::push_static_placeholders(app, device_name, ws_tx, registry).await;
+                    },
+                )
+                .await
+                {
+                    log::warn!(
+                        "[Distributed] Initial static placeholder push skipped: {}",
+                        e
+                    );
+                }
             }
 
             IncomingMessage::ExecuteTool {
@@ -343,9 +556,28 @@ impl DistributedClient {
                 );
 
                 // Execute and return result.
-                let response =
-                    Self::execute_tool(app, &request_id, &tool_name, tool_args, registry).await;
-                Self::send_message(ws_tx, &response).await;
+                let tool_name_for_timeout = tool_name.clone();
+                let request_id_for_timeout = request_id.clone();
+                let result = Self::with_native_wake_lock_timeout(app, "tool execution", async {
+                    let response =
+                        Self::execute_tool(app, &request_id, &tool_name, tool_args, registry).await;
+                    Self::send_message(ws_tx, &response).await;
+                })
+                .await;
+                if let Err(e) = result {
+                    log::warn!(
+                        "[Distributed] Tool '{}' timed out or failed in guarded execution: {}",
+                        tool_name_for_timeout,
+                        e
+                    );
+                    let response = OutgoingMessage::ToolResult {
+                        request_id: request_id_for_timeout,
+                        status: "error".to_string(),
+                        result: None,
+                        error: Some(e),
+                    };
+                    Self::send_message(ws_tx, &response).await;
+                }
             }
 
             IncomingMessage::Unknown(msg_type) => {
@@ -367,12 +599,6 @@ impl DistributedClient {
         status: &Arc<RwLock<DistributedStatus>>,
     ) {
         let tools = registry.get_all_manifests();
-
-        if tools.is_empty() {
-            log::info!("[Distributed] No tools to register.");
-            return;
-        }
-
         let count = tools.len();
         let msg = OutgoingMessage::RegisterTools {
             server_name: device_name.to_string(),
@@ -395,23 +621,9 @@ impl DistributedClient {
         // Collect local IPv4 addresses (simplified — no external crate needed)
         let local_ips = Vec::new(); // TODO: enumerate network interfaces in Phase 2
 
-        // Optional: fetch public IP
-        let public_ip: Option<String> =
-            match reqwest::get("https://api.ipify.org?format=json").await {
-                Ok(resp) => {
-                    if let Ok(data) = resp.json::<Value>().await {
-                        data.get("ip")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string())
-                    } else {
-                        None
-                    }
-                }
-                Err(e) => {
-                    log::warn!("[Distributed] Could not fetch public IP: {}", e);
-                    None
-                }
-            };
+        // Mobile battery/privacy default: do not wake the radio for a third-party
+        // public-IP lookup on every reconnect. Keep the protocol field nullable.
+        let public_ip: Option<String> = None;
 
         let msg = OutgoingMessage::ReportIp {
             server_name: device_name.to_string(),
@@ -425,11 +637,12 @@ impl DistributedClient {
     /// Push static placeholder values.
     /// VCPChat ref: pushStaticPlaceholderValues() line 374-398
     async fn push_static_placeholders(
+        app: &AppHandle,
         device_name: &str,
         ws_tx: &WsSink,
         registry: &Arc<ToolRegistry>,
     ) {
-        let placeholders = registry.get_all_placeholder_values();
+        let placeholders = registry.get_all_placeholder_values(app);
 
         if placeholders.is_empty() {
             return;
@@ -504,4 +717,45 @@ impl DistributedClient {
     async fn emit_status_with_app(app: &AppHandle, status: &Arc<RwLock<DistributedStatus>>) {
         Self::emit_status(app, status).await;
     }
+
+    async fn with_native_wake_lock_timeout<F, T>(
+        app: &AppHandle,
+        label: &str,
+        future: F,
+    ) -> Result<T, String>
+    where
+        F: std::future::Future<Output = T>,
+    {
+        acquire_wake_lock_helper(app);
+        let result = time::timeout(WAKE_LOCKED_IO_TIMEOUT, future).await;
+        release_wake_lock_helper(app);
+
+        result.map_err(|_| {
+            format!(
+                "{} timed out after {}s",
+                label,
+                WAKE_LOCKED_IO_TIMEOUT.as_secs()
+            )
+        })
+    }
 }
+
+#[cfg(target_os = "android")]
+fn acquire_wake_lock_helper(app: &tauri::AppHandle) {
+    if let Err(e) = tauri_plugin_vcp_mobile::system::acquire_wake_lock(app.clone()) {
+        log::warn!("[Distributed] Failed to acquire native wake lock: {}", e);
+    }
+}
+
+#[cfg(target_os = "android")]
+fn release_wake_lock_helper(app: &tauri::AppHandle) {
+    if let Err(e) = tauri_plugin_vcp_mobile::system::release_wake_lock(app.clone()) {
+        log::warn!("[Distributed] Failed to release native wake lock: {}", e);
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn acquire_wake_lock_helper(_app: &tauri::AppHandle) {}
+
+#[cfg(not(target_os = "android"))]
+fn release_wake_lock_helper(_app: &tauri::AppHandle) {}

@@ -31,39 +31,8 @@ impl DistributedState {
 }
 
 // ============================================================
-// Tauri commands — the 4 entry points registered in lib.rs
+// Tauri commands — entry points registered in lib.rs
 // ============================================================
-
-/// Phase 2 sensor bridge: frontend pushes sensor data into the shared store.
-/// Called by SensorCollector.vue via invoke("update_sensor_data", { key, value }).
-#[tauri::command]
-pub fn update_sensor_data(key: String, value: String) {
-    tools::frontend_bridge::update_sensor(&key, value);
-}
-
-/// Start the distributed node connection.
-#[tauri::command]
-pub async fn start_distributed_node(
-    app: tauri::AppHandle,
-    state: State<'_, DistributedState>,
-    ws_url: String,
-    vcp_key: String,
-    device_name: String,
-) -> Result<(), String> {
-    let registry = state.registry.clone();
-    let client = state.client.read().await;
-    client
-        .start(app, ws_url, vcp_key, device_name, registry)
-        .await
-}
-
-/// Stop the distributed node connection.
-#[tauri::command]
-pub async fn stop_distributed_node(state: State<'_, DistributedState>) -> Result<(), String> {
-    let client = state.client.read().await;
-    client.stop().await;
-    Ok(())
-}
 
 /// Get current distributed node status.
 #[tauri::command]
@@ -72,4 +41,58 @@ pub async fn get_distributed_status(
 ) -> Result<types::DistributedStatus, String> {
     let client = state.client.read().await;
     Ok(client.get_status().await)
+}
+
+/// Get all registered tools metadata for frontend display.
+#[tauri::command]
+pub async fn get_registered_tools_metadata(
+    state: State<'_, DistributedState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    Ok(state.registry.get_tools_metadata())
+}
+
+/// Update disabled tools list and re-register if connected.
+#[tauri::command]
+pub async fn update_disabled_tools(
+    app: tauri::AppHandle,
+    state: State<'_, DistributedState>,
+    disabled_names: Vec<String>,
+) -> Result<(), String> {
+    let changed = state.registry.update_disabled(disabled_names);
+
+    if changed {
+        let _ = state.registry.save_disabled_config(&app);
+        let client = state.client.read().await;
+        if client.is_connected().await {
+            client.re_register_tools().await;
+        }
+    }
+    Ok(())
+}
+
+/// Execute a distributed tool by name.
+#[tauri::command]
+pub async fn execute_distributed_tool(
+    app: tauri::AppHandle,
+    state: State<'_, DistributedState>,
+    name: String,
+) -> Result<String, String> {
+    let res = state
+        .registry
+        .execute(&name, serde_json::Value::Null, &app)
+        .await?;
+    match res {
+        serde_json::Value::String(s) => Ok(s),
+        other => Ok(other.to_string()),
+    }
+}
+
+/// Trigger immediate reconnect of the distributed client.
+#[tauri::command]
+pub async fn reconnect_distributed_client(
+    state: State<'_, DistributedState>,
+) -> Result<(), String> {
+    let client = state.client.read().await;
+    client.trigger_reconnect().await;
+    Ok(())
 }

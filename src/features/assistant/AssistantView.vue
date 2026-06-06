@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, nextTick, watch } from "vue";
+import { ref, onMounted, onUnmounted, nextTick, watch } from "vue";
 import { useFloatingAssistantStore } from "../../core/stores/floatingAssistant";
 import AssistantMessageCard from "./AssistantMessageCard.vue";
 
@@ -74,6 +74,12 @@ onMounted(() => {
   }
   focusTextarea();
 });
+
+onUnmounted(() => {
+  if (floatingStore.isFloatingMode) {
+    floatingStore.closeWebSocket();
+  }
+});
 </script>
 
 <template>
@@ -82,7 +88,7 @@ onMounted(() => {
   >
     <!-- Header -->
     <div
-      class="flex items-center justify-between px-4 py-3 border-b border-black/5 dark:border-white/5 shrink-0 bg-white/50 dark:bg-zinc-900/50 backdrop-blur-md"
+      class="flex items-center justify-between px-4 py-3 border-b border-black/5 dark:border-white/5 shrink-0 bg-white dark:bg-zinc-900"
     >
       <div class="flex items-center gap-2">
         <div

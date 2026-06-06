@@ -82,7 +82,7 @@ const stopPermissionPolling = () => {
 onMounted(() => {
   check();
   // 当应用从后台切回前台时重检（用户在设置页操作后返回）
-  window.addEventListener('visibilitychange', onVisibilityChange);
+  document.addEventListener('visibilitychange', onVisibilityChange);
   // Kotlin 侧主动推送的权限变更事件
   window.addEventListener('vcp-permission-change', onPermissionChange);
   startPermissionPolling();
@@ -90,7 +90,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   stopPermissionPolling();
-  window.removeEventListener('visibilitychange', onVisibilityChange);
+  document.removeEventListener('visibilitychange', onVisibilityChange);
   window.removeEventListener('vcp-permission-change', onPermissionChange);
 });
 </script>

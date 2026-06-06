@@ -42,8 +42,6 @@ export const useSyncSessionStore = defineStore('syncSession', () => {
     logs.value = [];
     progressData.value = { phase: 'initialization', total: 0, completed: 0, message: '' };
 
-    // 立即启动前台服务，实现瞬时响应通知栏，消除跨端 API 电量异步检测等待耗时
-    invoke('plugin:vcp-mobile|start_streaming_service', { agentName: '[数据同步] VCP Mobile' }).catch(() => {});
     status.value = 'connecting';
     acquireScreenKeep();
 
@@ -59,7 +57,6 @@ export const useSyncSessionStore = defineStore('syncSession', () => {
           status.value = 'error';
           canDismiss.value = true;
           releaseScreenKeep();
-          invoke('plugin:vcp-mobile|stop_streaming_service', { agentName: '[数据同步] VCP Mobile' }).catch(() => {});
           return;
         }
         if (battery.level > 0 && battery.level < 30) {
@@ -67,7 +64,6 @@ export const useSyncSessionStore = defineStore('syncSession', () => {
           status.value = 'error';
           canDismiss.value = true;
           releaseScreenKeep();
-          invoke('plugin:vcp-mobile|stop_streaming_service', { agentName: '[数据同步] VCP Mobile' }).catch(() => {});
           return;
         }
       }
@@ -82,7 +78,6 @@ export const useSyncSessionStore = defineStore('syncSession', () => {
       status.value = 'error';
       canDismiss.value = true;
       releaseScreenKeep();
-      invoke('plugin:vcp-mobile|stop_streaming_service', { agentName: '[数据同步] VCP Mobile' }).catch(() => {});
     });
   };
 
@@ -93,7 +88,6 @@ export const useSyncSessionStore = defineStore('syncSession', () => {
     cleanupListeners();
     releaseScreenKeep();
     invoke('stop_sync').catch(() => {});
-    invoke('plugin:vcp-mobile|stop_streaming_service', { agentName: '[数据同步] VCP Mobile' }).catch(() => {});
   };
 
   const copyLogs = async () => {
@@ -127,11 +121,10 @@ export const useSyncSessionStore = defineStore('syncSession', () => {
     listen('vcp-sync-status', (event: any) => {
       const s = event.payload.status;
       if (s === 'open') { status.value = 'connected'; canDismiss.value = false; }
-      if (s === 'error') { 
-        status.value = 'error'; 
-        canDismiss.value = true; 
+      if (s === 'error') {
+        status.value = 'error';
+        canDismiss.value = true;
         releaseScreenKeep();
-        invoke('plugin:vcp-mobile|stop_streaming_service', { agentName: '[数据同步] VCP Mobile' }).catch(() => {});
       }
     }).then(fn => unlistenFns.push(fn));
 
@@ -141,7 +134,6 @@ export const useSyncSessionStore = defineStore('syncSession', () => {
       needsReload.value = true;
       releaseScreenKeep();
       pushLog('success', '同步已全部完成，点击关闭以刷新数据');
-      invoke('plugin:vcp-mobile|stop_streaming_service', { agentName: '[数据同步] VCP Mobile' }).catch(() => {});
     }).then(fn => unlistenFns.push(fn));
   };
 

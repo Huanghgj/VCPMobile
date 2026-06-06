@@ -29,6 +29,7 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             system::move_task_to_back,
             system::pick_file,
             system::get_battery_status,
+            system::get_network_status,
             system::open_file_native,
             system::capture_window_snapshot,
             system::save_image_to_gallery,
@@ -40,6 +41,17 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             system::request_overlay_permission,
             system::register_shared_files,
             system::toggle_floating_ball,
+            system::start_sensor_collection,
+            system::stop_sensor_collection,
+            system::get_sensor_data,
+            system::get_cpu_thermal_status,
+            system::get_gpu_status,
+            system::check_root_access,
+            system::run_root_command,
+            system::launch_root_manager,
+            system::acquire_wake_lock,
+            system::release_wake_lock,
+            system::start_network_monitoring,
         ])
         .setup(|app, _api| {
             #[cfg(target_os = "android")]

@@ -73,7 +73,47 @@ export const useNotificationStore = defineStore('notification', () => {
     vcpCoreStatus.value = payload;
   };
 
-  const toastTimers = new Set<ReturnType<typeof setTimeout>>();
+  const toastTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  let ghostCleanupTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const clearToastTimer = (id: string) => {
+    const timer = toastTimers.get(id);
+    if (timer) {
+      clearTimeout(timer);
+      toastTimers.delete(id);
+    }
+  };
+
+  const scheduleToastRemoval = (notification: VcpNotification) => {
+    clearToastTimer(notification.id);
+    if (notification.duration === 0) return;
+
+    const timer = setTimeout(() => {
+      activeToasts.value = activeToasts.value.filter(t => t.id !== notification.id);
+      toastTimers.delete(notification.id);
+    }, notification.duration || 3000);
+    toastTimers.set(notification.id, timer);
+    scheduleGhostCleanup();
+  };
+
+  const scheduleGhostCleanup = () => {
+    if (ghostCleanupTimer || toastTimers.size === 0) return;
+
+    ghostCleanupTimer = setTimeout(() => {
+      ghostCleanupTimer = null;
+      const now = Date.now();
+      activeToasts.value = activeToasts.value.filter(toast => {
+        // duration === 0 为审批类通知，不应被清理
+        if (toast.duration === 0) return true;
+        const duration = toast.duration || 3000;
+        const shouldKeep = now - toast.timestamp < duration + 5000;
+        if (!shouldKeep) {
+          clearToastTimer(toast.id);
+        }
+        return shouldKeep;
+      });
+    }, 30000);
+  };
 
   const addNotification = (payload: Partial<VcpNotification>) => {
     if (payload.silent) return;
@@ -92,12 +132,7 @@ export const useNotificationStore = defineStore('notification', () => {
         } as VcpNotification;
         activeToasts.value[existingIndex] = updated;
 
-        if (updated.duration !== 0) {
-          const timer = setTimeout(() => {
-            activeToasts.value = activeToasts.value.filter(t => t.id !== updated.id);
-          }, updated.duration || 3000);
-          toastTimers.add(timer);
-        }
+        scheduleToastRemoval(updated);
         return;
       }
 
@@ -143,12 +178,7 @@ export const useNotificationStore = defineStore('notification', () => {
       activeToasts.value.push(notification);
 
       // 3. 自动移除逻辑 (如果 duration 为 0 则不自动消失)
-      if (notification.duration !== 0) {
-        const timer = setTimeout(() => {
-          activeToasts.value = activeToasts.value.filter(t => t.id !== id);
-        }, notification.duration || 3000);
-        toastTimers.add(timer);
-      }
+      scheduleToastRemoval(notification);
     }
   };
 
@@ -163,6 +193,8 @@ export const useNotificationStore = defineStore('notification', () => {
       unreadCount.value = Math.max(0, unreadCount.value - 1);
     }
     historyList.value = historyList.value.filter(n => n.id !== id);
+    activeToasts.value = activeToasts.value.filter(t => t.id !== id);
+    clearToastTimer(id);
   };
 
   const markAllRead = () => {
@@ -195,25 +227,18 @@ export const useNotificationStore = defineStore('notification', () => {
         item.actions = [];
         item.message = `[已处理] 操作: ${action.label}`;
         activeToasts.value = activeToasts.value.filter(t => t.id !== item.id);
+        clearToastTimer(item.id);
       } catch (e) {
         console.error('[NotificationStore] Action failed:', e);
       }
     }
   };
 
-  // 幽灵 Toast 清理机制 (每 30s 检查一次)
-  const ghostCleanupInterval = setInterval(() => {
-    const now = Date.now();
-    activeToasts.value = activeToasts.value.filter(toast => {
-      // duration === 0 为审批类通知，不应被清理
-      if (toast.duration === 0) return true;
-      const duration = toast.duration || 3000;
-      return now - toast.timestamp < duration + 5000; // 冗余 5s 后强制清理
-    });
-  }, 30000);
-
   onScopeDispose(() => {
-    clearInterval(ghostCleanupInterval);
+    if (ghostCleanupTimer) {
+      clearTimeout(ghostCleanupTimer);
+      ghostCleanupTimer = null;
+    }
     toastTimers.forEach(clearTimeout);
     toastTimers.clear();
   });

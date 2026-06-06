@@ -13,18 +13,24 @@
  * 注意：此组件内的视图通过 SlidePage 管理滑入/滑出动画，
  * 物理上它们会渲染在 GlobalOverlayManager 提供的容器中。
  */
-import { ref, onMounted } from 'vue';
+import { ref, onMounted, defineAsyncComponent } from 'vue';
 import { useOverlayStore } from '../core/stores/overlay';
-import SettingsView from '../features/settings/SettingsView.vue';
-import AgentSettingsView from '../features/agent/AgentSettingsView.vue';
-import GroupSettingsView from '../features/agent/GroupSettingsView.vue';
-import TarvenSettingsView from '../features/chat/components/TarvenSettings.vue';
-import SensorCollector from '../features/distributed/SensorCollector.vue';
+import { useSettingsStore } from '../core/stores/settings';
 import ToolInteractionOverlay from '../features/distributed/ToolInteractionOverlay.vue';
-import SyncSessionView from '../features/sync/SyncSessionView.vue';
-import RebuildSessionView from '../features/settings/components/RebuildSessionView.vue';
+import TarvenSettingsView from '../features/chat/components/TarvenSettings.vue';
+
+// 相对低频的设置页按需懒加载：用户首次打开时才下载 chunk，SlidePage 动画天然遮盖加载延迟
+const AgentSettingsView = defineAsyncComponent(() => import('../features/agent/AgentSettingsView.vue'));
+const GroupSettingsView = defineAsyncComponent(() => import('../features/agent/GroupSettingsView.vue'));
+
+// 其余页面同样按需异步加载，状态由 Store 完全托管
+const SyncSessionView = defineAsyncComponent(() => import('../features/sync/SyncSessionView.vue'));
+const RebuildSessionView = defineAsyncComponent(() => import('../features/settings/components/RebuildSessionView.vue'));
+const DistributedView = defineAsyncComponent(() => import('../features/distributed/DistributedView.vue'));
+const SettingsView = defineAsyncComponent(() => import('../features/settings/SettingsView.vue'));
 
 const overlayStore = useOverlayStore();
+const settingsStore = useSettingsStore();
 const isMounted = ref(false);
 
 onMounted(() => {
@@ -69,7 +75,12 @@ onMounted(() => {
       :z-index="overlayStore.getPageZIndex('rebuildSession')"
     />
 
-    <SensorCollector />
-    <ToolInteractionOverlay />
+    <DistributedView
+      :is-open="overlayStore.isDistributedOpen"
+      :z-index="overlayStore.getPageZIndex('distributed')"
+      @close="overlayStore.closeDistributed()"
+    />
+    <!-- 仅当用户已启用分布式计算时才挂载事件监听器，避免常驻不必要的后台监听 -->
+    <ToolInteractionOverlay v-if="settingsStore.settings?.distributedEnabled" />
   </div>
 </template>

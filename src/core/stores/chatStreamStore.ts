@@ -43,6 +43,29 @@ export const useChatStreamStore = defineStore("chatStream", () => {
   }>();
   const MIN_RENDER_INTERVAL_MS = 33.3; // 限制最大刷新频率为 30Hz
 
+  const isDocumentHidden = () =>
+    typeof document !== "undefined" && document.hidden;
+
+  const hasPendingRAFData = (up: {
+    content: string | null;
+    blocks: any[] | null;
+    tailContent: string | null;
+    tailBlock: any | null | undefined;
+  }) =>
+    up.content !== null ||
+    up.blocks !== null ||
+    up.tailContent !== null ||
+    up.tailBlock !== undefined;
+
+  const pauseRAFCommitsForBackground = () => {
+    rAFPendingUpdates.forEach((up) => {
+      if (up.animationFrameId !== null) {
+        cancelAnimationFrame(up.animationFrameId);
+        up.animationFrameId = null;
+      }
+    });
+  };
+
   /**
    * 物理防线：强行中止、强制同步刷新并安全清理指定消息的 rAF 帧状态，杜绝任何泄漏与闪烁
    */
@@ -277,6 +300,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
   const scheduleRAFCommit = (messageId: string) => {
     const update = rAFPendingUpdates.get(messageId);
     if (!update || update.animationFrameId !== null) return;
+    if (isDocumentHidden()) return;
 
     const runRenderLoop = () => {
       const up = rAFPendingUpdates.get(messageId);
@@ -309,6 +333,26 @@ export const useChatStreamStore = defineStore("chatStream", () => {
 
     update.animationFrameId = requestAnimationFrame(runRenderLoop);
   };
+
+  const resumeRAFCommitsForForeground = () => {
+    rAFPendingUpdates.forEach((up, messageId) => {
+      if (up.animationFrameId === null && hasPendingRAFData(up)) {
+        scheduleRAFCommit(messageId);
+      }
+    });
+  };
+
+  const handleVisibilityChange = () => {
+    if (isDocumentHidden()) {
+      pauseRAFCommitsForBackground();
+    } else {
+      resumeRAFCommitsForForeground();
+    }
+  };
+
+  if (typeof document !== "undefined") {
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+  }
 
   /**
    * 处理流式事件的核心逻辑 (会话隔离调度器)
@@ -619,6 +663,9 @@ export const useChatStreamStore = defineStore("chatStream", () => {
   };
 
   onScopeDispose(() => {
+    if (typeof document !== "undefined") {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    }
     cleanupTimers.forEach(clearTimeout);
     cleanupTimers.clear();
     rAFPendingUpdates.forEach((up) => {

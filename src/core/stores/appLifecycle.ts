@@ -7,6 +7,7 @@ import { useThemeStore } from './theme';
 import { useNotificationStore } from './notification';
 import { isTauriRuntime } from '../utils/runtime';
 import { useAvatarStore } from './avatar';
+import { updateDistributedState } from '../../features/distributed/composables/useDistributed';
 
 export type AppState = 'PERMISSIONS' | 'BOOTING' | 'CONNECTING' | 'PRELOADING' | 'READY' | 'ERROR';
 
@@ -15,12 +16,8 @@ export interface CoreStatus {
   message: string;
 }
 
-type PreloadTask = {
-  label: string;
-  run: () => Promise<void>;
-};
-
 const CONNECT_TIMEOUT_MS = 15000;
+const PRELOAD_TIMEOUT_MS = 20000;
 
 export const useAppLifecycleStore = defineStore('appLifecycle', () => {
   const state = ref<AppState>('BOOTING');
@@ -88,74 +85,16 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
     bootstrapPromise = null;
     setState('ERROR', message);
     // 统一更新通知系统的核心状态槽
-    notificationStore.updateCoreStatus({ 
-      status: 'error', 
-      message, 
-      source: 'Core' 
+    notificationStore.updateCoreStatus({
+      status: 'error',
+      message,
+      source: 'Core'
     });
     console.error('[Lifecycle] FATAL:', message);
   };
 
-  const runSequentialTask = async (task: PreloadTask) => {
-    updatePhaseLabel(`预加载 ${task.label}...`);
-    console.log(`[Lifecycle] [Sequential] START ${task.label}`);
-    const startTime = Date.now();
-    try {
-      await task.run();
-      console.log(`[Lifecycle] [Sequential] DONE ${task.label}`);
-      // 视觉防抖机制：若载入过快，则进行毫秒级视觉补白
-      const elapsed = Date.now() - startTime;
-      if (elapsed < 150) {
-        await new Promise(resolve => setTimeout(resolve, 150 - elapsed));
-      }
-    } catch (error) {
-      console.error(`[Lifecycle] [Sequential] FAILED ${task.label}:`, error);
-      throw error;
-    }
-  };
 
-  const runParallelTasks = async (tasks: PreloadTask[]) => {
-    if (!tasks.length) return;
 
-    const labels = tasks.map(task => task.label).join(' / ');
-    updatePhaseLabel(`并发预加载 ${labels}...`);
-    console.log(`[Lifecycle] [Parallel] START ${labels}`);
-
-    // 为并发任务添加硬超时保护 (20秒)
-    const PRELOAD_TIMEOUT = 20000;
-    const startTime = Date.now();
-    
-    try {
-      await Promise.race([
-        Promise.all(tasks.map(async (task) => {
-          console.log(`[Lifecycle] [Parallel] -> ${task.label} (Starting)`);
-          const taskStartTime = Date.now();
-          try {
-            await task.run();
-            const duration = Date.now() - taskStartTime;
-            console.log(`[Lifecycle] [Parallel] <- ${task.label} (Success in ${duration}ms)`);
-          } catch (error) {
-            const duration = Date.now() - taskStartTime;
-            console.error(`[Lifecycle] [Parallel] !! ${task.label} (Failed after ${duration}ms):`, error);
-            throw error;
-          }
-        })),
-        new Promise((_, reject) => 
-          setTimeout(() => reject(new Error(`并发预加载任务超时 (${labels})`)), PRELOAD_TIMEOUT)
-        )
-      ]);
-      console.log('[Lifecycle] [Parallel] ALL DONE');
-      
-      // 视觉防抖机制：确保并发组整体停留至少 150ms
-      const elapsed = Date.now() - startTime;
-      if (elapsed < 150) {
-        await new Promise(resolve => setTimeout(resolve, 150 - elapsed));
-      }
-    } catch (error) {
-      console.error('[Lifecycle] [Parallel] One or more tasks failed or timed out');
-      throw error;
-    }
-  };
 
   // 全局监听同步状态变化 (移除自动触发神经同步逻辑)
   const unwatchVcpStatus = watch(
@@ -181,46 +120,35 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
 
     cleanupConnectionWaiters();
     setState('PRELOADING', '开始预加载核心业务数据');
-
-    const settingsTask: PreloadTask = {
-      label: 'Settings',
-      run: async () => {
-        await settingsStore.fetchSettings();
-      }
-    };
-
-    const assistantParallelTasks: PreloadTask[] = [
-      {
-        label: 'Agents',
-        run: async () => {
-          await assistantStore.fetchAgents();
-        }
-      },
-      {
-        label: 'Groups',
-        run: async () => {
-          await assistantStore.fetchGroups();
-        }
-      }
-    ];
-
-    const frontendParallelTasks: PreloadTask[] = [
-      {
-        label: 'Avatars',
-        run: async () => {
-          await avatarStore.preloadAvatars([
-            { ownerType: 'user', ownerId: 'user_avatar' },
-            ...assistantStore.agents.map((agent) => ({ ownerType: 'agent' as const, ownerId: agent.id })),
-            ...assistantStore.groups.map((group) => ({ ownerType: 'group' as const, ownerId: group.id })),
-          ]);
-        }
-      }
-    ];
+    const startTime = Date.now();
 
     try {
-      await runSequentialTask(settingsTask);
-      await runParallelTasks(assistantParallelTasks);
-      await runParallelTasks(frontendParallelTasks);
+      updatePhaseLabel('正在并发预加载配置与助手数据...');
+      console.log('[Lifecycle] [Concurrent] START Preloading Settings and AgentsAndGroups');
+
+      await Promise.race([
+        Promise.all([
+          settingsStore.fetchSettings(),
+          assistantStore.fetchAgentsAndGroups()
+        ]),
+        new Promise((_, reject) => {
+          setTimeout(() => reject(new Error('核心数据预加载超时')), PRELOAD_TIMEOUT_MS);
+        })
+      ]);
+
+      console.log(`[Lifecycle] [Concurrent] DONE Preloading in ${Date.now() - startTime}ms`);
+
+      updatePhaseLabel('正在预加载头像资源...');
+      await Promise.race([
+        avatarStore.preloadAvatars([
+          { ownerType: 'user', ownerId: 'user_avatar' },
+          ...assistantStore.agents.map((agent) => ({ ownerType: 'agent' as const, ownerId: agent.id })),
+          ...assistantStore.groups.map((group) => ({ ownerType: 'group' as const, ownerId: group.id })),
+        ]),
+        new Promise((_, reject) => {
+          setTimeout(() => reject(new Error('头像资源预加载超时')), PRELOAD_TIMEOUT_MS);
+        })
+      ]);
 
       updatePhaseLabel('核心数据预加载完成');
 
@@ -237,13 +165,12 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
 
   const waitForCoreReady = async () => {
     updatePhaseLabel('检查核心服务状态...');
-    
-    // 1. 同步一次当前状态
-    const currentStatus = await invoke<string>('get_core_status');
-    console.log(`[Lifecycle] Initial core status -> ${currentStatus}`);
+
+    // 核心优化：直接读取第一步在 hydrateSystemStatus 中拉回并写入真相源的状态，免去重复 IPC 检测
+    const currentStatus = notificationStore.vcpCoreStatus.status;
+    console.log(`[Lifecycle] Checked core status from snapshot -> ${currentStatus}`);
 
     if (currentStatus === 'ready') {
-      notificationStore.updateCoreStatus({ status: 'ready', message: '核心引擎已就绪', source: 'Core' });
       return;
     }
 
@@ -260,11 +187,16 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
     await new Promise<void>((resolve, reject) => {
       let settled = false;
       let timeoutId: ReturnType<typeof setTimeout>;
-      let unwatch: (() => void);
+      let unwatch: (() => void) | null = null;
+      let shouldStopImmediately = false;
 
       const cleanup = () => {
         clearTimeout(timeoutId);
-        unwatch();
+        if (unwatch) {
+          unwatch();
+        } else {
+          shouldStopImmediately = true;
+        }
       };
 
       // 仅作为极端挂死的兜底
@@ -292,14 +224,17 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
         },
         { immediate: true }
       );
+      if (shouldStopImmediately) {
+        unwatch();
+      }
     });
   };
 
   const hydrateSystemStatus = async () => {
     try {
       console.log('[Lifecycle] Fetching system status snapshot...');
-      const snapshot = await invoke<{ core: string; log: string; sync: string }>('get_system_snapshot');
-      
+      const snapshot = await invoke<{ core: string; log: string; sync: string; distributed: string }>('get_system_snapshot');
+
       // 同步到 Notification Store (唯一真相源)
       notificationStore.updateCoreStatus({
         status: snapshot.core as any,
@@ -309,13 +244,14 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
 
       notificationStore.updateStatus({
         status: snapshot.log as any,
-        message: snapshot.log === 'open' ? '已连接' : '正在连接...',
+        message: snapshot.log === 'connected' ? '已连接' : '正在连接...',
         source: 'VCPLog'
       });
 
-      // 同步状态不再渲染到全局状态栏（同步已改为完全手动触发）
+      // 同步分布式连接状态到专有的 Distributed Composable
+      updateDistributedState(snapshot.distributed as any);
 
-      console.log('[Lifecycle] Snapshot hydrated:', snapshot);
+      console.log('[Lifecycle] Snapshot hydrated:', JSON.stringify(snapshot));
     } catch (e) {
       console.error('[Lifecycle] Failed to hydrate status snapshot:', e);
     }
@@ -375,7 +311,7 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
         }
 
         setState('BOOTING', '开始前端主线程启动编排');
-        
+
         // --- 核心优化：先拿快照，再跑流程 ---
         await hydrateSystemStatus();
 

@@ -2,8 +2,8 @@
 id: VUE-CHAT-022
 title: Tarven规则系统
 description: VCP Mobile 前端 Tarven 注入规则的状态管理、选择器 UI 与规则编辑面板
-version: 0.9.14
-date: 2026-05-27
+version: 1.0.3
+date: 2026-06-05
 ---
 
 # 22. Tarven 规则系统
@@ -107,14 +107,14 @@ export interface TarvenRule {
   content: string;                               // 注入内容
   scope: 'global' | 'agent' | 'group';           // 作用范围
   wrap: boolean;                                 // 是否 XML 包裹
-  
+
   // context_inject 专用
   role?: 'user' | 'assistant';                   // 虚拟消息角色
   depth?: number;                                // 插入深度
-  
+
   // system_suffix / user_suffix 专用
   position?: 'prepend' | 'append';               // 前置 / 后置
-  
+
   sortOrder: number;                             // 同类型内排序权重
 }
 ```
@@ -184,7 +184,7 @@ Rust 后端使用 `#[serde(rename_all = "camelCase")]`，因此前端 `ruleType`
 > 过滤逻辑实现位置：`src-tauri/src/vcp_modules/chat/context_injection.rs` 第 43–76 行
 
 ```sql
-SELECT ... FROM tarven_rules 
+SELECT ... FROM tarven_rules
 WHERE is_enabled = 1 AND (scope = 'global' OR scope = ?)
 ORDER BY sort_order ASC
 ```
@@ -353,9 +353,9 @@ const toggleRuleState = (id: string) => {
 <button v-longpress="openTarvenSelector" @click="showAttachMenu = !showAttachMenu">
   <div class="i-heroicons-plus-circle text-2xl"></div>
   <!-- 绿色指示点：当有任何规则处于启用状态时显示 -->
-  <div v-if="tarvenStore.rules.some(r => r.isEnabled)" 
-    class="absolute top-1.5 right-1.5 w-2 h-2 bg-emerald-500 rounded-full 
-           border-2 border-[var(--secondary-bg)] 
+  <div v-if="tarvenStore.rules.some(r => r.isEnabled)"
+    class="absolute top-1.5 right-1.5 w-2 h-2 bg-emerald-500 rounded-full
+           border-2 border-[var(--secondary-bg)]
            shadow-[0_0_8px_rgba(16,185,129,0.5)]">
   </div>
 </button>
@@ -433,22 +433,22 @@ const handleMove = async (rule: TarvenRule, direction: 'up' | 'down') => {
   const sameTypeRules = tarvenStore.rules
     .filter(r => r.ruleType === rule.ruleType)
     .sort((a, b) => a.sortOrder - b.sortOrder);
-  
+
   // 2. 找到当前索引并计算目标索引
   const index = sameTypeRules.findIndex(r => r.id === rule.id);
   const targetIndex = direction === 'up' ? index - 1 : index + 1;
-  
+
   // 3. 交换相邻元素的 ID
   const sameTypeIds = sameTypeRules.map(r => r.id);
   const temp = sameTypeIds[index];
   sameTypeIds[index] = sameTypeIds[targetIndex];
   sameTypeIds[targetIndex] = temp;
-  
+
   // 4. 合并其他类型规则的 ID（保持其原有顺序不变）
   const otherTypeIds = tarvenStore.rules
     .filter(r => r.ruleType !== rule.ruleType)
     .map(r => r.id);
-  
+
   const finalOrderedIds = [...otherTypeIds, ...sameTypeIds];
   await tarvenStore.saveOrder(finalOrderedIds);
 };
@@ -705,7 +705,7 @@ Rust preview_tarven_injection()
 
 ### 7.1 Tauri Commands 调用表
 
-> 命令定义位置：`src-tauri/src/vcp_modules/chat/context_injection.rs` 第 279–409 行  
+> 命令定义位置：`src-tauri/src/vcp_modules/chat/context_injection.rs` 第 279–409 行
 > 命令注册位置：`src-tauri/src/lib.rs` 第 188–195 行
 
 | 命令名 | 签名（Rust） | 输入 | 输出 | 前端调用方 |
@@ -720,9 +720,9 @@ Rust preview_tarven_injection()
 **`save_tarven_rule` 的 UPSERT 语义**：
 
 ```sql
-INSERT INTO tarven_rules (id, name, ..., created_at, updated_at) 
+INSERT INTO tarven_rules (id, name, ..., created_at, updated_at)
 VALUES (?, ?, ..., ?, ?)
-ON CONFLICT(id) DO UPDATE SET 
+ON CONFLICT(id) DO UPDATE SET
     name = excluded.name,
     rule_type = excluded.rule_type,
     is_enabled = excluded.is_enabled,
@@ -903,7 +903,7 @@ CREATE TABLE IF NOT EXISTS tarven_rules (
 
 索引：
 ```sql
-CREATE INDEX IF NOT EXISTS idx_tarven_rules_active 
+CREATE INDEX IF NOT EXISTS idx_tarven_rules_active
 ON tarven_rules(rule_type, is_enabled, sort_order ASC);
 ```
 
@@ -936,4 +936,4 @@ ON tarven_rules(rule_type, is_enabled, sort_order ASC);
 | 长按触发 | Long-press Trigger | 按住按钮 350ms 以上触发 TarvenSelector 的交互方式 | `InputEnhancer.vue` |
 
 ---
-*最后更新：2026-05-27 | VCP Mobile v0.9.14*
+*最后更新：2026-06-05 | VCP Mobile v1.0.3*

@@ -26,8 +26,9 @@ import AgentSidebar from "./components/layout/AgentSidebar.vue";
 import GlobalOverlayManager from "./components/GlobalOverlayManager.vue";
 import FeatureOverlays from "./components/FeatureOverlays.vue";
 import UpdatePrompt from "./components/ui/UpdatePrompt.vue";
-import NotificationCenterPage from "./features/notification/NotificationCenterPage.vue";
+import RightSidebar from "./components/layout/RightSidebar.vue";
 import ShareAgentSelector from "./features/chat/components/ShareAgentSelector.vue";
+
 
 interface SharedFileEntry {
   cachePath: string;
@@ -71,6 +72,10 @@ const sharedContent = ref<SharedContentData>({ text: "", files: [] });
 const showShareSelector = ref(false);
 const pendingSharedFiles = ref<PickedFileInfo[]>([]);
 
+const handleShareIntent = (e: Event) => {
+  processSharedIntent((e as CustomEvent).detail);
+};
+
 const processSharedIntent = async (detail: any) => {
   console.log("[App] Share intent received:", detail);
 
@@ -82,11 +87,18 @@ const processSharedIntent = async (detail: any) => {
   // Wait for core to be ready, then process files
   if (lifecycleStore.state !== "READY") {
     console.log("[App] Core not ready yet, deferring share intent processing...");
-    const unwatch = watch(
+    if (stopPendingShareReadyWatch) {
+      stopPendingShareReadyWatch();
+      stopPendingShareReadyWatch = null;
+    }
+    stopPendingShareReadyWatch = watch(
       () => lifecycleStore.state,
       async (state) => {
         if (state === "READY") {
-          unwatch();
+          if (stopPendingShareReadyWatch) {
+            stopPendingShareReadyWatch();
+            stopPendingShareReadyWatch = null;
+          }
           await prepareShareFiles();
         }
       },
@@ -153,10 +165,6 @@ const handleShareSelectorClose = () => {
   showShareSelector.value = false;
 };
 
-const handleShareIntent = (e: Event) => {
-  processSharedIntent((e as CustomEvent).detail);
-};
-
 // --- Global Swipe Logic for Sidebar ---
 const appRootRef = ref<HTMLElement | null>(null);
 useSidebarSwipe(appRootRef, { type: "global" });
@@ -212,6 +220,8 @@ const backgroundStyle = computed(() => {
 
 // 用于取消监听的清理函数
 let unlistenLog: (() => void) | null = null;
+let removeRouteGuard: (() => void) | null = null;
+let stopPendingShareReadyWatch: (() => void) | null = null;
 
 // --- Root Exit Handler (Double-Tap to Exit with Toast) ---
 let exitTimer: number | null = null;
@@ -247,7 +257,7 @@ const handleExitRequest = async () => {
       exitTimer = null;
     }
     isWaitingExit.value = false;
-    
+
     try {
       await invoke("plugin:vcp-mobile|move_task_to_back");
     } catch (err) {
@@ -285,19 +295,25 @@ const handleVisibilityChange = () => {
   }
 };
 
+let isAppBackground = false;
+
 const handleVcpLifecycle = (e: Event) => {
   if (isAssistant.value) return;
 
   const detail = (e as CustomEvent).detail;
   const state = detail?.state;
-  
+
   if (state === "stop" || state === "pause") {
+    if (isAppBackground) return;
+    isAppBackground = true;
     console.log("[Lifecycle] App moved to background, tuning heartbeat to 120s...");
     suspendPhysicalScreenKeep(); // 休眠物理亮屏，达到省电效果
     invoke("set_vcp_log_heartbeat", { intervalMs: 120000 }).catch((err) => {
       console.error("[Lifecycle] Failed to set background heartbeat:", err);
     });
   } else if (state === "resume") {
+    if (!isAppBackground) return;
+    isAppBackground = false;
     console.log("[Lifecycle] App moved to foreground, restoring heartbeat to 15s...");
     reapplyScreenKeepIfActive(); // 唤醒时自动校准和恢复可能丢失的物理亮屏 FLAG
     invoke("set_vcp_log_heartbeat", { intervalMs: 15000 }).catch((err) => {
@@ -389,7 +405,7 @@ onMounted(async () => {
   initRootHistory();
 
   // 路由后置守护：在任何路由切换（包括重定向、刷新）完成后，自动校准防护盾，100% 确保栈顶处于防护状态
-  router.afterEach(() => {
+  removeRouteGuard = router.afterEach(() => {
     initRootHistory();
   });
 });
@@ -397,6 +413,15 @@ onMounted(async () => {
 onUnmounted(() => {
   document.documentElement.classList.remove("vcp-battery-static");
   if (unlistenLog) unlistenLog();
+  unlistenLog = null;
+  if (removeRouteGuard) removeRouteGuard();
+  removeRouteGuard = null;
+  if (stopPendingShareReadyWatch) stopPendingShareReadyWatch();
+  stopPendingShareReadyWatch = null;
+  if (exitTimer) {
+    clearTimeout(exitTimer);
+    exitTimer = null;
+  }
   window.removeEventListener("vcp-exit-requested", handleExitRequest);
   window.removeEventListener("vcp-hardware-back", handleExitRequest);
   document.removeEventListener("visibilitychange", handleVisibilityChange);
@@ -432,30 +457,32 @@ onUnmounted(() => {
       </router-view>
     </main>
 
-    <!-- 3. 左侧抽屉遮罩层位于主内容之后、抽屉之前，点击空白即可关闭 -->
+    <!-- 3. 抽屉遮罩层位于主内容之后、抽屉之前，点击空白即可关闭 -->
     <Transition name="fade">
-      <div v-if="layoutStore.leftDrawerOpen"
+      <div v-if="layoutStore.leftDrawerOpen || layoutStore.rightDrawerOpen"
         class="vcp-overlay fixed inset-0 z-drawer bg-black/12 md:hidden" @click.self="
           layoutStore.setLeftDrawer(false);
+          layoutStore.setRightDrawer(false);
         "></div>
     </Transition>
 
-    <!-- 4. 左侧抽屉在遮罩之后声明，不写 z-index 也能稳定压过主内容 -->
-    <AgentSidebar />
-    <NotificationCenterPage
+    <!-- 4. 左右抽屉在遮罩之后声明，不写 z-index 也能稳定压过主内容 -->
+    <AgentSidebar v-if="lifecycleStore.state === 'READY'" />
+    <RightSidebar
+      v-if="lifecycleStore.state === 'READY'"
+      class="pointer-events-auto shrink-0"
       :is-open="layoutStore.rightDrawerOpen"
-      :z-index="40"
       @close="layoutStore.setRightDrawer(false)"
     />
 
     <!-- 5. 全局覆盖层管理器 -->
-    <GlobalOverlayManager />
+    <GlobalOverlayManager v-if="lifecycleStore.state === 'READY'" />
 
     <!-- 6. 业务 Feature 视图挂载点 -->
-    <FeatureOverlays />
+    <FeatureOverlays v-if="lifecycleStore.state === 'READY'" />
 
     <!-- 7. 分享意图 Agent 选择器 -->
-    <ShareAgentSelector
+    <ShareAgentSelector v-if="lifecycleStore.state === 'READY'"
       :is-open="showShareSelector"
       :shared-text="sharedContent.text"
       :shared-file-count="sharedContent.files.length"

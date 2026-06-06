@@ -49,14 +49,6 @@ watch(
   { immediate: true }
 );
 
-const handleDelete = (id: string) => {
-  store.removeHistoryItem(id);
-};
-
-const handleAction = (payload: { id: string; action: { label: string; value: boolean; color: string } }) => {
-  store.executeAction(payload.id, payload.action);
-};
-
 // Debug mock injector
 const injectMockNotification = (type: 'rag' | 'thinking' | 'approval' | 'error') => {
   const timestamp = Date.now();
@@ -226,14 +218,7 @@ const injectMockNotification = (type: 'rag' | 'thinking' | 'approval' | 'error')
       </div>
 
       <!-- Status Bar -->
-      <NotificationStatusBar
-        :vcp-status="store.vcpStatus"
-        :vcp-core-status="store.vcpCoreStatus"
-        :unread-count="store.unreadCount"
-        :total-count="store.historyList.length"
-        @mark-all-read="store.markAllRead()"
-        @clear-history="store.clearHistory()"
-      />
+      <NotificationStatusBar />
 
       <!-- Category Segmented Tabs -->
       <div class="bg-transparent shrink-0 overflow-x-auto flex items-center gap-1.5 px-3 py-2 scrollbar-none">
@@ -265,9 +250,7 @@ const injectMockNotification = (type: 'rag' | 'thinking' | 'approval' | 'error')
 
       <!-- Notification List -->
       <NotificationList
-        :notifications="filteredNotifications"
-        @delete="handleDelete"
-        @action="handleAction"
+        :items="filteredNotifications"
       />
     </div>
   </SlidePage>

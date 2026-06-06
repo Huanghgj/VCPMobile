@@ -43,16 +43,16 @@ const isImage = computed(() => {
 const isText = computed(() => {
   if (!props.file) return false;
   const ext = props.file.name.split(".").pop()?.toLowerCase() || "";
-  
+
   // 核心加固：若存在后缀且完全不属于文本白名单，绝不判定为文本（与 Preview 判定主权一致）
   if (ext && !TEXT_WHITELIST.includes(ext)) {
     return false;
   }
-  
+
   if (TEXT_WHITELIST.includes(ext)) {
     return true;
   }
-  
+
   const type = (props.file.type || "").toLowerCase();
   return (
     type.startsWith("text/") ||
@@ -67,7 +67,7 @@ watch(() => props.isOpen, async (newVal) => {
     registerModal(modalId, close);
     previewText.value = "";
     isTextTruncated.value = false;
-    
+
     // 如果是可预览的文本，开始流式读取物理文件的前 128KB 进行预览
     if (isText.value && props.file) {
       isLoading.value = true;
@@ -82,21 +82,21 @@ watch(() => props.isOpen, async (newVal) => {
           ) {
             fetchUrl = convertFileSrc(sourcePath.replace("file://", ""));
           }
-          
+
           const response = await fetch(fetchUrl);
           const reader = response.body?.getReader();
           if (reader) {
             const chunks: Uint8Array[] = [];
             let receivedLength = 0;
             const LIMIT = 128 * 1024; // 128KB
-            
+
             while (receivedLength < LIMIT) {
               const { done, value } = await reader.read();
               if (done) break;
               chunks.push(value);
               receivedLength += value.length;
             }
-            
+
             // 合并并解码为 UTF-8
             const allChunks = new Uint8Array(receivedLength);
             let position = 0;
@@ -104,7 +104,7 @@ watch(() => props.isOpen, async (newVal) => {
               allChunks.set(chunk, position);
               position += chunk.length;
             }
-            
+
             previewText.value = new TextDecoder("utf-8").decode(allChunks);
             if (receivedLength >= LIMIT) {
               isTextTruncated.value = true;
@@ -147,7 +147,7 @@ const close = () => emit("close");
   <Transition name="viewer-fade">
     <div
       v-show="isOpen && file"
-      class="vcp-attachment-viewer fixed inset-0 z-viewer flex flex-col bg-[#f0f4f8] dark:bg-[#121e23] pointer-events-auto"
+      class="vcp-attachment-viewer fixed inset-0 z-viewer flex flex-col pointer-events-auto"
       @click.self="close"
     >
       <!-- Toolbar -->
@@ -209,7 +209,7 @@ const close = () => emit("close");
           <!-- Text content container -->
           <pre
             v-else
-            class="flex-1 font-mono text-[13px] whitespace-pre-wrap select-text leading-relaxed opacity-90 p-4 bg-gray-50 dark:bg-gray-900/50 rounded-lg border border-black/5 dark:border-white/5 break-all overflow-x-auto"
+            class="flex-1 font-mono text-[13px] whitespace-pre-wrap select-text leading-relaxed opacity-90 p-4 break-all overflow-x-auto"
           >{{ previewText }}</pre>
         </div>
 
@@ -232,6 +232,16 @@ const close = () => emit("close");
 </template>
 
 <style scoped>
+.vcp-attachment-viewer {
+  background: linear-gradient(145deg, #f9f9fb, #f2f2f7);
+  color: #333;
+}
+
+html.dark .vcp-attachment-viewer {
+  background: linear-gradient(145deg, #1c1c1e, #2c2c2e);
+  color: #f2f2f7;
+}
+
 .viewer-fade-enter-active,
 .viewer-fade-leave-active {
   transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);

@@ -44,16 +44,20 @@ import java.net.URLDecoder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
+import com.topjohnwu.superuser.Shell
 
 @TauriPlugin(permissions = [
     Permission(strings = ["android.permission.POST_NOTIFICATIONS"], alias = "notification"),
     Permission(strings = ["android.permission.READ_MEDIA_IMAGES"], alias = "storage"),
     Permission(strings = ["android.permission.READ_EXTERNAL_STORAGE", "android.permission.WRITE_EXTERNAL_STORAGE"], alias = "storageLegacy"),
     Permission(strings = ["android.permission.RECORD_AUDIO"], alias = "microphone"),
-    Permission(strings = ["android.permission.CAMERA"], alias = "camera")
+    Permission(strings = ["android.permission.CAMERA"], alias = "camera"),
+    Permission(strings = ["android.permission.ACCESS_FINE_LOCATION", "android.permission.ACCESS_COARSE_LOCATION"], alias = "location")
 ])
 class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
 
@@ -75,10 +79,21 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
     private val keyboardInsetsManager = KeyboardInsetsManager(activity)
     private val lifecycleBridge = LifecycleBridge()
     private val batteryStatusManager = BatteryStatusManager(activity)
+    private val networkStatusManager = NetworkStatusManager(activity)
+    private val cpuStatusManager = CpuStatusManager(activity)
+    private val gpuStatusManager = GpuStatusManager(activity)
     private val floatingWindowManager by lazy { FloatingWindowManager(activity) }
+    private val sensorStatusManager = SensorStatusManager(activity)
     private val shareIntentHandler = ShareIntentHandler(this)
     private val fileIoExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
     private var cameraTempFile: java.io.File? = null
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: android.net.wifi.WifiManager.WifiLock? = null
+    private val powerLockGuard = Any()
+    private var powerLockRefCount = 0
+    private var networkCallback: android.net.ConnectivityManager.NetworkCallback? = null
+    private var lastConnected: Boolean? = null
+    private var isNetworkMonitoringStarted = false
 
     // ==================================================================
     // Permissions & App Control
@@ -108,6 +123,8 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
 
         val microphoneGranted = ContextCompat.checkSelfPermission(activity, android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
         val cameraGranted = ContextCompat.checkSelfPermission(activity, android.Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        val locationGranted = ContextCompat.checkSelfPermission(activity, android.Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+            ContextCompat.checkSelfPermission(activity, android.Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
 
         val batteryOptimizationIgnored = pm.isIgnoringBatteryOptimizations(activity.packageName)
         val overlayGranted = floatingWindowManager.hasOverlayPermission()
@@ -117,6 +134,7 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
         result.put("storage", storageGranted)
         result.put("microphone", microphoneGranted)
         result.put("camera", cameraGranted)
+        result.put("location", locationGranted)
         result.put("battery", batteryOptimizationIgnored)
         result.put("overlay", overlayGranted)
 
@@ -148,6 +166,9 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
             "camera" -> {
                 requestPermissionForAlias("camera", invoke, "onPermissionResult")
             }
+            "location" -> {
+                requestPermissionForAlias("location", invoke, "onPermissionResult")
+            }
             "battery" -> {
                 try {
                     val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
@@ -178,7 +199,7 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     @ActivityCallback
-    fun onBatteryOptimizationResult(invoke: Invoke, result: ActivityResult) {
+    fun onBatteryOptimizationResult(invoke: Invoke, @Suppress("UNUSED_PARAMETER") result: ActivityResult) {
         emitPermissionsToWebView()
         invoke.resolve()
     }
@@ -207,11 +228,13 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
 
         val microphoneGranted = ContextCompat.checkSelfPermission(activity, android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
         val cameraGranted = ContextCompat.checkSelfPermission(activity, android.Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        val locationGranted = ContextCompat.checkSelfPermission(activity, android.Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+            ContextCompat.checkSelfPermission(activity, android.Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
 
         val batteryOptimizationIgnored = pm.isIgnoringBatteryOptimizations(activity.packageName)
         val overlayGranted = floatingWindowManager.hasOverlayPermission()
 
-        val json = """{"notification":$notificationGranted,"storage":$storageGranted,"microphone":$microphoneGranted,"camera":$cameraGranted,"battery":$batteryOptimizationIgnored,"overlay":$overlayGranted}"""
+        val json = """{"notification":$notificationGranted,"storage":$storageGranted,"microphone":$microphoneGranted,"camera":$cameraGranted,"battery":$batteryOptimizationIgnored,"overlay":$overlayGranted,"location":$locationGranted}"""
         val script = "window.dispatchEvent(new CustomEvent('vcp-permission-change', { detail: $json }))"
         webViewRef?.evaluateJavascript(script, null)
     }
@@ -257,6 +280,131 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
+    @Command
+    fun getNetworkStatus(invoke: Invoke) {
+        try {
+            val status = networkStatusManager.getNetworkStatus()
+            invoke.resolve(status)
+        } catch (e: Exception) {
+            Log.e(TAG, "getNetworkStatus failed", e)
+            invoke.reject(e.message ?: "Unknown error")
+        }
+    }
+
+    @Command
+    fun getCpuThermalStatus(invoke: Invoke) {
+        try {
+            val status = cpuStatusManager.getThermalStatus()
+            invoke.resolve(status)
+        } catch (e: Exception) {
+            Log.e(TAG, "getCpuThermalStatus failed", e)
+            invoke.reject(e.message ?: "Unknown error")
+        }
+    }
+
+    @Command
+    fun getGpuStatus(invoke: Invoke) {
+        try {
+            val status = gpuStatusManager.getGpuStatusJson()
+            invoke.resolve(status)
+        } catch (e: Exception) {
+            Log.e(TAG, "getGpuStatus failed", e)
+            invoke.reject(e.message ?: "Unknown error")
+        }
+    }
+
+    @Command
+    fun checkRootAccess(invoke: Invoke) {
+        fileIoExecutor.execute {
+            try {
+                val isRoot = Shell.getShell().isRoot
+                val result = JSObject()
+                result.put("isRoot", isRoot)
+                invoke.resolve(result)
+            } catch (e: Exception) {
+                val result = JSObject()
+                result.put("isRoot", false)
+                invoke.resolve(result)
+            }
+        }
+    }
+
+    @Command
+    fun runRootCommand(invoke: Invoke) {
+        try {
+            val args = invoke.parseArgs(RunRootCommandArgs::class.java)
+            fileIoExecutor.execute {
+                try {
+                    val future = Shell.cmd(args.command).enqueue()
+                    val timeoutMs = args.timeoutMs.toLong().coerceIn(500L, 5000L)
+                    val output = try {
+                        future.get(timeoutMs, TimeUnit.MILLISECONDS).out
+                    } catch (e: TimeoutException) {
+                        future.cancel(true)
+                        val result = JSObject().apply {
+                            put("success", false)
+                            put("output", "Root command timed out after ${timeoutMs}ms")
+                        }
+                        invoke.resolve(result)
+                        return@execute
+                    }
+                    val result = JSObject().apply {
+                        put("success", true)
+                        put("output", output.joinToString("\n"))
+                    }
+                    invoke.resolve(result)
+                } catch (e: Exception) {
+                    val result = JSObject().apply {
+                        put("success", false)
+                        put("output", e.message ?: "Unknown Shell execution error")
+                    }
+                    invoke.resolve(result)
+                }
+            }
+        } catch (e: Exception) {
+            invoke.reject(e.message ?: "Args parsing error")
+        }
+    }
+
+    @Command
+    fun launchRootManager(invoke: Invoke) {
+        try {
+            val managers = listOf(
+                "com.topjohnwu.magisk" to "Magisk",
+                "me.weishu.kernelsu" to "KernelSU",
+                "me.tool.apatch" to "APatch"
+            )
+            var launched = false
+            for ((pkg, name) in managers) {
+                try {
+                    val intent = activity.packageManager.getLaunchIntentForPackage(pkg)
+                    if (intent != null) {
+                        intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                        activity.startActivity(intent)
+                        launched = true
+                        val result = JSObject().apply {
+                            put("success", true)
+                            put("manager", name)
+                        }
+                        invoke.resolve(result)
+                        break
+                    }
+                } catch (e: Exception) {
+                    // Continue checking next package
+                }
+            }
+            if (!launched) {
+                val result = JSObject().apply {
+                    put("success", false)
+                    put("message", "未找到支持的 Root 管理器 (Magisk, KernelSU, APatch)。")
+                }
+                invoke.resolve(result)
+            }
+        } catch (e: Exception) {
+            invoke.reject(e.message ?: "启动 Root 管理器失败")
+        }
+    }
+
     // ==================================================================
     // Stream Service
     // ==================================================================
@@ -264,21 +412,56 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
     fun startStreamingService(invoke: Invoke) {
         try {
             val args = invoke.parseArgs(StartStreamArgs::class.java)
-            val intent = StreamKeepaliveService.createIntent(activity, args.agentName)
-            try {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    activity.startForegroundService(intent)
-                } else {
-                    activity.startService(intent)
-                }
-            } catch (e: SecurityException) {
-                Log.w(TAG, "POST_NOTIFICATIONS permission denied, degrading to normal service", e)
-                activity.startService(intent) // 静默降级为普通 Service，防止闪退崩溃
+            val hasKeepaliveParam = args.isKeepaliveMode != null
+            val isKeepalive = args.isKeepaliveMode ?: false
+            val nextAgentName = args.agentName
+            val nextKeepalive =
+                if (hasKeepaliveParam) isKeepalive else StreamKeepaliveService.isKeepaliveModeActive
+            val intent = StreamKeepaliveService.createIntent(activity, nextAgentName, nextKeepalive)
+
+            if (nextAgentName.isEmpty() && !nextKeepalive) {
+                Log.i(TAG, "startStreamingService: streams and keepalive are inactive. Stopping service directly.")
+                StreamKeepaliveService.currentStreamName = ""
+                StreamKeepaliveService.isKeepaliveModeActive = false
+                activity.stopService(intent)
+                invoke.resolve()
+                return
             }
+
+            if (nextAgentName.isEmpty() && hasKeepaliveParam && !isKeepalive) {
+                StreamKeepaliveService.isKeepaliveModeActive = false
+                if (StreamKeepaliveService.currentStreamName.isNotEmpty()) {
+                    startServiceCompatible(
+                        StreamKeepaliveService.createIntent(
+                            activity,
+                            StreamKeepaliveService.currentStreamName,
+                            false
+                        )
+                    )
+                    invoke.resolve()
+                    return
+                }
+            }
+
+            startServiceCompatible(intent)
             invoke.resolve()
         } catch (e: Exception) {
             Log.e(TAG, "startStreamingService failed", e)
             invoke.reject(e.message ?: "Unknown error")
+        }
+    }
+
+    private fun startServiceCompatible(intent: Intent) {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                activity.startForegroundService(intent)
+            } else {
+                activity.startService(intent)
+            }
+        } catch (e: SecurityException) {
+            Log.w(TAG, "Foreground service start denied; skipping keepalive service to avoid background drain", e)
+        } catch (e: Exception) {
+            Log.w(TAG, "Foreground service start failed; skipping keepalive service to avoid background drain", e)
         }
     }
 
@@ -294,9 +477,158 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
+    @Command
+    fun acquireWakeLock(invoke: Invoke) {
+        try {
+            synchronized(powerLockGuard) {
+                val pm = activity.getSystemService(Context.POWER_SERVICE) as PowerManager
+                if (wakeLock == null) {
+                    wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "VcpMobile:WakeLock")
+                }
+                if (wakeLock?.isHeld != true) {
+                    wakeLock?.acquire(5 * 60 * 1000L) // 最大持有5分钟安全限制
+                }
+
+                try {
+                    val wm = activity.applicationContext.getSystemService(Context.WIFI_SERVICE) as android.net.wifi.WifiManager
+                    if (wifiLock == null) {
+                        @Suppress("DEPRECATION")
+                        wifiLock = wm.createWifiLock(
+                            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q)
+                                android.net.wifi.WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                            else
+                                android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF,
+                            "VcpMobile:WifiLock"
+                        )
+                    }
+                    if (wifiLock?.isHeld != true) {
+                        wifiLock?.acquire()
+                    }
+                } catch (wifiEx: Exception) {
+                    Log.w(TAG, "Failed to acquire WiFi Lock: ${wifiEx.message}")
+                }
+
+                powerLockRefCount++
+            }
+            invoke.resolve()
+        } catch (e: Exception) {
+            Log.e(TAG, "acquireWakeLock failed", e)
+            invoke.reject(e.message ?: "Unknown error")
+        }
+    }
+
+    @Command
+    fun releaseWakeLock(invoke: Invoke) {
+        try {
+            synchronized(powerLockGuard) {
+                if (powerLockRefCount > 0) {
+                    powerLockRefCount--
+                }
+                if (powerLockRefCount == 0) {
+                    if (wakeLock?.isHeld == true) {
+                        wakeLock?.release()
+                    }
+                    if (wifiLock?.isHeld == true) {
+                        wifiLock?.release()
+                    }
+                }
+            }
+            invoke.resolve()
+        } catch (e: Exception) {
+            Log.e(TAG, "releaseWakeLock failed", e)
+            invoke.reject(e.message ?: "Unknown error")
+        }
+    }
+
+    @Command
+    fun startSensorCollection(invoke: Invoke) {
+        try {
+            activity.runOnUiThread {
+                sensorStatusManager.start()
+                invoke.resolve()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "startSensorCollection failed", e)
+            invoke.reject(e.message ?: "Unknown error")
+        }
+    }
+
+    @Command
+    fun stopSensorCollection(invoke: Invoke) {
+        try {
+            activity.runOnUiThread {
+                sensorStatusManager.stop()
+                invoke.resolve()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "stopSensorCollection failed", e)
+            invoke.reject(e.message ?: "Unknown error")
+        }
+    }
+
+    @Command
+    fun getSensorData(invoke: Invoke) {
+        try {
+            val args = invoke.parseArgs(GetSensorDataArgs::class.java)
+            fileIoExecutor.execute {
+                try {
+                    val result = sensorStatusManager.getSensorData(args.type)
+                    invoke.resolve(result)
+                } catch (e: Exception) {
+                    Log.e(TAG, "getSensorData failed", e)
+                    invoke.reject(e.message ?: "Unknown error")
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "getSensorData failed", e)
+            invoke.reject(e.message ?: "Unknown error")
+        }
+    }
+
     // ==================================================================
     // Plugin Lifecycle
     // ==================================================================
+
+    private fun emitNetworkStatusToWebView() {
+        val status = networkStatusManager.getNetworkStatus()
+        val connected = status.optBoolean("connected", false)
+        if (connected != lastConnected) {
+            lastConnected = connected
+            trigger("vcp-network-status-changed", status)
+        }
+    }
+
+    @Command
+    fun startNetworkMonitoring(invoke: Invoke) {
+        if (isNetworkMonitoringStarted) {
+            invoke.resolve()
+            return
+        }
+        try {
+            val cm = activity.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+            val request = android.net.NetworkRequest.Builder()
+                .addCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build()
+            networkCallback = object : android.net.ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: android.net.Network) {
+                    emitNetworkStatusToWebView()
+                }
+                override fun onLost(network: android.net.Network) {
+                    emitNetworkStatusToWebView()
+                }
+                override fun onCapabilitiesChanged(network: android.net.Network, networkCapabilities: android.net.NetworkCapabilities) {
+                    emitNetworkStatusToWebView()
+                }
+            }
+            cm.registerNetworkCallback(request, networkCallback!!)
+            isNetworkMonitoringStarted = true
+            Log.i(TAG, "[Network] Native network status monitoring started successfully.")
+            invoke.resolve()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to register network callback", e)
+            invoke.reject(e.message ?: "Failed to register network callback")
+        }
+    }
 
     override fun load(webView: WebView) {
         super.load(webView)
@@ -312,6 +644,33 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
 
     override fun onDestroy(activity: AppCompatActivity) {
         webViewRef = null
+        try {
+            if (networkCallback != null) {
+                val cm = activity.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+                cm.unregisterNetworkCallback(networkCallback!!)
+                networkCallback = null
+                isNetworkMonitoringStarted = false
+            }
+        } catch (_: Exception) {}
+        try {
+            synchronized(powerLockGuard) {
+                powerLockRefCount = 0
+                if (wakeLock?.isHeld == true) wakeLock?.release()
+                if (wifiLock?.isHeld == true) wifiLock?.release()
+            }
+        } catch (_: Exception) {}
+        try {
+            sensorStatusManager.stop()
+        } catch (_: Exception) {}
+        try {
+            floatingWindowManager.destroy()
+        } catch (_: Exception) {}
+        try {
+            val notificationManager = activity.getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+            notificationManager.cancel(DOWNLOAD_NOTIF_ID)
+            downloadNotificationBuilder = null
+            activity.stopService(StreamKeepaliveService.createIntent(activity, "", false))
+        } catch (_: Exception) {}
         try {
             fileIoExecutor.shutdown()
         } catch (_: Exception) {}
@@ -1458,6 +1817,7 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
 @InvokeArg
 class StartStreamArgs {
     lateinit var agentName: String
+    var isKeepaliveMode: Boolean? = null
 }
 
 @InvokeArg
@@ -1524,4 +1884,15 @@ class ProcessSharedFileArgs {
     lateinit var cachePath: String
     var mimeType: String? = null
     lateinit var fileName: String
+}
+
+@InvokeArg
+class GetSensorDataArgs {
+    lateinit var type: String
+}
+
+@InvokeArg
+class RunRootCommandArgs {
+    lateinit var command: String
+    var timeoutMs: Int = 1500
 }
