@@ -605,7 +605,6 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     console.log(
       `[ChatStreamStore] Sending interrupt signal for message: ${messageId}`,
     );
-    sealStreamInputs(messageId);
     try {
       await invoke("interruptRequest", { messageId: messageId });
     } catch (e) {
@@ -613,7 +612,9 @@ export const useChatStreamStore = defineStore("chatStream", () => {
         `[ChatStreamStore] Failed to interrupt stream for ${messageId}:`,
         e,
       );
+      return;
     }
+    sealStreamInputs(messageId);
 
     // 本地模拟一个结束状态
     const msg = activeStreamMessages.get(messageId);

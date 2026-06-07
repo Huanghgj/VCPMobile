@@ -156,7 +156,7 @@ async function fallbackBrowserDownload(
   fileName: string,
 ): Promise<void> {
   const trimmedSrc = src.trim();
-  const protocol = new URL(trimmedSrc).protocol;
+  const protocol = new URL(trimmedSrc, window.location.href).protocol;
   if (!["http:", "https:", "data:", "blob:"].includes(protocol)) {
     throw new Error("Unsupported URL scheme for download");
   }

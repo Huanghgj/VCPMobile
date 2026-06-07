@@ -20,8 +20,10 @@ export function startStreamService(agentName: string): Promise<void> {
   return invoke("plugin:vcp-mobile|start_streaming_service", { agentName });
 }
 
-export function stopStreamService(agentName: string): Promise<void> {
-  return invoke("plugin:vcp-mobile|stop_streaming_service", { agentName });
+export function stopStreamService(agentName?: string): Promise<void> {
+  return invoke("plugin:vcp-mobile|stop_streaming_service", {
+    agentName: agentName ?? "",
+  });
 }
 
 // ==================================================================

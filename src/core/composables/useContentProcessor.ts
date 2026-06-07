@@ -28,6 +28,21 @@ export interface ContentBlock {
 
 const injectedStyles = new Map<string, string>();
 
+function escapeCssAttributeValue(value: string): string {
+  return value.replace(/["\\\n\r\f]/g, (char) => {
+    switch (char) {
+      case "\n":
+        return "\\a ";
+      case "\r":
+        return "\\d ";
+      case "\f":
+        return "\\c ";
+      default:
+        return `\\${char}`;
+    }
+  });
+}
+
 function sanitizeScopedCss(css: string): string {
   return css
     .replace(/@(?:import|namespace|font-face|page)\b[^;{]*(?:;|\{[\s\S]*?\})/gi, "")
@@ -50,7 +65,7 @@ export function useContentProcessor() {
 
   const injectScopedCss = (css: string, messageId: string) => {
     if (!css || !messageId) return;
-    const scopeSelector = `[data-message-id="${messageId}"]`;
+    const scopeSelector = `[data-message-id="${escapeCssAttributeValue(messageId)}"]`;
     const sanitizedCss = sanitizeScopedCss(css);
     if (!sanitizedCss.trim()) return;
 

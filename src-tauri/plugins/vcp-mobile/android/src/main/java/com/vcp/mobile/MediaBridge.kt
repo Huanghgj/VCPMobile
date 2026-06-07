@@ -16,6 +16,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.ArrayDeque
 import java.util.UUID
 import java.util.concurrent.Executors
 import kotlin.math.abs
@@ -333,62 +334,68 @@ object MediaBridge {
 
                 val decoderBufferInfo = MediaCodec.BufferInfo()
                 val encoderBufferInfo = MediaCodec.BufferInfo()
-                var lastDecoderPresentationTimeUs = 0L
+                var encodedPcmBytes = 0L
 
                 // 获取输入的源音频参数
                 val srcSampleRate = inputFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
                 val srcChannelCount = inputFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
 
-                // PCM 重采样状态缓存区：ByteArrayOutputStream 避免反复 concat/copy 造成 O(n²) 耗电
-                // 猫娘把 PCM 缓冲夹紧，别让长音频在内存里骚骚膨胀喵♡
-                val pendingPcm = ByteArrayOutputStream(8192)
+                val pendingPcm = ArrayDeque<ByteArray>()
+                var pendingPcmBytes = 0
+                var pendingChunkOffset = 0
+                val encoderChunkBytes = 4096
 
                 // 最大压制时长硬截断: 3500s -> 3500,000,000 Us
                 val maxDurationUs = 3500L * 1_000_000L
 
+                fun encoderPtsForOffset(offsetBytes: Long): Long {
+                    val samples = offsetBytes / 2L // 16-bit mono after processPcmData()
+                    return samples * 1_000_000L / 16000L
+                }
+
                 fun feedEncoderPending() {
                     if (isEncoderInputEOS) return
-                    val pendingSize = pendingPcm.size()
-                    if (pendingSize < 4096 && !isDecoderOutputEOS) return
+                    if (pendingPcmBytes < encoderChunkBytes && !isDecoderOutputEOS) return
 
-                    // 这里按需快照，避免每轮空转都复制 PCM；EOS 小尾巴也要喂干净喵♡
-                    val pendingBytes = pendingPcm.toByteArray()
-                    var offset = 0
-                    while (pendingBytes.size - offset >= 4096 ||
-                        (isDecoderOutputEOS && pendingBytes.size > offset) ||
-                        (isDecoderOutputEOS && !isEncoderInputEOS && pendingBytes.size == offset)
+                    while (pendingPcmBytes >= encoderChunkBytes ||
+                        (isDecoderOutputEOS && pendingPcmBytes > 0) ||
+                        (isDecoderOutputEOS && pendingPcmBytes == 0)
                     ) {
                         val encInputBufIndex = encoder.dequeueInputBuffer(10000)
                         if (encInputBufIndex < 0) break
 
-                        val sizeToFeed = Math.min(4096, pendingBytes.size - offset)
+                        val sizeToFeed = Math.min(encoderChunkBytes, pendingPcmBytes)
                         val encBuffer = encoderInputBuffers[encInputBufIndex]
                         encBuffer.clear()
-                        if (sizeToFeed > 0) {
-                            encBuffer.put(pendingBytes, offset, sizeToFeed)
-                            offset += sizeToFeed
+                        var bytesCopied = 0
+                        while (bytesCopied < sizeToFeed && pendingPcm.isNotEmpty()) {
+                            val pendingChunk = pendingPcm.peek()
+                            val bytesFromChunk = Math.min(sizeToFeed - bytesCopied, pendingChunk.size - pendingChunkOffset)
+                            encBuffer.put(pendingChunk, pendingChunkOffset, bytesFromChunk)
+                            bytesCopied += bytesFromChunk
+                            pendingChunkOffset += bytesFromChunk
+                            pendingPcmBytes -= bytesFromChunk
+                            if (pendingChunkOffset >= pendingChunk.size) {
+                                pendingPcm.remove()
+                                pendingChunkOffset = 0
+                            }
                         }
 
-                        val flags = if (isDecoderOutputEOS && offset >= pendingBytes.size) {
+                        val flags = if (isDecoderOutputEOS && pendingPcmBytes == 0) {
                             MediaCodec.BUFFER_FLAG_END_OF_STREAM
                         } else {
                             0
                         }
+                        val presentationTimeUs = encoderPtsForOffset(encodedPcmBytes)
                         encoder.queueInputBuffer(
                             encInputBufIndex, 0, sizeToFeed,
-                            lastDecoderPresentationTimeUs, flags
+                            presentationTimeUs, flags
                         )
+                        encodedPcmBytes += sizeToFeed.toLong()
                         if ((flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
                             // EOS 也要温柔射进编码器，避免空尾巴音频把循环吊死喵♡
                             isEncoderInputEOS = true
-                        }
-                    }
-
-                    // 只在真的消费后重建尾巴，避免长音频反复复制整条肉流
-                    if (offset > 0) {
-                        pendingPcm.reset()
-                        if (offset < pendingBytes.size) {
-                            pendingPcm.write(pendingBytes, offset, pendingBytes.size - offset)
+                            break
                         }
                     }
                 }
@@ -429,12 +436,12 @@ object MediaBridge {
                             val chunk = ByteArray(decoderBufferInfo.size)
                             pcmBuffer.get(chunk)
                             decoder.releaseOutputBuffer(res, false)
-                            lastDecoderPresentationTimeUs = decoderBufferInfo.presentationTimeUs
 
                             // 将解码 PCM 进行重采样和降声道
                             val processedPcm = processPcmData(chunk, srcSampleRate, srcChannelCount)
                             if (processedPcm.isNotEmpty()) {
-                                pendingPcm.write(processedPcm)
+                                pendingPcm.add(processedPcm)
+                                pendingPcmBytes += processedPcm.size
                             }
 
                             if ((decoderBufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {

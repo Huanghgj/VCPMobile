@@ -22,7 +22,7 @@ export function sanitizeRenderedImageSrc(value: string): string {
   if (!src) return "";
   if (/^https?:\/\//i.test(src)) return src;
   if (/^data:image\//i.test(src)) return src;
-  if (/^(blob:|file:|content:|asset:)/i.test(src)) return src;
+  if (/^(blob:|asset:)/i.test(src)) return src;
   if (/^[./]/.test(src)) {
     try {
       return new URL(src, window.location.href).href;

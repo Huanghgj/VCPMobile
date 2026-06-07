@@ -1,5 +1,5 @@
 import { defineStore } from "pinia";
-import { ref, computed } from "vue";
+import { ref, computed, onScopeDispose } from "vue";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useChatSessionStore } from "./chatSessionStore";
@@ -37,7 +37,9 @@ export const useTopicStore = defineStore("topic", () => {
 
   // --- 事件监听 (Event Listeners) ---
   // 注意：topic-index-updated 事件当前在 Rust 侧未被 emit，已移除死代码
-  let topicTitleUpdatedUnlisten: Promise<UnlistenFn> | null = null;
+  let topicTitleUpdatedUnlisten: UnlistenFn | null = null;
+  let topicTitleListenerInit: Promise<void> | null = null;
+  let topicTitleListenerRetry: ReturnType<typeof window.setTimeout> | null = null;
 
   const applyTopicTitleUpdate = (topicId: string, title: string) => {
     const index = topics.value.findIndex((t) => t.id === topicId);
@@ -48,9 +50,9 @@ export const useTopicStore = defineStore("topic", () => {
   };
 
   const ensureTopicTitleListener = () => {
-    if (!isTauriRuntime() || topicTitleUpdatedUnlisten) return;
+    if (!isTauriRuntime() || topicTitleUpdatedUnlisten || topicTitleListenerInit) return;
 
-    topicTitleUpdatedUnlisten = listen<{
+    topicTitleListenerInit = listen<{
       topicId?: string;
       title?: string;
     }>("topic-title-updated", (event) => {
@@ -58,10 +60,35 @@ export const useTopicStore = defineStore("topic", () => {
       if (topicId && title) {
         applyTopicTitleUpdate(topicId, title);
       }
-    });
+    })
+      .then((unlisten) => {
+        topicTitleUpdatedUnlisten = unlisten;
+      })
+      .catch((err) => {
+        console.warn("[TopicStore] topic-title-updated listener init failed:", err);
+        topicTitleUpdatedUnlisten = null;
+        topicTitleListenerRetry = window.setTimeout(() => {
+          topicTitleListenerRetry = null;
+          ensureTopicTitleListener();
+        }, 2000);
+      })
+      .finally(() => {
+        topicTitleListenerInit = null;
+      });
   };
 
   ensureTopicTitleListener();
+
+  onScopeDispose(() => {
+    if (topicTitleListenerRetry) {
+      window.clearTimeout(topicTitleListenerRetry);
+      topicTitleListenerRetry = null;
+    }
+    if (topicTitleUpdatedUnlisten) {
+      topicTitleUpdatedUnlisten();
+      topicTitleUpdatedUnlisten = null;
+    }
+  });
 
   /**
    * 使所有话题列表缓存失效

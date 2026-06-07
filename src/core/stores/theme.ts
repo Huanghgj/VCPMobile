@@ -62,7 +62,7 @@ const resolveWallpaperUrl = (rawValue?: string): string | null => {
   if (!rawValue || rawValue === 'none') return null;
   const match = rawValue.match(/url\(['"]?(.*?)['"]?\)/);
   let filename = match ? match[1] : rawValue;
-  filename = filename.replace(/^.*[\\/]/, '').replace(/['"]/g, '').trim();
+  filename = filename.split(/[?#]/)[0].replace(/^.*[\\/]/, '').replace(/['"]/g, '').trim();
   if (!filename) return null;
   filename = filename.replace(/\.[^.]+$/, '') + '.webp';
   return `/wallpaper/${filename}`;

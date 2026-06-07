@@ -143,7 +143,7 @@ function renderInline(node: InlineNode): string {
       if (!src) return '';
       const originalSrc = node.src ? sanitizeImageUrl(node.src) : '';
       const originalAttr = originalSrc ? ` data-vcp-image-src="${originalSrc}"` : '';
-      return `<img src="${src}"${originalAttr} alt="${escapeHtml(node.alt || '')}" title="${escapeHtml(node.title || '')}" loading="eager" decoding="async" class="vcp-markdown-image" />`;
+      return `<img src="${src}"${originalAttr} alt="${escapeHtml(node.alt || '')}" title="${escapeHtml(node.title || '')}" loading="lazy" decoding="async" class="vcp-markdown-image" />`;
     }
     
     case 'line_break':
@@ -194,7 +194,7 @@ function sanitizeMarkdownHtml(html: string): string {
     FORBID_TAGS: ['script', 'iframe', 'object', 'embed', 'applet', 'link', 'meta'],
     FORBID_ATTR: ['srcdoc'],
     ALLOW_UNKNOWN_PROTOCOLS: false,
-    ALLOWED_URI_REGEXP: /^(?:(?:https?|mailto|tel|blob|asset|file|content):|data:image\/|\/|\.\/|\.\.\/|#)/i,
+    ALLOWED_URI_REGEXP: /^(?:(?:https?|mailto|tel|blob|asset):|data:image\/|\/|\.\/|\.\.\/|#)/i,
   });
 }
 
@@ -229,7 +229,7 @@ function sanitizeLinkUrl(value: string): string {
 function sanitizeImageUrl(value: string): string {
   const trimmed = value.trim();
   if (!trimmed) return '';
-  if (/^(https?:|data:image\/|blob:|asset:|file:|content:)/i.test(trimmed)) {
+  if (/^(https?:|data:image\/|blob:|asset:)/i.test(trimmed)) {
     return escapeHtml(trimmed);
   }
   if (/^[./#]/.test(trimmed)) {

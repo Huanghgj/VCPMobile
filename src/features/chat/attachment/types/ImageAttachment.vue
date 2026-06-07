@@ -12,7 +12,7 @@
         :src="safeSrc" 
         :alt="file.name"
         class="w-full h-full object-cover"
-        loading="eager"
+        loading="lazy"
         decoding="async"
       />
     </div>

@@ -176,11 +176,11 @@ onUnmounted(() => {
               <pre v-else><code class="hljs" v-html="highlightedCode"></code></pre>
             </div>
             <iframe
+              v-if="fullScreenTab === 'preview'"
               ref="fullscreenIframeRef"
-              v-show="fullScreenTab === 'preview'"
               class="vcp-fullscreen-iframe w-full h-full border-none"
               sandbox=""
-              loading="eager"
+              loading="lazy"
               :srcdoc="getSandboxHtml(content)"
             ></iframe>
           </div>
@@ -243,7 +243,7 @@ onUnmounted(() => {
           ref="inlineIframeRef"
           class="vcp-inline-iframe w-full h-full border-none no-swipe"
           sandbox=""
-          loading="eager"
+          loading="lazy"
           :srcdoc="getSandboxHtml(content)"
         ></iframe>
       </div>

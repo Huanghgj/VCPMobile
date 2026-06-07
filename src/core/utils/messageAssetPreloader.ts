@@ -57,7 +57,7 @@ export async function preloadMessageImages(messages: ChatMessage[]): Promise<voi
         let src = attachment.resolvedSrc || "";
         const rawSrc = attachment.thumbnailPath || attachment.internalPath || attachment.src;
         if (!src && rawSrc) {
-          if (/^(https?:|data:image\/|blob:|asset:|file:|content:)/i.test(rawSrc)) {
+          if (/^(https?:|data:image\/|blob:|asset:)/i.test(rawSrc)) {
             src = rawSrc;
           } else {
             try {

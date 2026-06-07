@@ -133,7 +133,7 @@ pub async fn check_for_update(app: AppHandle) -> Result<UpdateInfo, String> {
     let apk_asset = release
         .assets
         .iter()
-        .find(|a| a.name.contains(APK_ASSET_SUFFIX));
+        .find(|a| a.name.ends_with(APK_ASSET_SUFFIX));
 
     if apk_asset.is_none() && has_update {
         return Err(format!(

@@ -364,6 +364,13 @@ const trackInteraction = (e: Event) => {
     return;
   }
 
+  if (
+    clientX < rect.left || clientX > rect.right ||
+    clientY < rect.top || clientY > rect.bottom
+  ) {
+    return;
+  }
+
   // Normalize position to 0.0 ~ 1.0 range (with flipped Y for WebGL)
   const normalizedX = (clientX - rect.left) / rect.width;
   const normalizedY = 1.0 - (clientY - rect.top) / rect.height;

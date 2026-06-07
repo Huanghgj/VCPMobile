@@ -237,7 +237,7 @@ pub async fn summarize_topic_if_needed<R: Runtime>(
 
     if let Some(sync_state) = app_handle.try_state::<SyncState>() {
         match sqlx::query(
-            "SELECT config_hash FROM topics WHERE topic_id = ? AND deleted_at IS NULL",
+            "SELECT config_hash, owner_type FROM topics WHERE topic_id = ? AND deleted_at IS NULL",
         )
         .bind(&topic_id)
         .fetch_optional(&db_pool)
@@ -245,12 +245,13 @@ pub async fn summarize_topic_if_needed<R: Runtime>(
         {
             Ok(Some(row)) => {
                 let hash: String = row.get("config_hash");
+                let db_owner_type: String = row.get("owner_type");
                 let _ = sync_state.ws_sender.send(SyncCommand::NotifyLocalChange {
                     data_type: SyncDataType::Topic,
                     id: topic_id.clone(),
                     hash,
                     ts: now,
-                    owner_type: Some(owner_type.clone()),
+                    owner_type: Some(db_owner_type),
                 });
             }
             Ok(None) => {}

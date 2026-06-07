@@ -39,11 +39,6 @@ export function useNotificationPresentation() {
       return { value: distance.toFixed(4), isEstimated: false };
     }
 
-    const normalizedGeo = parseMetricNumber(item.normalized_geo);
-    if (normalizedGeo !== null) {
-      return { value: normalizedGeo.toFixed(4), isEstimated: false };
-    }
-
     const score = parseMetricNumber(item.score ?? item.rerank_score ?? item.original_score);
     if (score !== null && score > 0) {
       const est = (1 / score) - 1;

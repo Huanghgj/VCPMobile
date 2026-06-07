@@ -75,8 +75,7 @@ export function useNotificationGrouping(historyList: () => VcpNotification[]) {
       infoType === 'connection_ack' ||
       rawType === 'vcp-core-status' ||
       rawType === 'vcp-log-status' ||
-      rawType === 'vcp-info-status' ||
-      rawType === 'vcp-info-message'
+      rawType === 'vcp-info-status'
     ) return 'system';
 
     return 'other';

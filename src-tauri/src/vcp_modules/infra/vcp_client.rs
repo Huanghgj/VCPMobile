@@ -537,6 +537,18 @@ pub async fn perform_vcp_request<R: Runtime>(
         let mut last_aurora_content_len = 0usize;
         let mut reasoning_block_open = false;
 
+        fn close_reasoning_block(
+            buffer: &mut AuroraBuffer,
+            full_content: &mut String,
+            reasoning_block_open: &mut bool,
+        ) {
+            if *reasoning_block_open {
+                full_content.push_str("</think>");
+                buffer.append_chunk("</think>");
+                *reasoning_block_open = false;
+            }
+        }
+
         // 辅助闭包：发送 Aurora 更新事件（稀疏序列化 + 正文增量）
         let mut send_aurora_update = |buffer: &AuroraBuffer,
                                       stable_changed: bool,
@@ -584,6 +596,7 @@ pub async fn perform_vcp_request<R: Runtime>(
         tokio::select! {
             _ = &mut abort_rx => {
                                 log::warn!("[VCPClient] Request aborted before response for message: {}", message_id_inner);
+                                close_reasoning_block(&mut aurora_buffer, &mut full_content, &mut reasoning_block_open);
                                 aurora_buffer.finalize();
                 send_aurora_update(&aurora_buffer, true, true, Some("cancelled_by_user".to_string()), Some("请求已中止".to_string()));
                 active_requests_inner.remove(&message_id_inner);
@@ -602,6 +615,7 @@ pub async fn perform_vcp_request<R: Runtime>(
                                 _ = &mut abort_rx => {
                                     is_aborted = true;
                                     log::warn!("[VCPClient] Stream deep-polling detected abort for message: {}", message_id_inner);
+                                    close_reasoning_block(&mut aurora_buffer, &mut full_content, &mut reasoning_block_open);
                                     aurora_buffer.finalize();
                                     send_aurora_update(&aurora_buffer, true, true, Some("cancelled_by_user".to_string()), Some("请求已中止".to_string()));
 
@@ -617,6 +631,7 @@ pub async fn perform_vcp_request<R: Runtime>(
                                                 let data = line.trim_start_matches("data: ").trim();
                                                 if data == "[DONE]" {
                                                     log::debug!("[VCPClient] Stream finished normally with [DONE] for message: {}", message_id_inner);
+                                                    close_reasoning_block(&mut aurora_buffer, &mut full_content, &mut reasoning_block_open);
                                                     aurora_buffer.finalize();
                                                     send_aurora_update(&aurora_buffer, true, true, last_finish_reason.clone(), None);
                                                     break;
@@ -685,6 +700,7 @@ pub async fn perform_vcp_request<R: Runtime>(
                                         }
                                         Some(Err(e)) => {
                                             log::error!("[VCPClient] Stream read error: {:?}", e);
+                                            close_reasoning_block(&mut aurora_buffer, &mut full_content, &mut reasoning_block_open);
                                             aurora_buffer.finalize();
                                             send_aurora_update(&aurora_buffer, true, true, Some("error".to_string()), Some(format!("流读取错误: {}", e)));
                                             send_stream_event(StreamEvent::error(
@@ -697,6 +713,7 @@ pub async fn perform_vcp_request<R: Runtime>(
                                         }
                                         None => {
                                             // 修复：若此前已收到有效 chunk，则视为正常结束（对齐桌面端行为）
+                                            close_reasoning_block(&mut aurora_buffer, &mut full_content, &mut reasoning_block_open);
                                             aurora_buffer.finalize();
                                             if !full_content.is_empty() || last_finish_reason.is_some() {
                                                 log::debug!("[VCPClient] Stream ended without [DONE] but content was received. Treating as normal end.");

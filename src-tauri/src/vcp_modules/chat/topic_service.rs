@@ -256,19 +256,22 @@ pub async fn update_topic_title(
 
     // 2. 发送同步通知给局域网同步网络
     if let Some(sync_state) = app_handle.try_state::<SyncState>() {
-        let row = sqlx::query("SELECT config_hash FROM topics WHERE topic_id = ?")
-            .bind(&topic_id)
-            .fetch_one(&db_state.pool)
-            .await
-            .map_err(|e| e.to_string())?;
+        let row = sqlx::query(
+            "SELECT config_hash, owner_type FROM topics WHERE topic_id = ? AND deleted_at IS NULL",
+        )
+        .bind(&topic_id)
+        .fetch_one(&db_state.pool)
+        .await
+        .map_err(|e| e.to_string())?;
 
         let hash: String = row.get("config_hash");
+        let owner_type: String = row.get("owner_type");
         let _ = sync_state.ws_sender.send(SyncCommand::NotifyLocalChange {
             data_type: SyncDataType::Topic,
             id: topic_id,
             hash,
             ts: now,
-            owner_type: Some(_owner_type),
+            owner_type: Some(owner_type),
         });
     }
 
@@ -321,19 +324,22 @@ pub async fn toggle_topic_lock(
 
     // 2. 发送同步通知
     if let Some(sync_state) = app_handle.try_state::<SyncState>() {
-        let row = sqlx::query("SELECT config_hash FROM topics WHERE topic_id = ?")
-            .bind(&topic_id)
-            .fetch_one(&db_state.pool)
-            .await
-            .map_err(|e| e.to_string())?;
+        let row = sqlx::query(
+            "SELECT config_hash, owner_type FROM topics WHERE topic_id = ? AND deleted_at IS NULL",
+        )
+        .bind(&topic_id)
+        .fetch_one(&db_state.pool)
+        .await
+        .map_err(|e| e.to_string())?;
 
         let hash: String = row.get("config_hash");
+        let owner_type: String = row.get("owner_type");
         let _ = sync_state.ws_sender.send(SyncCommand::NotifyLocalChange {
             data_type: SyncDataType::Topic,
             id: topic_id,
             hash,
             ts: now,
-            owner_type: Some(_owner_type),
+            owner_type: Some(owner_type),
         });
     }
 

@@ -20,6 +20,16 @@ pub struct AgentChatPayload {
     pub vcp_api_key: String,
 }
 
+fn history_tail_matches_user_message(history: &[ChatMessage], user_message: &ChatMessage) -> bool {
+    history
+        .last()
+        .filter(|last| last.role == "user")
+        .is_some_and(|last| {
+            (!user_message.id.is_empty() && last.id == user_message.id)
+                || (!user_message.content.is_empty() && last.content == user_message.content)
+        })
+}
+
 #[tauri::command]
 pub async fn handle_agent_chat_message(
     app_handle: AppHandle,
@@ -83,7 +93,7 @@ pub async fn internal_process_agent_chat_message(
     }
 
     // 3. 加载完整历史记录用于上下文组装
-    let history = message_service::load_chat_history_internal(
+    let mut history = message_service::load_chat_history_internal(
         &app_handle,
         &agent_id,
         "agent",
@@ -95,6 +105,15 @@ pub async fn internal_process_agent_chat_message(
         false, // include_ui_render_data: 发请求不需要 blocks/shell
     )
     .await?;
+
+    if !append_user_msg && !history_tail_matches_user_message(&history, &user_message) {
+        log::warn!(
+            "[AgentChatAppService] Latest user message missing from persisted history; injecting inline for request context. topic_id={}, user_msg_id={}",
+            topic_id,
+            user_message.id
+        );
+        history.push(user_message.clone());
+    }
 
     // 4. 委派上下文级联装配外观中枢，完成微观编织与宏观 Tavern 规则流水线拦截
     let effective_prompt = if !agent_config.mobile_system_prompt.is_empty() {

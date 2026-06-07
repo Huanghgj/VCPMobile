@@ -192,7 +192,7 @@ const isImageValue = (key: string, value: string): boolean => {
               <!-- 图片值直接渲染为 img，其他值走 Markdown 管线 -->
               <template v-if="item.value && isImageValue(item.key, item.value)">
                 <a :href="safeImageUrl(item.value)" target="_blank" rel="noopener noreferrer" class="block">
-                  <img :src="safeImageUrl(item.value)" class="max-w-full rounded-lg" loading="eager" decoding="async" alt="Generated Image" />
+                  <img :src="safeImageUrl(item.value)" class="max-w-full rounded-lg" loading="lazy" decoding="async" alt="Generated Image" />
                 </a>
               </template>
               <div v-else class="text-xs opacity-90 vcp-markdown-block compact-markdown select-text" v-html="renderMarkdown(item.value || '')"></div>

@@ -381,7 +381,6 @@ pub async fn apply_frontend_update(
     zip_path: String,
     version: String,
 ) -> Result<(), String> {
-    validate_frontend_version(&version)?;
     let updates_dir = get_frontend_updates_dir(&app)?;
     if !updates_dir.exists() {
         std::fs::create_dir_all(&updates_dir).map_err(|e| e.to_string())?;
@@ -401,6 +400,20 @@ pub async fn apply_frontend_update(
     if !canonical_zip_path.starts_with(&canonical_download_dir) {
         return Err("前端更新包路径不受信任".to_string());
     }
+
+    let version_from_zip = canonical_zip_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(extract_version_from_asset_name)
+        .ok_or_else(|| "前端更新包文件名无法解析版本号".to_string())?;
+    validate_frontend_version(&version_from_zip)?;
+    if version != version_from_zip {
+        return Err(format!(
+            "前端更新版本不匹配: 参数={}, 文件={}",
+            version, version_from_zip
+        ));
+    }
+    let version = version_from_zip;
 
     let version_dir = updates_dir.join(&version);
     if version_dir.exists() {

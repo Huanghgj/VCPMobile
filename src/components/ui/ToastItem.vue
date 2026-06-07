@@ -89,10 +89,14 @@ const handleClick = () => {
         </div>
 
         <div v-if="toast.isPreformatted"
-          class="mt-1 p-1.5 bg-black/[0.04] dark:bg-black/25 rounded text-[8px] max-h-[60px] overflow-y-auto whitespace-pre-wrap break-all font-mono opacity-60 text-primary-text leading-normal select-text">
+          class="mt-1 p-1.5 bg-black/[0.04] dark:bg-black/25 rounded text-[8px] max-h-[60px] overflow-y-auto whitespace-pre-wrap break-all font-mono opacity-60 text-primary-text leading-normal select-text"
+          @click.stop
+          @mousedown.stop>
           {{ toast.message }}
         </div>
-        <p v-else-if="toast.message" class="text-[9.5px] text-primary-text opacity-50 break-words mt-0.5 leading-snug select-text">
+        <p v-else-if="toast.message" class="text-[9.5px] text-primary-text opacity-50 break-words mt-0.5 leading-snug select-text"
+          @click.stop
+          @mousedown.stop>
           {{ toast.message }}
         </p>
       </div>

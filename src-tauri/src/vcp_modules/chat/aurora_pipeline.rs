@@ -118,39 +118,11 @@ impl AuroraBuffer {
             return;
         }
         self.is_finishing = true;
-        self.close_unclosed_thinking_block();
         let final_new_blocks = self.parser.finalize(&self.full_text);
 
         self.stable_blocks.extend(final_new_blocks);
         self.tail_content.clear();
         self.tail_block = None;
-    }
-
-    fn close_unclosed_thinking_block(&mut self) {
-        let lower = self.full_text.to_lowercase();
-        let last_think_open = lower.rfind("<think");
-        let last_thinking_open = lower.rfind("<thinking");
-        let last_open = match (last_think_open, last_thinking_open) {
-            (Some(think_pos), Some(thinking_pos)) if thinking_pos >= think_pos => {
-                Some(("thinking", thinking_pos))
-            }
-            (Some(think_pos), _) => Some(("think", think_pos)),
-            (_, Some(thinking_pos)) => Some(("thinking", thinking_pos)),
-            _ => None,
-        };
-
-        if let Some((tag, open_pos)) = last_open {
-            let last_close = match tag {
-                "thinking" => lower.rfind("</thinking"),
-                _ => lower.rfind("</think"),
-            };
-            if last_close.is_none_or(|close_pos| close_pos < open_pos) {
-                self.full_text.push_str(match tag {
-                    "thinking" => "</thinking>",
-                    _ => "</think>",
-                });
-            }
-        }
     }
 
     /// 简单的 HTML 标签补全，防止流式输出截断导致 DOM 渲染异常
@@ -164,36 +136,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn finalize_closes_incomplete_think_block() {
+    fn finalize_does_not_invent_think_closing_tags() {
         let mut buffer = AuroraBuffer::new();
-        buffer.append_chunk("<think>正在分析");
+        buffer.append_chunk("普通文本里提到 <think 不是思考块");
         buffer.finalize();
 
-        assert_eq!(buffer.full_text, "<think>正在分析</think>");
+        assert_eq!(buffer.full_text, "普通文本里提到 <think 不是思考块");
         assert_eq!(buffer.stable_blocks.len(), 1);
 
         match &buffer.stable_blocks[0] {
-            StreamBlock::Thought {
-                theme,
-                content,
-                is_complete,
-                ..
-            } => {
-                assert_eq!(theme, "思考过程");
-                assert_eq!(content, "正在分析");
-                assert!(*is_complete);
+            StreamBlock::Markdown { content, .. } => {
+                assert_eq!(content, "普通文本里提到 <think 不是思考块");
             }
-            other => panic!("expected thought block, got {:?}", other),
+            other => panic!("expected markdown block, got {:?}", other),
         }
-    }
-
-    #[test]
-    fn finalize_closes_incomplete_thinking_block_with_matching_tag() {
-        let mut buffer = AuroraBuffer::new();
-        buffer.append_chunk("<thinking>正在分析");
-        buffer.finalize();
-
-        assert_eq!(buffer.full_text, "<thinking>正在分析</thinking>");
-        assert_eq!(buffer.stable_blocks.len(), 1);
     }
 }

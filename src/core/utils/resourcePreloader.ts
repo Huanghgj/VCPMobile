@@ -5,9 +5,18 @@ type PreloadImageOptions = {
 
 const imagePreloadCache = new Map<string, Promise<void>>();
 const DEFAULT_IMAGE_TIMEOUT_MS = 15000;
+const MAX_IMAGE_PRELOAD_CACHE_SIZE = 128;
 
 const normalizeImageUrl = (url: string): string => {
   return url.trim();
+};
+
+const pruneImagePreloadCache = (): void => {
+  while (imagePreloadCache.size > MAX_IMAGE_PRELOAD_CACHE_SIZE) {
+    const oldestKey = imagePreloadCache.keys().next().value;
+    if (!oldestKey) break;
+    imagePreloadCache.delete(oldestKey);
+  }
 };
 
 /**
@@ -46,6 +55,7 @@ export function preloadImage(url: string, options: PreloadImageOptions = {}): Pr
   });
 
   imagePreloadCache.set(normalized, task);
+  pruneImagePreloadCache();
   task.catch(() => {
     imagePreloadCache.delete(normalized);
   });
@@ -66,6 +76,7 @@ export function markImagePreloaded(url: string): void {
   const normalized = normalizeImageUrl(url);
   if (!normalized || imagePreloadCache.has(normalized)) return;
   imagePreloadCache.set(normalized, Promise.resolve());
+  pruneImagePreloadCache();
 }
 
 export function getImagePreloadCount(): number {

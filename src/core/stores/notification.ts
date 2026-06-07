@@ -17,12 +17,14 @@ export interface VcpNotification {
   structured?: {
     kind: 'rag' | 'thinking' | 'private_chat' | 'dream' | 'generic';
     summary?: string;
+    chips?: string[];
     rows?: {
       title: string;
       subtitle?: string;
       body?: string;
       chips?: string[];
       metrics?: { label: string; value: string }[];
+      distance?: string | number;
       source?: string;
       path?: string;
       snippet?: string;
@@ -211,10 +213,16 @@ export const useNotificationStore = defineStore('notification', () => {
     if (!item) return;
 
     if (item.rawPayload?.type === 'tool_approval_request') {
+      const requestId = item.rawPayload?.data?.requestId;
+      if (typeof requestId !== 'string' || !requestId.trim()) {
+        console.error('[NotificationStore] Missing approval requestId:', item.rawPayload);
+        return;
+      }
+
       const response = {
         type: 'tool_approval_response',
         data: {
-          requestId: item.rawPayload.data.requestId,
+          requestId: requestId.trim(),
           approved: action.value
         }
       };
