@@ -44,8 +44,9 @@ import java.net.URLDecoder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -335,12 +336,16 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
             val args = invoke.parseArgs(RunRootCommandArgs::class.java)
             fileIoExecutor.execute {
                 try {
-                    val future = Shell.cmd(args.command).enqueue()
                     val timeoutMs = args.timeoutMs.toLong().coerceIn(500L, 5000L)
-                    val output = try {
-                        future.get(timeoutMs, TimeUnit.MILLISECONDS).out
-                    } catch (e: TimeoutException) {
-                        future.cancel(true)
+                    val latch = CountDownLatch(1)
+                    val shellResultRef = AtomicReference<Shell.Result?>()
+
+                    Shell.cmd(args.command).submit(null) { shellResult ->
+                        shellResultRef.set(shellResult)
+                        latch.countDown()
+                    }
+
+                    if (!latch.await(timeoutMs, TimeUnit.MILLISECONDS)) {
                         val result = JSObject().apply {
                             put("success", false)
                             put("output", "Root command timed out after ${timeoutMs}ms")
@@ -348,9 +353,22 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
                         invoke.resolve(result)
                         return@execute
                     }
+
+                    val shellResult = shellResultRef.get()
+                    if (shellResult == null) {
+                        val result = JSObject().apply {
+                            put("success", false)
+                            put("output", "Root command returned no result")
+                        }
+                        invoke.resolve(result)
+                        return@execute
+                    }
+
+                    val stdout = shellResult.out.joinToString("\n")
+                    val stderr = shellResult.err.joinToString("\n")
                     val result = JSObject().apply {
-                        put("success", true)
-                        put("output", output.joinToString("\n"))
+                        put("success", shellResult.isSuccess)
+                        put("output", stdout.ifBlank { stderr })
                     }
                     invoke.resolve(result)
                 } catch (e: Exception) {
