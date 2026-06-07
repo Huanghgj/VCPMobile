@@ -2,6 +2,7 @@ mod distributed;
 mod vcp_modules;
 
 use tauri::{Listener, Manager};
+use tauri_plugin_log::{Target, TargetKind};
 use vcp_modules::agent_chat_application_service::{
     handle_agent_chat_message, handle_assistant_chat_stream,
 };
@@ -19,9 +20,7 @@ use vcp_modules::context_injection::{
     save_tarven_rule, toggle_rule_enabled,
 };
 use vcp_modules::context_sanitizer::ContextSanitizer;
-use vcp_modules::settings_manager::{read_settings, set_theme, update_settings, write_settings};
-// use vcp_modules::db_manager::DbState;
-use tauri_plugin_log::{Target, TargetKind};
+use vcp_modules::db_manager::{init_db, DbState};
 use vcp_modules::emoticon_manager::{
     fix_emoticon_url, get_emoticon_library, regenerate_emoticon_library,
 };
@@ -52,10 +51,11 @@ use vcp_modules::model_manager::{
     get_cached_models, get_favorite_models, get_hot_models, record_model_usage, refresh_models,
     toggle_favorite_model,
 };
+use vcp_modules::settings_manager::{read_settings, set_theme, update_settings, write_settings};
 
 use vcp_modules::sync_service::{
-    clear_old_sync_logs, get_sync_session_log_path, get_sync_status, list_sync_log_files,
-    read_sync_log_file, start_manual_sync, stop_sync,
+    clear_old_sync_logs, get_sync_session_log_path, get_sync_status, init_sync_service,
+    list_sync_log_files, read_sync_log_file, start_manual_sync, stop_sync,
 };
 use vcp_modules::topic_service::{
     archive_assistant_chat, create_topic, delete_topic, get_topics, get_topics_streamed,
@@ -127,8 +127,17 @@ pub fn run() {
             app.manage(vcp_modules::settings_manager::SettingsState::new());
             app.manage(vcp_modules::model_manager::ModelManagerState::new());
             app.manage(vcp_modules::emoticon_manager::EmoticonManagerState::default());
+            app.manage(init_sync_service(app.handle().clone()));
 
             let handle = app.handle().clone();
+
+            // DbState 是大量启动期命令的硬依赖，必须在 WebView 有机会 invoke 之前完成注册。
+            let (pool, db_path) = tauri::async_runtime::block_on(init_db(&handle))
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            app.manage(DbState {
+                pool,
+                path: db_path,
+            });
 
             // 0. 前端 OTA：APK 升级清理 & 损坏版本回滚 & 安全期冗余垃圾清理
             vcp_modules::frontend_update_manager::clear_on_apk_upgrade(&handle);

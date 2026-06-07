@@ -10,7 +10,7 @@ use crate::vcp_modules::topic_types::Topic;
 use serde_json::Value;
 use sqlx::Row;
 use std::collections::HashMap;
-use tauri::{ipc::Channel, AppHandle, Manager, State};
+use tauri::{ipc::Channel, AppHandle, Emitter, Manager, State};
 
 /// 批量获取所有 owner 的未读计数，替代前端的 N+1 查询
 #[tauri::command]
@@ -234,8 +234,8 @@ pub async fn delete_topic(
 pub async fn update_topic_title(
     app_handle: AppHandle,
     db_state: State<'_, DbState>,
-    _owner_id: String,
-    _owner_type: String,
+    owner_id: String,
+    owner_type: String,
     topic_id: String,
     title: String,
 ) -> Result<(), String> {
@@ -268,12 +268,23 @@ pub async fn update_topic_title(
         let owner_type: String = row.get("owner_type");
         let _ = sync_state.ws_sender.send(SyncCommand::NotifyLocalChange {
             data_type: SyncDataType::Topic,
-            id: topic_id,
+            id: topic_id.clone(),
             hash,
             ts: now,
             owner_type: Some(owner_type),
         });
     }
+
+    let _ = app_handle.emit(
+        "topic-title-updated",
+        serde_json::json!({
+            "topicId": topic_id,
+            "ownerId": owner_id,
+            "ownerType": owner_type,
+            "title": title,
+            "updatedAt": now,
+        }),
+    );
 
     Ok(())
 }

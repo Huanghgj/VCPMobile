@@ -46,6 +46,14 @@ const chatViewContainerRef = ref<HTMLElement | null>(null);
 
 // 流式状态
 const isStreamingActive = computed(() => streamStore.activeStreamingIds.size > 0);
+const currentTopicTitle = computed(() => {
+  const topicId = sessionStore.currentTopicId;
+  if (topicId) {
+    const topic = topicStore.topics.find((item) => item.id === topicId);
+    if (topic?.name) return topic.name;
+  }
+  return sessionStore.currentSelectedItem?.name || "VCP Mobile";
+});
 
 // 滚动管理 composable（封装 IO 双哨兵 + RAF 轮询 + 消息新增自动滚动）
 const {
@@ -66,16 +74,20 @@ const {
 
 // 监听话题切换与智能体变更，触发历史加载与防御性状态清空
 watch(
-  [() => sessionStore.currentTopicId, () => sessionStore.currentSelectedItem],
-  ([newTopicId, newSelectedItem]) => {
+  [
+    () => sessionStore.currentTopicId,
+    () => sessionStore.currentSelectedItem?.id,
+    () => sessionStore.currentSelectedItem?.type,
+  ],
+  ([newTopicId, newOwnerId, newOwnerType]) => {
     showScrollToBottom.value = false;
     resetChatScroll();
-    if (newTopicId && newSelectedItem) {
+    if (newTopicId && newOwnerId && newOwnerType) {
       console.log(`[ChatView] Topic changed to ${newTopicId}, loading history...`);
       topicStore.markTopicAsRead(newTopicId);
       historyStore.loadHistoryPaginated(
-        newSelectedItem.id,
-        newSelectedItem.type,
+        newOwnerId,
+        newOwnerType,
         newTopicId
       );
     } else {
@@ -216,7 +228,7 @@ onUnmounted(() => {
             class="font-bold text-sm truncate transition-colors duration-500"
             :style="{ color: sessionStore.currentSelectedItem?.avatarCalculatedColor || 'var(--primary-text)' }"
           >
-            {{ sessionStore.currentSelectedItem?.name || "VCP Mobile" }}
+            {{ currentTopicTitle }}
           </span>
   <div class="flex items-center gap-1" :title="lifecycleStore.errorMsg || undefined">
     <CoreStatusIndicator />

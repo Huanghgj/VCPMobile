@@ -5,14 +5,13 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::RwLock;
 
-use crate::vcp_modules::db_manager::{init_db, DbState};
+use crate::vcp_modules::db_manager::DbState;
 use crate::vcp_modules::emoticon_manager::{
     internal_load_library, refresh_emoticon_library_internal, EmoticonManagerState,
 };
 use crate::vcp_modules::infra::local_server::{self, ServerHandle};
 use crate::vcp_modules::model_manager::{init_model_manager, ModelManagerState};
 use crate::vcp_modules::settings_manager::{read_settings, SettingsState};
-use crate::vcp_modules::sync_service::init_sync_service;
 use crate::vcp_modules::vcp_log_service::init_vcp_log_connection_internal;
 
 #[derive(Debug, Serialize, Clone, Copy, PartialEq)]
@@ -161,33 +160,23 @@ pub async fn bootstrap(app: &AppHandle) -> Result<(), String> {
         }),
     );
 
-    // 1. 数据库初始化 (P0 - 绝对基础)
-    let _pool = match init_db(&handle).await {
-        Ok((p, path)) => {
-            handle.manage(DbState {
-                pool: p.clone(),
-                path,
-            });
-            p
-        }
-        Err(e) => {
-            let err_msg = format!("数据库初始化失败: {}", e);
-            *lifecycle.last_error.write().await = Some(err_msg.clone());
-            *lifecycle.status.write().await = CoreStatus::Error;
+    // 1. 数据库状态已在 setup 阶段同步注册，防止前端冷启动 invoke 早于异步 bootstrap。
+    if handle.try_state::<DbState>().is_none() {
+        let err_msg = "数据库状态未注册".to_string();
+        *lifecycle.last_error.write().await = Some(err_msg.clone());
+        *lifecycle.status.write().await = CoreStatus::Error;
 
-            // 发射致命错误
-            let _ = handle.emit(
-                "vcp-system-event",
-                serde_json::json!({
-                    "type": "vcp-core-status",
-                    "status": "error",
-                    "message": &err_msg,
-                    "source": "Core"
-                }),
-            );
-            return Err(err_msg);
-        }
-    };
+        let _ = handle.emit(
+            "vcp-system-event",
+            serde_json::json!({
+                "type": "vcp-core-status",
+                "status": "error",
+                "message": &err_msg,
+                "source": "Core"
+            }),
+        );
+        return Err(err_msg);
+    }
 
     // 2. 基础状态管理注册已在 lib.rs 中的 setup 阶段提前同步完成，此处无需重复注册以避免覆盖已有缓存。
 
@@ -231,9 +220,7 @@ pub async fn bootstrap(app: &AppHandle) -> Result<(), String> {
         reconcile_distributed_node(&handle, enable_dist, false).await;
     }
 
-    // 初始化同步服务
-    let sync_state = init_sync_service(handle.clone());
-    handle.manage(sync_state);
+    // 同步服务状态已在 setup 阶段注册，便于前端冷启动读取状态。
 
     // 4. 服务级后台初始化 (P2 - 非阻塞)
     {
@@ -448,7 +435,7 @@ pub async fn reconcile_distributed_node_cmd(
         "[Lifecycle] reconcile_distributed_node_cmd called: enable={}",
         enable
     );
-    reconcile_distributed_node(&app_handle, enable, false).await;
+    reconcile_distributed_node(&app_handle, enable, enable).await;
     Ok(enable)
 }
 

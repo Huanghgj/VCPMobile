@@ -13,12 +13,65 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::time;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_util::sync::CancellationToken;
+use url::Url;
 
 use super::tool_registry::ToolRegistry;
 use super::types::*;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const WAKE_LOCKED_IO_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn normalize_distributed_base_url(raw_url: &str) -> Result<String, String> {
+    let trimmed = raw_url.trim();
+    if trimmed.is_empty() {
+        return Err("Distributed WebSocket URL is empty".to_string());
+    }
+
+    let candidate = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("ws://{}", trimmed)
+    };
+
+    let mut url = Url::parse(&candidate).map_err(|e| format!("Invalid URL: {}", e))?;
+    match url.scheme() {
+        "ws" | "wss" => {}
+        "http" => {
+            let _ = url.set_scheme("ws");
+        }
+        "https" => {
+            let _ = url.set_scheme("wss");
+        }
+        scheme => {
+            return Err(format!(
+                "Unsupported distributed URL scheme '{}', expected ws/wss/http/https",
+                scheme
+            ));
+        }
+    }
+
+    url.set_query(None);
+    url.set_fragment(None);
+
+    let path = url.path().trim_end_matches('/').to_string();
+    let lower_path = path.to_ascii_lowercase();
+    let known_endpoints = [
+        "/vcp-distributed-server",
+        "/vcplog",
+        "/vcpinfo",
+        "/v1/chat/completions",
+    ];
+
+    let normalized_path = known_endpoints
+        .iter()
+        .filter_map(|endpoint| lower_path.find(endpoint).map(|index| &path[..index]))
+        .next()
+        .unwrap_or(path.as_str())
+        .trim_end_matches('/');
+
+    url.set_path(normalized_path);
+    Ok(url.as_str().trim_end_matches('/').to_string())
+}
 
 /// Type alias for the WebSocket sink to avoid excessive complexity in signatures.
 type WsSink = Arc<
@@ -123,7 +176,7 @@ impl DistributedClient {
         }
 
         let config = ConnectionConfig {
-            ws_url,
+            ws_url: normalize_distributed_base_url(&ws_url)?,
             vcp_key,
             device_name,
         };

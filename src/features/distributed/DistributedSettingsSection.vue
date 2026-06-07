@@ -86,9 +86,12 @@ const rowDescription = computed(() => {
 const notificationStore = useNotificationStore();
 
 const toggleConnection = async () => {
+  const { invoke } = await import("@tauri-apps/api/core");
+
   if (enabled.value) {
     enabled.value = false;
-    emit("save-request");
+    await settingsStore.saveSettings(props.settings);
+    await invoke("reconcile_distributed_node_cmd", { enable: false });
   } else {
     if (!derivedWsUrl.value || !derivedVcpKey.value) {
       notificationStore.addNotification({
@@ -104,7 +107,8 @@ const toggleConnection = async () => {
     props.settings.distributedVcpKey = derivedVcpKey.value;
     props.settings.distributedDeviceName = deviceName.value;
     enabled.value = true;
-    emit("save-request");
+    await settingsStore.saveSettings(props.settings);
+    await invoke("reconcile_distributed_node_cmd", { enable: true });
   }
 };
 </script>

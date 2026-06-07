@@ -4,10 +4,15 @@ import {
   X,
   Search,
   Plus,
-  Bug
+  Bug,
+  Trash2,
+  Boxes
 } from 'lucide-vue-next';
 import SlidePage from '../../components/ui/SlidePage.vue';
 import { useNotificationStore } from '../../core/stores/notification';
+import { useNotificationProcessor } from '../../core/composables/useNotificationProcessor';
+import { useSidebarSwipe } from '../../core/composables/useSidebarSwipe';
+import { useOverlayStore } from '../../core/stores/overlay';
 import NotificationStatusBar from './NotificationStatusBar.vue';
 import NotificationList from './NotificationList.vue';
 import { useNotificationGrouping } from './composables/useNotificationGrouping';
@@ -27,8 +32,12 @@ const emit = defineEmits<{
 }>();
 
 const store = useNotificationStore();
+const { processPayload } = useNotificationProcessor();
+const overlayStore = useOverlayStore();
+const pageRef = ref<HTMLElement | null>(null);
 const showDebugPanel = ref(false);
 const isDev = import.meta.env.DEV;
+useSidebarSwipe(pageRef, { type: 'right' });
 
 const {
   activeTab,
@@ -48,6 +57,96 @@ watch(
   },
   { immediate: true }
 );
+
+const openDistributedView = () => {
+  emit('close');
+  requestAnimationFrame(() => {
+    overlayStore.openDistributed();
+  });
+};
+
+const triggerDebugNotifications = () => {
+  if (!isDev) return;
+
+  const randomSuffix = () => Math.random().toString(36).substring(2, 5);
+  const debugPayloads = [
+    {
+      type: 'vcp_log',
+      data: {
+        tool_name: 'DailyNote',
+        status: 'success',
+        content: JSON.stringify({
+          MaidName: '[Nova]Nova',
+          timestamp: '2026-05-26T21:49:09.295+08:00',
+        }),
+      },
+    },
+    {
+      type: 'vcp_log',
+      data: {
+        tool_name: 'PowerShellExecutor',
+        status: 'success',
+        source: 'VCPLog',
+        content: JSON.stringify({
+          MaidName: '艾米莉亚',
+          timestamp: '2026-05-26T21:38:00',
+          original_plugin_output: {
+            status: 'success',
+            stdout:
+              'G:\\VCPMobile\\src\\components\\ui> ls\n\n    Directory: G:\\VCPMobile\\src\\components\\ui\n\nMode                 LastWriteTime         Length Name\n----                 -------------         ------ ----\n-a----        2026/05/26     21:38           1520 ToastItem.vue\n',
+          },
+        }),
+      },
+    },
+    {
+      type: 'vcp_log',
+      data: {
+        tool_name: 'AdbBridge',
+        status: 'error',
+        source: 'VCPLog',
+        content: '执行错误: {"plugin_error": "device \'emulator-5554\' not found."}',
+      },
+    },
+    {
+      type: 'vcp_log',
+      data: {
+        source: 'DistPluginManager',
+        content: '已成功同步 3 个分布式计算节点状态，物理核心 CPU 综合占用率 14%。',
+      },
+    },
+    {
+      type: 'video_generation_status',
+      data: {
+        status: 'Succeed',
+        timestamp: '2026-05-26T21:38:00',
+        original_plugin_output: {
+          message: '视频已生成，URL: https://cdn.vcpchat.com/generations/vid_77189b.mp4',
+        },
+      },
+    },
+    {
+      type: 'tool_approval_request',
+      data: {
+        requestId: `debug_req_${randomSuffix()}`,
+        toolName: 'PowerShellExecutor',
+        maid: '艾米莉亚',
+        args: { command: 'cargo check --workspace' },
+        timestamp: '2026-05-26 21:38:00',
+      },
+    },
+    {
+      type: 'connection_ack',
+      message: 'VCPLog 连接成功！',
+    },
+  ];
+
+  debugPayloads.forEach((payload) => {
+    const processed = processPayload(payload);
+    if (processed && !processed.silent) {
+      store.addNotification(processed);
+    }
+  });
+};
 
 // Debug mock injector
 const injectMockNotification = (type: 'rag' | 'thinking' | 'approval' | 'error') => {
@@ -151,7 +250,7 @@ const injectMockNotification = (type: 'rag' | 'thinking' | 'approval' | 'error')
 
 <template>
   <SlidePage :is-open="isOpen" :z-index="zIndex" @close="emit('close')">
-    <div class="flex flex-col h-full bg-[#fff5f7] text-slate-800 font-sans select-none overflow-hidden">
+    <div ref="pageRef" class="flex flex-col h-full bg-[#fff5f7] text-slate-800 font-sans select-none overflow-hidden">
       <!-- Header -->
       <div class="notification-page-header bg-white/90 border-b border-pink-100/80 px-4 pb-3 flex flex-col gap-2.5 shrink-0 shadow-sm">
         <div class="flex items-center justify-between">
@@ -162,11 +261,26 @@ const injectMockNotification = (type: 'rag' | 'thinking' | 'approval' | 'error')
           <div class="flex items-center gap-2">
             <button
               v-if="isDev"
+              @click="triggerDebugNotifications"
+              aria-label="推送调试通知"
+              class="p-1.5 rounded-lg bg-pink-50/60 border border-pink-100/50 text-pink-500 hover:bg-pink-50 active:scale-95 transition-all duration-150 motion-reduce:transition-none"
+            >
+              <Bug class="w-3.5 h-3.5" />
+            </button>
+            <button
+              v-if="isDev"
               @click="showDebugPanel = !showDebugPanel"
               aria-label="切换调试面板"
               class="p-1.5 rounded-lg bg-pink-50/60 border border-pink-100/50 text-pink-500 hover:bg-pink-50 active:scale-95 transition-all duration-150 motion-reduce:transition-none"
             >
-              <Bug class="w-3.5 h-3.5" />
+              <Plus class="w-3.5 h-3.5" />
+            </button>
+            <button
+              @click="store.clearHistory"
+              aria-label="清空通知"
+              class="p-1.5 rounded-lg bg-pink-50/60 border border-pink-100/50 text-pink-500 hover:bg-pink-50 active:scale-95 transition-all duration-150 motion-reduce:transition-none"
+            >
+              <Trash2 class="w-3.5 h-3.5" />
             </button>
             <button
               @click="emit('close')"
@@ -219,6 +333,17 @@ const injectMockNotification = (type: 'rag' | 'thinking' | 'approval' | 'error')
 
       <!-- Status Bar -->
       <NotificationStatusBar />
+
+      <!-- Quick Actions -->
+      <div class="px-3 py-2 border-b border-pink-100/60 bg-white/40 shrink-0">
+        <button
+          class="w-full py-2.5 px-3 rounded-lg bg-pink-500 text-white flex items-center justify-center gap-2 active:scale-[0.98] transition-transform shadow-sm shadow-pink-200"
+          @click="openDistributedView"
+        >
+          <Boxes class="w-3.5 h-3.5" />
+          <span class="font-bold text-xs leading-none">插件中心</span>
+        </button>
+      </div>
 
       <!-- Category Segmented Tabs -->
       <div class="bg-transparent shrink-0 overflow-x-auto flex items-center gap-1.5 px-3 py-2 scrollbar-none">

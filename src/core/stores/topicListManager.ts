@@ -43,10 +43,22 @@ export const useTopicStore = defineStore("topic", () => {
 
   const applyTopicTitleUpdate = (topicId: string, title: string) => {
     const index = topics.value.findIndex((t) => t.id === topicId);
-    if (index === -1 || !title) return;
+    if (!title) return;
 
-    topics.value[index] = { ...topics.value[index], name: title };
-    topics.value = [...topics.value];
+    if (index !== -1) {
+      topics.value[index] = { ...topics.value[index], name: title };
+      topics.value = [...topics.value];
+    }
+
+    if (
+      sessionStore.currentTopicId === topicId &&
+      sessionStore.currentSelectedItem
+    ) {
+      sessionStore.currentSelectedItem = {
+        ...sessionStore.currentSelectedItem,
+        name: title,
+      };
+    }
   };
 
   const ensureTopicTitleListener = () => {
@@ -301,10 +313,7 @@ export const useTopicStore = defineStore("topic", () => {
         title: newTitle,
       });
 
-      const index = topics.value.findIndex((t) => t.id === topicId);
-      if (index !== -1) {
-        applyTopicTitleUpdate(topicId, newTitle);
-      }
+      applyTopicTitleUpdate(topicId, newTitle);
     } catch (e) {
       console.error("[TopicStore] Failed to update topic title:", e);
       throw e;

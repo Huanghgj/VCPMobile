@@ -260,6 +260,7 @@ const loadSettings = async () => {
 const handleConnect = async () => {
   if (!wsUrl.value || !vcpKey.value) return;
   try {
+    const { invoke } = await import("@tauri-apps/api/core");
     if (settingsStore.settings) {
       const updates = {
         distributedWsUrl: wsUrl.value,
@@ -268,6 +269,7 @@ const handleConnect = async () => {
         distributedEnabled: true
       };
       await settingsStore.updateSettings(updates);
+      await invoke("reconcile_distributed_node_cmd", { enable: true });
     }
   } catch (e: any) {
     console.error("[DistributedView] Connection start failed:", e);
@@ -276,8 +278,10 @@ const handleConnect = async () => {
 
 const handleDisconnect = async () => {
   try {
+    const { invoke } = await import("@tauri-apps/api/core");
     if (settingsStore.settings) {
       await settingsStore.updateSettings({ distributedEnabled: false });
+      await invoke("reconcile_distributed_node_cmd", { enable: false });
     }
   } catch (e: any) {
     console.error("[DistributedView] Connection stop failed:", e);

@@ -26,8 +26,8 @@ import AgentSidebar from "./components/layout/AgentSidebar.vue";
 import GlobalOverlayManager from "./components/GlobalOverlayManager.vue";
 import FeatureOverlays from "./components/FeatureOverlays.vue";
 import UpdatePrompt from "./components/ui/UpdatePrompt.vue";
-import RightSidebar from "./components/layout/RightSidebar.vue";
 import ShareAgentSelector from "./features/chat/components/ShareAgentSelector.vue";
+import NotificationCenterPage from "./features/notification/NotificationCenterPage.vue";
 
 
 interface SharedFileEntry {
@@ -457,20 +457,18 @@ onUnmounted(() => {
       </router-view>
     </main>
 
-    <!-- 3. 抽屉遮罩层位于主内容之后、抽屉之前，点击空白即可关闭 -->
+    <!-- 3. 左侧抽屉遮罩层位于主内容之后、抽屉之前，点击空白即可关闭 -->
     <Transition name="fade">
-      <div v-if="layoutStore.leftDrawerOpen || layoutStore.rightDrawerOpen"
+      <div v-if="layoutStore.leftDrawerOpen"
         class="vcp-overlay fixed inset-0 z-drawer bg-black/12 md:hidden" @click.self="
           layoutStore.setLeftDrawer(false);
-          layoutStore.setRightDrawer(false);
         "></div>
     </Transition>
 
-    <!-- 4. 左右抽屉在遮罩之后声明，不写 z-index 也能稳定压过主内容 -->
+    <!-- 4. 左侧抽屉在遮罩之后声明；通知中心恢复为全屏页面体验 -->
     <AgentSidebar v-if="lifecycleStore.state === 'READY'" />
-    <RightSidebar
+    <NotificationCenterPage
       v-if="lifecycleStore.state === 'READY'"
-      class="pointer-events-auto shrink-0"
       :is-open="layoutStore.rightDrawerOpen"
       @close="layoutStore.setRightDrawer(false)"
     />

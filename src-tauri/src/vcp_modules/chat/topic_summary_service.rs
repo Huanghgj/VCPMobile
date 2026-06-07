@@ -15,7 +15,7 @@ use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 const DEFAULT_SUMMARY_PROMPT: &str = "请根据以上对话内容，仅返回一个简洁的话题标题。要求：1. 标题长度控制在10个汉字以内。2. 标题本身不能包含任何标点符号、数字编号 or 任何非标题文字。3. 直接给出标题文字，不要添加任何解释或前缀。";
 
 /// 话题总结的默认模型
-const DEFAULT_SUMMARY_MODEL: &str = "gemini-3.1-flash-lite";
+const DEFAULT_SUMMARY_MODEL: &str = "gemini-2.5-flash";
 
 /// 注：不主动发送 temperature 参数，以兼容 o1/Gemini thinking 等不支持该参数的模型
 /// AI 请求超时时间 (秒)
@@ -24,7 +24,7 @@ const AI_REQUEST_TIMEOUT_SECS: u64 = 30;
 /// AI 响应最大 Token 数（话题标题≤12汉字，64 token 绰绰有余）
 const AI_MAX_TOKENS: u32 = 64;
 
-const MIN_MESSAGES_FOR_AUTO_SUMMARY: i32 = 4;
+const MIN_MESSAGES_FOR_AUTO_SUMMARY: i32 = 2;
 
 lazy_static::lazy_static! {
     static ref AUTO_SUMMARY_IN_FLIGHT: dashmap::DashSet<String> = dashmap::DashSet::new();
