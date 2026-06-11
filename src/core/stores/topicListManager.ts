@@ -321,6 +321,38 @@ export const useTopicStore = defineStore("topic", () => {
   };
 
   /**
+   * 用 AI 重新总结并更新话题标题
+   */
+  const summarizeTopicTitle = async (
+    ownerId: string,
+    ownerType: string,
+    topicId: string,
+  ) => {
+    try {
+      const agentName =
+        sessionStore.currentSelectedItem?.id === ownerId
+          ? sessionStore.currentSelectedItem?.name || "AI"
+          : "AI";
+
+      const title = await invoke<string>("summarize_topic", {
+        ownerId,
+        ownerType,
+        topicId,
+        agentName,
+      });
+
+      if (title) {
+        applyTopicTitleUpdate(topicId, title);
+      }
+
+      return title;
+    } catch (e) {
+      console.error("[TopicStore] Failed to summarize topic title:", e);
+      throw e;
+    }
+  };
+
+  /**
    * 切换话题锁定状态
    */
   const toggleTopicLock = async (
@@ -463,6 +495,7 @@ export const useTopicStore = defineStore("topic", () => {
     createTopic,
     deleteTopic,
     updateTopicTitle,
+    summarizeTopicTitle,
     currentAgentId,
     toggleTopicLock,
     setTopicUnread,

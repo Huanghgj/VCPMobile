@@ -298,7 +298,7 @@ pub async fn summarize_topic(
     topic_id: String,
     agent_name: String,
 ) -> Result<String, String> {
-    crate::vcp_modules::topic_summary_service::summarize_topic(
+    crate::vcp_modules::topic_summary_service::summarize_and_update_topic(
         app_handle,
         settings_state,
         owner_id,

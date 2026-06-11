@@ -7,7 +7,7 @@ use crate::vcp_modules::vcp_client::normalize_vcp_url;
 use regex::Regex;
 use reqwest::Client;
 use serde_json::{json, Value};
-use sqlx::{Pool, Row, Sqlite};
+use sqlx::{Pool, Row, Sqlite, Transaction};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 
@@ -25,6 +25,22 @@ const AI_REQUEST_TIMEOUT_SECS: u64 = 30;
 const AI_MAX_TOKENS: u32 = 64;
 
 const MIN_MESSAGES_FOR_AUTO_SUMMARY: i32 = 2;
+
+#[derive(Debug, Clone)]
+struct TopicSummaryTarget {
+    title: String,
+    owner_id: String,
+    owner_type: String,
+}
+
+#[derive(Debug, Clone)]
+struct PersistedTopicSummary {
+    topic_id: String,
+    owner_id: String,
+    owner_type: String,
+    title: String,
+    updated_at: i64,
+}
 
 lazy_static::lazy_static! {
     static ref AUTO_SUMMARY_IN_FLIGHT: dashmap::DashSet<String> = dashmap::DashSet::new();
@@ -52,15 +68,119 @@ impl Drop for AutoSummaryInFlightGuard {
     }
 }
 
-fn is_default_topic_title(title: &str) -> bool {
+pub fn is_default_topic_title(title: &str) -> bool {
     lazy_static::lazy_static! {
         static ref DEFAULT_TOPIC_TITLE_RE: Regex = Regex::new(
-            r"^(新话题|新会话)(?:\s+(?:\d{1,2}:\d{2}:\d{2}(?:\s?(?:AM|PM|am|pm|上午|下午))?|(?:AM|PM|am|pm|上午|下午)\s*\d{1,2}:\d{2}:\d{2}))?$"
+            r"^(新话题|新会话)(?:\s+(?:(?:\d{4}[-/年]\d{1,2}[-/月]\d{1,2}日?\s+)?\d{1,2}:\d{2}(?::\d{2})?(?:\s?(?:AM|PM|am|pm|上午|下午))?|(?:AM|PM|am|pm|上午|下午)\s*\d{1,2}:\d{2}(?::\d{2})?|\d{1,2}[-/月]\d{1,2}日?\s+\d{1,2}:\d{2}(?::\d{2})?))?$"
         )
         .unwrap();
     }
 
     DEFAULT_TOPIC_TITLE_RE.is_match(title.trim())
+}
+
+async fn update_summarized_title_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    topic_id: &str,
+    expected_current_title: Option<&str>,
+    title: &str,
+) -> Result<Option<PersistedTopicSummary>, String> {
+    let target_row = sqlx::query(
+        "SELECT title, owner_id, owner_type FROM topics
+         WHERE topic_id = ? AND deleted_at IS NULL",
+    )
+    .bind(topic_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let Some(target_row) = target_row else {
+        return Ok(None);
+    };
+    let target = TopicSummaryTarget {
+        title: target_row.get("title"),
+        owner_id: target_row.get("owner_id"),
+        owner_type: target_row.get("owner_type"),
+    };
+
+    if let Some(expected_title) = expected_current_title {
+        if target.title != expected_title {
+            return Ok(None);
+        }
+    }
+
+    let now = crate::vcp_modules::infra::utils::now_millis();
+    let update_result = sqlx::query(
+        "UPDATE topics SET title = ?, updated_at = ?
+         WHERE topic_id = ? AND deleted_at IS NULL",
+    )
+    .bind(title)
+    .bind(now)
+    .bind(topic_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| e.to_string())?;
+    if update_result.rows_affected() == 0 {
+        return Ok(None);
+    }
+
+    HashAggregator::bubble_from_topic(tx, topic_id).await?;
+
+    Ok(Some(PersistedTopicSummary {
+        topic_id: topic_id.to_string(),
+        owner_id: target.owner_id,
+        owner_type: target.owner_type,
+        title: title.to_string(),
+        updated_at: now,
+    }))
+}
+
+async fn emit_persisted_topic_summary<R: Runtime>(
+    app_handle: AppHandle<R>,
+    db_pool: &Pool<Sqlite>,
+    persisted: &PersistedTopicSummary,
+) {
+    if let Some(sync_state) = app_handle.try_state::<SyncState>() {
+        let row = sqlx::query(
+            "SELECT config_hash, owner_type FROM topics WHERE topic_id = ? AND deleted_at IS NULL",
+        )
+        .bind(&persisted.topic_id)
+        .fetch_optional(db_pool)
+        .await
+        .map_err(|e| e.to_string());
+
+        match row {
+            Ok(Some(row)) => {
+                let hash: String = row.get("config_hash");
+                let db_owner_type: String = row.get("owner_type");
+                let _ = sync_state.ws_sender.send(SyncCommand::NotifyLocalChange {
+                    data_type: SyncDataType::Topic,
+                    id: persisted.topic_id.clone(),
+                    hash,
+                    ts: persisted.updated_at,
+                    owner_type: Some(db_owner_type),
+                });
+            }
+            Ok(None) => {}
+            Err(e) => {
+                log::warn!(
+                    "[TopicSummary] Failed to fetch summary hash for sync notification: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    let _ = app_handle.emit(
+        "topic-title-updated",
+        json!({
+            "topicId": persisted.topic_id,
+            "ownerId": persisted.owner_id,
+            "ownerType": persisted.owner_type,
+            "title": persisted.title,
+            "updatedAt": persisted.updated_at,
+        }),
+    );
 }
 
 async fn load_recent_topic_messages(
@@ -191,19 +311,16 @@ pub async fn summarize_topic_if_needed<R: Runtime>(
         return;
     }
 
-    let now = crate::vcp_modules::infra::utils::now_millis();
-    let update_result = match sqlx::query(
-        "UPDATE topics SET title = ?, updated_at = ?
-         WHERE topic_id = ? AND deleted_at IS NULL AND title = ?",
+    let persisted = match update_summarized_title_in_tx(
+        &mut tx,
+        &topic_id,
+        Some(&latest_title),
+        &summary_title,
     )
-    .bind(&summary_title)
-    .bind(now)
-    .bind(&topic_id)
-    .bind(&latest_title)
-    .execute(&mut *tx)
     .await
     {
-        Ok(result) => result,
+        Ok(Some(persisted)) => persisted,
+        Ok(None) => return,
         Err(e) => {
             log::warn!(
                 "[TopicSummary] Failed to persist auto summary for topic {}: {}",
@@ -214,18 +331,6 @@ pub async fn summarize_topic_if_needed<R: Runtime>(
         }
     };
 
-    if update_result.rows_affected() == 0 {
-        return;
-    }
-
-    if let Err(e) = HashAggregator::bubble_from_topic(&mut tx, &topic_id).await {
-        log::warn!(
-            "[TopicSummary] Failed to bubble summary hash for topic {}: {}",
-            topic_id,
-            e
-        );
-        return;
-    }
     if let Err(e) = tx.commit().await {
         log::warn!(
             "[TopicSummary] Failed to commit summary hash for topic {}: {}",
@@ -235,45 +340,7 @@ pub async fn summarize_topic_if_needed<R: Runtime>(
         return;
     }
 
-    if let Some(sync_state) = app_handle.try_state::<SyncState>() {
-        match sqlx::query(
-            "SELECT config_hash, owner_type FROM topics WHERE topic_id = ? AND deleted_at IS NULL",
-        )
-        .bind(&topic_id)
-        .fetch_optional(&db_pool)
-        .await
-        {
-            Ok(Some(row)) => {
-                let hash: String = row.get("config_hash");
-                let db_owner_type: String = row.get("owner_type");
-                let _ = sync_state.ws_sender.send(SyncCommand::NotifyLocalChange {
-                    data_type: SyncDataType::Topic,
-                    id: topic_id.clone(),
-                    hash,
-                    ts: now,
-                    owner_type: Some(db_owner_type),
-                });
-            }
-            Ok(None) => {}
-            Err(e) => {
-                log::warn!(
-                    "[TopicSummary] Failed to fetch summary hash for sync notification: {}",
-                    e
-                );
-            }
-        }
-    }
-
-    let _ = app_handle.emit(
-        "topic-title-updated",
-        json!({
-            "topicId": topic_id,
-            "ownerId": owner_id,
-            "ownerType": owner_type,
-            "title": summary_title,
-            "updatedAt": now,
-        }),
-    );
+    emit_persisted_topic_summary(app_handle, &db_pool, &persisted).await;
 }
 
 pub async fn summarize_topic<R: Runtime>(
@@ -358,6 +425,39 @@ pub async fn summarize_topic<R: Runtime>(
     }
 
     Ok(clean_title)
+}
+
+pub async fn summarize_and_update_topic<R: Runtime>(
+    app_handle: AppHandle<R>,
+    settings_state: State<'_, SettingsState>,
+    owner_id: String,
+    owner_type: String,
+    topic_id: String,
+    agent_name: String,
+) -> Result<String, String> {
+    let title = summarize_topic(
+        app_handle.clone(),
+        settings_state,
+        owner_id,
+        owner_type,
+        topic_id.clone(),
+        agent_name,
+    )
+    .await?;
+
+    let db_pool = app_handle
+        .state::<crate::vcp_modules::db_manager::DbState>()
+        .pool
+        .clone();
+    let mut tx = db_pool.begin().await.map_err(|e| e.to_string())?;
+    let persisted = update_summarized_title_in_tx(&mut tx, &topic_id, None, &title).await?;
+    tx.commit().await.map_err(|e| e.to_string())?;
+
+    if let Some(persisted) = persisted {
+        emit_persisted_topic_summary(app_handle, &db_pool, &persisted).await;
+    }
+
+    Ok(title)
 }
 
 pub fn clean_summarized_title(raw: &str) -> String {

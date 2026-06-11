@@ -8,7 +8,7 @@ import { useAssistantStore } from "../../core/stores/assistant";
 import { useLayoutStore } from "../../core/stores/layout";
 import { useOverlayStore } from "../../core/stores/overlay";
 import { useNotificationStore } from "../../core/stores/notification";
-import { Edit3, Lock, LockOpen, CheckCircle, Trash2, Copy } from "lucide-vue-next";
+import { Edit3, Lock, LockOpen, CheckCircle, Trash2, Copy, Sparkles } from "lucide-vue-next";
 
 const emit = defineEmits<{
   (e: "select-topic"): void;
@@ -108,6 +108,34 @@ const showTopicContextMenu = (topicId: string) => {
             title: "复制失败",
             message: "无法访问剪贴板",
             toastOnly: true,
+          });
+        }
+      },
+    },
+    {
+      label: "总结标题",
+      icon: Sparkles,
+      handler: async () => {
+        try {
+          const title = await topicListStore.summarizeTopicTitle(
+            itemId,
+            ownerType,
+            topic.id,
+          );
+          notificationStore.addNotification({
+            type: "success",
+            title: "标题已总结",
+            message: title,
+            toastOnly: true,
+          });
+        } catch (err: any) {
+          console.error("[TopicList] summarize title failed:", err);
+          notificationStore.addNotification({
+            type: "error",
+            title: "标题总结失败",
+            message:
+              typeof err === "string" ? err : err?.message || "请检查 VCP 设置与总结模型",
+            duration: 5000,
           });
         }
       },
