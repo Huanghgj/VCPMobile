@@ -21,9 +21,6 @@ const DEFAULT_SUMMARY_MODEL: &str = "gemini-2.5-flash";
 /// AI 请求超时时间 (秒)
 const AI_REQUEST_TIMEOUT_SECS: u64 = 30;
 
-/// AI 响应最大 Token 数（话题标题≤12汉字，64 token 绰绰有余）
-const AI_MAX_TOKENS: u32 = 64;
-
 const MIN_MESSAGES_FOR_AUTO_SUMMARY: i32 = 2;
 
 #[derive(Debug, Clone)]
@@ -400,7 +397,6 @@ pub async fn summarize_topic<R: Runtime>(
         .json(&json!({
             "messages": [{"role": "user", "content": summary_prompt}],
             "model": model,
-            "max_tokens": AI_MAX_TOKENS,
             "stream": false
         }))
         .send()
