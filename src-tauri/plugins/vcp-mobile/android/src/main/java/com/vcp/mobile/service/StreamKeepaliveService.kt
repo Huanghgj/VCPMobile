@@ -27,8 +27,6 @@ import android.os.PowerManager
  */
 class StreamKeepaliveService : Service() {
 
-    private var isKeepaliveModeActive = false
-    private var currentStreamName = ""
     private var wakeLock: PowerManager.WakeLock? = null
 
     companion object {
@@ -40,6 +38,12 @@ class StreamKeepaliveService : Service() {
 
         @Volatile
         var isServiceRunning = false
+
+        @Volatile
+        var isKeepaliveModeActive = false
+
+        @Volatile
+        var currentStreamName = ""
 
         /**
          * 构造启动该服务的 Intent
