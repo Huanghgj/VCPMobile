@@ -1,4 +1,5 @@
 use crate::vcp_modules::media_processor::convert_local_image_for_multimodal;
+use base64::Engine as _;
 use dashmap::{DashMap, DashSet};
 use futures_util::StreamExt;
 use futures_util::TryStreamExt;
@@ -9,7 +10,7 @@ use serde_json::{json, Value};
 use std::io::Error as IoError;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tauri::{ipc::Channel, AppHandle, Manager, Runtime};
 use tokio::sync::oneshot;
@@ -27,6 +28,8 @@ use crate::vcp_modules::settings_manager::{create_default_settings, Settings};
 /// =================================================================
 /// 该模块对应原项目的 modules/vcpClient.js，负责处理所有与 VCP 服务器的通信。
 /// 包含动态路由、上下文注入（音乐、UI 规范）、流式 SSE 解析以及请求中止机制。
+static IMAGE_HOST_UPLOAD_CACHE: LazyLock<DashMap<String, String>> = LazyLock::new(DashMap::new);
+
 /// 请求参数结构体
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -77,6 +80,313 @@ fn split_audio_data_url(audio_url: &str) -> (String, &'static str) {
     }
 
     (audio_url.to_string(), "mp3")
+}
+
+#[derive(Clone)]
+struct ImageHostConfig {
+    base_url: String,
+    image_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ImageUploadResponse {
+    success: Option<bool>,
+    url: Option<String>,
+    key: Option<String>,
+    error: Option<String>,
+}
+
+fn setting_string<'a>(settings: &'a Settings, key: &str) -> Option<&'a str> {
+    settings
+        .extra
+        .as_object()
+        .and_then(|extra| extra.get(key))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn origin_from_url(url_str: &str) -> Option<String> {
+    let url = Url::parse(url_str).ok()?;
+    let origin = url.origin().ascii_serialization();
+    if origin == "null" {
+        None
+    } else {
+        Some(origin.trim_end_matches('/').to_string())
+    }
+}
+
+impl ImageHostConfig {
+    fn from_settings(vcp_url: &str, settings: &Settings) -> Option<Self> {
+        let image_key = setting_string(settings, "imageKey")
+            .unwrap_or(settings.file_key.trim())
+            .trim();
+        if image_key.is_empty() {
+            return None;
+        }
+
+        let base_url = setting_string(settings, "imageServerUrl")
+            .or_else(|| setting_string(settings, "imagePublicBaseUrl"))
+            .and_then(origin_from_url)
+            .or_else(|| origin_from_url(vcp_url))?;
+
+        Some(Self {
+            base_url,
+            image_key: image_key.to_string(),
+        })
+    }
+
+    fn upload_url(&self) -> String {
+        format!(
+            "{}/pw={}/images/upload",
+            self.base_url,
+            urlencoding::encode(&self.image_key)
+        )
+    }
+
+    fn public_url_for_key(&self, key: &str) -> String {
+        let encoded_key = key
+            .split('/')
+            .map(urlencoding::encode)
+            .map(|part| part.into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        format!(
+            "{}/pw={}/images/{}",
+            self.base_url,
+            urlencoding::encode(&self.image_key),
+            encoded_key
+        )
+    }
+
+    fn cache_scope(&self) -> String {
+        format!("{}|{}", self.base_url, self.image_key)
+    }
+}
+
+fn image_extension_for_mime(mime: &str) -> &'static str {
+    match mime.to_ascii_lowercase().as_str() {
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/svg+xml" => "svg",
+        "image/bmp" => "bmp",
+        "image/x-icon" | "image/vnd.microsoft.icon" => "ico",
+        _ => "png",
+    }
+}
+
+fn safe_upload_file_name(file_name: &str, mime: &str) -> String {
+    let raw_name = std::path::Path::new(file_name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("upload");
+
+    if std::path::Path::new(raw_name).extension().is_some() {
+        raw_name.to_string()
+    } else {
+        format!("{}.{}", raw_name, image_extension_for_mime(mime))
+    }
+}
+
+fn image_mime_for_path(path: &std::path::Path, declared_mime: &str) -> String {
+    if declared_mime.starts_with("image/") {
+        return declared_mime.to_string();
+    }
+    let guessed = mime_guess::from_path(path).first_or_octet_stream();
+    if guessed.type_().as_str() == "image" {
+        guessed.to_string()
+    } else {
+        "image/png".to_string()
+    }
+}
+
+fn trim_upload_error_body(body: &str) -> String {
+    let compact = body.trim().replace('\n', " ");
+    let mut chars = compact.chars();
+    let clipped: String = chars.by_ref().take(240).collect();
+    if chars.next().is_some() {
+        format!("{}...", clipped)
+    } else {
+        compact
+    }
+}
+
+fn mask_image_url_for_log(url: &str) -> String {
+    match Url::parse(url) {
+        Ok(mut parsed) => {
+            if let Some(segments) = parsed.path_segments() {
+                let masked_segments = segments
+                    .map(|segment| {
+                        if segment.starts_with("pw=") {
+                            "pw=***".to_string()
+                        } else {
+                            segment.to_string()
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                parsed.set_path(&masked_segments.join("/"));
+            }
+            parsed.to_string()
+        }
+        Err(_) => url.replace("/pw=", "/pw=***"),
+    }
+}
+
+async fn post_image_to_host(
+    client: &Client,
+    config: &ImageHostConfig,
+    bytes: Vec<u8>,
+    mime: &str,
+    file_name: &str,
+    trace_id: &str,
+) -> Result<String, String> {
+    if !mime.starts_with("image/") {
+        return Err(format!("unsupported image MIME: {}", mime));
+    }
+
+    let safe_name = safe_upload_file_name(file_name, mime);
+    let part = reqwest::multipart::Part::bytes(bytes)
+        .file_name(safe_name)
+        .mime_str(mime)
+        .map_err(|e| format!("invalid upload MIME {}: {}", mime, e))?;
+    let form = reqwest::multipart::Form::new()
+        .part("image", part)
+        .text("traceId", trace_id.to_string())
+        .text("prefix", "vcp-mobile".to_string());
+
+    let response = client
+        .post(config.upload_url())
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| format!("image host request failed: {}", e))?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("image host response read failed: {}", e))?;
+
+    if !status.is_success() {
+        return Err(format!(
+            "image host returned HTTP {}: {}",
+            status.as_u16(),
+            trim_upload_error_body(&body)
+        ));
+    }
+
+    let upload: ImageUploadResponse = serde_json::from_str(&body).map_err(|e| {
+        format!(
+            "image host JSON parse failed: {} ({})",
+            e,
+            trim_upload_error_body(&body)
+        )
+    })?;
+    if upload.success == Some(false) {
+        return Err(upload
+            .error
+            .unwrap_or_else(|| "image host reported upload failure".to_string()));
+    }
+
+    upload
+        .url
+        .filter(|url| !url.trim().is_empty())
+        .or_else(|| upload.key.map(|key| config.public_url_for_key(&key)))
+        .ok_or_else(|| "image host upload response did not include url/key".to_string())
+}
+
+async fn upload_image_path_to_host(
+    client: &Client,
+    config: &ImageHostConfig,
+    path: &std::path::Path,
+    declared_mime: &str,
+    file_name: &str,
+    trace_id: &str,
+) -> Result<String, String> {
+    let cache_key = format!("{}|path|{}", config.cache_scope(), path.display());
+    if let Some(cached) = IMAGE_HOST_UPLOAD_CACHE.get(&cache_key) {
+        return Ok(cached.value().clone());
+    }
+
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .map_err(|e| format!("image metadata read failed: {}", e))?;
+    const IMAGE_HOST_MAX_BYTES: u64 = 50 * 1024 * 1024;
+    if metadata.len() > IMAGE_HOST_MAX_BYTES {
+        return Err(format!(
+            "image file is too large for ImageServer upload: {} bytes",
+            metadata.len()
+        ));
+    }
+
+    let mime = image_mime_for_path(path, declared_mime);
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|e| format!("image file read failed: {}", e))?;
+    let url = post_image_to_host(client, config, bytes, &mime, file_name, trace_id).await?;
+    IMAGE_HOST_UPLOAD_CACHE.insert(cache_key, url.clone());
+    Ok(url)
+}
+
+fn decode_image_data_url(data_url: &str) -> Result<(String, Vec<u8>), String> {
+    let (meta, data) = data_url
+        .split_once(',')
+        .ok_or_else(|| "image data URL is missing comma separator".to_string())?;
+    let mime = meta
+        .strip_prefix("data:")
+        .and_then(|rest| rest.split(';').next())
+        .filter(|mime| mime.starts_with("image/"))
+        .ok_or_else(|| "image data URL is not image/*".to_string())?;
+    let compact = data.replace(char::is_whitespace, "");
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(compact)
+        .map_err(|e| format!("image data URL base64 decode failed: {}", e))?;
+    Ok((mime.to_string(), bytes))
+}
+
+async fn upload_image_data_url_to_host(
+    client: &Client,
+    config: &ImageHostConfig,
+    data_url: &str,
+    file_name: &str,
+    trace_id: &str,
+) -> Result<String, String> {
+    let (mime, bytes) = decode_image_data_url(data_url)?;
+    post_image_to_host(client, config, bytes, &mime, file_name, trace_id).await
+}
+
+fn append_hosted_image_lines(parts: &mut Vec<Value>, lines: Vec<String>) {
+    if lines.is_empty() {
+        return;
+    }
+
+    let hosted_text = format!(
+        "\n\n[多模态图床URL]\n{}\n[/多模态图床URL]",
+        lines.join("\n")
+    );
+
+    if let Some(text_part) = parts
+        .iter_mut()
+        .find(|part| part.get("type").and_then(|t| t.as_str()) == Some("text"))
+    {
+        if let Some(Value::String(text)) = text_part.get_mut("text") {
+            text.push_str(&hosted_text);
+            return;
+        }
+    }
+
+    parts.insert(
+        0,
+        json!({
+            "type": "text",
+            "text": hosted_text.trim_start()
+        }),
+    );
 }
 
 impl StreamEvent {
@@ -319,9 +629,26 @@ pub async fn perform_vcp_request<R: Runtime>(
         }
     };
 
+    let app_settings = load_app_settings(app).await.unwrap_or_else(|e| {
+        log::warn!("[VCPClient] Failed to load app settings: {}", e);
+        create_default_settings()
+    });
+    let image_host_config = ImageHostConfig::from_settings(&payload.vcp_url, &app_settings);
+    let image_host_client = if image_host_config.is_some() {
+        Some(
+            Client::builder()
+                .timeout(Duration::from_secs(60))
+                .build()
+                .map_err(|e| e.to_string())?,
+        )
+    } else {
+        None
+    };
+    let request_message_id = payload.message_id.clone();
+
     // === 0. 数据验证和规范化 ===
     let mut messages: Vec<Value> = Vec::new();
-    for msg_val in payload.messages.into_iter() {
+    for (msg_index, msg_val) in payload.messages.into_iter().enumerate() {
         if !msg_val.is_object() {
             messages.push(json!({"role": "system", "content": "[Invalid message]"}));
             continue;
@@ -333,6 +660,7 @@ pub async fn perform_vcp_request<R: Runtime>(
         // 处理多模态或复杂内容数组
         if let Some(content_array) = content.as_array() {
             let mut new_parts = Vec::new();
+            let mut hosted_image_text_lines: Vec<String> = Vec::new();
             for part in content_array {
                 if let Some(obj) = part.as_object() {
                     // 识别自定义的 local_file 类型并进行路径还原与编码
@@ -386,50 +714,135 @@ pub async fn perform_vcp_request<R: Runtime>(
                                 };
 
                                 if media_kind == "image" {
-                                    // 图片类型：长边 > 1120px 时缩放，避免多模态 payload 过大
-                                    let path_buf_clone = path_buf.clone();
-                                    let app_clone = app.clone();
-                                    match tokio::task::spawn_blocking(move || {
-                                        convert_local_image_for_multimodal(
-                                            &app_clone,
-                                            &path_buf_clone,
-                                        )
-                                    })
-                                    .await
+                                    if let (Some(config), Some(client)) =
+                                        (image_host_config.as_ref(), image_host_client.as_ref())
                                     {
-                                        Ok(Ok(data_url)) => {
-                                            new_parts.push(json!({
-                                                "type": "image_url",
-                                                "image_url": { "url": data_url }
-                                            }));
-                                            converted = true;
+                                        match upload_image_path_to_host(
+                                            client,
+                                            config,
+                                            &path_buf,
+                                            declared_mime,
+                                            display_name,
+                                            &format!(
+                                                "{}-m{}-{}",
+                                                request_message_id,
+                                                msg_index,
+                                                new_parts.len()
+                                            ),
+                                        )
+                                        .await
+                                        {
+                                            Ok(url) => {
+                                                log::info!(
+                                                    "[VCPClient] Image uploaded to ImageServer for multimodal payload: {}",
+                                                    mask_image_url_for_log(&url)
+                                                );
+                                                hosted_image_text_lines.push(format!(
+                                                    "[图床URL: {}] (文件名: {})",
+                                                    url, display_name
+                                                ));
+                                                new_parts.push(json!({
+                                                    "type": "image_url",
+                                                    "image_url": { "url": url }
+                                                }));
+                                                converted = true;
+                                            }
+                                            Err(e) => {
+                                                log::warn!(
+                                                    "[VCPClient] ImageServer upload failed for {:?}: {}. Falling back to base64 multimodal payload.",
+                                                    path_buf,
+                                                    e
+                                                );
+                                            }
                                         }
-                                        Ok(Err(e)) => {
-                                            log::warn!(
-                                                "[VCPClient] Image conversion failed for {:?}: {}",
-                                                path_buf,
-                                                e
-                                            );
-                                        }
-                                        Err(e) => {
-                                            log::warn!(
-                                                "[VCPClient] Image conversion task panicked: {}",
-                                                e
-                                            );
+                                    }
+
+                                    // 图片图床不可用时，保留旧行为：长边 > 1120px 时缩放，避免多模态 payload 过大
+                                    if !converted {
+                                        let path_buf_clone = path_buf.clone();
+                                        let app_clone = app.clone();
+                                        match tokio::task::spawn_blocking(move || {
+                                            convert_local_image_for_multimodal(
+                                                &app_clone,
+                                                &path_buf_clone,
+                                            )
+                                        })
+                                        .await
+                                        {
+                                            Ok(Ok(data_url)) => {
+                                                new_parts.push(json!({
+                                                    "type": "image_url",
+                                                    "image_url": { "url": data_url }
+                                                }));
+                                                converted = true;
+                                            }
+                                            Ok(Err(e)) => {
+                                                log::warn!(
+                                                    "[VCPClient] Image conversion failed for {:?}: {}",
+                                                    path_buf,
+                                                    e
+                                                );
+                                            }
+                                            Err(e) => {
+                                                log::warn!(
+                                                    "[VCPClient] Image conversion task panicked: {}",
+                                                    e
+                                                );
+                                            }
                                         }
                                     }
                                 } else if media_kind == "video" {
-                                    // 视频：抽帧 → 每张帧作为 image_url
-                                    let path_clone = path_buf.clone();
+                                    // 视频：抽帧 → 每张帧作为 image_url；若图床可用则把帧上传为 HTTP URL
+                                    let path_buf_clone = path_buf.clone();
                                     let app_clone = app.clone();
                                     match tokio::task::spawn_blocking(move || {
-                                        crate::vcp_modules::media_processor::process_video_for_multimodal(&app_clone, &path_clone)
-                                    }).await {
+                                        crate::vcp_modules::media_processor::process_video_for_multimodal(&app_clone, &path_buf_clone)
+                                    })
+                                    .await
+                                    {
                                         Ok(Ok(frames)) => {
-                                            for frame_url in frames {
+                                            for (frame_index, frame_url) in frames.into_iter().enumerate() {
+                                                let mut final_frame_url = frame_url.clone();
+                                                if let (Some(config), Some(client)) =
+                                                    (image_host_config.as_ref(), image_host_client.as_ref())
+                                                {
+                                                    match upload_image_data_url_to_host(
+                                                        client,
+                                                        config,
+                                                        &frame_url,
+                                                        &format!("{}-frame-{}.jpg", display_name, frame_index + 1),
+                                                        &format!(
+                                                            "{}-m{}-{}-frame{}",
+                                                            request_message_id,
+                                                            msg_index,
+                                                            new_parts.len(),
+                                                            frame_index + 1
+                                                        ),
+                                                    )
+                                                    .await
+                                                    {
+                                                        Ok(url) => {
+                                                            final_frame_url = url.clone();
+                                                            hosted_image_text_lines.push(format!(
+                                                                "[视频抽帧图床URL: {}] (文件名: {}, 帧: {})",
+                                                                url,
+                                                                display_name,
+                                                                frame_index + 1
+                                                            ));
+                                                        }
+                                                        Err(e) => {
+                                                            log::warn!(
+                                                                "[VCPClient] ImageServer upload failed for video frame {} of {:?}: {}. Falling back to base64 frame.",
+                                                                frame_index + 1,
+                                                                path_buf,
+                                                                e
+                                                            );
+                                                        }
+                                                    }
+                                                }
                                                 new_parts.push(json!({
                                                     "type": "image_url",
-                                                    "image_url": { "url": frame_url }
+                                                    "image_url": { "url": final_frame_url }
                                                 }));
                                             }
                                             converted = true;
@@ -484,6 +897,7 @@ pub async fn perform_vcp_request<R: Runtime>(
                     new_parts.push(part.clone());
                 }
             }
+            append_hosted_image_lines(&mut new_parts, hosted_image_text_lines);
             msg["content"] = json!(new_parts);
         } else if content.is_object() {
             if let Some(text) = content.get("text") {
@@ -501,13 +915,11 @@ pub async fn perform_vcp_request<R: Runtime>(
     // === 1. 读取设置与动态路由切换 ===
     let mut enable_vcp_tool_injection = false;
 
-    if let Ok(settings) = load_app_settings(app).await {
-        if let Some(extra) = settings.extra.as_object() {
-            enable_vcp_tool_injection = extra
-                .get("enableVcpToolInjection")
-                .and_then(|v: &Value| v.as_bool())
-                .unwrap_or(false);
-        }
+    if let Some(extra) = app_settings.extra.as_object() {
+        enable_vcp_tool_injection = extra
+            .get("enableVcpToolInjection")
+            .and_then(|v: &Value| v.as_bool())
+            .unwrap_or(false);
     }
 
     let mut final_url = payload.vcp_url.clone();

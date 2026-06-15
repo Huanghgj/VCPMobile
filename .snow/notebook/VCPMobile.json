@@ -1,0 +1,181 @@
+{
+  "src/core/utils/safeMarkdown.ts": [
+    {
+      "id": "notebook-1781507758562_jvxstzhbb",
+      "filePath": "src/core/utils/safeMarkdown.ts",
+      "note": "新增统一的 renderSafeMarkdown/sanitizeMarkdownHtml，所有直接 marked.parse 后接 v-html 的非 AST 渲染路径应复用它，避免工具结果/RAG/助手消息中的 HTML 被未净化注入。",
+      "createdAt": "2026-06-15T07:15:58.562",
+      "updatedAt": "2026-06-15T07:15:58.562"
+    }
+  ],
+  "src-tauri/src/vcp_modules/chat/stream_block_parser.rs": [
+    {
+      "id": "notebook-1781507758790_ciu3yjopa",
+      "filePath": "src-tauri/src/vcp_modules/chat/stream_block_parser.rs",
+      "note": "StreamBlockParser::build_incomplete_tail_block 用于 finalize 未闭合 tail；未闭合 <think>/<thinking> 或 VCP 元思考链必须沉淀为 is_complete=false 的 thought 块，避免最终消息把思考标记当普通 Markdown 展示。",
+      "createdAt": "2026-06-15T07:15:58.790",
+      "updatedAt": "2026-06-15T07:15:58.790"
+    }
+  ],
+  "src/features/chat/blocks/MermaidFullScreenViewer.vue": [
+    {
+      "id": "notebook-1781507759024_44h0zfqpc",
+      "filePath": "src/features/chat/blocks/MermaidFullScreenViewer.vue",
+      "note": "Mermaid 全屏预览不应直接 v-html 原始 svgHtml；使用 DOMPurify 计算 sanitizedSvgHtml 后注入。renderLibraryPreloader 同步将 Mermaid securityLevel 设为 strict。",
+      "createdAt": "2026-06-15T07:15:59.024",
+      "updatedAt": "2026-06-15T07:15:59.024"
+    }
+  ],
+  "src-tauri/src/vcp_modules/infra/high_speed_channel.rs": [
+    {
+      "id": "notebook-1781511688446_oevo05wo4",
+      "filePath": "src-tauri/src/vcp_modules/infra/high_speed_channel.rs",
+      "note": "prepare_vcp_upload 的高速上传 POST 必须校验 X-Upload-Token；前端 attachmentStore.ts 大文件 XHR 需设置同名 header。OPTIONS 预检允许 X-Upload-Token, Content-Type，非 POST 或 token 不匹配应返回错误。",
+      "createdAt": "2026-06-15T08:21:28.445",
+      "updatedAt": "2026-06-15T08:21:28.445"
+    }
+  ],
+  "src-tauri/src/vcp_modules/infra/file_manager.rs": [
+    {
+      "id": "notebook-1781511688779_pgq55eana",
+      "filePath": "src-tauri/src/vcp_modules/infra/file_manager.rs",
+      "note": "附件按内容 hash 落盘时必须使用 no-overwrite 语义：safe_rename/safe_move_no_overwrite_async 用 hard_link 或 create_new，目标已存在时删除临时源文件，避免并发同 hash 上传/注册覆盖已落盘文件。",
+      "createdAt": "2026-06-15T08:21:28.779",
+      "updatedAt": "2026-06-15T08:21:28.779"
+    }
+  ],
+  "src-tauri/src/vcp_modules/chat/ast_diff.rs": [
+    {
+      "id": "notebook-1781511689012_wisq6sakw",
+      "filePath": "src-tauri/src/vcp_modules/chat/ast_diff.rs",
+      "note": "流式 AST diff 压测优先读取 scripts/tail-test/测试文档.txt；fixture 缺失时使用内置确定性长样本，避免 Linux/CI 因本地文件或旧 Windows 绝对路径缺失导致 cargo test 失败。",
+      "createdAt": "2026-06-15T08:21:29.012",
+      "updatedAt": "2026-06-15T08:21:29.012"
+    }
+  ],
+  "src/core/stores/chatStreamStore.ts": [
+    {
+      "id": "notebook-1781532404520_lcuebaq17",
+      "filePath": "src/core/stores/chatStreamStore.ts",
+      "note": "流式功耗优化约束：Aurora/data 流式提交故意用 STREAM_RENDER_INTERVAL_MS=66.7ms（约 15Hz）做 timer + 单次 requestAnimationFrame 合并，避免旧实现未到阈值时每个物理刷新帧空转轮询。所有 rAFPendingUpdates 清理/后台暂停必须同时取消 animationFrameId 和 renderTimerId；最终 clearRAFUpdate(..., true) 必须同步 flush content/blocks/tailContent/tailBlock/tailSnapshot/tailFrame，避免收尾丢字或闪烁。",
+      "createdAt": "2026-06-15T14:06:44.520",
+      "updatedAt": "2026-06-15T14:06:44.520"
+    },
+    {
+      "id": "notebook-1781511689315_oodskm6tj",
+      "filePath": "src/core/stores/chatStreamStore.ts",
+      "note": "addSessionStream 同一 owner/topic/messageId 只允许首次登记增加 activeStreamRefCounts 和 activeStreamTotal；thinking/data/aurora 多类事件重复到达时应早退，避免屏幕常亮引用计数泄漏。",
+      "createdAt": "2026-06-15T08:21:29.315",
+      "updatedAt": "2026-06-15T08:21:29.315"
+    }
+  ],
+  "src/core/stores/floatingAssistant.ts": [
+    {
+      "id": "notebook-1781511794973_tovtptrc6",
+      "filePath": "src/core/stores/floatingAssistant.ts",
+      "note": "initWebSocket 需要避免重复 CONNECTING/OPEN socket，并让 onopen/onmessage/onerror/onclose 先校验 ws.value === socket；关闭旧 socket 前要解绑 handler，防止重连后的陈旧事件改写悬浮助手状态。",
+      "createdAt": "2026-06-15T08:23:14.973",
+      "updatedAt": "2026-06-15T08:23:14.973"
+    }
+  ],
+  "src/core/composables/useChatScroll.ts": [
+    {
+      "id": "notebook-1781532404744_bvi4a74ut",
+      "filePath": "src/core/composables/useChatScroll.ts",
+      "note": "流式滚动功耗约束：ResizeObserver 回调内不要同步 handleContentChange；统一合并到下一帧并在 document.hidden 时早退。following 模式流式追加只在内容仍不足一屏（currentScrollHeight <= list.clientHeight + 10）时触发自动续载 debounce，避免高频创建/取消定时器。",
+      "createdAt": "2026-06-15T14:06:44.744",
+      "updatedAt": "2026-06-15T14:06:44.744"
+    },
+    {
+      "id": "notebook-1781511795219_gnn11fwy7",
+      "filePath": "src/core/composables/useChatScroll.ts",
+      "note": "滚动锚点不要把 messageId 拼进 CSS selector；使用 querySelectorAll('[data-message-id]') 后比较 el.dataset.messageId，可避免特殊字符破坏 selector。",
+      "createdAt": "2026-06-15T08:23:15.219",
+      "updatedAt": "2026-06-15T08:23:15.219"
+    }
+  ],
+  "docs/CODE_REVIEW_HANDOVER_2026-06-15.md": [
+    {
+      "id": "notebook-1781512916692_92k21j6ze",
+      "filePath": "docs/CODE_REVIEW_HANDOVER_2026-06-15.md",
+      "note": "归档交接文档已创建；其中关于 vcp_client.rs 25 秒 idle timeout 的风险提示已在后续处理后过期：流式成功分支已恢复 bytes_stream/StreamReader/FramedRead lines 初始化，删除 idle timeout 分支，并通过 Rust/前端验证。",
+      "createdAt": "2026-06-15T08:41:56.692",
+      "updatedAt": "2026-06-15T08:52:02.183"
+    }
+  ],
+  "src-tauri/src/vcp_modules/infra/vcp_client.rs": [
+    {
+      "id": "notebook-1781513522402_5zxadzaln",
+      "filePath": "src-tauri/src/vcp_modules/infra/vcp_client.rs",
+      "note": "VCP SSE 流读取不应使用 25 秒 idle timeout；长时间工具调用可能不会吐 token。当前实现仅等待用户 abort_rx、SSE 行读取结果、[DONE] 或连接自然结束；成功响应分支通过 resp.bytes_stream() -> StreamReader -> FramedRead<LinesCodec> 初始化 lines。",
+      "createdAt": "2026-06-15T08:52:02.402",
+      "updatedAt": "2026-06-15T08:52:02.402"
+    }
+  ],
+  "../VCPChat": [
+    {
+      "id": "notebook-1781514804432_624q2iy7j",
+      "filePath": "../VCPChat",
+      "note": "2026-06-15 已按用户确认执行 `git pull origin main`，从 2b89566 快进到 98dd65b；随后运行 `npm install`、`npx electron-rebuild --only better-sqlite3`、`npm run pack` 均成功。npm install 报告 2 个 moderate 漏洞，未执行 `npm audit fix --force`，因为会包含破坏性升级风险。",
+      "createdAt": "2026-06-15T09:13:24.432",
+      "updatedAt": "2026-06-15T09:13:24.432"
+    }
+  ],
+  ".github/workflows/release.yml": [
+    {
+      "id": "notebook-1781515535709_cvvhvwto7",
+      "filePath": ".github/workflows/release.yml",
+      "note": "Android Release workflow_dispatch 必须提供 release_tag，且 workflow 会 checkout steps.meta.outputs.tag；如当前版本 tag 已指向旧提交，应先在目标提交上创建新的 v* tag（例如 v1.1.1-manual.1）并推送，再用 gh workflow run release.yml --ref <branch> -f release_tag=<tag> 触发。",
+      "createdAt": "2026-06-15T09:25:35.709",
+      "updatedAt": "2026-06-15T09:25:35.709"
+    }
+  ],
+  "../VCPToolBox": [
+    {
+      "id": "notebook-1781537180946_bsi0ei2nv",
+      "filePath": "../VCPToolBox",
+      "note": "MinIO 管理后台已通过 console.tc.432503.xyz 暴露到公网 HTTPS，DNS 必须保持灰云/DNS-only 指向 67.217.58.56；橙云代理会因 console.tc.432503.xyz 属于更深层子域而触发 Cloudflare 边缘 TLS 握手失败。Nginx 对 console 域名反代 127.0.0.1:9001，并先加 Basic Auth；Basic Auth 凭据文件在存储服务器 /opt/minio-imagebed/console-basic-auth.txt，MinIO root 凭据在 /opt/minio-imagebed/.env，均不要打印到聊天/日志。",
+      "createdAt": "2026-06-15T15:26:20.946",
+      "updatedAt": "2026-06-15T15:26:20.946"
+    },
+    {
+      "id": "notebook-1781534374857_83x4fr6if",
+      "filePath": "../VCPToolBox",
+      "note": "闲置大存储服务器评估基线：67.217.58.56 可用 root SSH 登录（密码不要记录），主机名 vps3382221.trouble-free.net，Ubuntu 22.04.5，/dev/sda2 ext4 挂载为 /，总量约 3.9T、已用约 308G、可用约 3.5T，内存约 7.9GiB。适合作为 VCP/ComfyUI 图像资产大容量存储；建议改 SSH key 后再部署 NFS/MinIO/rsync 等方案。",
+      "createdAt": "2026-06-15T14:39:34.857",
+      "updatedAt": "2026-06-15T14:39:34.857"
+    }
+  ],
+  "../VCPToolBox/Plugin/ImageServer/image-server.js": [
+    {
+      "id": "notebook-1781538774404_haauq20fx",
+      "filePath": "../VCPToolBox/Plugin/ImageServer/image-server.js",
+      "note": "VCP 本机写 MinIO 时必须直连源站 67.217.58.56，不要走 Cloudflare；否则 S3 SDK 可能收到 Cloudflare HTML 错误页并报 XML 解析失败。当前通过 /etc/hosts 与 /etc/cloud/templates/hosts.debian.tmpl 固定 tc.432503.xyz -> 67.217.58.56；公网读取仍可走 Cloudflare，并已验证上传 1x1 PNG 后 Cloudflare HEAD 返回 200 image/png。",
+      "createdAt": "2026-06-15T15:52:54.404",
+      "updatedAt": "2026-06-15T15:52:54.404"
+    },
+    {
+      "id": "notebook-1781538774404_5yrl6tyme",
+      "filePath": "../VCPToolBox/Plugin/ImageServer/image-server.js",
+      "note": "Plugin.js 通过 module.registerRoutes.length 判断旧/新路由签名，因此 ImageServer 的 registerRoutes 必须保持 3 个形参；不要给第二形参写默认值（会让 .length 变成 1），否则插件管理器会按 4 参数新式签名错误调用。",
+      "createdAt": "2026-06-15T15:52:54.404",
+      "updatedAt": "2026-06-15T15:52:54.404"
+    },
+    {
+      "id": "notebook-1781538774404_4iv62w0tr",
+      "filePath": "../VCPToolBox/Plugin/ImageServer/image-server.js",
+      "note": "ImageServer 已接入 MinIO/S3：registerRoutes 内必须调用 configureImageStorage(pluginConfig)，上传入口为 /pw=[Image_Key]/images/upload，状态检查为 /pw=[Image_Key]/images/storage-status；生产 config.env 使用 IMAGE_STORAGE_BACKEND=s3、IMAGE_S3_ENDPOINT=https://tc.432503.xyz、IMAGE_S3_BUCKET=vcp-assets、IMAGE_S3_PUBLIC_BASE_URL=https://tc.432503.xyz/vcp-assets，密钥来自存储服务器 /opt/minio-imagebed/.env，严禁打印。",
+      "createdAt": "2026-06-15T15:52:54.404",
+      "updatedAt": "2026-06-15T15:52:54.404"
+    }
+  ],
+  "../VCPToolBox/Plugin/ComfyUIGen/ComfyUIGen.js": [
+    {
+      "id": "notebook-1781564808351_k5lg92ybh",
+      "filePath": "../VCPToolBox/Plugin/ComfyUIGen/ComfyUIGen.js",
+      "note": "ComfyUI 图生图桥接约束：不要把手机 content://、file://、Tauri/WebView 临时路径直接写进 LoadImage。ComfyUIGen 的 uploadImageToComfyUI() 会把 URL/base64/本地可读路径下载/读取后上传到 ComfyUI /upload/image，并返回 {name, subfolder, type, loadImageValue}；所有写入 workflow LoadImage.inputs.image 或 mapping input_image/uploaded_image_filename 的位置必须使用 loadImageValue 字符串，不能传整个对象。已验证 VCP 图床 URL(tc.432503.xyz/vcp-assets/...) -> ComfyUI /upload/image -> /view 返回 HTTP 200 image/png。",
+      "createdAt": "2026-06-15T23:06:48.351",
+      "updatedAt": "2026-06-15T23:06:48.351"
+    }
+  ]
+}

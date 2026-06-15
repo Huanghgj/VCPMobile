@@ -86,8 +86,8 @@ export const useChatStreamStore = defineStore("chatStream", () => {
 
   const cleanupTimers = new Set<ReturnType<typeof setTimeout>>();
 
-  // ===== rAF 30Hz 帧合并直推暂存池 =====
-  // 记录每个消息最新的 Aurora 暂存数据，消灭定时器空转，硬件级防抖并实现30Hz降降基数
+  // ===== 低功耗流式帧合并暂存池 =====
+  // 流式事件可能高于人眼可读速度；用 timer + 单次 rAF 合并提交，避免每个物理刷新帧空转轮询。
   const rAFPendingUpdates = new Map<
     string,
     {
@@ -98,10 +98,11 @@ export const useChatStreamStore = defineStore("chatStream", () => {
       tailFrame: TailFrame | null;
       tailSnapshot: any[] | null;
       animationFrameId: number | null;
+      renderTimerId: ReturnType<typeof setTimeout> | null;
       lastRenderTime: number;
     }
   >();
-  const MIN_RENDER_INTERVAL_MS = 33.3; // 限制最大刷新频率为 30Hz
+  const STREAM_RENDER_INTERVAL_MS = 66.7; // 约 15Hz：移动端流式可读且显著降低 DOM/AST diff 唤醒频率
 
   const isDocumentHidden = () =>
     typeof document !== "undefined" && document.hidden;
@@ -121,12 +122,23 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     up.tailFrame !== null ||
     up.tailSnapshot !== null;
 
+  const cancelScheduledCommit = (up: {
+    animationFrameId: number | null;
+    renderTimerId: ReturnType<typeof setTimeout> | null;
+  }) => {
+    if (up.animationFrameId !== null) {
+      cancelAnimationFrame(up.animationFrameId);
+      up.animationFrameId = null;
+    }
+    if (up.renderTimerId !== null) {
+      clearTimeout(up.renderTimerId);
+      up.renderTimerId = null;
+    }
+  };
+
   const pauseRAFCommitsForBackground = () => {
     rAFPendingUpdates.forEach((up) => {
-      if (up.animationFrameId !== null) {
-        cancelAnimationFrame(up.animationFrameId);
-        up.animationFrameId = null;
-      }
+      cancelScheduledCommit(up);
     });
   };
 
@@ -136,10 +148,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
   const clearRAFUpdate = (messageId: string, forceFlush = false) => {
     const up = rAFPendingUpdates.get(messageId);
     if (up) {
-      if (up.animationFrameId !== null) {
-        cancelAnimationFrame(up.animationFrameId);
-        up.animationFrameId = null;
-      }
+      cancelScheduledCommit(up);
       if (forceFlush) {
         const msg = activeStreamMessages.get(messageId);
         if (msg) {
@@ -379,52 +388,75 @@ export const useChatStreamStore = defineStore("chatStream", () => {
         tailFrame: null,
         tailSnapshot: null,
         animationFrameId: null,
+        renderTimerId: null,
         lastRenderTime: 0,
       };
       rAFPendingUpdates.set(messageId, update);
     }
+
     return update;
+  };
+
+  const commitPendingUpdate = (messageId: string) => {
+    const up = rAFPendingUpdates.get(messageId);
+    if (!up || isDocumentHidden()) return;
+
+    // 满足低功耗节流间隔后，触发 Vue 响应式写入进行重绘
+    const m = activeStreamMessages.get(messageId);
+    if (m) {
+      if (up.content !== null) m.content = up.content;
+      if (up.blocks !== null) m.blocks = up.blocks;
+      if (up.tailContent !== null) m.tailContent = up.tailContent;
+      if (up.tailBlock !== undefined) m.tailBlock = up.tailBlock;
+      if (up.tailSnapshot !== null) m.tailSnapshot = up.tailSnapshot as any;
+      if (up.tailFrame !== null) m.tailFrame = up.tailFrame;
+    }
+    up.lastRenderTime = performance.now();
+    // 重置当前提交周期内的合并暂存状态
+    up.content = null;
+    up.blocks = null;
+    up.tailContent = null;
+    up.tailBlock = undefined;
+    up.tailFrame = null;
+    up.tailSnapshot = null;
   };
 
   const scheduleRAFCommit = (messageId: string) => {
     const update = rAFPendingUpdates.get(messageId);
-    if (!update || update.animationFrameId !== null) return;
-    if (isDocumentHidden()) return;
+    if (
+      !update ||
+      update.animationFrameId !== null ||
+      update.renderTimerId !== null ||
+      isDocumentHidden()
+    ) {
+      return;
+    }
 
-    const runRenderLoop = () => {
+    const requestCommitFrame = () => {
       const up = rAFPendingUpdates.get(messageId);
-      if (!up) return;
+      if (!up || isDocumentHidden()) return;
 
-      const now = performance.now();
-      const elapsed = now - up.lastRenderTime;
-
-      if (elapsed >= MIN_RENDER_INTERVAL_MS) {
-        // 满足约 30Hz 间隔，触发 Vue 响应式写入进行重绘
-        const m = activeStreamMessages.get(messageId);
-        if (m) {
-          if (up.content !== null) m.content = up.content;
-          if (up.blocks !== null) m.blocks = up.blocks;
-          if (up.tailContent !== null) m.tailContent = up.tailContent;
-          if (up.tailBlock !== undefined) m.tailBlock = up.tailBlock;
-          if (up.tailSnapshot !== null) m.tailSnapshot = up.tailSnapshot as any;
-          if (up.tailFrame !== null) m.tailFrame = up.tailFrame;
-        }
-        up.lastRenderTime = now;
-        // 重置当前帧内的合并暂存状态
-        up.content = null;
-        up.blocks = null;
-        up.tailContent = null;
-        up.tailBlock = undefined;
-        up.tailFrame = null;
-        up.tailSnapshot = null;
-        up.animationFrameId = null;
-      } else {
-        // 没到门槛，在下一屏幕物理刷新帧继续尝试
-        up.animationFrameId = requestAnimationFrame(runRenderLoop);
-      }
+      up.animationFrameId = requestAnimationFrame(() => {
+        const current = rAFPendingUpdates.get(messageId);
+        if (!current) return;
+        current.animationFrameId = null;
+        commitPendingUpdate(messageId);
+      });
     };
 
-    update.animationFrameId = requestAnimationFrame(runRenderLoop);
+    const elapsed = performance.now() - update.lastRenderTime;
+    const delay = Math.max(0, STREAM_RENDER_INTERVAL_MS - elapsed);
+    if (delay <= 1) {
+      requestCommitFrame();
+      return;
+    }
+
+    update.renderTimerId = setTimeout(() => {
+      const up = rAFPendingUpdates.get(messageId);
+      if (!up) return;
+      up.renderTimerId = null;
+      requestCommitFrame();
+    }, delay);
   };
 
   const resumeRAFCommitsForForeground = () => {
@@ -651,9 +683,10 @@ export const useChatStreamStore = defineStore("chatStream", () => {
           }
         }
 
-        // 3. 申请硬件级 rAF 自适应阻尼渲染（最大 30Hz）
+        // 3. 申请低功耗合并渲染（约 15Hz，上屏前稀疏合并 Aurora 高频帧）
         scheduleRAFCommit(actualMessageId);
       }
+
       msg!.isThinking = false;
       addSessionStream(itemId, topicId, actualMessageId);
     } else if (type === "end" || type === "error") {
@@ -818,10 +851,9 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     cleanupTimers.forEach(clearTimeout);
     cleanupTimers.clear();
     rAFPendingUpdates.forEach((up) => {
-      if (up.animationFrameId !== null) {
-        cancelAnimationFrame(up.animationFrameId);
-      }
+      cancelScheduledCommit(up);
     });
+
     rAFPendingUpdates.clear();
     sealedStreamMessageIds.clear();
     terminalStreamMessageIds.clear();

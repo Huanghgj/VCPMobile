@@ -71,8 +71,8 @@ const rebuildEmoticonLibrary = async () => {
       <SettingsTextField
         v-model="settings.fileKey"
         is-secure
-        label="表情包图床密钥 (fileKey)"
-        placeholder="用于构造表情包 URL 的密码"
+        label="VCP 图床密钥 (Image_Key)"
+        placeholder="用于表情包和多模态图片上传"
         mono
       />
 

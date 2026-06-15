@@ -172,8 +172,10 @@ export function useChatScroll(options: UseChatScrollOptions) {
     // 场景3：跟随模式下的新内容/流式追加
     if (scrollScene.value === "following" && !showScrollToBottom.value) {
       scrollToBottom(false);
-      // 随着内容变动，持续评估并推迟可能的自动续载
-      triggerAutoLoadMoreWithDebounce();
+      // 普通流式追加期间不要反复创建/取消自动续载定时器；只有内容仍不足一屏时才需要续载。
+      if (currentScrollHeight <= list.clientHeight + 10) {
+        triggerAutoLoadMoreWithDebounce();
+      }
       return;
     }
 
@@ -192,24 +194,14 @@ export function useChatScroll(options: UseChatScrollOptions) {
     const target = list.querySelector(".messages-inner-container") || list;
 
     resizeObserver = new ResizeObserver(() => {
-      // 🌟 流式跟随状态下，或正在加载历史消息时，必须同步处理滚动，以防止 DOM 重排和滚动条设置跨帧引发的上下跳变。
-      if (
-        scrollScene.value === "following" ||
-        scrollScene.value === "loading-top"
-      ) {
-        if (scrollRafId) {
-          cancelAnimationFrame(scrollRafId);
-          scrollRafId = null;
-        }
+      if (typeof document !== "undefined" && document.hidden) return;
+      if (scrollRafId) return;
+
+      // 流式渲染时 ResizeObserver 可能随文本换行高频触发；统一合并到下一帧，避免在 RO 回调内同步读写布局。
+      scrollRafId = requestAnimationFrame(() => {
+        scrollRafId = null;
         handleContentChange();
-      } else {
-        // 其他初始/非流式跟随场景，继续使用 RAF 节流以保证能耗和页面初载的稳定性
-        if (scrollRafId) cancelAnimationFrame(scrollRafId);
-        scrollRafId = requestAnimationFrame(() => {
-          scrollRafId = null;
-          handleContentChange();
-        });
-      }
+      });
     });
 
     resizeObserver.observe(target);

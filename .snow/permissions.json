@@ -1,0 +1,12 @@
+{
+  "alwaysApprovedTools": [
+    "notebook-manage",
+    "filesystem-read",
+    "terminal-execute",
+    "ace-search",
+    "subagent-agent_explore",
+    "filesystem-create",
+    "filesystem-replaceedit",
+    "ide-get_diagnostics"
+  ]
+}

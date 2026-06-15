@@ -1,0 +1,107 @@
+{
+  "69843946-46c4-4f73-96da-23caed81cbfb:1": [
+    {
+      "op": "add",
+      "notebookId": "notebook-1781507758562_jvxstzhbb"
+    },
+    {
+      "op": "add",
+      "notebookId": "notebook-1781507758790_ciu3yjopa"
+    },
+    {
+      "op": "add",
+      "notebookId": "notebook-1781507759024_44h0zfqpc"
+    }
+  ],
+  "e1a5317a-31e8-4d85-8443-1595e1421b20:0": [
+    {
+      "op": "add",
+      "notebookId": "notebook-1781511688446_oevo05wo4"
+    },
+    {
+      "op": "add",
+      "notebookId": "notebook-1781511688779_pgq55eana"
+    },
+    {
+      "op": "add",
+      "notebookId": "notebook-1781511689012_wisq6sakw"
+    },
+    {
+      "op": "add",
+      "notebookId": "notebook-1781511689315_oodskm6tj"
+    },
+    {
+      "op": "add",
+      "notebookId": "notebook-1781511794973_tovtptrc6"
+    },
+    {
+      "op": "add",
+      "notebookId": "notebook-1781511795219_gnn11fwy7"
+    },
+    {
+      "op": "add",
+      "notebookId": "notebook-1781512916692_92k21j6ze"
+    }
+  ],
+  "f596e702-f3b8-4876-b264-51fbb8116d1a:0": [
+    {
+      "op": "update",
+      "notebookId": "notebook-1781512916692_92k21j6ze",
+      "previousNote": "归档交接文档已创建，明确标注 vcp_client.rs 的 25 秒 idle timeout 移除仍需优先修复/验证：当前文件疑似缺少 lines 初始化且成功分支尾部括号结构重复，不能将该 timeout 任务视为完成。"
+    },
+    {
+      "op": "add",
+      "notebookId": "notebook-1781513522402_5zxadzaln"
+    },
+    {
+      "op": "add",
+      "notebookId": "notebook-1781514804432_624q2iy7j"
+    }
+  ],
+  "abe97a19-6218-4f92-b933-28b344f44b28:1": [
+    {
+      "op": "add",
+      "notebookId": "notebook-1781515535709_cvvhvwto7"
+    }
+  ],
+  "65acc584-2d68-428c-ae35-86a5ac69cd68:1": [
+    {
+      "op": "add",
+      "notebookId": "notebook-1781532404520_lcuebaq17"
+    },
+    {
+      "op": "add",
+      "notebookId": "notebook-1781532404744_bvi4a74ut"
+    }
+  ],
+  "c691bfdf-4926-4d78-a050-459cacbe2017:0": [
+    {
+      "op": "add",
+      "notebookId": "notebook-1781534374857_83x4fr6if"
+    }
+  ],
+  "f2cfb43a-9ddd-45b5-b717-ba06125aaf82:0": [
+    {
+      "op": "add",
+      "notebookId": "notebook-1781537180946_bsi0ei2nv"
+    },
+    {
+      "op": "add",
+      "notebookId": "notebook-1781538774404_4iv62w0tr"
+    },
+    {
+      "op": "add",
+      "notebookId": "notebook-1781538774404_5yrl6tyme"
+    },
+    {
+      "op": "add",
+      "notebookId": "notebook-1781538774404_haauq20fx"
+    }
+  ],
+  "6e53e82b-a365-48b7-a625-db11bc21c5a9:0": [
+    {
+      "op": "add",
+      "notebookId": "notebook-1781564808351_k5lg92ybh"
+    }
+  ]
+}

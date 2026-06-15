@@ -1,0 +1,12 @@
+{
+  "yoloMode": false,
+  "planMode": false,
+  "vulnerabilityHuntingMode": false,
+  "toolSearchEnabled": false,
+  "hybridCompressEnabled": false,
+  "teamMode": false,
+  "ultraTodoEnabled": false,
+  "goal": {
+    "defaultTokenBudgetM": 2
+  }
+}

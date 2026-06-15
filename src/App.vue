@@ -3,7 +3,10 @@ import { onMounted, onUnmounted, computed, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
-import { getCurrentWebviewWindow, WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import {
+  getCurrentWebviewWindow,
+  WebviewWindow,
+} from "@tauri-apps/api/webviewWindow";
 import { useSidebarSwipe } from "./core/composables/useSidebarSwipe";
 import { useThemeStore } from "./core/stores/theme";
 import { useAppLifecycleStore } from "./core/stores/appLifecycle";
@@ -17,7 +20,10 @@ import { useChatSessionStore } from "./core/stores/chatSessionStore";
 import { useAssistantStore } from "./core/stores/assistant";
 import { useSettingsStore } from "./core/stores/settings";
 import { isTauriRuntime } from "./core/utils/runtime";
-import { reapplyScreenKeepIfActive, suspendPhysicalScreenKeep } from "./core/composables/useScreenKeeper";
+import {
+  reapplyScreenKeepIfActive,
+  suspendPhysicalScreenKeep,
+} from "./core/composables/useScreenKeeper";
 
 // Layout Components
 import PermissionGate from "./components/layout/PermissionGate.vue";
@@ -28,7 +34,6 @@ import FeatureOverlays from "./components/FeatureOverlays.vue";
 import UpdatePrompt from "./components/ui/UpdatePrompt.vue";
 import ShareAgentSelector from "./features/chat/components/ShareAgentSelector.vue";
 import NotificationCenterPage from "./features/notification/NotificationCenterPage.vue";
-
 
 interface SharedFileEntry {
   cachePath: string;
@@ -60,7 +65,8 @@ const assistantStore = useAssistantStore();
 const settingsStore = useSettingsStore();
 const { processPayload } = useNotificationProcessor();
 const { initGlobalFixer } = useEmoticonFixer();
-const { isPromptOpen, updateInfo, handleConfirm, handleDismiss } = useAutoUpdate();
+const { isPromptOpen, updateInfo, handleConfirm, handleDismiss } =
+  useAutoUpdate();
 const router = useRouter();
 
 const { initRootHistory } = useModalHistory();
@@ -80,13 +86,17 @@ const processSharedIntent = async (detail: any) => {
   console.log("[App] Share intent received:", detail);
 
   const text = typeof detail?.text === "string" ? detail.text : "";
-  const files: SharedFileEntry[] = Array.isArray(detail?.files) ? detail.files : [];
+  const files: SharedFileEntry[] = Array.isArray(detail?.files)
+    ? detail.files
+    : [];
 
   sharedContent.value = { text, files };
 
   // Wait for core to be ready, then process files
   if (lifecycleStore.state !== "READY") {
-    console.log("[App] Core not ready yet, deferring share intent processing...");
+    console.log(
+      "[App] Core not ready yet, deferring share intent processing..."
+    );
     if (stopPendingShareReadyWatch) {
       stopPendingShareReadyWatch();
       stopPendingShareReadyWatch = null;
@@ -101,7 +111,7 @@ const processSharedIntent = async (detail: any) => {
           }
           await prepareShareFiles();
         }
-      },
+      }
     );
     return;
   }
@@ -114,13 +124,16 @@ const prepareShareFiles = async () => {
   if (files.length > 0) {
     try {
       console.log(`[App] Registering ${files.length} shared file(s)...`);
-      const results = await invoke<PickedFileInfo[]>("plugin:vcp-mobile|register_shared_files", {
-        files: files.map((f) => ({
-          cachePath: f.cachePath,
-          mimeType: f.mimeType,
-          fileName: f.fileName,
-        })),
-      });
+      const results = await invoke<PickedFileInfo[]>(
+        "plugin:vcp-mobile|register_shared_files",
+        {
+          files: files.map((f) => ({
+            cachePath: f.cachePath,
+            mimeType: f.mimeType,
+            fileName: f.fileName,
+          })),
+        }
+      );
       pendingSharedFiles.value = results;
       console.log("[App] Shared files registered:", results);
     } catch (err) {
@@ -150,7 +163,7 @@ const handleShareAgentSelected = async (agent: any) => {
     await sessionStore.startShareSession(
       agent.id,
       sharedContent.value.text,
-      pendingSharedFiles.value,
+      pendingSharedFiles.value
     );
   } catch (err) {
     console.error("[App] Failed to start share session:", err);
@@ -187,9 +200,11 @@ const bootstrapApp = async () => {
 };
 
 const backgroundStyle = computed(() => {
-  const themeInfo = themeStore.currentThemeInfo || themeStore.availableThemes.find(
-    (t) => t.fileName === themeStore.currentTheme,
-  );
+  const themeInfo =
+    themeStore.currentThemeInfo ||
+    themeStore.availableThemes.find(
+      (t) => t.fileName === themeStore.currentTheme
+    );
   if (!themeInfo) return {};
 
   const isLight = !themeStore.isDarkResolved;
@@ -230,8 +245,12 @@ const isWaitingExit = ref(false);
 const handleExitRequest = async () => {
   console.log(
     `[ExitRequest] KeyPressed! State: ${lifecycleStore.state}, Item: ${
-      sessionStore.currentSelectedItem ? sessionStore.currentSelectedItem.id : 'NULL'
-    }, Topic: ${sessionStore.currentTopicId}, Modals: ${useModalHistory().modalStackLength()}`
+      sessionStore.currentSelectedItem
+        ? sessionStore.currentSelectedItem.id
+        : "NULL"
+    }, Topic: ${
+      sessionStore.currentTopicId
+    }, Modals: ${useModalHistory().modalStackLength()}`
   );
 
   // 1. 优先让 Modal Stack 消费返回事件 (支持 Sidebar、Page、Dialog 等 LIFO 退出)
@@ -241,8 +260,13 @@ const handleExitRequest = async () => {
   }
 
   // 2. 第二级：若当前在 Agent 聊天中（且已就绪），按返回键退回到初始零数据引导欢迎页
-  if (lifecycleStore.state === 'READY' && sessionStore.currentSelectedItem !== null) {
-    console.log('[ExitRequest] Resetting active session to welcome boot screen.');
+  if (
+    lifecycleStore.state === "READY" &&
+    sessionStore.currentSelectedItem !== null
+  ) {
+    console.log(
+      "[ExitRequest] Resetting active session to welcome boot screen."
+    );
     sessionStore.$patch((state) => {
       state.currentSelectedItem = null;
       state.currentTopicId = null;
@@ -261,7 +285,10 @@ const handleExitRequest = async () => {
     try {
       await invoke("plugin:vcp-mobile|move_task_to_back");
     } catch (err) {
-      console.warn("[Exit] Failed to move task to back, calling window close fallback:", err);
+      console.warn(
+        "[Exit] Failed to move task to back, calling window close fallback:",
+        err
+      );
       getCurrentWebviewWindow().close();
     }
   } else {
@@ -286,7 +313,6 @@ const handleExitRequest = async () => {
   }
 };
 
-
 const handleVisibilityChange = () => {
   if (document.hidden) {
     document.documentElement.classList.add("vcp-paused-animations");
@@ -306,7 +332,9 @@ const handleVcpLifecycle = (e: Event) => {
   if (state === "stop" || state === "pause") {
     if (isAppBackground) return;
     isAppBackground = true;
-    console.log("[Lifecycle] App moved to background, tuning heartbeat to 120s...");
+    console.log(
+      "[Lifecycle] App moved to background, tuning heartbeat to 120s..."
+    );
     suspendPhysicalScreenKeep(); // 休眠物理亮屏，达到省电效果
     invoke("set_vcp_log_heartbeat", { intervalMs: 120000 }).catch((err) => {
       console.error("[Lifecycle] Failed to set background heartbeat:", err);
@@ -314,7 +342,9 @@ const handleVcpLifecycle = (e: Event) => {
   } else if (state === "resume") {
     if (!isAppBackground) return;
     isAppBackground = false;
-    console.log("[Lifecycle] App moved to foreground, restoring heartbeat to 15s...");
+    console.log(
+      "[Lifecycle] App moved to foreground, restoring heartbeat to 15s..."
+    );
     reapplyScreenKeepIfActive(); // 唤醒时自动校准和恢复可能丢失的物理亮屏 FLAG
     invoke("set_vcp_log_heartbeat", { intervalMs: 15000 }).catch((err) => {
       console.error("[Lifecycle] Failed to restore foreground heartbeat:", err);
@@ -330,7 +360,9 @@ const handleFloatingBallClick = async () => {
   try {
     let win = await WebviewWindow.getByLabel("assistant");
     if (win) {
-      console.log("[App] Assistant window already exists, showing and focusing...");
+      console.log(
+        "[App] Assistant window already exists, showing and focusing..."
+      );
       await win.show();
       await win.setFocus();
       return;
@@ -394,7 +426,9 @@ onMounted(async () => {
       }
     });
   } else {
-    console.info("[App] Web preview runtime detected, skipping Tauri event listeners.");
+    console.info(
+      "[App] Web preview runtime detected, skipping Tauri event listeners."
+    );
   }
 
   // 2. 异步执行重度核心资源加载 (启动引导)
@@ -426,7 +460,10 @@ onUnmounted(() => {
   window.removeEventListener("vcp-hardware-back", handleExitRequest);
   document.removeEventListener("visibilitychange", handleVisibilityChange);
   window.removeEventListener("vcp-lifecycle", handleVcpLifecycle);
-  window.removeEventListener("vcp-floating-ball-click", handleFloatingBallClick);
+  window.removeEventListener(
+    "vcp-floating-ball-click",
+    handleFloatingBallClick
+  );
   window.removeEventListener("vcp-share-intent", handleShareIntent);
 });
 </script>
@@ -445,10 +482,17 @@ onUnmounted(() => {
 
     <!-- 1. 背景底层 -->
     <Transition name="bg-fade">
-      <div :key="backgroundStyle.backgroundImage" class="vcp-background-layer" :style="backgroundStyle"></div>
+      <div
+        :key="backgroundStyle.backgroundImage"
+        class="vcp-background-layer"
+        :style="backgroundStyle"
+      ></div>
     </Transition>
-    <div class="vcp-background-overlay absolute inset-0 pointer-events-none transition-colors" style="transition-duration: 350ms;"
-      :class="themeStore.isDarkResolved ? 'bg-black/12' : 'bg-transparent'"></div>
+    <div
+      class="vcp-background-overlay absolute inset-0 pointer-events-none transition-colors"
+      style="transition-duration: 350ms"
+      :class="themeStore.isDarkResolved ? 'bg-black/12' : 'bg-transparent'"
+    ></div>
 
     <!-- 2. 主内容区先渲染，抽屉与遮罩在后声明，靠 DOM 顺位自然覆盖 -->
     <main class="flex-1 min-w-0 relative overflow-hidden">
@@ -459,10 +503,11 @@ onUnmounted(() => {
 
     <!-- 3. 左侧抽屉遮罩层位于主内容之后、抽屉之前，点击空白即可关闭 -->
     <Transition name="fade">
-      <div v-if="layoutStore.leftDrawerOpen"
-        class="vcp-overlay fixed inset-0 z-drawer bg-black/12 md:hidden" @click.self="
-          layoutStore.setLeftDrawer(false);
-        "></div>
+      <div
+        v-if="layoutStore.leftDrawerOpen"
+        class="vcp-overlay fixed inset-0 z-drawer bg-black/12 md:hidden"
+        @click.self="layoutStore.setLeftDrawer(false)"
+      ></div>
     </Transition>
 
     <!-- 4. 左侧抽屉在遮罩之后声明；通知中心恢复为全屏页面体验 -->
@@ -480,7 +525,8 @@ onUnmounted(() => {
     <FeatureOverlays v-if="lifecycleStore.state === 'READY'" />
 
     <!-- 7. 分享意图 Agent 选择器 -->
-    <ShareAgentSelector v-if="lifecycleStore.state === 'READY'"
+    <ShareAgentSelector
+      v-if="lifecycleStore.state === 'READY'"
       :is-open="showShareSelector"
       :shared-text="sharedContent.text"
       :shared-file-count="sharedContent.files.length"
@@ -504,8 +550,14 @@ onUnmounted(() => {
 :root {
   --vcp-android-safe-top-fallback: 0px;
   --vcp-android-safe-bottom-fallback: 0px;
-  --vcp-safe-top: max(env(safe-area-inset-top, 0px), var(--vcp-android-safe-top-fallback));
-  --vcp-safe-bottom: max(env(safe-area-inset-bottom, 0px), var(--vcp-android-safe-bottom-fallback));
+  --vcp-safe-top: max(
+    env(safe-area-inset-top, 0px),
+    var(--vcp-android-safe-top-fallback)
+  );
+  --vcp-safe-bottom: max(
+    env(safe-area-inset-bottom, 0px),
+    var(--vcp-android-safe-bottom-fallback)
+  );
 }
 
 html.vcp-android-runtime {
@@ -588,17 +640,28 @@ body,
   animation-play-state: paused !important;
 }
 
-/* Android WebView 省电护栏：默认停掉装饰性无限动画，只保留加载/流式等有状态反馈。 */
+/* Android WebView 省电护栏：默认停掉装饰性无限动画，流式状态也只保留静态反馈。 */
 .vcp-battery-static .vcp-decorative-motion,
 .vcp-battery-static .vcp-decorative-motion::before,
 .vcp-battery-static .vcp-decorative-motion::after {
   animation: none !important;
   transition-duration: 0.01ms !important;
+  will-change: auto !important;
 }
 
+.vcp-battery-static .streaming .vcp-bubble-container::before,
+.vcp-battery-static .thinking-dots span,
+.vcp-battery-static .custom-ping,
+.vcp-battery-static .vcp-tool-block.is-tool-use,
+.vcp-battery-static .vcp-tool-block.is-tool-use::after,
+.vcp-battery-static .streaming-tail,
+.vcp-battery-static .streaming-tail * {
+  animation: none !important;
+  transition-duration: 0.01ms !important;
+  will-change: auto !important;
+}
 
 .vcp-battery-static .streaming .vcp-bubble-container::before {
-  animation: none !important;
   opacity: 0.35 !important;
 }
 
@@ -612,6 +675,4 @@ body,
     transition-duration: 0.01ms !important;
   }
 }
-
-
 </style>
