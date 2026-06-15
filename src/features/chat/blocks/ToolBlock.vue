@@ -10,17 +10,11 @@ import {
   X,
 } from "lucide-vue-next";
 import type { ContentBlock } from "../../../core/types/chat";
-import { marked } from "marked";
 import { useNotificationStore } from "../../../core/stores/notification";
 import { useModalHistory } from "../../../core/composables/useModalHistory";
+import { renderSafeMarkdown } from "../../../core/utils/safeMarkdown";
 
 const notificationStore = useNotificationStore();
-
-// Configure marked to support Github Flavored Markdown & breaks
-marked.setOptions({
-  gfm: true,
-  breaks: true,
-});
 
 const parsedMarkdownCache = new Map<string, string>();
 const MAX_MARKDOWN_CACHE_SIZE = 50;
@@ -30,20 +24,15 @@ const renderMarkdown = (text: string): string => {
   if (parsedMarkdownCache.has(text)) {
     return parsedMarkdownCache.get(text)!;
   }
-  try {
-    const rendered = marked.parse(text) as string;
-    if (parsedMarkdownCache.size >= MAX_MARKDOWN_CACHE_SIZE) {
-      const firstKey = parsedMarkdownCache.keys().next().value;
-      if (firstKey !== undefined) {
-        parsedMarkdownCache.delete(firstKey);
-      }
+  const rendered = renderSafeMarkdown(text);
+  if (parsedMarkdownCache.size >= MAX_MARKDOWN_CACHE_SIZE) {
+    const firstKey = parsedMarkdownCache.keys().next().value;
+    if (firstKey !== undefined) {
+      parsedMarkdownCache.delete(firstKey);
     }
-    parsedMarkdownCache.set(text, rendered);
-    return rendered;
-  } catch (e) {
-    console.error("[ToolBlock] marked parse failed:", e);
-    return text;
   }
+  parsedMarkdownCache.set(text, rendered);
+  return rendered;
 };
 
 const props = withDefaults(
@@ -55,7 +44,7 @@ const props = withDefaults(
   }>(),
   {
     defaultExpanded: false,
-  },
+  }
 );
 
 const isExpanded = ref(props.defaultExpanded);
@@ -64,13 +53,15 @@ watch(
   () => props.defaultExpanded,
   (newVal) => {
     isExpanded.value = newVal;
-  },
+  }
 );
 
 const isFullScreen = ref(false);
 
 const { registerModal, unregisterModal } = useModalHistory();
-const modalId = `ToolBlockFullScreen_${Math.random().toString(36).substring(2, 9)}`;
+const modalId = `ToolBlockFullScreen_${Math.random()
+  .toString(36)
+  .substring(2, 9)}`;
 
 watch(isFullScreen, (newVal) => {
   if (newVal) {
@@ -125,7 +116,7 @@ const toolBlockRef = ref<HTMLElement | null>(null);
 let observer: IntersectionObserver | null = null;
 
 const isToolAnimating = computed(
-  () => props.type === "tool-use" && !props.block.is_complete,
+  () => props.type === "tool-use" && !props.block.is_complete
 );
 
 onMounted(() => {
@@ -140,7 +131,7 @@ onMounted(() => {
         }
       });
     },
-    { threshold: 0 },
+    { threshold: 0 }
   );
   observer.observe(toolBlockRef.value);
 });
@@ -373,13 +364,13 @@ const isImageValue = (key: string, value: string): boolean => {
             <div class="min-w-0">
               <template v-if="item.value && isImageValue(item.key, item.value)">
                 <a
-                  :href="item.value"
+                  :href="safeImageUrl(item.value)"
                   target="_blank"
                   rel="noopener noreferrer"
                   class="block"
                 >
                   <img
-                    :src="item.value"
+                    :src="safeImageUrl(item.value)"
                     class="max-w-full rounded-lg"
                     loading="lazy"
                     alt="Generated Image"
@@ -505,12 +496,8 @@ const isImageValue = (key: string, value: string): boolean => {
     #76c4f7
   );
   background-size: 300% 300%;
-  -webkit-mask:
-    linear-gradient(#fff 0 0) content-box,
-    linear-gradient(#fff 0 0);
-  mask:
-    linear-gradient(#fff 0 0) content-box,
-    linear-gradient(#fff 0 0);
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
   -webkit-mask-composite: xor;
   mask-composite: exclude;
   z-index: 0;
@@ -668,8 +655,7 @@ html.dark .vcp-fullscreen-tool-panel.is-tool-result .vcp-fullscreen-header {
 /* --- Transitions --- */
 .fade-slide-enter-active,
 .fade-slide-leave-active {
-  transition:
-    opacity 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+  transition: opacity 0.25s cubic-bezier(0.4, 0, 0.2, 1),
     transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
 }
 

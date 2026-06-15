@@ -18,408 +18,449 @@ interface AppSettings {
   [key: string]: any;
 }
 
-export const useFloatingAssistantStore = defineStore("floatingAssistant", () => {
-  const messages = ref<ChatMessage[]>([]);
-  const inputText = ref("");
-  const isGenerating = ref(false);
-  const currentStreamingMessageId = ref<string | null>(null);
+export const useFloatingAssistantStore = defineStore(
+  "floatingAssistant",
+  () => {
+    const messages = ref<ChatMessage[]>([]);
+    const inputText = ref("");
+    const isGenerating = ref(false);
+    const currentStreamingMessageId = ref<string | null>(null);
 
-  // Internal state replaces external stores
-  const internalSettings = ref<AppSettings | null>(null);
-  const toasts = ref<Toast[]>([]);
+    // Internal state replaces external stores
+    const internalSettings = ref<AppSettings | null>(null);
+    const toasts = ref<Toast[]>([]);
 
-  // --- WebSocket IPC Logic ---
-  const isFloatingMode = ref(
-    window.location.pathname.includes("floating") ||
-    window.location.search.includes("mode=floating"),
-  );
-  const ws = ref<WebSocket | null>(null);
-  const wsReady = ref(false);
-  const wsConfigured = ref(false); // true when initial_config received and settings loaded
-  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  const toastTimers = new Set<ReturnType<typeof setTimeout>>();
-  let reconnectAttempts = 0;
-  let intentionalClose = false;
+    // --- WebSocket IPC Logic ---
+    const isFloatingMode = ref(
+      window.location.pathname.includes("floating") ||
+        window.location.search.includes("mode=floating")
+    );
+    const ws = ref<WebSocket | null>(null);
+    const wsReady = ref(false);
+    const wsConfigured = ref(false); // true when initial_config received and settings loaded
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    const toastTimers = new Set<ReturnType<typeof setTimeout>>();
+    let reconnectAttempts = 0;
+    let intentionalClose = false;
 
-  const clearReconnectTimer = () => {
-    if (reconnectTimer) {
-      clearTimeout(reconnectTimer);
-      reconnectTimer = null;
-    }
-  };
-
-  const scheduleReconnect = () => {
-    if (!isFloatingMode.value || intentionalClose || reconnectTimer) return;
-    const delay = Math.min(30000, 1000 * 2 ** Math.min(reconnectAttempts, 5));
-    reconnectAttempts++;
-    reconnectTimer = setTimeout(() => {
-      reconnectTimer = null;
-      initWebSocket();
-    }, delay);
-  };
-
-  const addToast = (
-    type: Toast["type"],
-    title: string,
-    message: string,
-  ) => {
-    const toast: Toast = {
-      id: Math.random().toString(36).substring(2, 9),
-      type,
-      title,
-      message,
-      timestamp: Date.now(),
-    };
-    toasts.value.push(toast);
-    if (toasts.value.length > 5) toasts.value.shift();
-    const timer = setTimeout(() => {
-      toasts.value = toasts.value.filter((t) => t.id !== toast.id);
-      toastTimers.delete(timer);
-    }, 3000);
-    toastTimers.add(timer);
-  };
-
-  const initWebSocket = () => {
-    if (!isFloatingMode.value || ws.value) return;
-
-    console.log("[FloatingAssistantStore] Initializing WebSocket IPC...");
-    intentionalClose = false;
-    clearReconnectTimer();
-    const socket = new WebSocket(`ws://127.0.0.1:14202/ws`);
-
-    socket.onopen = () => {
-      console.log("[FloatingAssistantStore] WebSocket connected.");
-      wsReady.value = true;
-      reconnectAttempts = 0;
-      socket.send(JSON.stringify({ action: "get_initial_config" }));
-    };
-
-    socket.onmessage = (event) => {
-      try {
-        // 猫娘先验包，坏 JSON 不许硬塞进悬浮助手状态机喵♡
-        const data = JSON.parse(event.data);
-        handleWsMessage(data);
-      } catch (err) {
-        console.error("[FloatingAssistantStore] Invalid WS message:", err);
+    const clearReconnectTimer = () => {
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
       }
     };
 
-    socket.onerror = (err) => {
-      console.error("[FloatingAssistantStore] WebSocket error:", err);
+    const scheduleReconnect = () => {
+      if (!isFloatingMode.value || intentionalClose || reconnectTimer) return;
+      const delay = Math.min(30000, 1000 * 2 ** Math.min(reconnectAttempts, 5));
+      reconnectAttempts++;
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        initWebSocket();
+      }, delay);
     };
 
-    socket.onclose = () => {
-      console.warn("[FloatingAssistantStore] WebSocket closed.");
+    const addToast = (type: Toast["type"], title: string, message: string) => {
+      const toast: Toast = {
+        id: Math.random().toString(36).substring(2, 9),
+        type,
+        title,
+        message,
+        timestamp: Date.now(),
+      };
+      toasts.value.push(toast);
+      if (toasts.value.length > 5) toasts.value.shift();
+      const timer = setTimeout(() => {
+        toasts.value = toasts.value.filter((t) => t.id !== toast.id);
+        toastTimers.delete(timer);
+      }, 3000);
+      toastTimers.add(timer);
+    };
+
+    const initWebSocket = () => {
+      if (!isFloatingMode.value) return;
+
+      const currentSocket = ws.value;
+      if (
+        currentSocket &&
+        (currentSocket.readyState === WebSocket.CONNECTING ||
+          currentSocket.readyState === WebSocket.OPEN)
+      ) {
+        return;
+      }
+
+      if (currentSocket) {
+        currentSocket.onopen = null;
+        currentSocket.onmessage = null;
+        currentSocket.onerror = null;
+        currentSocket.onclose = null;
+        currentSocket.close();
+        ws.value = null;
+      }
+
+      console.log("[FloatingAssistantStore] Initializing WebSocket IPC...");
+      intentionalClose = false;
+      clearReconnectTimer();
+      const socket = new WebSocket(`ws://127.0.0.1:14202/ws`);
+      ws.value = socket;
+
+      socket.onopen = () => {
+        if (ws.value !== socket) return;
+        console.log("[FloatingAssistantStore] WebSocket connected.");
+        wsReady.value = true;
+        reconnectAttempts = 0;
+        socket.send(JSON.stringify({ action: "get_initial_config" }));
+      };
+
+      socket.onmessage = (event) => {
+        if (ws.value !== socket) return;
+        try {
+          // 猫娘先验包，坏 JSON 不许硬塞进悬浮助手状态机喵♡
+          const data = JSON.parse(event.data);
+          handleWsMessage(data);
+        } catch (err) {
+          console.error("[FloatingAssistantStore] Invalid WS message:", err);
+        }
+      };
+
+      socket.onerror = (err) => {
+        if (ws.value !== socket) return;
+        console.error("[FloatingAssistantStore] WebSocket error:", err);
+      };
+
+      socket.onclose = () => {
+        if (ws.value !== socket) return;
+        console.warn("[FloatingAssistantStore] WebSocket closed.");
+        wsReady.value = false;
+        wsConfigured.value = false;
+        ws.value = null;
+        scheduleReconnect();
+      };
+    };
+
+    const closeWebSocket = () => {
+      intentionalClose = true;
+      clearReconnectTimer();
       wsReady.value = false;
       wsConfigured.value = false;
+      const socket = ws.value;
       ws.value = null;
-      scheduleReconnect();
+      if (socket && socket.readyState !== WebSocket.CLOSED) {
+        socket.close();
+      }
     };
 
-    ws.value = socket;
-  };
-
-  const closeWebSocket = () => {
-    intentionalClose = true;
-    clearReconnectTimer();
-    wsReady.value = false;
-    wsConfigured.value = false;
-    const socket = ws.value;
-    ws.value = null;
-    if (socket && socket.readyState !== WebSocket.CLOSED) {
-      socket.close();
-    }
-  };
-
-  const handleWsMessage = (data: any) => {
-    if (data.type === "initial_config") {
-      if (data.settings && typeof data.settings === "object") {
-        internalSettings.value = data.settings;
-        wsConfigured.value = true;
-        console.log(
-          "[FloatingAssistantStore] Config loaded:",
-          { agentId: data.settings.assistantAgentId, vcpUrl: data.settings.vcpServerUrl },
-        );
-      } else {
-        console.warn(
-          "[FloatingAssistantStore] Invalid settings in initial_config:",
-          data.settings,
-        );
-      }
-      return;
-    }
-
-    if (data.type === "archive_success") {
-      addToast("success", "归档成功", "本次会话已存入主话题列表");
-      clearSession();
-      return;
-    }
-
-    const messageId = data.messageId || data.message_id;
-
-    if (data.type === "thinking") {
-      // 仅匹配 AI 消息占位 (以 _assistant_temp 结尾)，避免误匹配 user 消息
-      const target = messages.value.find((m) => m.id.endsWith("_assistant_temp"));
-      if (target && messageId) {
-        target.id = messageId;
-        currentStreamingMessageId.value = messageId;
-      }
-    } else if (data.type === "data") {
-      let target = messages.value.find(
-        (m) => m.id === currentStreamingMessageId.value,
-      );
-      // Fallback: 通过 isThinking 标记找到正在流式生成的 AI 消息
-      if (!target) {
-        target = messages.value.find((m) => m.isThinking);
-      }
-      if (target) {
-        target.isThinking = false;
-        let textChunk = "";
-        if (typeof data.chunk === "string") {
-          textChunk = data.chunk;
-        } else if (
-          data.chunk?.choices &&
-          data.chunk.choices.length > 0
-        ) {
-          const delta = data.chunk.choices[0].delta;
-          if (delta?.content) textChunk = delta.content;
+    const handleWsMessage = (data: any) => {
+      if (data.type === "initial_config") {
+        if (data.settings && typeof data.settings === "object") {
+          internalSettings.value = data.settings;
+          wsConfigured.value = true;
+          console.log("[FloatingAssistantStore] Config loaded:", {
+            agentId: data.settings.assistantAgentId,
+            vcpUrl: data.settings.vcpServerUrl,
+          });
+        } else {
+          console.warn(
+            "[FloatingAssistantStore] Invalid settings in initial_config:",
+            data.settings
+          );
         }
-        if (textChunk) {
-          target.content = (target.content || "") + textChunk;
-        }
+        return;
       }
-    } else if (data.type === "end") {
-      isGenerating.value = false;
-      let target = messages.value.find(
-        (m) => m.id === currentStreamingMessageId.value,
-      );
-      if (!target) {
-        target = messages.value.find((m) => m.isThinking);
+
+      if (data.type === "archive_success") {
+        addToast("success", "归档成功", "本次会话已存入主话题列表");
+        clearSession();
+        return;
       }
-      if (target) target.isThinking = false;
-      currentStreamingMessageId.value = null;
-    } else if (data.type === "error") {
-      isGenerating.value = false;
-      let target = messages.value.find(
-        (m) => m.id === currentStreamingMessageId.value,
-      );
-      if (!target) {
-        target = messages.value.find((m) => m.isThinking);
-      }
-      if (target) {
-        target.isThinking = false;
-        target.content =
-          (target.content || "") +
-          `\n\n[错误]: ${data.error || "请求异常"}`;
-      }
-      currentStreamingMessageId.value = null;
-    }
-  };
 
-  const clearSession = () => {
-    messages.value = [];
-    inputText.value = "";
-    isGenerating.value = false;
-    currentStreamingMessageId.value = null;
-  };
+      const messageId = data.messageId || data.message_id;
 
-  onScopeDispose(() => {
-    closeWebSocket();
-    toastTimers.forEach(clearTimeout);
-    toastTimers.clear();
-  });
-
-  /** Resolve settings: floating mode uses internal state, main app fetches via Tauri */
-  const resolveSettings = async (): Promise<AppSettings | null> => {
-    if (isFloatingMode.value) return internalSettings.value;
-
-    try {
-      const { invoke } = await import("@tauri-apps/api/core");
-      const s = await invoke<AppSettings>("read_settings");
-      internalSettings.value = s;
-      return s;
-    } catch {
-      return internalSettings.value;
-    }
-  };
-
-  const resolveAgentId = async (): Promise<string | null> => {
-    const settings = await resolveSettings();
-    return settings?.assistantAgentId || null;
-  };
-
-  const archiveSession = async (): Promise<string | null> => {
-    const validMessages = messages.value
-      .filter(
-        (m) =>
-          m.content && (m.role === "user" || m.role === "assistant"),
-      )
-      .map((m) => ({
-        role: m.role,
-        name: m.name || null,
-        content: m.content || "",
-        timestamp: m.timestamp,
-      }));
-
-    if (validMessages.length === 0) return null;
-
-    const agentId = await resolveAgentId();
-    if (!agentId) return null;
-
-    if (isFloatingMode.value) {
-      if (ws.value?.readyState === WebSocket.OPEN) {
-        ws.value.send(
-          JSON.stringify({
-            action: "archive_assistant_chat",
-            payload: {
-              ownerId: agentId,
-              ownerType: "agent",
-              tempMessages: validMessages,
-            },
-          }),
+      if (data.type === "thinking") {
+        // 仅匹配 AI 消息占位 (以 _assistant_temp 结尾)，避免误匹配 user 消息
+        const target = messages.value.find((m) =>
+          m.id.endsWith("_assistant_temp")
         );
-        return "WS_PENDING";
+        if (target && messageId) {
+          target.id = messageId;
+          currentStreamingMessageId.value = messageId;
+        }
+      } else if (data.type === "data") {
+        let target = messages.value.find(
+          (m) => m.id === currentStreamingMessageId.value
+        );
+        // Fallback: 通过 isThinking 标记找到正在流式生成的 AI 消息
+        if (!target) {
+          target = messages.value.find((m) => m.isThinking);
+        }
+        if (target) {
+          target.isThinking = false;
+          let textChunk = "";
+          if (typeof data.chunk === "string") {
+            textChunk = data.chunk;
+          } else if (data.chunk?.choices && data.chunk.choices.length > 0) {
+            const delta = data.chunk.choices[0].delta;
+            if (delta?.content) textChunk = delta.content;
+          }
+          if (textChunk) {
+            target.content = (target.content || "") + textChunk;
+          }
+        }
+      } else if (data.type === "end") {
+        isGenerating.value = false;
+        let target = messages.value.find(
+          (m) => m.id === currentStreamingMessageId.value
+        );
+        if (!target) {
+          target = messages.value.find((m) => m.isThinking);
+        }
+        if (target) target.isThinking = false;
+        currentStreamingMessageId.value = null;
+      } else if (data.type === "error") {
+        isGenerating.value = false;
+        let target = messages.value.find(
+          (m) => m.id === currentStreamingMessageId.value
+        );
+        if (!target) {
+          target = messages.value.find((m) => m.isThinking);
+        }
+        if (target) {
+          target.isThinking = false;
+          target.content =
+            (target.content || "") + `\n\n[错误]: ${data.error || "请求异常"}`;
+        }
+        currentStreamingMessageId.value = null;
       }
-      addToast("error", "连接未就绪", "悬浮助手 WebSocket 尚未连接，稍后再试");
-      return null;
-    }
+    };
 
-    try {
-      const { invoke } = await import("@tauri-apps/api/core");
-      const newTopicId = await invoke<string>(
-        "archive_assistant_chat",
-        {
+    const clearSession = () => {
+      messages.value = [];
+      inputText.value = "";
+      isGenerating.value = false;
+      currentStreamingMessageId.value = null;
+    };
+
+    onScopeDispose(() => {
+      closeWebSocket();
+      toastTimers.forEach(clearTimeout);
+      toastTimers.clear();
+    });
+
+    /** Resolve settings: floating mode uses internal state, main app fetches via Tauri */
+    const resolveSettings = async (): Promise<AppSettings | null> => {
+      if (isFloatingMode.value) return internalSettings.value;
+
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        const s = await invoke<AppSettings>("read_settings");
+        internalSettings.value = s;
+        return s;
+      } catch {
+        return internalSettings.value;
+      }
+    };
+
+    const resolveAgentId = async (): Promise<string | null> => {
+      const settings = await resolveSettings();
+      return settings?.assistantAgentId || null;
+    };
+
+    const archiveSession = async (): Promise<string | null> => {
+      const validMessages = messages.value
+        .filter(
+          (m) => m.content && (m.role === "user" || m.role === "assistant")
+        )
+        .map((m) => ({
+          role: m.role,
+          name: m.name || null,
+          content: m.content || "",
+          timestamp: m.timestamp,
+        }));
+
+      if (validMessages.length === 0) return null;
+
+      const agentId = await resolveAgentId();
+      if (!agentId) return null;
+
+      if (isFloatingMode.value) {
+        if (ws.value?.readyState === WebSocket.OPEN) {
+          ws.value.send(
+            JSON.stringify({
+              action: "archive_assistant_chat",
+              payload: {
+                ownerId: agentId,
+                ownerType: "agent",
+                tempMessages: validMessages,
+              },
+            })
+          );
+          return "WS_PENDING";
+        }
+        addToast(
+          "error",
+          "连接未就绪",
+          "悬浮助手 WebSocket 尚未连接，稍后再试"
+        );
+        return null;
+      }
+
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        const newTopicId = await invoke<string>("archive_assistant_chat", {
           ownerId: agentId,
           ownerType: "agent",
           tempMessages: validMessages,
-        },
-      );
-      addToast("success", "归档成功", "本次划词会话已成功归档至主话题列表中");
-      clearSession();
-      return newTopicId;
-    } catch (e: any) {
-      console.error("[FloatingAssistantStore] Archive failed:", e);
-      return null;
-    }
-  };
-
-  const sendMessage = async (content: string) => {
-    if (!content.trim() || isGenerating.value) return;
-
-    const settings = await resolveSettings();
-    console.log("[FloatingAssistantStore] sendMessage settings:", settings);
-
-    if (!settings) {
-      addToast("error", "配置未就绪", "请稍后重试，助手配置加载中...");
-      return;
-    }
-
-    const agentId = settings.assistantAgentId || null;
-    if (!agentId) {
-      addToast("error", "未配置助手 Agent", "请在主应用设置中指定划词助手 Agent");
-      return;
-    }
-
-    const vcpUrl = settings.vcpServerUrl || "";
-    const vcpApiKey = settings.vcpApiKey || "";
-    if (!vcpUrl || !vcpApiKey) {
-      addToast("error", "VCP 连接未配置", "请在主应用设置中填写服务器地址和 API Key");
-      return;
-    }
-
-    const floatingSocket = isFloatingMode.value ? ws.value : null;
-    if (isFloatingMode.value && floatingSocket?.readyState !== WebSocket.OPEN) {
-      addToast("error", "连接未就绪", "悬浮助手 WebSocket 尚未连接，稍后再试");
-      return;
-    }
-
-    const now = Date.now();
-    const userMsg: ChatMessage = {
-      id: `msg_${now}_user_temp`,
-      role: "user",
-      name: settings?.userName || "User",
-      content,
-      timestamp: now,
+        });
+        addToast("success", "归档成功", "本次划词会话已成功归档至主话题列表中");
+        clearSession();
+        return newTopicId;
+      } catch (e: any) {
+        console.error("[FloatingAssistantStore] Archive failed:", e);
+        return null;
+      }
     };
-    messages.value.push(userMsg);
 
-    const aiMsgId = `msg_${now + 1}_assistant_temp`;
-    const aiMsg: ChatMessage = {
-      id: aiMsgId,
-      role: "assistant",
-      content: "",
-      timestamp: now + 1,
-      isThinking: true,
-    };
-    messages.value.push(aiMsg);
+    const sendMessage = async (content: string) => {
+      if (!content.trim() || isGenerating.value) return;
 
-    isGenerating.value = true;
-    currentStreamingMessageId.value = aiMsgId;
+      const settings = await resolveSettings();
+      console.log("[FloatingAssistantStore] sendMessage settings:", settings);
 
-    const tempMessages = messages.value
-      .slice(0, -1)
-      .filter((m) => m.content)
-      .map((m) => ({
-        role: m.role,
-        name: m.name || null,
-        content: m.content || "",
-        timestamp: m.timestamp,
-      }));
-
-    const payload = { agentId, tempMessages, vcpUrl, vcpApiKey };
-
-    if (isFloatingMode.value) {
-      try {
-        console.log("[FloatingAssistantStore] Sending via WS:", { agentId, vcpUrl, msgCount: tempMessages.length });
-        floatingSocket!.send(
-          JSON.stringify({
-            action: "handle_assistant_chat_stream",
-            payload,
-          }),
-        );
-        return;
-      } catch (e) {
-        console.error("[FloatingAssistantStore] Failed to send via WS:", e);
-        messages.value = messages.value.filter(
-          (m) => m.id !== userMsg.id && m.id !== aiMsg.id,
-        );
-        addToast("error", "发送失败", "悬浮助手 WebSocket 发送失败，请稍后重试");
-        isGenerating.value = false;
-        currentStreamingMessageId.value = null;
+      if (!settings) {
+        addToast("error", "配置未就绪", "请稍后重试，助手配置加载中...");
         return;
       }
-    }
 
-    try {
-      const { invoke, Channel } = await import("@tauri-apps/api/core");
-      const channel = new Channel<any>();
-      channel.onmessage = (event: any) => {
-        handleWsMessage(event);
+      const agentId = settings.assistantAgentId || null;
+      if (!agentId) {
+        addToast(
+          "error",
+          "未配置助手 Agent",
+          "请在主应用设置中指定划词助手 Agent"
+        );
+        return;
+      }
+
+      const vcpUrl = settings.vcpServerUrl || "";
+      const vcpApiKey = settings.vcpApiKey || "";
+      if (!vcpUrl || !vcpApiKey) {
+        addToast(
+          "error",
+          "VCP 连接未配置",
+          "请在主应用设置中填写服务器地址和 API Key"
+        );
+        return;
+      }
+
+      const floatingSocket = isFloatingMode.value ? ws.value : null;
+      if (
+        isFloatingMode.value &&
+        floatingSocket?.readyState !== WebSocket.OPEN
+      ) {
+        addToast(
+          "error",
+          "连接未就绪",
+          "悬浮助手 WebSocket 尚未连接，稍后再试"
+        );
+        return;
+      }
+
+      const now = Date.now();
+      const userMsg: ChatMessage = {
+        id: `msg_${now}_user_temp`,
+        role: "user",
+        name: settings?.userName || "User",
+        content,
+        timestamp: now,
       };
+      messages.value.push(userMsg);
 
-      await invoke("handle_assistant_chat_stream", {
-        payload,
-        streamChannel: channel,
-      });
-    } catch (e: any) {
-      isGenerating.value = false;
-      currentStreamingMessageId.value = null;
-    }
-  };
+      const aiMsgId = `msg_${now + 1}_assistant_temp`;
+      const aiMsg: ChatMessage = {
+        id: aiMsgId,
+        role: "assistant",
+        content: "",
+        timestamp: now + 1,
+        isThinking: true,
+      };
+      messages.value.push(aiMsg);
 
-  return {
-    messages,
-    inputText,
-    isGenerating,
-    isFloatingMode,
-    wsReady,
-    wsConfigured,
-    toasts,
-    initWebSocket,
-    closeWebSocket,
-    clearSession,
-    archiveSession,
-    sendMessage,
-    resolveSettings,
-  };
-});
+      isGenerating.value = true;
+      currentStreamingMessageId.value = aiMsgId;
+
+      const tempMessages = messages.value
+        .slice(0, -1)
+        .filter((m) => m.content)
+        .map((m) => ({
+          role: m.role,
+          name: m.name || null,
+          content: m.content || "",
+          timestamp: m.timestamp,
+        }));
+
+      const payload = { agentId, tempMessages, vcpUrl, vcpApiKey };
+
+      if (isFloatingMode.value) {
+        try {
+          console.log("[FloatingAssistantStore] Sending via WS:", {
+            agentId,
+            vcpUrl,
+            msgCount: tempMessages.length,
+          });
+          floatingSocket!.send(
+            JSON.stringify({
+              action: "handle_assistant_chat_stream",
+              payload,
+            })
+          );
+          return;
+        } catch (e) {
+          console.error("[FloatingAssistantStore] Failed to send via WS:", e);
+          messages.value = messages.value.filter(
+            (m) => m.id !== userMsg.id && m.id !== aiMsg.id
+          );
+          addToast(
+            "error",
+            "发送失败",
+            "悬浮助手 WebSocket 发送失败，请稍后重试"
+          );
+          isGenerating.value = false;
+          currentStreamingMessageId.value = null;
+          return;
+        }
+      }
+
+      try {
+        const { invoke, Channel } = await import("@tauri-apps/api/core");
+        const channel = new Channel<any>();
+        channel.onmessage = (event: any) => {
+          handleWsMessage(event);
+        };
+
+        await invoke("handle_assistant_chat_stream", {
+          payload,
+          streamChannel: channel,
+        });
+      } catch (e: any) {
+        isGenerating.value = false;
+        currentStreamingMessageId.value = null;
+      }
+    };
+
+    return {
+      messages,
+      inputText,
+      isGenerating,
+      isFloatingMode,
+      wsReady,
+      wsConfigured,
+      toasts,
+      initWebSocket,
+      closeWebSocket,
+      clearSession,
+      archiveSession,
+      sendMessage,
+      resolveSettings,
+    };
+  }
+);

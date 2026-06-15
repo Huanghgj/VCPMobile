@@ -1,12 +1,6 @@
 <script setup lang="ts">
-import { computed } from 'vue';
-import { marked } from 'marked';
-
-// Configure marked to support Github Flavored Markdown & breaks
-marked.setOptions({
-  gfm: true,
-  breaks: true,
-});
+import { computed } from "vue";
+import { renderSafeMarkdown } from "../../core/utils/safeMarkdown";
 
 interface Props {
   text: string;
@@ -18,21 +12,16 @@ const props = withDefaults(defineProps<Props>(), {
 });
 
 const renderedHtml = computed(() => {
-  let rawText = props.text || '';
+  let rawText = props.text || "";
 
   if (props.isQuery) {
     // 转义特殊 HTML 字符，防止在 v-html 渲染 query/response 文本时因浏览器误判 <Tauri> 等标签而吞字
-    rawText = rawText.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    rawText = rawText.replace(/</g, "&lt;").replace(/>/g, "&gt;");
   }
 
-  try {
-    // 修复 Markdown 引擎将 "[AI]:" 或 "[USER]:" 识别为隐藏链接定义（Link Reference Definition）从而吞字的 Bug
-    const safeText = rawText.replace(/^(\s*)\[([^\]]+)\]:/gm, '$1\\[$2\\]:');
-    return marked.parse(safeText) as string;
-  } catch (e) {
-    console.error('[RagPayloadDetail] marked parse failed:', e);
-    return rawText;
-  }
+  // 修复 Markdown 引擎将 "[AI]:" 或 "[USER]:" 识别为隐藏链接定义（Link Reference Definition）从而吞字的 Bug
+  const safeText = rawText.replace(/^(\s*)\[([^\]]+)\]:/gm, "$1\\[$2\\]:");
+  return renderSafeMarkdown(safeText);
 });
 </script>
 

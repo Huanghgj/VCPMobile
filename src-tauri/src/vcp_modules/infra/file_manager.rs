@@ -42,7 +42,9 @@ pub fn get_thumbnails_root_dir<R: tauri::Runtime>(
     Ok(path)
 }
 
-/// 物理安全的文件重命名工具，能够跨越物理挂载分区 (EXDEV) 降级进行物理拷贝+删除
+/// 物理安全的文件移动工具，能够跨越物理挂载分区 (EXDEV) 降级进行物理拷贝+删除。
+///
+/// 目标路径按内容哈希命名，可能被并发上传提前创建；本函数必须避免覆盖已存在目标。
 pub fn safe_rename<P: AsRef<std::path::Path>, Q: AsRef<std::path::Path>>(
     from: P,
     to: Q,
@@ -50,11 +52,101 @@ pub fn safe_rename<P: AsRef<std::path::Path>, Q: AsRef<std::path::Path>>(
     let from = from.as_ref();
     let to = to.as_ref();
 
-    if std::fs::rename(from, to).is_err() {
-        // 如果是跨物理分区移动，执行物理复制 + 物理删除源文件以兜底
-        std::fs::copy(from, to)?;
+    if to.exists() {
         let _ = std::fs::remove_file(from);
+        return Ok(());
     }
+
+    match std::fs::hard_link(from, to) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(from);
+            return Ok(());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(from);
+            return Ok(());
+        }
+        Err(_) => {}
+    }
+
+    let mut source = std::fs::File::open(from)?;
+    let mut dest = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(from);
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+
+    if let Err(e) = std::io::copy(&mut source, &mut dest) {
+        let _ = std::fs::remove_file(to);
+        return Err(e);
+    }
+
+    if let Err(e) = dest.sync_all() {
+        let _ = std::fs::remove_file(to);
+        return Err(e);
+    }
+
+    let _ = std::fs::remove_file(from);
+    Ok(())
+}
+
+async fn safe_move_no_overwrite_async(
+    from: &std::path::Path,
+    to: &std::path::Path,
+) -> Result<(), String> {
+    if to.exists() {
+        let _ = tokio::fs::remove_file(from).await;
+        return Ok(());
+    }
+
+    match tokio::fs::hard_link(from, to).await {
+        Ok(()) => {
+            let _ = tokio::fs::remove_file(from).await;
+            return Ok(());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = tokio::fs::remove_file(from).await;
+            return Ok(());
+        }
+        Err(_) => {}
+    }
+
+    let mut source = tokio::fs::File::open(from)
+        .await
+        .map_err(|e| format!("打开待移动文件失败: {}", e))?;
+    let mut dest = match tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)
+        .await
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = tokio::fs::remove_file(from).await;
+            return Ok(());
+        }
+        Err(e) => return Err(format!("创建目标文件失败: {}", e)),
+    };
+
+    if let Err(e) = tokio::io::copy(&mut source, &mut dest).await {
+        let _ = tokio::fs::remove_file(to).await;
+        return Err(format!("复制文件到目标路径失败: {}", e));
+    }
+
+    use tokio::io::AsyncWriteExt;
+    if let Err(e) = dest.flush().await {
+        let _ = tokio::fs::remove_file(to).await;
+        return Err(format!("刷新目标文件失败: {}", e));
+    }
+
+    let _ = tokio::fs::remove_file(from).await;
     Ok(())
 }
 
@@ -408,11 +500,26 @@ pub async fn store_file(
     }
 
     let internal_file_path = attachments_dir.join(&internal_file_name);
-    let internal_path_str = internal_file_path.to_str().unwrap().to_string();
+    let internal_path_str = internal_file_path
+        .to_str()
+        .ok_or("无效的目标路径字符")?
+        .to_string();
 
-    // 2. 写入物理文件 (如果哈希不存在)
+    // 2. 写入物理文件 (如果哈希不存在)。使用 create_new 避免并发写入同一哈希时覆盖已存在文件。
     if !internal_file_path.exists() {
-        fs::write(&internal_file_path, &file_bytes).map_err(|e| e.to_string())?;
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&internal_file_path)
+        {
+            Ok(mut file) => {
+                use std::io::Write;
+                file.write_all(&file_bytes).map_err(|e| e.to_string())?;
+                file.sync_all().map_err(|e| e.to_string())?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.to_string()),
+        }
     }
 
     // 3. 注册并返回元数据
@@ -551,26 +658,15 @@ pub async fn register_local_file(
     let dest_path = attachments_dir.join(&internal_file_name);
     let dest_path_str = dest_path.to_str().ok_or("无效的目标路径字符")?.to_string();
 
-    // 如果目标文件已存在（内容寻址去重去冗余），则直接删除源临时文件
+    // 如果目标文件已存在（内容寻址去重去冗余），则直接删除源临时文件。
+    // 如果不存在，使用 create_new/hard_link 语义移动，避免并发注册同一哈希时覆盖已落盘文件。
     if dest_path.exists() {
         let _ = tokio::fs::remove_file(&source_path).await;
         log::info!(
             "[FileManager] Duplicated local file found. Removed source path: {}",
             local_path
         );
-        if let Some(ref sid) = stable_id {
-            app_handle
-                .emit(
-                    "vcp-file-register-progress",
-                    serde_json::json!({
-                        "progress": 99,
-                        "stableId": sid,
-                    }),
-                )
-                .ok();
-        }
     } else {
-        // 先尝试 rename 极速移动，失败时 fallback 复制 + 删除
         if let Some(ref sid) = stable_id {
             app_handle
                 .emit(
@@ -582,23 +678,19 @@ pub async fn register_local_file(
                 )
                 .ok();
         }
-        if tokio::fs::rename(&source_path, &dest_path).await.is_err() {
-            tokio::fs::copy(&source_path, &dest_path)
-                .await
-                .map_err(|e| format!("复制文件到正式目录失败: {}", e))?;
-            let _ = tokio::fs::remove_file(&source_path).await;
-        }
-        if let Some(ref sid) = stable_id {
-            app_handle
-                .emit(
-                    "vcp-file-register-progress",
-                    serde_json::json!({
-                        "progress": 99,
-                        "stableId": sid,
-                    }),
-                )
-                .ok();
-        }
+        safe_move_no_overwrite_async(&source_path, &dest_path).await?;
+    }
+
+    if let Some(ref sid) = stable_id {
+        app_handle
+            .emit(
+                "vcp-file-register-progress",
+                serde_json::json!({
+                    "progress": 99,
+                    "stableId": sid,
+                }),
+            )
+            .ok();
     }
 
     // 5. 修正 MIME 类型
@@ -623,6 +715,8 @@ pub async fn register_local_file(
     if let Some(ref tp) = thumbnail_path {
         let source_thumb = std::path::PathBuf::from(tp);
         if source_thumb.exists() {
+            ensure_safe_path(&app_handle, &source_thumb)?;
+
             let thumbs_dir = get_thumbnails_root_dir(&app_handle)?;
             if !thumbs_dir.exists() {
                 tokio::fs::create_dir_all(&thumbs_dir)
@@ -630,18 +724,12 @@ pub async fn register_local_file(
                     .map_err(|e| e.to_string())?;
             }
             let dest_thumb_path = thumbs_dir.join(format!("{}_thumb.webp", hash));
-            let dest_thumb_path_str = dest_thumb_path.to_str().unwrap().to_string();
+            let dest_thumb_path_str = dest_thumb_path
+                .to_str()
+                .ok_or("无效的缩略图目标路径字符")?
+                .to_string();
 
-            if dest_thumb_path.exists()
-                || (tokio::fs::rename(&source_thumb, &dest_thumb_path)
-                    .await
-                    .is_err()
-                    && tokio::fs::copy(&source_thumb, &dest_thumb_path)
-                        .await
-                        .is_ok())
-            {
-                let _ = tokio::fs::remove_file(&source_thumb).await;
-            }
+            safe_move_no_overwrite_async(&source_thumb, &dest_thumb_path).await?;
 
             // 更新 SQLite 中的 thumbnail_path，使其指向正式保存的缩略图
             sqlx::query("UPDATE attachments SET thumbnail_path = ?, updated_at = ? WHERE hash = ?")

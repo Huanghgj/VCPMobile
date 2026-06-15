@@ -146,12 +146,15 @@ impl AuroraBuffer {
 
         self.tail_content = new_tail;
 
-        // 2. 推测渲染 (Speculative Rendering)：将 tail 视为一个临时 Markdown 块
-        //    当 tail 超过 MAX_SPECULATIVE_TAIL_AST_BYTES 时跳过 AST 解析，
-        //    避免在流式热路径上产生性能悬崖
+        // 2. 推测渲染 (Speculative Rendering)：将 tail 视为一个临时块
+        //    当普通 Markdown tail 超过 MAX_SPECULATIVE_TAIL_AST_BYTES 时跳过 AST 解析，
+        //    避免在流式热路径上产生性能悬崖；未闭合思考块仍保留语义化渲染。
         if !self.tail_content.is_empty() {
-            let nodes = if crate::vcp_modules::content_parser::is_html_tag_block(&self.tail_content)
-            {
+            let semantic_tail_block =
+                StreamBlockParser::build_incomplete_semantic_tail_block(&self.tail_content);
+            let nodes = if let Some(StreamBlock::Thought { nodes, .. }) = &semantic_tail_block {
+                nodes.clone()
+            } else if crate::vcp_modules::content_parser::is_html_tag_block(&self.tail_content) {
                 // 如果是以 HTML 容器/样式标签开头，直接将其作为 RawHtml 块，防止 pulldown_cmark 将内部 CSS 规则或内联样式解析为缩进代码块
                 Some(vec![
                     crate::vcp_modules::pre_renderer::MarkdownNode::raw_html(
@@ -196,11 +199,13 @@ impl AuroraBuffer {
                 self.tail_snapshot_pending = None;
             }
 
-            self.tail_block = Some(StreamBlock::markdown(
-                self.tail_content.clone(),
-                nodes,
-                hash,
-            ));
+            self.tail_block = semantic_tail_block.or_else(|| {
+                Some(StreamBlock::markdown(
+                    self.tail_content.clone(),
+                    nodes,
+                    hash,
+                ))
+            });
         } else {
             self.tail_block = None;
             if !self.prev_tail_ast.is_empty() || !self.tail_content.is_empty() {

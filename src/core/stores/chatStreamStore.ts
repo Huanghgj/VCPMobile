@@ -1,7 +1,10 @@
 import { defineStore } from "pinia";
 import { ref, computed, reactive, onScopeDispose } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import { acquireScreenKeep, releaseScreenKeep } from "../composables/useScreenKeeper";
+import {
+  acquireScreenKeep,
+  releaseScreenKeep,
+} from "../composables/useScreenKeeper";
 import { useChatSessionStore } from "./chatSessionStore";
 import { useAssistantStore } from "./assistant";
 import { useAvatarStore } from "./avatar";
@@ -20,10 +23,15 @@ export const useChatStreamStore = defineStore("chatStream", () => {
   // 无论是在前台还是后台，流式消息都从此池中获取，保证响应式链路不断裂
   const activeStreamMessages = reactive<Map<string, ChatMessage>>(new Map());
   const activeStreamRefCounts = reactive<Record<string, number>>({});
-  const activeStreamContexts = reactive<Record<string, {
-    itemId: string;
-    topicId: string;
-  }>>({});
+  const activeStreamContexts = reactive<
+    Record<
+      string,
+      {
+        itemId: string;
+        topicId: string;
+      }
+    >
+  >({});
   const activeStreamTotal = ref(0);
   const auroraActiveMessageIds = new Set<string>();
   const sealedStreamMessageIds = new Set<string>();
@@ -52,7 +60,10 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     }
   }
 
-  function mergeTailFrame(existing: TailFrame | null, incoming: TailFrame): TailFrame {
+  function mergeTailFrame(
+    existing: TailFrame | null,
+    incoming: TailFrame
+  ): TailFrame {
     const incomingMutations = incoming.mutations || [];
     if (!existing || incoming.reset || incoming.epoch !== existing.epoch) {
       return {
@@ -77,16 +88,19 @@ export const useChatStreamStore = defineStore("chatStream", () => {
 
   // ===== rAF 30Hz 帧合并直推暂存池 =====
   // 记录每个消息最新的 Aurora 暂存数据，消灭定时器空转，硬件级防抖并实现30Hz降降基数
-  const rAFPendingUpdates = new Map<string, {
-    content: string | null;
-    blocks: any[] | null;
-    tailContent: string | null;
-    tailBlock: any | null | undefined;
-    tailFrame: TailFrame | null;
-    tailSnapshot: any[] | null;
-    animationFrameId: number | null;
-    lastRenderTime: number;
-  }>();
+  const rAFPendingUpdates = new Map<
+    string,
+    {
+      content: string | null;
+      blocks: any[] | null;
+      tailContent: string | null;
+      tailBlock: any | null | undefined;
+      tailFrame: TailFrame | null;
+      tailSnapshot: any[] | null;
+      animationFrameId: number | null;
+      lastRenderTime: number;
+    }
+  >();
   const MIN_RENDER_INTERVAL_MS = 33.3; // 限制最大刷新频率为 30Hz
 
   const isDocumentHidden = () =>
@@ -134,7 +148,8 @@ export const useChatStreamStore = defineStore("chatStream", () => {
           // 漏洞 1 修复：同步强刷收尾时，必须将暂存池中的 tail 字段强刷，绝不允许丢字闪烁
           if (up.tailContent !== null) msg.tailContent = up.tailContent;
           if (up.tailBlock !== undefined) msg.tailBlock = up.tailBlock;
-          if (up.tailSnapshot !== null) msg.tailSnapshot = up.tailSnapshot as any;
+          if (up.tailSnapshot !== null)
+            msg.tailSnapshot = up.tailSnapshot as any;
           if (up.tailFrame !== null) msg.tailFrame = up.tailFrame;
         }
       }
@@ -150,10 +165,15 @@ export const useChatStreamStore = defineStore("chatStream", () => {
   /**
    * 在前端本地计算 MessageShell（替代 Rust 的 precompute_shell）
    */
-  function computeShell(msg: { role: string; agentId?: string; name?: string }): MessageShell {
+  function computeShell(msg: {
+    role: string;
+    agentId?: string;
+    name?: string;
+  }): MessageShell {
     const empty = "";
     if (msg.role === "user") {
-      const userColor = avatarStore.getDominantColor("user", "user_avatar") || "rgb(226,54,56)";
+      const userColor =
+        avatarStore.getDominantColor("user", "user_avatar") || "rgb(226,54,56)";
       return {
         avatarColor: userColor,
         bubbleBorderColor: empty,
@@ -192,11 +212,14 @@ export const useChatStreamStore = defineStore("chatStream", () => {
   const isMessageStreamingInSession = (
     messageId: string,
     itemId?: string | null,
-    topicId?: string | null,
+    topicId?: string | null
   ) => {
-    if (!itemId || !topicId || !isMessageInActiveStream(messageId)) return false;
+    if (!itemId || !topicId || !isMessageInActiveStream(messageId))
+      return false;
     const context = activeStreamContexts[messageId];
-    return !!context && context.itemId === itemId && context.topicId === topicId;
+    return (
+      !!context && context.itemId === itemId && context.topicId === topicId
+    );
   };
 
   const isGroupGenerating = computed(() => {
@@ -216,7 +239,11 @@ export const useChatStreamStore = defineStore("chatStream", () => {
   const TERMINAL_TOMBSTONE_TTL_MS = 5 * 60 * 1000;
 
   const cleanupInactiveStreamMessage = (messageId: string) => {
-    if (isMessageInActiveStream(messageId) || sealedStreamMessageIds.has(messageId)) return;
+    if (
+      isMessageInActiveStream(messageId) ||
+      sealedStreamMessageIds.has(messageId)
+    )
+      return;
     activeStreamMessages.delete(messageId);
     delete activeStreamContexts[messageId];
     auroraActiveMessageIds.delete(messageId);
@@ -265,27 +292,32 @@ export const useChatStreamStore = defineStore("chatStream", () => {
   const addSessionStream = (
     ownerId: string,
     topicId: string,
-    messageId: string,
+    messageId: string
   ) => {
     const key = `${ownerId}:${topicId}`;
+    const streams = sessionActiveStreams.value[key] ?? [];
     if (!sessionActiveStreams.value[key]) {
-      sessionActiveStreams.value[key] = [];
+      sessionActiveStreams.value[key] = streams;
     }
-    if (!sessionActiveStreams.value[key].includes(messageId)) {
-      sessionActiveStreams.value[key].push(messageId);
-      if (!activeStreamRefCounts[messageId]) {
-        activeStreamRefCounts[messageId] = 0;
-      }
-      activeStreamContexts[messageId] = {
-        itemId: ownerId,
-        topicId,
-      };
-      if (activeStreamTotal.value === 0) {
-        acquireScreenKeep();
-      }
-      activeStreamRefCounts[messageId]++;
-      activeStreamTotal.value++;
+
+    if (streams.includes(messageId)) {
+      // 同一会话同一消息会收到 thinking/data/aurora 多类事件；只允许首次登记增加引用计数。
+      enforceStreamPoolLimit();
+      return;
     }
+
+    streams.push(messageId);
+    activeStreamRefCounts[messageId] =
+      (activeStreamRefCounts[messageId] || 0) + 1;
+    activeStreamContexts[messageId] = {
+      itemId: ownerId,
+      topicId,
+    };
+    if (activeStreamTotal.value === 0) {
+      acquireScreenKeep();
+    }
+    activeStreamTotal.value++;
+
     // 新增流时检查并执行上限保护
     enforceStreamPoolLimit();
   };
@@ -293,7 +325,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
   const removeSessionStream = (
     ownerId: string,
     topicId: string,
-    messageId: string,
+    messageId: string
   ) => {
     const key = `${ownerId}:${topicId}`;
     const streams = sessionActiveStreams.value[key];
@@ -327,11 +359,14 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     cleanupTimers.add(cleanupTimer);
   };
 
-  const blocksSignature = (blocks: Array<{ hash?: string; type?: string }> = []) =>
-    blocks.map((block) => block.hash || block.type || "").join("|");
+  const blocksSignature = (
+    blocks: Array<{ hash?: string; type?: string }> = []
+  ) => blocks.map((block) => block.hash || block.type || "").join("|");
 
-  const tailSignature = (tailBlock: { hash?: string; type?: string } | undefined, tail?: string) =>
-    tailBlock?.hash || `${tailBlock?.type || ""}:${tail || ""}`;
+  const tailSignature = (
+    tailBlock: { hash?: string; type?: string } | undefined,
+    tail?: string
+  ) => tailBlock?.hash || `${tailBlock?.type || ""}:${tail || ""}`;
 
   const getRAFUpdate = (messageId: string) => {
     let update = rAFPendingUpdates.get(messageId);
@@ -415,19 +450,22 @@ export const useChatStreamStore = defineStore("chatStream", () => {
   /**
    * 处理流式事件的核心逻辑 (会话隔离调度器)
    */
-  const processStreamEvent = async (event: any, callbacks?: {
-    onMessageCreated?: (msg: ChatMessage, topicId: string) => void;
-    onStreamFinished?: (messageId: string, topicId: string) => void;
-  }) => {
+  const processStreamEvent = async (
+    event: any,
+    callbacks?: {
+      onMessageCreated?: (msg: ChatMessage, topicId: string) => void;
+      onStreamFinished?: (messageId: string, topicId: string) => void;
+    }
+  ) => {
     const actualMessageId = event.messageId || event.message_id || "";
     const { chunk, type, context } = event;
     const ctx = context || {};
     const topicId = ctx.topicId;
     const isGroup = !!ctx.isGroupMessage || !!ctx.groupId;
-    const itemId = isGroup ? ctx.groupId : (ctx.agentId || ctx.ownerId);
- 
+    const itemId = isGroup ? ctx.groupId : ctx.agentId || ctx.ownerId;
+
     if (!actualMessageId || !topicId || !itemId) return;
- 
+
     const isTerminalEvent = type === "end" || type === "error";
     if (!isTerminalEvent && sealedStreamMessageIds.has(actualMessageId)) {
       return;
@@ -443,7 +481,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     let msg = activeStreamMessages.get(actualMessageId);
     if (isTerminalEvent && !msg) return;
     const isNewStream = !msg;
- 
+
     if (isNewStream) {
       auroraActiveMessageIds.delete(actualMessageId);
       streamBlockSignatures.delete(actualMessageId);
@@ -460,10 +498,14 @@ export const useChatStreamStore = defineStore("chatStream", () => {
         topicId,
         groupId: ctx.groupId,
         isGroupMessage: !!ctx.isGroupMessage,
-        shell: computeShell({ role: "assistant", agentId: ctx.agentId, name: ctx.agentName }),
+        shell: computeShell({
+          role: "assistant",
+          agentId: ctx.agentId,
+          name: ctx.agentName,
+        }),
       });
       activeStreamMessages.set(actualMessageId, msg!);
-      
+
       topicStore.incrementTopicMsgCount(topicId);
       if (topicId !== sessionStore.currentTopicId) {
         topicStore.incrementTopicUnreadCount(topicId);
@@ -490,9 +532,12 @@ export const useChatStreamStore = defineStore("chatStream", () => {
           groupId: ctx.groupId || null,
           topicId,
           isGroupMessage: isGroup,
-        }
-      }).catch(e => {
-        console.error("[ChatStreamStore] Failed to persist initial thinking skeleton:", e);
+        },
+      }).catch((e) => {
+        console.error(
+          "[ChatStreamStore] Failed to persist initial thinking skeleton:",
+          e
+        );
       });
     }
 
@@ -533,36 +578,41 @@ export const useChatStreamStore = defineStore("chatStream", () => {
           auroraPayload: {
             stableChanged: aurora.stableChanged,
             stableBlocksCount: aurora.stableBlocks?.length || 0,
-            stableBlocksHashes: aurora.stableBlocks?.map((b: any) => b.hash) || [],
+            stableBlocksHashes:
+              aurora.stableBlocks?.map((b: any) => b.hash) || [],
             tailChanged: aurora.tailChanged,
             tailContent: aurora.tail || "",
             tailBlockType: aurora.tailBlock?.type || null,
             contentDeltaLength: aurora.contentDelta?.length || 0,
-            tailFrame: aurora.tailFrame ? {
-              epoch: aurora.tailFrame.epoch,
-              revision: aurora.tailFrame.revision,
-              frameSeq: aurora.tailFrame.frameSeq,
-              reset: aurora.tailFrame.reset,
-              mutationsCount: aurora.tailFrame.mutations?.length || 0,
-              hasSnapshot: !!aurora.tailFrame.snapshot,
-            } : null,
+            tailFrame: aurora.tailFrame
+              ? {
+                  epoch: aurora.tailFrame.epoch,
+                  revision: aurora.tailFrame.revision,
+                  frameSeq: aurora.tailFrame.frameSeq,
+                  reset: aurora.tailFrame.reset,
+                  mutationsCount: aurora.tailFrame.mutations?.length || 0,
+                  hasSnapshot: !!aurora.tailFrame.snapshot,
+                }
+              : null,
           },
-          msgSnapshot: msg ? {
-            contentLength: msg.content?.length || 0,
-            blocksCount: msg.blocks?.length || 0,
-            tailContentLength: msg.tailContent?.length || 0,
-          } : null,
+          msgSnapshot: msg
+            ? {
+                contentLength: msg.content?.length || 0,
+                blocksCount: msg.blocks?.length || 0,
+                tailContentLength: msg.tailContent?.length || 0,
+              }
+            : null,
         });
 
         // 1. 初始化或获取该 messageId 的帧合并状态
         const update = getRAFUpdate(actualMessageId);
 
-
         // 2. 覆盖写入暂存数据（稀疏合并）
         if (typeof aurora.content === "string") {
           update.content = aurora.content;
         } else if (typeof aurora.contentDelta === "string") {
-          update.content = (update.content ?? msg!.content ?? "") + aurora.contentDelta;
+          update.content =
+            (update.content ?? msg!.content ?? "") + aurora.contentDelta;
         }
         if (aurora.stableChanged && aurora.stableBlocks) {
           const nextSignature = blocksSignature(aurora.stableBlocks);
@@ -572,7 +622,13 @@ export const useChatStreamStore = defineStore("chatStream", () => {
           }
         }
         if (aurora.tailFrame) {
-          streamDebugLog(`[chatStreamStore] Received tailFrame seq=${aurora.tailFrame.frameSeq} mutations=${aurora.tailFrame.mutations?.length || 0} for ${actualMessageId}`);
+          streamDebugLog(
+            `[chatStreamStore] Received tailFrame seq=${
+              aurora.tailFrame.frameSeq
+            } mutations=${
+              aurora.tailFrame.mutations?.length || 0
+            } for ${actualMessageId}`
+          );
           update.tailFrame = mergeTailFrame(update.tailFrame, aurora.tailFrame);
           if (aurora.tailFrame.snapshot) {
             update.tailSnapshot = aurora.tailFrame.snapshot as any[];
@@ -584,7 +640,10 @@ export const useChatStreamStore = defineStore("chatStream", () => {
         if (aurora.tailChanged) {
           const nextTail = aurora.tail || "";
           const nextTailBlock = (aurora.tailBlock as any) || null;
-          const nextTailSignature = tailSignature(nextTailBlock || undefined, nextTail);
+          const nextTailSignature = tailSignature(
+            nextTailBlock || undefined,
+            nextTail
+          );
           if (streamTailSignatures.get(actualMessageId) !== nextTailSignature) {
             update.tailContent = nextTail;
             update.tailBlock = nextTailBlock;
@@ -611,9 +670,15 @@ export const useChatStreamStore = defineStore("chatStream", () => {
       streamTailSignatures.delete(actualMessageId);
       if (finishReason) msg!.finishReason = finishReason;
 
-      if (streamingMessageId.value === actualMessageId) streamingMessageId.value = null;
+      if (streamingMessageId.value === actualMessageId)
+        streamingMessageId.value = null;
 
-      if (type === "error" && !hadError && errorMsg && errorMsg !== "请求已中止") {
+      if (
+        type === "error" &&
+        !hadError &&
+        errorMsg &&
+        errorMsg !== "请求已中止"
+      ) {
         const errorText = `\n\n> VCP流式错误: ${errorMsg}`;
         msg!.content += errorText;
         msg!.finishReason = "error";
@@ -650,7 +715,9 @@ export const useChatStreamStore = defineStore("chatStream", () => {
           // === 🚀 输出流式诊断提示与回放指南（开发模式生效，Release 构建时自动摇树切除） ===
           if (import.meta.env.DEV) {
             console.log(
-              `%c[VCP Stream Debugger] 🎉 流式传输结束！当前录制帧数: ${(window as any).__VCP_STREAM_TRACES__?.length || 0}`,
+              `%c[VCP Stream Debugger] 🎉 流式传输结束！当前录制帧数: ${
+                (window as any).__VCP_STREAM_TRACES__?.length || 0
+              }`,
               "color: #10b981; font-weight: bold; font-size: 13px;"
             );
             console.log(
@@ -663,7 +730,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
             );
           }
         }
-        
+
         if (callbacks?.onStreamFinished) {
           callbacks.onStreamFinished(actualMessageId, topicId);
         }
@@ -677,16 +744,19 @@ export const useChatStreamStore = defineStore("chatStream", () => {
   /**
    * 中止指定消息的生成
    */
-  const stopMessage = async (messageId: string, onUpdateMessage?: (msgId: string) => Promise<void>) => {
+  const stopMessage = async (
+    messageId: string,
+    onUpdateMessage?: (msgId: string) => Promise<void>
+  ) => {
     console.log(
-      `[ChatStreamStore] Sending interrupt signal for message: ${messageId}`,
+      `[ChatStreamStore] Sending interrupt signal for message: ${messageId}`
     );
     try {
       await invoke("interruptRequest", { messageId: messageId });
     } catch (e) {
       console.error(
         `[ChatStreamStore] Failed to interrupt stream for ${messageId}:`,
-        e,
+        e
       );
       return;
     }
@@ -726,13 +796,15 @@ export const useChatStreamStore = defineStore("chatStream", () => {
    * 强行中止整个群组的接力赛回合
    */
   const stopGroupTurn = async (topicId: string) => {
-    console.log(`[ChatStreamStore] Global Group Interruption for topic: ${topicId}`);
+    console.log(
+      `[ChatStreamStore] Global Group Interruption for topic: ${topicId}`
+    );
     try {
       await invoke("interruptGroupTurn", { topicId: topicId });
-      
+
       const activeIds = Array.from(activeStreamingIds.value);
       if (activeIds.length > 0) {
-        await Promise.all(activeIds.map(id => stopMessage(id)));
+        await Promise.all(activeIds.map((id) => stopMessage(id)));
       }
     } catch (e) {
       console.error("[ChatStreamStore] Failed to stop group turn:", e);

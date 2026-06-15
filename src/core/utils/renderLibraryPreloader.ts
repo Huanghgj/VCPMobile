@@ -19,7 +19,11 @@ export async function getKatexRenderer() {
 export async function getMermaidRenderer() {
   const mermaid = (await loadMermaidModule()).default;
   if (!mermaidInitialized) {
-    mermaid.initialize({ startOnLoad: false, theme: "dark" });
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: "dark",
+      securityLevel: "strict",
+    });
     mermaidInitialized = true;
   }
   return mermaid;

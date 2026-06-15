@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, watch, nextTick } from "vue";
-import { marked } from "marked";
 import type { ChatMessage } from "../../core/types/chat";
+import { renderSafeMarkdown } from "../../core/utils/safeMarkdown";
 
 const props = defineProps<{
   message: ChatMessage;
@@ -10,28 +10,8 @@ const props = defineProps<{
 const contentRef = ref<HTMLElement | null>(null);
 const renderedHtml = ref("");
 
-// Configure marked
-marked.setOptions({
-  breaks: true,
-  gfm: true,
-});
-
 function renderMarkdown(text: string): string {
-  if (!text) return "";
-  try {
-    return marked.parse(text) as string;
-  } catch {
-    return escapeHtml(text);
-  }
-}
-
-function escapeHtml(text: string): string {
-  return text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
+  return renderSafeMarkdown(text);
 }
 
 // Watch content changes and re-render
@@ -119,7 +99,8 @@ watch(renderedHtml, async () => {
       <pre
         v-else-if="message.content"
         class="font-sans whitespace-pre-wrap break-all m-0 select-text"
-      >{{ message.content }}</pre>
+        >{{ message.content }}</pre
+      >
     </div>
 
     <!-- Timestamp -->
@@ -127,12 +108,14 @@ watch(renderedHtml, async () => {
       class="text-[9px] mt-1.5 px-1 opacity-40 font-mono tracking-tighter w-full"
       :class="message.role === 'user' ? 'text-right' : 'text-left'"
     >
-      {{ new Date(message.timestamp).toLocaleString("zh-CN", {
-        month: "2-digit",
-        day: "2-digit",
-        hour: "2-digit",
-        minute: "2-digit",
-      }) }}
+      {{
+        new Date(message.timestamp).toLocaleString("zh-CN", {
+          month: "2-digit",
+          day: "2-digit",
+          hour: "2-digit",
+          minute: "2-digit",
+        })
+      }}
     </div>
   </div>
 </template>

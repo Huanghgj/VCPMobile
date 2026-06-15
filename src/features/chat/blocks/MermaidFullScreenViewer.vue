@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { ref, watch, onUnmounted } from 'vue';
-import { useModalHistory } from '../../../core/composables/useModalHistory';
-import { useNotificationStore } from '../../../core/stores/notification';
-import { useThemeStore } from '../../../core/stores/theme';
-import { saveImageToGallery } from 'tauri-plugin-vcp-mobile';
+import { computed, ref, watch, onUnmounted } from "vue";
+import DOMPurify from "dompurify";
+import { useModalHistory } from "../../../core/composables/useModalHistory";
+import { useNotificationStore } from "../../../core/stores/notification";
+import { useThemeStore } from "../../../core/stores/theme";
+import { saveImageToGallery } from "tauri-plugin-vcp-mobile";
 
 const props = defineProps<{
   visible: boolean;
@@ -12,13 +13,24 @@ const props = defineProps<{
 }>();
 
 const emit = defineEmits<{
-  (e: 'close'): void;
+  (e: "close"): void;
 }>();
 
 const themeStore = useThemeStore();
 const notificationStore = useNotificationStore();
 
-const modalId = `MermaidFullScreen_${Math.random().toString(36).substring(2, 9)}`;
+const sanitizedSvgHtml = computed(() =>
+  DOMPurify.sanitize(props.svgHtml, {
+    USE_PROFILES: { svg: true, svgFilters: true },
+    FORBID_TAGS: ["script", "foreignObject"],
+    FORBID_ATTR: ["srcdoc"],
+    ALLOW_UNKNOWN_PROTOCOLS: false,
+  })
+);
+
+const modalId = `MermaidFullScreen_${Math.random()
+  .toString(36)
+  .substring(2, 9)}`;
 const { registerModal, unregisterModal } = useModalHistory();
 
 // Transform States
@@ -41,27 +53,30 @@ const closeCopyDropdown = () => {
   isCopyDropdownVisible.value = false;
 };
 
-watch(() => props.visible, (newVal) => {
-  if (newVal) {
-    registerModal(modalId, () => {
-      emit('close');
-    });
-    // Reset transform on open to default 100% size
-    scale.value = 1;
-    translateX.value = 0;
-    translateY.value = 0;
+watch(
+  () => props.visible,
+  (newVal) => {
+    if (newVal) {
+      registerModal(modalId, () => {
+        emit("close");
+      });
+      // Reset transform on open to default 100% size
+      scale.value = 1;
+      translateX.value = 0;
+      translateY.value = 0;
 
-    window.addEventListener('click', closeCopyDropdown);
-  } else {
-    unregisterModal(modalId);
-    window.removeEventListener('click', closeCopyDropdown);
-    isCopyDropdownVisible.value = false;
+      window.addEventListener("click", closeCopyDropdown);
+    } else {
+      unregisterModal(modalId);
+      window.removeEventListener("click", closeCopyDropdown);
+      isCopyDropdownVisible.value = false;
+    }
   }
-});
+);
 
 onUnmounted(() => {
   unregisterModal(modalId);
-  window.removeEventListener('click', closeCopyDropdown);
+  window.removeEventListener("click", closeCopyDropdown);
 });
 
 // Operations
@@ -81,10 +96,14 @@ const resetView = () => {
 
 const fitToWidth = () => {
   if (!fullscreenCanvasRef.value || !fullscreenViewportRef.value) return;
-  const svg = fullscreenCanvasRef.value.querySelector('svg');
+  const svg = fullscreenCanvasRef.value.querySelector("svg");
   if (!svg) return;
 
-  const svgWidth = svg.getBBox?.().width || svg.viewBox?.baseVal?.width || svg.clientWidth || svg.getBoundingClientRect().width;
+  const svgWidth =
+    svg.getBBox?.().width ||
+    svg.viewBox?.baseVal?.width ||
+    svg.clientWidth ||
+    svg.getBoundingClientRect().width;
 
   const viewWidth = fullscreenViewportRef.value.clientWidth - 48; // 24px padding on each side
 
@@ -199,14 +218,14 @@ const copySource = async () => {
   try {
     await navigator.clipboard.writeText(props.sourceCode);
     notificationStore.addNotification({
-      type: 'success',
-      title: '复制成功',
-      message: 'Mermaid 源码已成功复制到剪贴板',
-      toastOnly: true
+      type: "success",
+      title: "复制成功",
+      message: "Mermaid 源码已成功复制到剪贴板",
+      toastOnly: true,
     });
     isCopyDropdownVisible.value = false;
   } catch (err) {
-    console.error('Copy source failed', err);
+    console.error("Copy source failed", err);
   }
 };
 
@@ -214,77 +233,91 @@ const copySvg = async () => {
   try {
     await navigator.clipboard.writeText(props.svgHtml);
     notificationStore.addNotification({
-      type: 'success',
-      title: '复制成功',
-      message: 'SVG 代码已成功复制到剪贴板',
-      toastOnly: true
+      type: "success",
+      title: "复制成功",
+      message: "SVG 代码已成功复制到剪贴板",
+      toastOnly: true,
     });
     isCopyDropdownVisible.value = false;
   } catch (err) {
-    console.error('Copy SVG failed', err);
+    console.error("Copy SVG failed", err);
   }
 };
 
-
 const exportToGallery = () => {
   if (!fullscreenCanvasRef.value) return;
-  const svg = fullscreenCanvasRef.value.querySelector('svg');
+  const svg = fullscreenCanvasRef.value.querySelector("svg");
   if (!svg) return;
 
   const clonedSvg = svg.cloneNode(true) as SVGElement;
-  clonedSvg.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+  clonedSvg.setAttribute("xmlns", "http://www.w3.org/2000/svg");
 
-  const svgWidth = svg.getBBox?.().width || svg.viewBox?.baseVal?.width || svg.clientWidth || 600;
-  const svgHeight = svg.getBBox?.().height || svg.viewBox?.baseVal?.height || svg.clientHeight || 400;
+  const svgWidth =
+    svg.getBBox?.().width ||
+    svg.viewBox?.baseVal?.width ||
+    svg.clientWidth ||
+    600;
+  const svgHeight =
+    svg.getBBox?.().height ||
+    svg.viewBox?.baseVal?.height ||
+    svg.clientHeight ||
+    400;
 
-  clonedSvg.setAttribute('width', String(svgWidth));
-  clonedSvg.setAttribute('height', String(svgHeight));
+  clonedSvg.setAttribute("width", String(svgWidth));
+  clonedSvg.setAttribute("height", String(svgHeight));
 
   const svgString = new XMLSerializer().serializeToString(clonedSvg);
-  const svgBlob = new Blob([svgString], { type: 'image/svg+xml;charset=utf-8' });
+  const svgBlob = new Blob([svgString], {
+    type: "image/svg+xml;charset=utf-8",
+  });
   const url = URL.createObjectURL(svgBlob);
 
   const img = new Image();
   img.onload = () => {
-    const canvas = document.createElement('canvas');
-    const scaleFactor = Math.min(2.5, Math.max(1.0, 2048 / Math.max(svgWidth, svgHeight)));
+    const canvas = document.createElement("canvas");
+    const scaleFactor = Math.min(
+      2.5,
+      Math.max(1.0, 2048 / Math.max(svgWidth, svgHeight))
+    );
 
     canvas.width = svgWidth * scaleFactor;
     canvas.height = svgHeight * scaleFactor;
 
-    const ctx = canvas.getContext('2d');
+    const ctx = canvas.getContext("2d");
     if (ctx) {
-      ctx.fillStyle = themeStore.isDarkResolved ? '#0d1117' : '#ffffff';
+      ctx.fillStyle = themeStore.isDarkResolved ? "#0d1117" : "#ffffff";
       ctx.fillRect(0, 0, canvas.width, canvas.height);
       ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
 
       try {
-        const dataUrl = canvas.toDataURL('image/png');
-        saveImageToGallery(dataUrl, `mermaid_${Date.now()}.png`).then(() => {
-          notificationStore.addNotification({
-            type: 'success',
-            title: '保存成功',
-            message: '图表已作为高清 PNG 图片保存到系统相册',
-            toastOnly: true
+        const dataUrl = canvas.toDataURL("image/png");
+        saveImageToGallery(dataUrl, `mermaid_${Date.now()}.png`)
+          .then(() => {
+            notificationStore.addNotification({
+              type: "success",
+              title: "保存成功",
+              message: "图表已作为高清 PNG 图片保存到系统相册",
+              toastOnly: true,
+            });
+          })
+          .catch((err) => {
+            console.error("Save image to gallery failed:", err);
+            notificationStore.addNotification({
+              type: "error",
+              title: "保存失败",
+              message: "保存失败：" + String(err),
+              toastOnly: true,
+            });
           });
-        }).catch((err) => {
-          console.error('Save image to gallery failed:', err);
-          notificationStore.addNotification({
-            type: 'error',
-            title: '保存失败',
-            message: '保存失败：' + String(err),
-            toastOnly: true
-          });
-        });
       } catch (err) {
-        console.error('Canvas serialization failed:', err);
+        console.error("Canvas serialization failed:", err);
       }
     }
     URL.revokeObjectURL(url);
   };
 
   img.onerror = (e) => {
-    console.error('Image load failed', e);
+    console.error("Image load failed", e);
     URL.revokeObjectURL(url);
   };
 
@@ -302,15 +335,35 @@ const exportToGallery = () => {
       leave-from-class="translate-y-0 opacity-100"
       leave-to-class="translate-y-10 opacity-0"
     >
-      <div v-if="visible" class="fixed inset-0 z-viewer flex flex-col select-none overflow-hidden pb-[env(safe-area-inset-bottom)]"
-        :class="themeStore.isDarkResolved ? 'bg-[#0d1117] text-gray-200' : 'bg-[#f8fafc] text-gray-800'">
-
+      <div
+        v-if="visible"
+        class="fixed inset-0 z-viewer flex flex-col select-none overflow-hidden pb-[env(safe-area-inset-bottom)]"
+        :class="
+          themeStore.isDarkResolved
+            ? 'bg-[#0d1117] text-gray-200'
+            : 'bg-[#f8fafc] text-gray-800'
+        "
+      >
         <!-- Header -->
-        <div class="h-14 flex items-center justify-between px-4 border-b pt-[env(safe-area-inset-top)] box-content"
-          :class="themeStore.isDarkResolved ? 'border-white/5 bg-[#0d1117]' : 'border-black/5 bg-[#f8fafc]'">
+        <div
+          class="h-14 flex items-center justify-between px-4 border-b pt-[env(safe-area-inset-top)] box-content"
+          :class="
+            themeStore.isDarkResolved
+              ? 'border-white/5 bg-[#0d1117]'
+              : 'border-black/5 bg-[#f8fafc]'
+          "
+        >
           <div class="flex items-center gap-3">
-            <button @click="emit('close')" class="p-2 -ml-2 active:scale-95 transition-transform">
-              <div class="i-ph:caret-left-bold w-5 h-5" :class="themeStore.isDarkResolved ? 'text-gray-400' : 'text-gray-600'"></div>
+            <button
+              @click="emit('close')"
+              class="p-2 -ml-2 active:scale-95 transition-transform"
+            >
+              <div
+                class="i-ph:caret-left-bold w-5 h-5"
+                :class="
+                  themeStore.isDarkResolved ? 'text-gray-400' : 'text-gray-600'
+                "
+              ></div>
             </button>
             <span class="text-sm font-bold">图表预览</span>
           </div>
@@ -318,25 +371,47 @@ const exportToGallery = () => {
           <div class="flex items-center gap-2">
             <!-- 复制二级下拉菜单容器 -->
             <div class="relative">
-              <button @click="toggleCopyDropdown" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs active:scale-95 transition-all"
-                :class="themeStore.isDarkResolved ? 'border-white/10 bg-white/5 text-gray-400' : 'border-black/10 bg-black/5 text-gray-600'">
+              <button
+                @click="toggleCopyDropdown"
+                class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs active:scale-95 transition-all"
+                :class="
+                  themeStore.isDarkResolved
+                    ? 'border-white/10 bg-white/5 text-gray-400'
+                    : 'border-black/10 bg-black/5 text-gray-600'
+                "
+              >
                 <div class="i-ph:copy-bold w-3.5 h-3.5"></div>
                 <span>复制</span>
                 <div class="i-ph:caret-down-bold w-3 h-3 opacity-60"></div>
               </button>
 
               <!-- 下拉菜单 (Dropdown) -->
-              <div v-if="isCopyDropdownVisible"
+              <div
+                v-if="isCopyDropdownVisible"
                 class="absolute right-0 mt-1.5 w-36 rounded-lg border shadow-lg z-30 py-1"
-                :class="themeStore.isDarkResolved ? 'border-white/10 bg-[#1e293b] text-gray-200' : 'border-black/10 bg-white text-gray-800'"
+                :class="
+                  themeStore.isDarkResolved
+                    ? 'border-white/10 bg-[#1e293b] text-gray-200'
+                    : 'border-black/10 bg-white text-gray-800'
+                "
                 @click.stop
               >
-                <button @click="copySource" class="w-full text-left px-3 py-2 text-xs hover:bg-black/5 dark:hover:bg-white/5 flex items-center gap-2">
+                <button
+                  @click="copySource"
+                  class="w-full text-left px-3 py-2 text-xs hover:bg-black/5 dark:hover:bg-white/5 flex items-center gap-2"
+                >
                   <div class="i-ph:code-bold w-3.5 h-3.5 opacity-70"></div>
                   <span>复制代码</span>
                 </button>
-                <button @click="copySvg" class="w-full text-left px-3 py-2 text-xs hover:bg-black/5 dark:hover:bg-white/5 flex items-center gap-2 border-t"
-                  :class="themeStore.isDarkResolved ? 'border-white/5' : 'border-black/5'">
+                <button
+                  @click="copySvg"
+                  class="w-full text-left px-3 py-2 text-xs hover:bg-black/5 dark:hover:bg-white/5 flex items-center gap-2 border-t"
+                  :class="
+                    themeStore.isDarkResolved
+                      ? 'border-white/5'
+                      : 'border-black/5'
+                  "
+                >
                   <div class="i-ph:file-code-bold w-3.5 h-3.5 opacity-70"></div>
                   <span>复制 SVG 代码</span>
                 </button>
@@ -344,8 +419,15 @@ const exportToGallery = () => {
             </div>
 
             <!-- 保存到相册按钮（改用下载图标，文字按钮样式） -->
-            <button @click="exportToGallery" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs active:scale-95 transition-all"
-              :class="themeStore.isDarkResolved ? 'border-white/10 bg-white/5 text-gray-400' : 'border-black/10 bg-black/5 text-gray-600'">
+            <button
+              @click="exportToGallery"
+              class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs active:scale-95 transition-all"
+              :class="
+                themeStore.isDarkResolved
+                  ? 'border-white/10 bg-white/5 text-gray-400'
+                  : 'border-black/10 bg-black/5 text-gray-600'
+              "
+            >
               <div class="i-ph:download-simple-bold w-3.5 h-3.5"></div>
               <span>保存到相册</span>
             </button>
@@ -360,7 +442,7 @@ const exportToGallery = () => {
             backgroundImage: themeStore.isDarkResolved
               ? 'radial-gradient(rgba(255, 255, 255, 0.08) 1px, transparent 1px)'
               : 'radial-gradient(rgba(0, 0, 0, 0.06) 1px, transparent 1px)',
-            backgroundSize: '20px 20px'
+            backgroundSize: '20px 20px',
           }"
           @pointerdown="handlePointerDown"
           @pointermove="handlePointerMove"
@@ -374,34 +456,55 @@ const exportToGallery = () => {
             class="inline-flex items-center justify-center min-w-full min-h-full p-8 box-border origin-center"
             :style="{
               transform: `translate(${translateX}px, ${translateY}px) scale(${scale})`,
-              transition: isDragging ? 'none' : 'transform 0.1s ease-out'
+              transition: isDragging ? 'none' : 'transform 0.1s ease-out',
             }"
-            v-html="svgHtml"
+            v-html="sanitizedSvgHtml"
           ></div>
         </div>
 
         <!-- Floating Control Bar (No Backdrop Blur, Solid background) -->
-        <div class="absolute bottom-6 left-1/2 -translate-x-1/2 flex items-center gap-1 px-3 py-2 rounded-xl border shadow-xl z-20"
-          :class="themeStore.isDarkResolved
-            ? 'border-white/10 bg-[#1e293b] text-gray-200'
-            : 'border-black/10 bg-white text-gray-800'">
-
-          <button @click="zoomOut" class="p-2 active:scale-90 transition-all hover:opacity-80" title="缩小">
+        <div
+          class="absolute bottom-6 left-1/2 -translate-x-1/2 flex items-center gap-1 px-3 py-2 rounded-xl border shadow-xl z-20"
+          :class="
+            themeStore.isDarkResolved
+              ? 'border-white/10 bg-[#1e293b] text-gray-200'
+              : 'border-black/10 bg-white text-gray-800'
+          "
+        >
+          <button
+            @click="zoomOut"
+            class="p-2 active:scale-90 transition-all hover:opacity-80"
+            title="缩小"
+          >
             <div class="i-ph:minus-bold w-4.5 h-4.5"></div>
           </button>
 
-          <button @click="resetView" class="px-2.5 py-1 text-xs font-semibold font-mono rounded-lg active:bg-black/5 dark:active:bg-white/5 transition-all hover:opacity-80" title="重置 100%">
+          <button
+            @click="resetView"
+            class="px-2.5 py-1 text-xs font-semibold font-mono rounded-lg active:bg-black/5 dark:active:bg-white/5 transition-all hover:opacity-80"
+            title="重置 100%"
+          >
             {{ Math.round(scale * 100) }}%
           </button>
 
-          <button @click="zoomIn" class="p-2 active:scale-90 transition-all hover:opacity-80" title="放大">
+          <button
+            @click="zoomIn"
+            class="p-2 active:scale-90 transition-all hover:opacity-80"
+            title="放大"
+          >
             <div class="i-ph:plus-bold w-4.5 h-4.5"></div>
           </button>
 
-          <div class="w-[1px] h-4 mx-1"
-            :class="themeStore.isDarkResolved ? 'bg-white/15' : 'bg-black/15'"></div>
+          <div
+            class="w-[1px] h-4 mx-1"
+            :class="themeStore.isDarkResolved ? 'bg-white/15' : 'bg-black/15'"
+          ></div>
 
-          <button @click="fitToWidth" class="p-2 active:scale-90 transition-all hover:opacity-80" title="适应屏幕">
+          <button
+            @click="fitToWidth"
+            class="p-2 active:scale-90 transition-all hover:opacity-80"
+            title="适应屏幕"
+          >
             <div class="i-ph:arrows-in-line-horizontal-bold w-4.5 h-4.5"></div>
           </button>
         </div>

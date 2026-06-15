@@ -278,23 +278,79 @@ impl StreamBlockParser {
     /// 流结束：强制处理剩余 tail 为最后一个 Markdown 块
     pub fn finalize(&mut self, full_text: &str) -> Vec<StreamBlock> {
         let (mut blocks, tail) = self.process(full_text);
+        if let Some(block) = Self::build_incomplete_tail_block(&tail) {
+            blocks.push(block);
+        }
+        blocks
+    }
+
+    /// 将未闭合的流式尾部构造成可渲染的最终语义块。
+    pub fn build_incomplete_tail_block(tail: &str) -> Option<StreamBlock> {
         let trimmed = tail.trim();
-        if !trimmed.is_empty() {
-            let nodes = if crate::vcp_modules::content_parser::is_html_tag_block(trimmed) {
-                vec![crate::vcp_modules::pre_renderer::MarkdownNode::raw_html(
-                    trimmed.to_string(),
-                )]
-            } else {
-                crate::vcp_modules::pre_renderer::parse_markdown_to_ast(trimmed)
-            };
-            let hash = HashAggregator::compute_content_hash(trimmed);
-            blocks.push(StreamBlock::markdown(
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        if let Some(block) = Self::build_incomplete_semantic_tail_block(trimmed) {
+            return Some(block);
+        }
+
+        let nodes = if crate::vcp_modules::content_parser::is_html_tag_block(trimmed) {
+            vec![crate::vcp_modules::pre_renderer::MarkdownNode::raw_html(
                 trimmed.to_string(),
+            )]
+        } else {
+            crate::vcp_modules::pre_renderer::parse_markdown_to_ast(trimmed)
+        };
+        let hash = HashAggregator::compute_content_hash(trimmed);
+        Some(StreamBlock::markdown(
+            trimmed.to_string(),
+            Some(nodes),
+            hash,
+        ))
+    }
+
+    /// 将未闭合的流式尾部构造成临时语义块；普通 Markdown 由调用方按性能预算处理。
+    pub fn build_incomplete_semantic_tail_block(tail: &str) -> Option<StreamBlock> {
+        let trimmed = tail.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        if let Some(caps) = THINK_START.captures(trimmed) {
+            let marker = caps.get(0)?;
+            let content = trimmed[marker.end()..].trim().to_string();
+            let nodes = crate::vcp_modules::pre_renderer::parse_markdown_to_ast(&content);
+            let hash = HashAggregator::compute_content_hash(&format!("think:{}", content));
+            return Some(StreamBlock::thought(
+                "思考过程".to_string(),
+                content,
+                false,
                 Some(nodes),
                 hash,
             ));
         }
-        blocks
+
+        if let Some(caps) = THOUGHT_START.captures(trimmed) {
+            let marker = caps.get(0)?;
+            let theme = caps
+                .get(1)
+                .map(|m| m.as_str().trim().replace("\"", ""))
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "元思考链".to_string());
+            let content = trimmed[marker.end()..].trim().to_string();
+            let nodes = crate::vcp_modules::pre_renderer::parse_markdown_to_ast(&content);
+            let hash = HashAggregator::compute_content_hash(&format!("{}:{}", theme, content));
+            return Some(StreamBlock::thought(
+                theme,
+                content,
+                false,
+                Some(nodes),
+                hash,
+            ));
+        }
+
+        None
     }
 
     /// 重置解析器状态（用于新消息）
@@ -729,12 +785,32 @@ fn parse_tool_result(content: &str) -> (String, String, Vec<ToolResultDetail>, S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use std::path::PathBuf;
+
+    fn load_tail_test_document() -> String {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let candidates = [
+            manifest_dir.join("../scripts/tail-test/测试文档.txt"),
+            manifest_dir.join("scripts/tail-test/测试文档.txt"),
+        ];
+
+        for path in candidates {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                return text;
+            }
+        }
+
+        [
+            "### 维度一：普通段落\n\n这是一份内置的确定性流式解析测试样本，用于在外部 fixture 缺失时保持测试可运行。\n\n",
+            "### 维度二：代码高亮\n\n测试 HTML fenced code block 的沉淀行为：\n\n```html\n<div class=\"preview\">\n  <p>Hello from fallback fixture</p>\n</div>\n```\n\n",
+            "### 维度三：结尾段落\n\n继续追加普通 Markdown，确保 finalize 能产出稳定块。\n\n",
+        ]
+        .join("")
+    }
 
     #[test]
     fn test_code_block_precipitation_failure() {
-        let file_path = "g:\\VCPMobile\\scripts\\tail-test\\测试文档.txt";
-        let mut text = fs::read_to_string(file_path).expect("Failed to read test document");
+        let mut text = load_tail_test_document();
 
         // 兼容处理：如果是转义过的 JSON Payload，使用 serde_json 进行 unescape
         if text.contains("\\n") || text.contains("\\\"") {

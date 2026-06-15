@@ -24,7 +24,13 @@ type ScrollScene = "initial" | "following" | "free" | "loading-top";
  * 改用 scroll 事件精确几何检测 + MutationObserver 双重 RAF 确保布局稳定后操作。
  */
 export function useChatScroll(options: UseChatScrollOptions) {
-  const { messageListRef, messageCount, hasMoreHistory, isLoadingHistory, onLoadMore } = options;
+  const {
+    messageListRef,
+    messageCount,
+    hasMoreHistory,
+    isLoadingHistory,
+    onLoadMore,
+  } = options;
 
   const showScrollToBottom = ref(false);
   const scrollScene = ref<ScrollScene>("initial");
@@ -50,16 +56,29 @@ export function useChatScroll(options: UseChatScrollOptions) {
   };
 
   // --- 锚定元素 ---
+  const findMessageElementById = (
+    list: HTMLElement,
+    messageId: string
+  ): HTMLElement | null => {
+    const messages = list.querySelectorAll<HTMLElement>("[data-message-id]");
+    return (
+      Array.from(messages).find((el) => el.dataset.messageId === messageId) ??
+      null
+    );
+  };
+
   const prepareLoadAnchor = () => {
     const list = messageListRef.value;
     if (!list) return;
-    const messages = list.querySelectorAll("[data-message-id]");
+    const messages = list.querySelectorAll<HTMLElement>("[data-message-id]");
     const listRect = list.getBoundingClientRect();
     for (const el of Array.from(messages)) {
       const rect = el.getBoundingClientRect();
       if (rect.top >= listRect.top) {
+        const messageId = el.dataset.messageId;
+        if (!messageId) continue;
         loadAnchor = {
-          messageId: el.getAttribute("data-message-id")!,
+          messageId,
           offsetFromTop: rect.top - listRect.top,
         };
         break;
@@ -68,10 +87,11 @@ export function useChatScroll(options: UseChatScrollOptions) {
   };
 
   const restoreScrollByAnchor = () => {
-    if (!loadAnchor || !messageListRef.value) return;
-    const el = messageListRef.value.querySelector(`[data-message-id="${loadAnchor.messageId}"]`);
+    const list = messageListRef.value;
+    if (!loadAnchor || !list) return;
+    const el = findMessageElementById(list, loadAnchor.messageId);
     if (el) {
-      messageListRef.value.scrollTop = (el as HTMLElement).offsetTop - loadAnchor.offsetFromTop;
+      list.scrollTop = el.offsetTop - loadAnchor.offsetFromTop;
     }
     loadAnchor = null;
   };
@@ -90,7 +110,9 @@ export function useChatScroll(options: UseChatScrollOptions) {
       hasMoreHistory.value &&
       !isLoadingHistory.value
     ) {
-      console.log(`[useChatScroll] Auto loading more because height (${list.scrollHeight}) <= clientHeight (${list.clientHeight}) + 10`);
+      console.log(
+        `[useChatScroll] Auto loading more because height (${list.scrollHeight}) <= clientHeight (${list.clientHeight}) + 10`
+      );
       prepareLoadAnchor();
       scrollScene.value = "loading-top";
       onLoadMore();
@@ -171,7 +193,10 @@ export function useChatScroll(options: UseChatScrollOptions) {
 
     resizeObserver = new ResizeObserver(() => {
       // 🌟 流式跟随状态下，或正在加载历史消息时，必须同步处理滚动，以防止 DOM 重排和滚动条设置跨帧引发的上下跳变。
-      if (scrollScene.value === "following" || scrollScene.value === "loading-top") {
+      if (
+        scrollScene.value === "following" ||
+        scrollScene.value === "loading-top"
+      ) {
         if (scrollRafId) {
           cancelAnimationFrame(scrollRafId);
           scrollRafId = null;
@@ -217,7 +242,8 @@ export function useChatScroll(options: UseChatScrollOptions) {
       }
 
       const nearTop = list.scrollTop < 100;
-      const nearBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 150;
+      const nearBottom =
+        list.scrollHeight - list.scrollTop - list.clientHeight < 150;
 
       // 更新底部按钮显隐
       showScrollToBottom.value = !nearBottom;
@@ -260,7 +286,10 @@ export function useChatScroll(options: UseChatScrollOptions) {
     if (loading) return;
 
     // 首屏加载完成兜底 或 分页加载完成兜底
-    if (scrollScene.value === "initial" || (scrollScene.value === "loading-top" && loadAnchor)) {
+    if (
+      scrollScene.value === "initial" ||
+      (scrollScene.value === "loading-top" && loadAnchor)
+    ) {
       await nextTick();
       requestAnimationFrame(() => {
         requestAnimationFrame(() => {

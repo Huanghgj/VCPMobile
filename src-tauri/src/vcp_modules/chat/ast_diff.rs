@@ -402,6 +402,7 @@ fn diff_text_node(id: &str, old_value: &str, new_value: &str, mutations: &mut Ve
 mod tests {
     use super::*;
     use crate::vcp_modules::aurora_pipeline::AuroraBuffer;
+    use std::path::PathBuf;
 
     struct SimpleRng {
         state: u32,
@@ -416,6 +417,29 @@ mod tests {
             let val = (self.state / 65536) % 32768;
             min + (val as usize) % (max - min + 1)
         }
+    }
+
+    fn load_agent_stream_fixture() -> String {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let candidates = [
+            manifest_dir.join("../scripts/tail-test/测试文档.txt"),
+            manifest_dir.join("scripts/tail-test/测试文档.txt"),
+        ];
+
+        for path in candidates {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                return text;
+            }
+        }
+
+        (0..240)
+            .map(|idx| {
+                format!(
+                    "### 测试章节 {idx}\n\n这是一段用于模拟真实 Agent 流式输出的确定性样本文本，包含中文、Markdown 结构和足够的长度。\n\n- 要点 A：保持 tail diff 持续增长。\n- 要点 B：验证序列化路径不会 panic。\n\n```rust\nfn sample_{idx}() {{\n    println!(\"chunk {idx}\");\n}}\n```\n\n"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
     }
 
     #[test]
@@ -468,12 +492,7 @@ mod tests {
 
     #[test]
     fn test_real_agent_stream_simulation() {
-        // 读取真实的 9.8KB Agent 输出样张文档
-        let text =
-            std::fs::read_to_string("../scripts/tail-test/测试文档.txt").unwrap_or_else(|_| {
-                std::fs::read_to_string("scripts/tail-test/测试文档.txt")
-                    .expect("Failed to find or read 测试文档.txt in scripts/tail-test")
-            });
+        let text = load_agent_stream_fixture();
 
         let mut rng = SimpleRng::new(42); // 固定 seed 保证测试具有确定的可复现性
         let mut buffer = AuroraBuffer::new();
