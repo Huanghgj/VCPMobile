@@ -32,6 +32,20 @@ fn repair_assistant_render_content_before_persist(message: &mut ChatMessage) {
     }
 }
 
+fn compute_message_hash_from_content(content: &str, attachments: Option<&[Attachment]>) -> String {
+    let attachment_hashes: Vec<String> = attachments
+        .map(|atts| {
+            atts.iter()
+                .filter_map(|att| att.hash.as_deref())
+                .filter(|hash| !hash.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    HashAggregator::compute_message_fingerprint(content, &attachment_hashes)
+}
+
 /// Writes a lightweight assistant placeholder for an active stream.
 ///
 /// This intentionally skips render_cache and attachment cleanup. The final stream
@@ -135,7 +149,7 @@ pub async fn load_multi_topic_messages(
 
     let placeholders = topic_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
     let query_str = format!(
-        "SELECT m.msg_id, m.role, m.name, m.agent_id, m.content, m.timestamp, m.is_group_message, m.group_id, m.finish_reason, r.render_content, m.topic_id, m.content_hash
+        "SELECT m.msg_id, m.role, m.name, m.agent_id, m.content, m.timestamp, m.is_group_message, m.group_id, m.finish_reason, r.render_content, r.content_hash AS render_content_hash, m.topic_id, m.content_hash
          FROM messages m
          LEFT JOIN render_cache r ON m.topic_id = r.topic_id AND m.msg_id = r.msg_id
          WHERE m.topic_id IN ({}) AND m.deleted_at IS NULL
@@ -155,7 +169,7 @@ pub async fn load_multi_topic_messages(
         let topic_id: String = row.get("topic_id");
         let timestamp: i64 = row.get("timestamp");
         let render_content: Option<Vec<u8>> = row.get("render_content");
-        let blocks = parse_render_bytes(render_content);
+        let render_content_hash: Option<String> = row.get("render_content_hash");
 
         let content_bytes: Vec<u8> = row.get("content");
         let content = ContentCompressor::decompress(&content_bytes).unwrap_or_default();
@@ -164,6 +178,17 @@ pub async fn load_multi_topic_messages(
             None
         } else {
             Some(content_hash_raw)
+        };
+        let blocks = match (&render_content, &render_content_hash, &content_hash) {
+            (Some(bytes), Some(render_hash), Some(message_hash))
+                if !render_hash.is_empty() && render_hash == message_hash =>
+            {
+                parse_render_bytes(Some(bytes.clone()))
+            }
+            _ if !content.is_empty() => {
+                serde_json::to_value(MessageRenderCompiler::compile(&content)).ok()
+            }
+            _ => None,
         };
 
         let message = crate::vcp_modules::chat_manager::ChatMessage {
@@ -243,10 +268,22 @@ pub async fn load_multi_topic_messages(
             // 回填附件到消息
             for (tid, msgs) in result.iter_mut() {
                 for msg in msgs.iter_mut() {
-                    if let Some(atts) = att_map.remove(&(tid.clone(), msg.id.clone())) {
+                    let attachments = att_map.remove(&(tid.clone(), msg.id.clone()));
+                    if let Some(atts) = attachments {
                         msg.attachments = Some(atts);
                     }
                 }
+            }
+        }
+    }
+
+    for msgs in result.values_mut() {
+        for msg in msgs {
+            if msg.content_hash.is_none() {
+                msg.content_hash = Some(compute_message_hash_from_content(
+                    &msg.content,
+                    msg.attachments.as_deref(),
+                ));
             }
         }
     }
@@ -272,7 +309,7 @@ pub async fn load_chat_history_internal(
     let offset = offset.unwrap_or(0);
 
     let render_select = if include_ui_render_data {
-        ", r.render_content"
+        ", r.render_content, r.content_hash AS render_content_hash"
     } else {
         ""
     };
@@ -449,8 +486,35 @@ pub async fn load_chat_history_internal(
         } else {
             None
         };
+        let render_content_hash: Option<String> = if include_ui_render_data {
+            row.get("render_content_hash")
+        } else {
+            None
+        };
+        let content_hash_raw: String = row.get("content_hash");
+        let timestamp: i64 = row.get("timestamp");
+        let is_thinking: Option<bool> = Some(false);
 
-        // 懒渲染策略：render_cache 命中则直接用，未命中则实时编译
+        let attachments = att_map.remove(&msg_id);
+        let content_hash_backfill = if content_hash_raw.is_empty() {
+            let content = ContentCompressor::decompress(&content_bytes).unwrap_or_default();
+            Some(compute_message_hash_from_content(
+                &content,
+                attachments.as_deref(),
+            ))
+        } else {
+            None
+        };
+        let effective_content_hash = content_hash_backfill.clone().unwrap_or(content_hash_raw);
+        let content_hash = Some(effective_content_hash.clone());
+        let cache_matches_content = match (&render_content, &render_content_hash, &content_hash) {
+            (Some(_), Some(render_hash), Some(message_hash)) if !render_hash.is_empty() => {
+                render_hash == message_hash
+            }
+            _ => false,
+        };
+
+        // 懒渲染策略：render_cache 指纹命中才直接用，避免旧 blocks 与新 content 串台
         let (blocks, content) = if !include_ui_render_data {
             let content = if include_content {
                 ContentCompressor::decompress(&content_bytes).unwrap_or_default()
@@ -458,7 +522,10 @@ pub async fn load_chat_history_internal(
                 String::new()
             };
             (None, content)
-        } else if let Some(ref rb) = render_content {
+        } else if cache_matches_content {
+            let rb = render_content
+                .as_ref()
+                .expect("checked by cache_matches_content");
             let blocks = parse_render_bytes(Some(rb.clone()));
             let content = if include_content {
                 ContentCompressor::decompress(&content_bytes).unwrap_or_default()
@@ -480,17 +547,33 @@ pub async fn load_chat_history_internal(
                     let pool_c = pool.clone();
                     let tid = topic_id.to_string();
                     let mid = msg_id.clone();
+                    let content_hash_for_cache = effective_content_hash.clone();
+                    let content_hash_backfill_for_message = content_hash_backfill.clone();
                     tokio::spawn(async move {
                         let now = chrono::Utc::now().timestamp_millis();
+                        if let Some(hash) = content_hash_backfill_for_message {
+                            let _ = sqlx::query(
+                                "UPDATE messages SET content_hash = ?, updated_at = ? \
+                                 WHERE topic_id = ? AND msg_id = ? AND content_hash = ''",
+                            )
+                            .bind(&hash)
+                            .bind(now)
+                            .bind(&tid)
+                            .bind(&mid)
+                            .execute(&pool_c)
+                            .await;
+                        }
                         let _ = sqlx::query(
-                            "INSERT INTO render_cache (topic_id, msg_id, render_content, updated_at) \
-                             VALUES (?, ?, ?, ?) \
+                            "INSERT INTO render_cache (topic_id, msg_id, content_hash, render_content, updated_at) \
+                             VALUES (?, ?, ?, ?, ?) \
                              ON CONFLICT(topic_id, msg_id) DO UPDATE SET \
+                             content_hash = excluded.content_hash, \
                              render_content = excluded.render_content, \
                              updated_at = excluded.updated_at"
                         )
                         .bind(&tid)
                         .bind(&mid)
+                        .bind(&content_hash_for_cache)
                         .bind(&serialized)
                         .bind(now)
                         .execute(&pool_c)
@@ -506,18 +589,6 @@ pub async fn load_chat_history_internal(
                 (blocks_json, content)
             }
         };
-
-        let content_hash_raw: String = row.get("content_hash");
-        let content_hash = if content_hash_raw.is_empty() {
-            None
-        } else {
-            Some(content_hash_raw)
-        };
-
-        let timestamp: i64 = row.get("timestamp");
-        let is_thinking: Option<bool> = Some(false);
-
-        let attachments = att_map.remove(&msg_id);
 
         let mut message = ChatMessage {
             id: msg_id,
@@ -568,15 +639,15 @@ pub async fn load_chat_text_history_for_context(
 
     // 彻底剥离了对 render_cache 联表查询，仅拉取核心文本和配置字段
     let query_str = if limit.is_some() {
-        "SELECT m.msg_id, m.role, m.name, m.agent_id, m.content, m.timestamp, m.is_group_message, m.group_id, m.finish_reason, m.content_hash 
+        "SELECT m.msg_id, m.role, m.name, m.agent_id, m.content, m.timestamp, m.is_group_message, m.group_id, m.finish_reason, m.content_hash
          FROM messages m
-         WHERE m.topic_id = ? AND m.deleted_at IS NULL 
-         ORDER BY m.timestamp DESC, m.rowid DESC 
+         WHERE m.topic_id = ? AND m.deleted_at IS NULL
+         ORDER BY m.timestamp DESC, m.rowid DESC
          LIMIT ? OFFSET ?"
     } else {
-        "SELECT m.msg_id, m.role, m.name, m.agent_id, m.content, m.timestamp, m.is_group_message, m.group_id, m.finish_reason, m.content_hash 
+        "SELECT m.msg_id, m.role, m.name, m.agent_id, m.content, m.timestamp, m.is_group_message, m.group_id, m.finish_reason, m.content_hash
          FROM messages m
-         WHERE m.topic_id = ? AND m.deleted_at IS NULL 
+         WHERE m.topic_id = ? AND m.deleted_at IS NULL
          ORDER BY m.timestamp DESC, m.rowid DESC"
     };
 
@@ -608,7 +679,7 @@ pub async fn load_chat_text_history_for_context(
                     ma.msg_id, ma.display_name, ma.src, ma.status
              FROM message_attachments ma
              JOIN attachments a ON ma.hash = a.hash
-             WHERE ma.topic_id = ? AND ma.msg_id IN ({}) 
+             WHERE ma.topic_id = ? AND ma.msg_id IN ({})
              ORDER BY ma.msg_id, ma.attachment_order ASC",
             extracted_text_column, placeholders
         );
@@ -854,12 +925,13 @@ pub async fn re_render_message(
     let db_state = app_handle.state::<crate::vcp_modules::db_manager::DbState>();
     let pool = &db_state.pool;
 
-    let row = sqlx::query("SELECT content FROM messages WHERE msg_id = ? AND topic_id = ?")
-        .bind(&message_id)
-        .bind(&topic_id)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| e.to_string())?;
+    let row =
+        sqlx::query("SELECT content, content_hash FROM messages WHERE msg_id = ? AND topic_id = ?")
+            .bind(&message_id)
+            .bind(&topic_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
 
     match row {
         Some(r) => {
@@ -873,17 +945,20 @@ pub async fn re_render_message(
 
             let compiled = MessageRenderCompiler::compile(&decompressed);
             let serialized = MessageRenderCompiler::serialize(&compiled)?;
+            let content_hash: String = r.get("content_hash");
 
             let now = chrono::Utc::now().timestamp_millis();
             sqlx::query(
-                "INSERT INTO render_cache (topic_id, msg_id, render_content, updated_at) \
-                 VALUES (?, ?, ?, ?) \
+                "INSERT INTO render_cache (topic_id, msg_id, content_hash, render_content, updated_at) \
+                 VALUES (?, ?, ?, ?, ?) \
                  ON CONFLICT(topic_id, msg_id) DO UPDATE SET \
+                 content_hash = excluded.content_hash, \
                  render_content = excluded.render_content, \
                  updated_at = excluded.updated_at",
             )
             .bind(&topic_id)
             .bind(&message_id)
+            .bind(&content_hash)
             .bind(&serialized)
             .bind(now)
             .execute(pool)

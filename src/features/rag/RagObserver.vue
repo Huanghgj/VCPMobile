@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue';
-import { 
+import {
   X, Trash2, ChevronDown, ChevronUp, Copy, Loader2, Sparkles, Check,
   Brain, Clock, BookOpen, Moon, ShieldAlert, Calendar,
   Share2, MessageSquare, History, Search, Bookmark
@@ -117,10 +117,10 @@ const handleTouchEnd = (e: TouchEvent) => {
   if (e.changedTouches.length > 0) {
     const deltaX = e.changedTouches[0].clientX - touchStartX;
     const deltaY = e.changedTouches[0].clientY - touchStartY;
-    
+
     const absX = Math.abs(deltaX);
     const absY = Math.abs(deltaY);
-    
+
     if (absX > 50 && absY <= absX * 0.4663) {
       isSwipeProcessed = true;
       const currentIdx = filterTabs.findIndex(tab => tab.value === activeFilter.value);
@@ -166,34 +166,6 @@ const filterTabs = [
   { value: 'memo', label: '记忆检索' },
   { value: 'dream', label: 'Agent梦境' }
 ] as const;
-
-// 监听是否打开，挂载和注销 Tauri WebSocket 监听
-watch(() => props.isOpen, (isOpen) => {
-  if (isOpen) {
-    store.initListener();
-    drawSpectrum();
-  } else {
-    store.destroyListener();
-    if (animationFrameId) {
-      cancelAnimationFrame(animationFrameId);
-      animationFrameId = null;
-    }
-  }
-});
-
-onMounted(() => {
-  if (props.isOpen) {
-    store.initListener();
-    drawSpectrum();
-  }
-});
-
-onUnmounted(() => {
-  store.destroyListener();
-  if (animationFrameId) {
-    cancelAnimationFrame(animationFrameId);
-  }
-});
 
 // 根据 Filter 过滤列表
 const filteredMetadataList = computed(() => {
@@ -242,7 +214,7 @@ const statusLabel = computed(() => {
 // 折叠/展开卡片
 const toggleCard = async (id: string) => {
   const isCollapsing = expandedCardIds.value.has(id);
-  
+
   if (isCollapsing) {
     expandedCardIds.value.delete(id);
     delete payloadCache.value[id]; // 折叠时自动清理 JS 内存中该项的饱水 Payload
@@ -332,86 +304,145 @@ const getTitleStyle = (type: string) => {
   };
 };
 
+let spectrumPhase = 0;
+
+const stopSpectrum = () => {
+  if (animationFrameId) {
+    cancelAnimationFrame(animationFrameId);
+    animationFrameId = null;
+  }
+};
+
+const shouldRunSpectrum = () =>
+  props.isOpen && store.triggerSpectrumAnimation && !document.hidden;
+
+const renderSpectrumFrame = () => {
+  const canvas = spectrumCanvas.value;
+  if (!canvas) return false;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return false;
+
+  const dpr = window.devicePixelRatio || 1;
+  const expectedWidth = canvas.clientWidth * dpr;
+  const expectedHeight = canvas.clientHeight * dpr;
+
+  if (canvas.width !== expectedWidth || canvas.height !== expectedHeight) {
+    canvas.width = expectedWidth;
+    canvas.height = expectedHeight;
+  }
+
+  const width = canvas.width;
+  const height = canvas.height;
+
+  if (width === 0 || height === 0) return false;
+
+  ctx.clearRect(0, 0, width, height);
+
+  const isAnimating = shouldRunSpectrum();
+  const spacing = 1.5 * dpr;
+  const barWidth = (width - (numBars - 1) * spacing) / numBars;
+
+  // 创建横向霓虹渐变
+  const grad = ctx.createLinearGradient(0, 0, width, 0);
+  grad.addColorStop(0, '#9b59b6');
+  grad.addColorStop(0.5, '#3498db');
+  grad.addColorStop(1, '#9b59b6');
+  ctx.fillStyle = grad;
+
+  if (isAnimating) {
+    spectrumPhase += 0.06; // 控制正弦波流动的速度
+  }
+
+  let needsSettleFrame = false;
+  for (let i = 0; i < numBars; i++) {
+    if (isAnimating) {
+      // 计算正弦波的当前角度（使得 24 柱正好呈现大约 1.5 个周期的完整波形）
+      const angle = (i / numBars) * Math.PI * 2 * 1.5 - spectrumPhase;
+      // 振幅限制在可用 Canvas 高度的一半，避免触顶溢出
+      const amplitude = (height - 3 * dpr) / 2;
+      const offset = height / 2;
+      const targetHeight = Math.sin(angle) * amplitude + offset;
+
+      barsHeights[i] += (targetHeight - barsHeights[i]) * 0.2;
+      needsSettleFrame = true;
+    } else {
+      // 静默时平滑收缩到 1px 物理高度的精致底部线
+      const restingHeight = 1 * dpr;
+      barsHeights[i] += (restingHeight - barsHeights[i]) * 0.15;
+      if (Math.abs(barsHeights[i] - restingHeight) > 0.2) {
+        needsSettleFrame = true;
+      }
+    }
+
+    const x = i * (barWidth + spacing);
+    const y = height - barsHeights[i];
+
+    ctx.fillRect(x, y, barWidth, barsHeights[i]);
+  }
+
+  return isAnimating || needsSettleFrame;
+};
+
 // 24柱全宽跳动音频频谱微动画
 const drawSpectrum = () => {
-  let phase = 0;
-
-  const render = () => {
-    // 动态在循环内部解包，一旦组件销毁且 canvas 被设为 null，循环自动安全终止
-    const canvas = spectrumCanvas.value;
-    if (!canvas) {
-      animationFrameId = null;
-      return;
-    }
-    const ctx = canvas.getContext('2d');
-    if (!ctx) {
-      animationFrameId = null;
-      return;
-    }
-
-    const dpr = window.devicePixelRatio || 1;
-    const expectedWidth = canvas.clientWidth * dpr;
-    const expectedHeight = canvas.clientHeight * dpr;
-
-    if (canvas.width !== expectedWidth || canvas.height !== expectedHeight) {
-      canvas.width = expectedWidth;
-      canvas.height = expectedHeight;
-    }
-
-    const width = canvas.width;
-    const height = canvas.height;
-
-    if (width === 0 || height === 0) {
-      animationFrameId = requestAnimationFrame(render);
-      return;
-    }
-
-    ctx.clearRect(0, 0, width, height);
-
-    const isAnimating = store.triggerSpectrumAnimation;
-    const spacing = 1.5 * dpr;
-    const barWidth = (width - (numBars - 1) * spacing) / numBars;
-
-    // 创建横向霓虹渐变
-    const grad = ctx.createLinearGradient(0, 0, width, 0);
-    grad.addColorStop(0, '#9b59b6');
-    grad.addColorStop(0.5, '#3498db');
-    grad.addColorStop(1, '#9b59b6');
-    ctx.fillStyle = grad;
-
-    if (isAnimating) {
-      phase += 0.06; // 控制正弦波流动的速度
-    }
-
-    for (let i = 0; i < numBars; i++) {
-      if (isAnimating) {
-        // 计算正弦波的当前角度（使得 24 柱正好呈现大约 1.5 个周期的完整波形）
-        const angle = (i / numBars) * Math.PI * 2 * 1.5 - phase;
-        // 振幅限制在可用 Canvas 高度的一半，避免触顶溢出
-        const amplitude = (height - 3 * dpr) / 2;
-        const offset = height / 2;
-        const targetHeight = Math.sin(angle) * amplitude + offset;
-
-        barsHeights[i] += (targetHeight - barsHeights[i]) * 0.2;
-      } else {
-        // 静默时平滑收缩到 1px 物理高度的精致底部线
-        barsHeights[i] += (1 * dpr - barsHeights[i]) * 0.15;
-      }
-
-      const x = i * (barWidth + spacing);
-      const y = height - barsHeights[i];
-
-      ctx.fillRect(x, y, barWidth, barsHeights[i]);
-    }
-
-    animationFrameId = requestAnimationFrame(render);
-  };
-
   if (animationFrameId) {
     cancelAnimationFrame(animationFrameId);
   }
+
+  const render = () => {
+    animationFrameId = null;
+    if (!props.isOpen || document.hidden) return;
+    if (renderSpectrumFrame()) {
+      animationFrameId = requestAnimationFrame(render);
+    }
+  };
+
   render();
 };
+
+const handleSpectrumVisibilityChange = () => {
+  if (document.hidden) {
+    stopSpectrum();
+    return;
+  }
+  if (props.isOpen) {
+    drawSpectrum();
+  }
+};
+
+watch(() => store.triggerSpectrumAnimation, (isAnimating) => {
+  if (!props.isOpen || document.hidden) return;
+  if (isAnimating) {
+    drawSpectrum();
+  } else {
+    renderSpectrumFrame();
+  }
+});
+
+// 监听是否打开，挂载和注销 Tauri WebSocket 监听
+watch(() => props.isOpen, (isOpen) => {
+  if (isOpen) {
+    store.initListener();
+    renderSpectrumFrame();
+  } else {
+    store.destroyListener();
+    stopSpectrum();
+  }
+});
+
+onMounted(() => {
+  document.addEventListener('visibilitychange', handleSpectrumVisibilityChange);
+  if (props.isOpen) {
+    store.initListener();
+    renderSpectrumFrame();
+  }
+});
+
+onUnmounted(() => {
+  document.removeEventListener('visibilitychange', handleSpectrumVisibilityChange);
+  store.destroyListener();
+  stopSpectrum();
+});
 </script>
 
 <template>
@@ -476,7 +507,7 @@ const drawSpectrum = () => {
       </div>
 
       <!-- 消息列表区 -->
-      <div ref="listContainer" 
+      <div ref="listContainer"
            class="flex-1 overflow-y-auto no-rubber-band px-3 py-2 bg-transparent relative z-10"
            @touchstart="handleTouchStart"
            @touchmove="handleTouchMove"
@@ -497,11 +528,11 @@ const drawSpectrum = () => {
             class="mb-3 border-l-2 rounded-r border transition-all overflow-hidden vcp-info-card-item"
             :class="[
               getAccentClass(item.type),
-              themeStore.isDarkResolved 
-                ? 'bg-[#1b222f] border-white/5 text-slate-100' 
+              themeStore.isDarkResolved
+                ? 'bg-[#1b222f] border-white/5 text-slate-100'
                 : 'bg-[#f5f7f9] border-gray-300/60 shadow-sm text-slate-800',
-              expandedCardIds.has(item.id) 
-                ? (themeStore.isDarkResolved ? 'ring-1 ring-white/10' : 'ring-1 ring-black/5') 
+              expandedCardIds.has(item.id)
+                ? (themeStore.isDarkResolved ? 'ring-1 ring-white/10' : 'ring-1 ring-black/5')
                 : ''
             ]"
           >
@@ -514,13 +545,13 @@ const drawSpectrum = () => {
               <div class="flex-1 min-w-0 pr-2">
                 <div class="flex items-center justify-between mb-1.5">
                   <div class="flex items-center gap-1.5 min-w-0">
-                    <component 
-                      :is="getTitleStyle(item.type).icon" 
-                      :size="12" 
-                      :class="themeStore.isDarkResolved ? getTitleStyle(item.type).colorClass : getTitleStyle(item.type).colorClass.replace('-400', '-600')" 
-                      class="shrink-0" 
+                    <component
+                      :is="getTitleStyle(item.type).icon"
+                      :size="12"
+                      :class="themeStore.isDarkResolved ? getTitleStyle(item.type).colorClass : getTitleStyle(item.type).colorClass.replace('-400', '-600')"
+                      class="shrink-0"
                     />
-                    <span 
+                    <span
                       class="text-[12px] font-bold tracking-wide truncate"
                       :class="themeStore.isDarkResolved ? getTitleStyle(item.type).colorClass : getTitleStyle(item.type).colorClass.replace('-400', '-600')"
                     >
@@ -535,7 +566,7 @@ const drawSpectrum = () => {
                   {{ item.subtitle }}
                 </div>
                 <!-- summary 预览：折叠时单行截断，展开时完整换行展示 -->
-                <div 
+                <div
                   class="text-[11px] leading-relaxed break-words"
                   :class="[
                     expandedCardIds.has(item.id) ? '' : 'truncate',
@@ -556,7 +587,7 @@ const drawSpectrum = () => {
             <!-- 展开栏：Payload Lazy 加载与结构化渲染 -->
             <div v-if="expandedCardIds.has(item.id)" class="border-t p-3 text-[11px]"
                  :class="themeStore.isDarkResolved ? 'border-white/5 bg-[#111620]' : 'border-gray-300/40 bg-[#e9ecef]'">
-              
+
               <!-- 1. 加载中 -->
               <div v-if="payloadLoading[item.id]" class="flex items-center justify-center py-4 gap-2" :class="themeStore.isDarkResolved ? 'text-white/30' : 'text-gray-400'">
                 <Loader2 :size="14" class="animate-spin" />
@@ -582,8 +613,8 @@ const drawSpectrum = () => {
                   <button
                     @click="copyPayload(item.id, $event)"
                     class="flex items-center gap-1 px-2 py-0.5 rounded transition-all active:scale-95 text-[9px]"
-                    :class="themeStore.isDarkResolved 
-                      ? 'border border-white/10 hover:bg-white/10 text-white/50' 
+                    :class="themeStore.isDarkResolved
+                      ? 'border border-white/10 hover:bg-white/10 text-white/50'
                       : 'border border-gray-300 hover:bg-gray-200/60 text-gray-600'"
                   >
                     <Check v-if="copiedCardId === item.id" :size="10" class="text-green-500" />
@@ -595,13 +626,13 @@ const drawSpectrum = () => {
                 <!-- RAG 知识库检索结果详情 -->
                 <div v-if="item.type === '' || item.type === 'RAG_RETRIEVAL_DETAILS'" class="space-y-2.5">
                   <!-- RAG Query Section -->
-                  <div 
-                    v-if="payloadCache[item.id].query" 
+                  <div
+                    v-if="payloadCache[item.id].query"
                     @click.stop="toggleSubCard(`${item.id}_query`)"
                     :ref="el => { if (el) subCardRefs[`${item.id}_query`] = el }"
                     class="p-2 rounded border mb-1.5 cursor-pointer transition-colors"
-                    :class="themeStore.isDarkResolved 
-                      ? 'bg-blue-500/5 border-blue-500/10 active:bg-blue-500/10 text-slate-100' 
+                    :class="themeStore.isDarkResolved
+                      ? 'bg-blue-500/5 border-blue-500/10 active:bg-blue-500/10 text-slate-100'
                       : 'bg-blue-50/30 border-blue-200/80 active:bg-blue-100/30 text-slate-700'"
                   >
                     <div class="flex justify-between items-center mb-1 text-[9px] font-bold"
@@ -628,9 +659,9 @@ const drawSpectrum = () => {
 
                   <!-- Core Tags -->
                   <div v-if="payloadCache[item.id].coreTags && payloadCache[item.id].coreTags.length > 0" class="flex flex-wrap gap-1.5 mb-2">
-                    <span 
-                      v-for="tag in payloadCache[item.id].coreTags" 
-                      :key="tag" 
+                    <span
+                      v-for="tag in payloadCache[item.id].coreTags"
+                      :key="tag"
                       class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-white font-bold text-[9px]"
                       :class="themeStore.isDarkResolved ? 'bg-[#b38c2b]/90 shadow-[0_0_6px_rgba(179,140,43,0.2)]' : 'bg-[#b38c2b] shadow-sm'"
                     >
@@ -665,7 +696,7 @@ const drawSpectrum = () => {
                       :class="themeStore.isDarkResolved ? 'bg-white/5 border-white/5' : 'bg-[#f1f3f5] border-gray-350/50 shadow-sm text-slate-800'"
                     >
                       <!-- Sub-card Header, clickable to toggle detail collapse -->
-                      <div 
+                      <div
                         @click.stop="toggleSubCard(`${item.id}_res_${idx}`)"
                         class="flex flex-col text-[9px] cursor-pointer select-none py-0.5"
                         :class="themeStore.isDarkResolved ? 'text-white/45' : 'text-gray-500'"
@@ -673,9 +704,9 @@ const drawSpectrum = () => {
                         <div class="flex justify-between items-center">
                           <div class="flex items-center gap-1.5 min-w-0 pr-2">
                             <span class="font-bold shrink-0" :class="themeStore.isDarkResolved ? 'text-white/25' : 'text-gray-400'">#{{ idx + 1 }}</span>
-                            <span 
+                            <span
                               class="px-1 py-0.5 rounded font-bold font-mono text-[9px] shrink-0"
-                              :class="res.originalScore && res.originalScore !== res.score 
+                              :class="res.originalScore && res.originalScore !== res.score
                                 ? (themeStore.isDarkResolved ? 'bg-yellow-500/20 text-yellow-400 border border-yellow-500/30' : 'bg-yellow-50 border-yellow-200 text-yellow-700')
                                 : (themeStore.isDarkResolved ? 'bg-blue-500/20 text-blue-400' : 'bg-blue-50 text-blue-700')"
                             >
@@ -700,7 +731,7 @@ const drawSpectrum = () => {
                       <!-- Sub-card Expandable Content -->
                       <div v-if="expandedSubCardIds.has(`${item.id}_res_${idx}`)" class="space-y-1.5 pt-1.5 border-t"
                            :class="themeStore.isDarkResolved ? 'border-white/5' : 'border-gray-200'">
-                        <RagPayloadDetail 
+                        <RagPayloadDetail
                           class="leading-relaxed font-mono select-text text-[10px] break-words"
                           :class="[themeStore.isDarkResolved ? 'prose-invert text-white/85' : 'text-gray-800', 'prose prose-xs text-[10px]']"
                           :text="res.text"
@@ -733,13 +764,13 @@ const drawSpectrum = () => {
                   </div>
 
                   <!-- Thinking Chain Query Section -->
-                  <div 
-                    v-if="payloadCache[item.id].query" 
+                  <div
+                    v-if="payloadCache[item.id].query"
                     @click.stop="toggleSubCard(`${item.id}_chain_query`)"
                     :ref="el => { if (el) subCardRefs[`${item.id}_chain_query`] = el }"
                     class="p-2 rounded border mb-1 cursor-pointer transition-colors"
-                    :class="themeStore.isDarkResolved 
-                      ? 'bg-purple-900/10 border-purple-500/10 active:bg-purple-500/10 text-slate-100' 
+                    :class="themeStore.isDarkResolved
+                      ? 'bg-purple-900/10 border-purple-500/10 active:bg-purple-500/10 text-slate-100'
                       : 'bg-purple-50/50 border-purple-200 active:bg-purple-100/50 text-slate-700'"
                   >
                     <div class="flex justify-between items-center mb-1 text-[9px] font-bold"
@@ -774,7 +805,7 @@ const drawSpectrum = () => {
 
                   <div class="text-[9px] font-bold uppercase tracking-widest mb-2"
                        :class="themeStore.isDarkResolved ? 'text-white/20' : 'text-gray-400'">阶段执行详情</div>
-                  
+
                   <div class="space-y-2.5">
                     <div
                       v-for="stage in payloadCache[item.id].stages"
@@ -792,12 +823,12 @@ const drawSpectrum = () => {
                           v-for="(res, rIdx) in stage.results"
                           :key="rIdx"
                           class="p-2 rounded border font-mono text-[9px] space-y-1 transition-all"
-                          :class="themeStore.isDarkResolved 
-                            ? 'bg-white/5 border-white/5 text-slate-100' 
+                          :class="themeStore.isDarkResolved
+                            ? 'bg-white/5 border-white/5 text-slate-100'
                             : 'bg-gray-300/25 border-gray-300/40 shadow-sm text-slate-800'"
                         >
                           <!-- Sub-card Header -->
-                          <div 
+                          <div
                             @click.stop="toggleSubCard(`${item.id}_s${stage.stage}_res_${rIdx}`)"
                             class="flex flex-col text-[8px] cursor-pointer select-none py-0.5"
                             :class="themeStore.isDarkResolved ? 'text-white/40' : 'text-slate-500'"
@@ -806,10 +837,10 @@ const drawSpectrum = () => {
                               <div class="flex items-center gap-1.5 min-w-0">
                                 <span class="font-bold shrink-0"
                                       :class="themeStore.isDarkResolved ? 'text-white/25' : 'text-slate-400'">#{{ rIdx + 1 }}</span>
-                                <span 
+                                <span
                                   class="px-1 py-0.5 rounded font-bold font-mono text-[8px] shrink-0"
-                                  :class="themeStore.isDarkResolved 
-                                    ? 'bg-purple-500/20 text-purple-400' 
+                                  :class="themeStore.isDarkResolved
+                                    ? 'bg-purple-500/20 text-purple-400'
                                     : 'bg-purple-600/10 text-purple-700'"
                                 >
                                   Score: {{ res.score?.toFixed(3) || 'N/A' }}
@@ -822,7 +853,7 @@ const drawSpectrum = () => {
                               </div>
                             </div>
                             <!-- 30-char preview when collapsed -->
-                            <div v-if="!expandedSubCardIds.has(`${item.id}_s${stage.stage}_res_${rIdx}`)" 
+                            <div v-if="!expandedSubCardIds.has(`${item.id}_s${stage.stage}_res_${rIdx}`)"
                                  class="text-[8px] truncate mt-0.5 pl-1 leading-normal"
                                  :class="themeStore.isDarkResolved ? 'text-white/30' : 'text-slate-500'">
                               {{ res.text.slice(0, 30) }}{{ res.text.length > 30 ? '...' : '' }}
@@ -830,10 +861,10 @@ const drawSpectrum = () => {
                           </div>
 
                           <!-- Sub-card Expandable Content -->
-                          <div v-if="expandedSubCardIds.has(`${item.id}_s${stage.stage}_res_${rIdx}`)" 
+                          <div v-if="expandedSubCardIds.has(`${item.id}_s${stage.stage}_res_${rIdx}`)"
                                class="space-y-1.5 pt-1.5 border-t"
                                :class="themeStore.isDarkResolved ? 'border-white/5' : 'border-gray-300/40'">
-                            <RagPayloadDetail 
+                            <RagPayloadDetail
                               :class="[themeStore.isDarkResolved ? 'prose-invert text-white/85' : 'text-gray-800', 'prose prose-xs leading-relaxed break-words font-mono text-[10px] select-text']"
                               :text="res.text"
                             />
@@ -849,13 +880,13 @@ const drawSpectrum = () => {
                   <div class="p-2.5 rounded border space-y-2"
                        :class="themeStore.isDarkResolved ? 'bg-white/5 border-white/5' : 'bg-[#f1f3f5] border-gray-300/60 shadow-sm'">
                     <!-- USER QUERY Box -->
-                    <div 
+                    <div
                       @click.stop="toggleSubCard(`${item.id}_chat_q`)"
                       :ref="el => { if (el) subCardRefs[`${item.id}_chat_q`] = el }"
                       class="border-l pl-2 cursor-pointer transition-colors"
                       :class="[
-                        themeStore.isDarkResolved 
-                          ? 'border-white/20 active:bg-white/5' 
+                        themeStore.isDarkResolved
+                          ? 'border-white/20 active:bg-white/5'
                           : 'border-gray-300 active:bg-gray-200/40'
                       ]"
                     >
@@ -879,15 +910,15 @@ const drawSpectrum = () => {
                         </template>
                       </div>
                     </div>
-                    
+
                     <!-- AI RESPONSE Box -->
-                    <div 
+                    <div
                       @click.stop="toggleSubCard(`${item.id}_chat_r`)"
                       :ref="el => { if (el) subCardRefs[`${item.id}_chat_r`] = el }"
                       class="border-l pl-2 mt-2 pt-1 border-t cursor-pointer transition-colors"
                       :class="[
-                        themeStore.isDarkResolved 
-                          ? 'border-orange-500/50 border-t-white/5 active:bg-orange-500/5' 
+                        themeStore.isDarkResolved
+                          ? 'border-orange-500/50 border-t-white/5 active:bg-orange-500/5'
                           : 'border-orange-500 border-t-gray-300 active:bg-orange-50/50'
                       ]"
                     >
@@ -932,13 +963,13 @@ const drawSpectrum = () => {
                   </div>
 
                   <!-- Memo Query Box -->
-                  <div 
-                    v-if="payloadCache[item.id].query" 
+                  <div
+                    v-if="payloadCache[item.id].query"
                     @click.stop="toggleSubCard(`${item.id}_memo_query`)"
                     :ref="el => { if (el) subCardRefs[`${item.id}_memo_query`] = el }"
                     class="p-2 rounded border cursor-pointer transition-colors"
-                    :class="themeStore.isDarkResolved 
-                      ? 'bg-green-500/5 border-green-500/10 active:bg-green-500/10 text-slate-100' 
+                    :class="themeStore.isDarkResolved
+                      ? 'bg-green-500/5 border-green-500/10 active:bg-green-500/10 text-slate-100'
                       : 'bg-green-50/30 border-green-200/80 active:bg-green-100/30 text-slate-750'"
                   >
                     <div class="flex justify-between items-center mb-1 text-[9px] font-bold"
@@ -980,12 +1011,12 @@ const drawSpectrum = () => {
 
                 <!-- DailyNote 日记动作追踪 -->
                 <div v-else-if="item.type === 'DailyNote'" class="space-y-2.5">
-                  <div 
+                  <div
                     @click.stop="toggleSubCard(`${item.id}_note`)"
                     :ref="el => { if (el) subCardRefs[`${item.id}_note`] = el }"
                     class="p-2.5 rounded border-l-2 cursor-pointer transition-colors"
-                    :class="themeStore.isDarkResolved 
-                      ? 'bg-green-500/5 border border-green-500/15 border-l-green-500 active:bg-green-500/10' 
+                    :class="themeStore.isDarkResolved
+                      ? 'bg-green-500/5 border border-green-500/15 border-l-green-500 active:bg-green-500/10'
                       : 'bg-green-50/40 border border-green-200/80 border-l-green-600 active:bg-green-100/30'"
                   >
                     <div class="flex justify-between items-center mb-1 text-[10px] font-bold"
@@ -1097,7 +1128,7 @@ const drawSpectrum = () => {
                     >
                       <div class="flex items-center gap-1.5 min-w-0 pr-2">
                         <!-- Type Badge -->
-                        <span 
+                        <span
                           class="px-1.5 py-0.5 rounded-full text-[8px] font-bold uppercase tracking-wider"
                           :class="{
                             'bg-orange-500/25 text-orange-400 border border-orange-500/35': op.type === 'merge',
@@ -1112,7 +1143,7 @@ const drawSpectrum = () => {
                       </div>
 
                       <!-- Status Badge -->
-                      <span 
+                      <span
                         class="px-1 py-0.5 rounded text-[8px] font-bold"
                         :class="{
                           'bg-yellow-400/20 text-yellow-400 border border-yellow-400/30': op.status === 'pending_review',
@@ -1137,12 +1168,12 @@ const drawSpectrum = () => {
                       梦境ID: {{ payloadCache[item.id].dreamId }}
                     </span>
                   </div>
-                  <div 
+                  <div
                     @click.stop="toggleSubCard(`${item.id}_narrative`)"
                     :ref="el => { if (el) subCardRefs[`${item.id}_narrative`] = el }"
                     class="p-2.5 rounded border cursor-pointer transition-colors"
-                    :class="themeStore.isDarkResolved 
-                      ? 'bg-white/5 border-white/5 active:bg-white/8' 
+                    :class="themeStore.isDarkResolved
+                      ? 'bg-white/5 border-white/5 active:bg-white/8'
                       : 'bg-[#f1f3f5] border-gray-300/60 active:bg-gray-200/50 shadow-sm'"
                   >
                     <div class="flex justify-between items-center mb-1.5 text-[9px] font-bold"
@@ -1173,8 +1204,8 @@ const drawSpectrum = () => {
                 <!-- Agent 梦境开始与结束 -->
                 <div v-else-if="item.type === 'AGENT_DREAM_START'" class="space-y-2.5">
                   <div class="p-2.5 rounded border-l-2 flex items-center gap-2"
-                       :class="themeStore.isDarkResolved 
-                         ? 'bg-purple-500/10 border-purple-500/20 border-l-purple-500 text-white/95' 
+                       :class="themeStore.isDarkResolved
+                         ? 'bg-purple-500/10 border-purple-500/20 border-l-purple-500 text-white/95'
                          : 'bg-purple-100/30 border-purple-200/80 border-l-purple-600 text-purple-950 shadow-sm'">
                     <Moon :size="12" class="text-purple-500 animate-pulse" />
                     <div class="font-mono text-[10px]">{{ payloadCache[item.id].message }}</div>
@@ -1182,9 +1213,9 @@ const drawSpectrum = () => {
                 </div>
 
                 <div v-else-if="item.type === 'AGENT_DREAM_END'" class="space-y-2.5">
-                  <div 
+                  <div
                     class="p-2.5 rounded border-l-2 flex flex-col gap-1.5"
-                    :class="payloadCache[item.id].status === 'error' 
+                    :class="payloadCache[item.id].status === 'error'
                       ? (themeStore.isDarkResolved ? 'bg-red-500/10 border-red-500/20 border-l-red-500 text-red-400' : 'bg-red-100/30 border-red-200/80 border-l-red-500 text-red-700 shadow-sm')
                       : (themeStore.isDarkResolved ? 'bg-green-500/10 border-green-500/20 border-l-green-500 text-green-400' : 'bg-green-100/30 border-green-200/80 border-l-green-600 text-green-700 shadow-sm')"
                   >
@@ -1203,8 +1234,8 @@ const drawSpectrum = () => {
                 <!-- Agent 梦调度通知 -->
                 <div v-else-if="item.type === 'AGENT_DREAM_SCHEDULE'" class="space-y-2.5">
                   <div class="p-2.5 rounded border-l-2 space-y-1.5"
-                       :class="themeStore.isDarkResolved 
-                         ? 'bg-blue-500/10 border-blue-500/20 border-l-blue-500' 
+                       :class="themeStore.isDarkResolved
+                         ? 'bg-blue-500/10 border-blue-500/20 border-l-blue-500'
                          : 'bg-blue-100/30 border-blue-200/80 border-l-blue-600 shadow-sm'">
                     <div class="flex items-center gap-1.5 font-bold text-[10px]" :class="themeStore.isDarkResolved ? 'text-blue-400' : 'text-blue-700'">
                       <Clock :size="11" />
@@ -1221,8 +1252,8 @@ const drawSpectrum = () => {
                 <!-- 兜底 JSON 显示 -->
                 <div v-else class="mt-2">
                   <pre class="p-2.5 rounded border overflow-x-auto text-[10px] font-mono leading-relaxed select-text"
-                       :class="themeStore.isDarkResolved 
-                         ? 'bg-[#111620] border-white/5 text-slate-300' 
+                       :class="themeStore.isDarkResolved
+                         ? 'bg-[#111620] border-white/5 text-slate-300'
                          : 'bg-[#f1f3f5] border-gray-300/60 text-slate-700'">{{ JSON.stringify(payloadCache[item.id], null, 2) }}</pre>
                 </div>
               </template>

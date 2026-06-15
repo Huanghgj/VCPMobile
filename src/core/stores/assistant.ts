@@ -135,12 +135,12 @@ export const useAssistantStore = defineStore("assistant", () => {
         unreadCounts: Record<string, number>;
       }>("get_assistants_snapshot");
       console.log(`[Profile] invoke('get_assistants_snapshot') resolved in ${Date.now() - startTime}ms`);
-      
+
       // 在同一次 tick 中合并赋值，触发 Vue 3 渲染的批处理更新
       agents.value = snapshot.agents;
       groups.value = snapshot.groups;
       unreadCounts.value = snapshot.unreadCounts;
-      
+
       console.log(`[Profile] fetchAgentsAndGroups finished in ${Date.now() - startTime}ms`);
     } catch (e: any) {
       error.value = e.toString();
@@ -226,7 +226,7 @@ export const useAssistantStore = defineStore("assistant", () => {
   const saveAgent = async (agent: AgentConfig) => {
     try {
       await invoke("save_agent_config", { agent });
-      
+
       // 点对点局部更新（仅更新轻量列表渲染字段，防止大提示词等字段污染全局列表轻量缓存）
       const index = agents.value.findIndex((a) => a.id === agent.id);
       if (index !== -1) {

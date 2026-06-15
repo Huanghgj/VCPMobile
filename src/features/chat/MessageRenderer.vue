@@ -393,11 +393,12 @@ function renderBlockHtml(block: ContentBlock): string {
 }
 
 function getBlockKey(block: ContentBlock, index: number): string {
+  const messageScope = props.message.id || "unknown-message";
   if (block.hash !== undefined && block.hash !== null) {
-    return `${block.type}-${String(block.hash)}-${index}`;
+    return `${messageScope}-${block.type}-${String(block.hash)}-${index}`;
   }
   // Fallback for legacy data (index-based)
-  return `${block.type}-idx-${index}`;
+  return `${messageScope}-${block.type}-idx-${index}`;
 }
 
 function escapeHtml(text: string): string {
@@ -1143,12 +1144,6 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
-.vcp-message-item {
-  /* Native Virtual Scrolling: defers rendering and layout of off-screen messages */
-  content-visibility: auto;
-  contain-intrinsic-size: auto 100px;
-}
-
 .animate-fade-in {
   animation: fadeIn 0.4s cubic-bezier(0.16, 1, 0.3, 1);
 }

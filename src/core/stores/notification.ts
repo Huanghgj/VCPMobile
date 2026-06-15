@@ -214,7 +214,9 @@ export const useNotificationStore = defineStore('notification', () => {
    * 将业务逻辑从 UI 组件下沉到 Store，确保状态一致性
    */
   const executeAction = async (notificationId: string, action: { label: string; value: any }, reason?: string) => {
-    const item = historyList.value.find(n => n.id === notificationId);
+    const item =
+      historyList.value.find(n => n.id === notificationId) ||
+      activeToasts.value.find(n => n.id === notificationId);
     if (!item) return;
 
     if (item.rawPayload?.type === 'tool_approval_request') {
@@ -245,6 +247,11 @@ export const useNotificationStore = defineStore('notification', () => {
         // 处理后 UI 反馈：清空按钮并从 Toast 移除
         item.actions = [];
         item.message = `[已处理] 操作: ${action.label}${trimmedReason ? ` (理由: ${trimmedReason})` : ''}`;
+        const historyItem = historyList.value.find(n => n.id === item.id);
+        if (historyItem && historyItem !== item) {
+          historyItem.actions = [];
+          historyItem.message = item.message;
+        }
         activeToasts.value = activeToasts.value.filter(t => t.id !== item.id);
         clearToastTimer(item.id);
       } catch (e) {

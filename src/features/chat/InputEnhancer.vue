@@ -544,7 +544,7 @@ onUnmounted(() => {
               录音时长: {{ recordingDuration }} 秒
             </div>
           </div>
-          
+
           <div class="absolute top-0 left-0 right-0 h-4 pointer-events-none bg-[var(--secondary-bg)] opacity-90"
             style="mask-image: linear-gradient(to bottom, black, transparent); -webkit-mask-image: linear-gradient(to bottom, black, transparent);"></div>
         </div>

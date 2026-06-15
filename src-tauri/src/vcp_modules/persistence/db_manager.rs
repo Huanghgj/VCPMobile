@@ -228,6 +228,7 @@ async fn setup_tables(pool: &Pool<Sqlite>) -> Result<(), String> {
         "CREATE TABLE IF NOT EXISTS render_cache (
             topic_id TEXT NOT NULL,
             msg_id TEXT NOT NULL,
+            content_hash TEXT NOT NULL DEFAULT '',
             render_content BLOB,
             updated_at BIGINT NOT NULL,
             PRIMARY KEY (topic_id, msg_id),
@@ -237,6 +238,21 @@ async fn setup_tables(pool: &Pool<Sqlite>) -> Result<(), String> {
     .execute(pool)
     .await
     .map_err(|e| e.to_string())?;
+
+    let render_cache_columns = sqlx::query("PRAGMA table_info(render_cache)")
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let has_render_cache_content_hash = render_cache_columns.iter().any(|row| {
+        use sqlx::Row;
+        row.get::<String, _>("name") == "content_hash"
+    });
+    if !has_render_cache_content_hash {
+        sqlx::query("ALTER TABLE render_cache ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''")
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
 
     // 8. message_attachments 表
     sqlx::query(

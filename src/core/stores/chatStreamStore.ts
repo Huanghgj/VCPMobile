@@ -6,6 +6,7 @@ import { useChatSessionStore } from "./chatSessionStore";
 import { useAssistantStore } from "./assistant";
 import { useAvatarStore } from "./avatar";
 import { useTopicStore } from "./topicListManager";
+import { clearMessageCache } from "../utils/astRenderer";
 import type { ChatMessage, MessageShell, TailFrame } from "../types/chat";
 
 export const useChatStreamStore = defineStore("chatStream", () => {
@@ -447,6 +448,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
       auroraActiveMessageIds.delete(actualMessageId);
       streamBlockSignatures.delete(actualMessageId);
       streamTailSignatures.delete(actualMessageId);
+      clearMessageCache(actualMessageId);
       msg = reactive<ChatMessage>({
         id: actualMessageId,
         role: "assistant",
@@ -455,6 +457,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
         timestamp: Date.now(),
         isThinking: type === "thinking",
         agentId: ctx.agentId,
+        topicId,
         groupId: ctx.groupId,
         isGroupMessage: !!ctx.isGroupMessage,
         shell: computeShell({ role: "assistant", agentId: ctx.agentId, name: ctx.agentName }),
@@ -624,6 +627,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
         if (event.timestamp) {
           msg!.timestamp = event.timestamp;
         }
+        clearMessageCache(actualMessageId);
         try {
           // 如果后端已经带回了预渲染好的 blocks，直接使用，跳过冗余解析
           if (event.blocks) {

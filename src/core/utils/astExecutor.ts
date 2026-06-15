@@ -1,4 +1,5 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
+import DOMPurify from "dompurify";
 import morphdom from "morphdom";
 import type { MarkdownNode, InlineNode, AstMutation } from "../types/chat";
 
@@ -106,6 +107,110 @@ function recordAstTrace(data: any): void {
 }
 
 const registryShards = new Map<string, Map<string, Node>>();
+
+function sanitizeMarkdownHtml(html: string): string {
+  return DOMPurify.sanitize(html, {
+    USE_PROFILES: { html: true, svg: true, mathMl: true },
+    FORBID_TAGS: ["script", "iframe", "object", "embed", "applet", "link", "meta"],
+    FORBID_ATTR: ["srcdoc"],
+    ALLOW_UNKNOWN_PROTOCOLS: false,
+    ALLOWED_URI_REGEXP:
+      /^(?:(?:https?|mailto|tel|blob|asset):|data:image\/|\/|\.\/|\.\.\/|#)/i,
+  });
+}
+
+function sanitizeHighlightedCodeHtml(html: string): string {
+  return DOMPurify.sanitize(html, {
+    USE_PROFILES: { html: true },
+    ALLOWED_TAGS: ["pre", "code", "span"],
+    ALLOWED_ATTR: ["class", "style"],
+  });
+}
+
+function sanitizeClassList(value: string | undefined, fallback: string): string {
+  const classList = (value || fallback)
+    .split(/\s+/)
+    .map((item) => item.trim())
+    .filter((item) => /^[A-Za-z0-9_-]+$/.test(item));
+  return classList.length ? classList.join(" ") : fallback;
+}
+
+function sanitizeLinkUrl(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  if (/^(https?:|mailto:|tel:|blob:|asset:)/i.test(trimmed)) return trimmed;
+  if (/^[./#]/.test(trimmed)) return trimmed;
+  return "";
+}
+
+function sanitizeImageUrl(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  if (/^(https?:|data:image\/|blob:|asset:)/i.test(trimmed)) return trimmed;
+  if (/^[./#]/.test(trimmed)) return trimmed;
+  return "";
+}
+
+function resolveLinkHref(node: InlineNode): string {
+  const href =
+    node.needs_asset_conversion && node.href
+      ? convertFileSrc(node.href)
+      : node.href || "";
+  return sanitizeLinkUrl(href);
+}
+
+function resolveImageSrc(node: InlineNode): string {
+  const src =
+    node.needs_asset_conversion && node.src
+      ? convertFileSrc(node.src)
+      : node.src || "";
+  return sanitizeImageUrl(src);
+}
+
+function copySafeAttributes(fromEl: HTMLElement, toEl: HTMLElement): void {
+  for (const attr of Array.from(fromEl.attributes)) {
+    if (attr.name === "class") continue;
+    if (/^on/i.test(attr.name) || attr.name === "srcdoc") continue;
+    const value =
+      attr.name === "href"
+        ? sanitizeLinkUrl(attr.value)
+        : attr.name === "src"
+          ? sanitizeImageUrl(attr.value)
+          : attr.value;
+    if (value) toEl.setAttribute(attr.name, value);
+  }
+}
+
+function setSafeAttribute(
+  node: HTMLElement,
+  key: string,
+  value: string,
+): boolean {
+  const normalizedKey = key.trim();
+  if (!normalizedKey || /^on/i.test(normalizedKey) || normalizedKey === "srcdoc") {
+    return false;
+  }
+  if (normalizedKey === "href") {
+    const href = sanitizeLinkUrl(value);
+    if (!href) {
+      node.removeAttribute("href");
+      return true;
+    }
+    node.setAttribute("href", href);
+    return true;
+  }
+  if (normalizedKey === "src") {
+    const src = sanitizeImageUrl(value);
+    if (!src) {
+      node.removeAttribute("src");
+      return true;
+    }
+    node.setAttribute("src", src);
+    return true;
+  }
+  node.setAttribute(normalizedKey, value);
+  return true;
+}
 
 export type ApplyFrameResult = {
   ok: boolean;
@@ -244,7 +349,7 @@ function createDomFromNode(
             html = innerMatch[1];
           }
         }
-        el.innerHTML = html;
+        el.innerHTML = sanitizeHighlightedCodeHtml(html);
       } else {
         const code = document.createElement("code");
         code.textContent = node.code || "";
@@ -281,7 +386,7 @@ function createDomFromNode(
 
     case "table": {
       const wrapper = document.createElement("div");
-      wrapper.className = node.wrapper_class || "vcp-table-wrapper";
+      wrapper.className = sanitizeClassList(node.wrapper_class, "vcp-table-wrapper");
       const table = document.createElement("table");
 
       const thead = document.createElement("thead");
@@ -339,12 +444,12 @@ function createDomFromNode(
       // 直接赋给 innerHTML 会导致部分 WebView 解析器因无法定位标签边界而直接丢弃并生成空 DOM。
       // 我们通过外层临时 <div> 进行强行诱导闭合补全，确保浏览器能够正确还原并渲染中间状态节点。
       const temp = document.createElement("div");
-      temp.innerHTML = `<div>${repairHtmlFragment(node.content || "")}</div>`;
+      temp.innerHTML = `<div>${sanitizeMarkdownHtml(repairHtmlFragment(node.content || ""))}</div>`;
       const parsed = temp.firstElementChild;
       if (parsed) {
-        el.innerHTML = parsed.innerHTML;
+        el.innerHTML = sanitizeMarkdownHtml(parsed.innerHTML);
       } else {
-        el.innerHTML = node.content || "";
+        el.innerHTML = sanitizeMarkdownHtml(node.content || "");
       }
       break;
     }
@@ -401,10 +506,7 @@ function createInlineDom(
 
     case "link": {
       const a = document.createElement("a");
-      a.href =
-        node.needs_asset_conversion && node.href
-          ? convertFileSrc(node.href)
-          : node.href || "";
+      a.href = resolveLinkHref(node);
       a.title = node.title || "";
       a.target = "_blank";
       a.rel = "noopener noreferrer";
@@ -418,10 +520,7 @@ function createInlineDom(
 
     case "image": {
       const img = document.createElement("img");
-      img.src =
-        node.needs_asset_conversion && node.src
-          ? convertFileSrc(node.src)
-          : node.src || "";
+      img.src = resolveImageSrc(node);
       img.alt = node.alt || "";
       img.title = node.title || "";
       img.loading = "lazy";
@@ -478,12 +577,12 @@ function createInlineDom(
       const span = document.createElement("span");
       // 物理防御：使用临时 <div> 强行闭合可能未闭合的 inline 标签，防止 WebView 抛弃节点
       const temp = document.createElement("div");
-      temp.innerHTML = `<div>${repairHtmlFragment(node.content || "")}</div>`;
+      temp.innerHTML = `<div>${sanitizeMarkdownHtml(repairHtmlFragment(node.content || ""))}</div>`;
       const parsed = temp.firstElementChild;
       if (parsed) {
-        span.innerHTML = parsed.innerHTML;
+        span.innerHTML = sanitizeMarkdownHtml(parsed.innerHTML);
       } else {
-        span.innerHTML = node.content || "";
+        span.innerHTML = sanitizeMarkdownHtml(node.content || "");
       }
       el = span;
       break;
@@ -601,10 +700,7 @@ function executeMutation(
           const replacement = document.createElement(`h${level}`);
           replacement.innerHTML = node.innerHTML;
           replacement.className = node.className;
-          for (const attr of Array.from(node.attributes)) {
-            if (attr.name !== "class")
-              replacement.setAttribute(attr.name, attr.value);
-          }
+          copySafeAttributes(node, replacement);
           if (node.parentNode) {
             registry.set(mutation.id, replacement);
             node.parentNode.replaceChild(replacement, node);
@@ -613,7 +709,10 @@ function executeMutation(
             detail = "Node has no parentNode";
           }
         } else {
-          node.setAttribute(mutation.key, mutation.value);
+          if (!setSafeAttribute(node, mutation.key, mutation.value)) {
+            status = "failed";
+            detail = `Unsafe attribute '${mutation.key}' rejected`;
+          }
         }
       } else {
         status = "failed";
@@ -654,7 +753,7 @@ function executeMutation(
               }
             }
 
-            oldNode.innerHTML = html; // 原地覆盖
+            oldNode.innerHTML = sanitizeHighlightedCodeHtml(html); // 原地覆盖
             astDebugLog(`[AST replace code_block optimized] id=${mutation.id}`);
             break;
           }
@@ -777,10 +876,7 @@ function executeMutation(
 
           // 2. 策略 B：图片属性原地更新，不销毁 DOM
           if (nodeType === "image" && oldNode instanceof HTMLImageElement) {
-            oldNode.src =
-              mutation.node.needs_asset_conversion && mutation.node.src
-                ? convertFileSrc(mutation.node.src)
-                : mutation.node.src || "";
+            oldNode.src = resolveImageSrc(mutation.node);
             oldNode.alt = mutation.node.alt || "";
             oldNode.title = mutation.node.title || "";
             break;

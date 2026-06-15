@@ -8,7 +8,6 @@ import { useAssistantStore } from "./assistant";
 import { useSettingsStore } from "./settings";
 import { useTopicStore } from "./topicListManager";
 import { clearMessageCache } from "../utils/astRenderer";
-import { acquireScreenKeep } from "../composables/useScreenKeeper";
 import { preloadMessageImages } from "../utils/messageAssetPreloader";
 import type { ChatMessage, HistoryChunk, ContentBlock } from "../types/chat";
 
@@ -151,6 +150,18 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
           return;
         }
 
+        if (!chunk.message) {
+          if (chunk.is_last) {
+            if (offset === 0) {
+              currentChatHistory.value = [];
+              historyOffset.value = 0;
+            }
+            hasMoreHistory.value = false;
+            completeLoad();
+          }
+          return;
+        }
+
         // 2. [关键修复] 消息对象劫持 (Object Hydration)
         // 如果该消息正在活跃生成中，则从全局流池中取出“活的”响应式对象
         // 这确保了即使是刚从 DB 拉回来的骨架，也能瞬间恢复流式动画与渲染状态
@@ -283,7 +294,6 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
 
     const agentId = sessionStore.currentSelectedItem.id;
     const topicId = sessionStore.currentTopicId;
-    acquireScreenKeep();
     try {
       const compiledBlocks = await invoke<ContentBlock[]>("append_single_message", {
         ownerId: sessionStore.currentSelectedItem.id,
@@ -501,7 +511,6 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     const countToDelete = currentChatHistory.value.length - (lastUserMsgIndex + 1);
     currentChatHistory.value = currentChatHistory.value.slice(0, lastUserMsgIndex + 1);
     topicStore.decrementTopicMsgCount(topicId, countToDelete);
-    acquireScreenKeep();
 
     // 3. 调用后端重构后的重生接口
     try {

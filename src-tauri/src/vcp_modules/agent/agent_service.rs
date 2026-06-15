@@ -595,7 +595,7 @@ pub async fn get_assistants_snapshot(
 
     // 1. 获取 agents (并写入缓存预热)
     let agent_rows = sqlx::query(
-        "SELECT a.agent_id, a.name, a.system_prompt, a.mobile_system_prompt, a.model, a.temperature, a.context_token_limit, a.max_output_tokens, a.stream_output, a.use_temperature, av.dominant_color 
+        "SELECT a.agent_id, a.name, a.system_prompt, a.mobile_system_prompt, a.model, a.temperature, a.context_token_limit, a.max_output_tokens, a.stream_output, a.use_temperature, av.dominant_color
          FROM agents a
          LEFT JOIN avatars av ON av.owner_id = a.agent_id AND av.owner_type = 'agent'
          WHERE a.deleted_at IS NULL"
@@ -640,7 +640,7 @@ pub async fn get_assistants_snapshot(
 
     // 2. 获取 groups (并写入缓存预热)
     let group_rows = sqlx::query(
-        "SELECT g.group_id, g.name, g.mode, g.group_prompt, g.invite_prompt, g.use_unified_model, g.unified_model, g.tag_match_mode, g.created_at, av.dominant_color 
+        "SELECT g.group_id, g.name, g.mode, g.group_prompt, g.invite_prompt, g.use_unified_model, g.unified_model, g.tag_match_mode, g.created_at, av.dominant_color
          FROM groups g
          LEFT JOIN avatars av ON av.owner_id = g.group_id AND av.owner_type = 'group'
          WHERE g.deleted_at IS NULL"
@@ -650,8 +650,8 @@ pub async fn get_assistants_snapshot(
     .map_err(|e| e.to_string())?;
 
     let member_rows = sqlx::query(
-        "SELECT group_id, agent_id, member_tag 
-         FROM group_members 
+        "SELECT group_id, agent_id, member_tag
+         FROM group_members
          ORDER BY group_id, sort_order ASC",
     )
     .fetch_all(pool)
@@ -719,10 +719,10 @@ pub async fn get_assistants_snapshot(
 
     // 3. 获取 unread_counts
     let unread_rows = sqlx::query(
-        "SELECT owner_id, 
+        "SELECT owner_id,
                 CAST(COALESCE(SUM(unread_count), 0) AS INTEGER) as total_count,
                 MAX(CASE WHEN unread = 1 THEN 1 ELSE 0 END) as has_unread
-         FROM topics 
+         FROM topics
          WHERE deleted_at IS NULL
          GROUP BY owner_id",
     )

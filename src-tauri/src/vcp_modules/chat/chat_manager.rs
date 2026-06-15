@@ -76,7 +76,7 @@ pub struct ChatMessage {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct HistoryChunk {
-    pub message: ChatMessage,
+    pub message: Option<ChatMessage>,
     pub index: usize,
     pub is_last: bool,
 }
@@ -106,10 +106,19 @@ pub async fn load_chat_history_streamed(
     )
     .await?;
     let total = messages.len();
+    if total == 0 {
+        let _ = on_message.send(HistoryChunk {
+            message: None,
+            index: 0,
+            is_last: true,
+        });
+        return Ok(0);
+    }
+
     for (index, message) in messages.into_iter().enumerate() {
         let is_last = index == total.saturating_sub(1);
         let _ = on_message.send(HistoryChunk {
-            message,
+            message: Some(message),
             index,
             is_last,
         });

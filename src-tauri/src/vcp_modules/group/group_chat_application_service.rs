@@ -36,6 +36,19 @@ pub struct GroupChatParams {
     pub stream_channel: Option<Channel<crate::vcp_modules::vcp_client::StreamEvent>>,
 }
 
+fn context_history_message_limit(context_token_limit: i32) -> usize {
+    const MIN_HISTORY_MESSAGES: usize = 24;
+    const MAX_HISTORY_MESSAGES: usize = 240;
+    const TOKENS_PER_MESSAGE_BUDGET: usize = 1_500;
+
+    if context_token_limit <= 0 {
+        return 96;
+    }
+
+    ((context_token_limit as usize) / TOKENS_PER_MESSAGE_BUDGET)
+        .clamp(MIN_HISTORY_MESSAGES, MAX_HISTORY_MESSAGES)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn internal_process_group_chat_message(
     app_handle: AppHandle,
@@ -121,11 +134,17 @@ pub async fn internal_process_group_chat_message(
         return Ok(json!({"status": "no_ai_response"}));
     }
 
+    let context_limit = speakers
+        .iter()
+        .map(|speaker| context_history_message_limit(speaker.context_token_limit))
+        .max()
+        .unwrap_or(96);
+
     // 提前加载轻量级全量纯文本和附件历史记录作为接力上下文的基础 (从底层隔离 UI 渲染反序列化和 Shell 计算)
     let mut full_history_for_context = message_service::load_chat_text_history_for_context(
         &app_handle,
         &topic_id,
-        None, // 加载全部用于 VCP 上下文
+        Some(context_limit),
         None,
         true, // include_extracted_text: 组装群聊上下文发送给 VCP 时需要包含附件提取文本内容
     )

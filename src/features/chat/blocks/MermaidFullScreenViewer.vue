@@ -50,7 +50,7 @@ watch(() => props.visible, (newVal) => {
     scale.value = 1;
     translateX.value = 0;
     translateY.value = 0;
-    
+
     window.addEventListener('click', closeCopyDropdown);
   } else {
     unregisterModal(modalId);
@@ -83,19 +83,19 @@ const fitToWidth = () => {
   if (!fullscreenCanvasRef.value || !fullscreenViewportRef.value) return;
   const svg = fullscreenCanvasRef.value.querySelector('svg');
   if (!svg) return;
-  
+
   const svgWidth = svg.getBBox?.().width || svg.viewBox?.baseVal?.width || svg.clientWidth || svg.getBoundingClientRect().width;
-  
+
   const viewWidth = fullscreenViewportRef.value.clientWidth - 48; // 24px padding on each side
-  
+
   if (!svgWidth) {
     resetView();
     return;
   }
-  
+
   const scaleW = viewWidth / svgWidth;
   const targetScale = Math.min(2.0, Math.max(0.15, scaleW));
-  
+
   scale.value = targetScale;
   translateX.value = 0;
   translateY.value = 0;
@@ -112,14 +112,14 @@ let startTranslateY = 0;
 
 const handlePointerDown = (e: PointerEvent) => {
   if (!fullscreenViewportRef.value) return;
-  
+
   try {
     fullscreenViewportRef.value.setPointerCapture(e.pointerId);
   } catch (err) {}
-  
+
   activePointers.set(e.pointerId, { clientX: e.clientX, clientY: e.clientY });
   const pointerList = Array.from(activePointers.values());
-  
+
   if (pointerList.length === 1) {
     isDragging.value = true;
     startDragX = e.clientX;
@@ -137,10 +137,10 @@ const handlePointerDown = (e: PointerEvent) => {
 
 const handlePointerMove = (e: PointerEvent) => {
   if (!activePointers.has(e.pointerId)) return;
-  
+
   activePointers.set(e.pointerId, { clientX: e.clientX, clientY: e.clientY });
   const pointerList = Array.from(activePointers.values());
-  
+
   if (pointerList.length === 1 && isDragging.value) {
     const dx = e.clientX - startDragX;
     const dy = e.clientY - startDragY;
@@ -163,13 +163,13 @@ const handlePointerUp = (e: PointerEvent) => {
       fullscreenViewportRef.value.releasePointerCapture(e.pointerId);
     } catch (err) {}
   }
-  
+
   activePointers.delete(e.pointerId);
-  
+
   if (activePointers.size < 2) {
     initialPinchDistance = 0;
   }
-  
+
   if (activePointers.size === 0) {
     isDragging.value = false;
   } else if (activePointers.size === 1) {
@@ -233,10 +233,10 @@ const exportToGallery = () => {
 
   const clonedSvg = svg.cloneNode(true) as SVGElement;
   clonedSvg.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
-  
+
   const svgWidth = svg.getBBox?.().width || svg.viewBox?.baseVal?.width || svg.clientWidth || 600;
   const svgHeight = svg.getBBox?.().height || svg.viewBox?.baseVal?.height || svg.clientHeight || 400;
-  
+
   clonedSvg.setAttribute('width', String(svgWidth));
   clonedSvg.setAttribute('height', String(svgHeight));
 
@@ -248,16 +248,16 @@ const exportToGallery = () => {
   img.onload = () => {
     const canvas = document.createElement('canvas');
     const scaleFactor = Math.min(2.5, Math.max(1.0, 2048 / Math.max(svgWidth, svgHeight)));
-    
+
     canvas.width = svgWidth * scaleFactor;
     canvas.height = svgHeight * scaleFactor;
-    
+
     const ctx = canvas.getContext('2d');
     if (ctx) {
       ctx.fillStyle = themeStore.isDarkResolved ? '#0d1117' : '#ffffff';
       ctx.fillRect(0, 0, canvas.width, canvas.height);
       ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-      
+
       try {
         const dataUrl = canvas.toDataURL('image/png');
         saveImageToGallery(dataUrl, `mermaid_${Date.now()}.png`).then(() => {
@@ -282,12 +282,12 @@ const exportToGallery = () => {
     }
     URL.revokeObjectURL(url);
   };
-  
+
   img.onerror = (e) => {
     console.error('Image load failed', e);
     URL.revokeObjectURL(url);
   };
-  
+
   img.src = url;
 };
 </script>
@@ -304,7 +304,7 @@ const exportToGallery = () => {
     >
       <div v-if="visible" class="fixed inset-0 z-viewer flex flex-col select-none overflow-hidden pb-[env(safe-area-inset-bottom)]"
         :class="themeStore.isDarkResolved ? 'bg-[#0d1117] text-gray-200' : 'bg-[#f8fafc] text-gray-800'">
-        
+
         <!-- Header -->
         <div class="h-14 flex items-center justify-between px-4 border-b pt-[env(safe-area-inset-top)] box-content"
           :class="themeStore.isDarkResolved ? 'border-white/5 bg-[#0d1117]' : 'border-black/5 bg-[#f8fafc]'">
@@ -314,7 +314,7 @@ const exportToGallery = () => {
             </button>
             <span class="text-sm font-bold">图表预览</span>
           </div>
-          
+
           <div class="flex items-center gap-2">
             <!-- 复制二级下拉菜单容器 -->
             <div class="relative">
@@ -324,9 +324,9 @@ const exportToGallery = () => {
                 <span>复制</span>
                 <div class="i-ph:caret-down-bold w-3 h-3 opacity-60"></div>
               </button>
-              
+
               <!-- 下拉菜单 (Dropdown) -->
-              <div v-if="isCopyDropdownVisible" 
+              <div v-if="isCopyDropdownVisible"
                 class="absolute right-0 mt-1.5 w-36 rounded-lg border shadow-lg z-30 py-1"
                 :class="themeStore.isDarkResolved ? 'border-white/10 bg-[#1e293b] text-gray-200' : 'border-black/10 bg-white text-gray-800'"
                 @click.stop
@@ -351,14 +351,14 @@ const exportToGallery = () => {
             </button>
           </div>
         </div>
-        
+
         <!-- Viewport Grid Background (No Backdrop Blur) -->
-        <div 
+        <div
           ref="fullscreenViewportRef"
           class="flex-1 relative w-full overflow-hidden cursor-grab active:cursor-grabbing touch-none"
           :style="{
-            backgroundImage: themeStore.isDarkResolved 
-              ? 'radial-gradient(rgba(255, 255, 255, 0.08) 1px, transparent 1px)' 
+            backgroundImage: themeStore.isDarkResolved
+              ? 'radial-gradient(rgba(255, 255, 255, 0.08) 1px, transparent 1px)'
               : 'radial-gradient(rgba(0, 0, 0, 0.06) 1px, transparent 1px)',
             backgroundSize: '20px 20px'
           }"
@@ -369,7 +369,7 @@ const exportToGallery = () => {
           @wheel="handleWheel"
           @dblclick="handleDblClick"
         >
-          <div 
+          <div
             ref="fullscreenCanvasRef"
             class="inline-flex items-center justify-center min-w-full min-h-full p-8 box-border origin-center"
             :style="{
@@ -379,28 +379,28 @@ const exportToGallery = () => {
             v-html="svgHtml"
           ></div>
         </div>
-        
+
         <!-- Floating Control Bar (No Backdrop Blur, Solid background) -->
         <div class="absolute bottom-6 left-1/2 -translate-x-1/2 flex items-center gap-1 px-3 py-2 rounded-xl border shadow-xl z-20"
-          :class="themeStore.isDarkResolved 
-            ? 'border-white/10 bg-[#1e293b] text-gray-200' 
+          :class="themeStore.isDarkResolved
+            ? 'border-white/10 bg-[#1e293b] text-gray-200'
             : 'border-black/10 bg-white text-gray-800'">
-          
+
           <button @click="zoomOut" class="p-2 active:scale-90 transition-all hover:opacity-80" title="缩小">
             <div class="i-ph:minus-bold w-4.5 h-4.5"></div>
           </button>
-          
+
           <button @click="resetView" class="px-2.5 py-1 text-xs font-semibold font-mono rounded-lg active:bg-black/5 dark:active:bg-white/5 transition-all hover:opacity-80" title="重置 100%">
             {{ Math.round(scale * 100) }}%
           </button>
-          
+
           <button @click="zoomIn" class="p-2 active:scale-90 transition-all hover:opacity-80" title="放大">
             <div class="i-ph:plus-bold w-4.5 h-4.5"></div>
           </button>
-          
+
           <div class="w-[1px] h-4 mx-1"
             :class="themeStore.isDarkResolved ? 'bg-white/15' : 'bg-black/15'"></div>
-          
+
           <button @click="fitToWidth" class="p-2 active:scale-90 transition-all hover:opacity-80" title="适应屏幕">
             <div class="i-ph:arrows-in-line-horizontal-bold w-4.5 h-4.5"></div>
           </button>

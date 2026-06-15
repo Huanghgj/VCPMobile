@@ -19,7 +19,7 @@ const props = withDefaults(defineProps<Props>(), {
 
 const renderedHtml = computed(() => {
   let rawText = props.text || '';
-  
+
   if (props.isQuery) {
     // 转义特殊 HTML 字符，防止在 v-html 渲染 query/response 文本时因浏览器误判 <Tauri> 等标签而吞字
     rawText = rawText.replace(/</g, '&lt;').replace(/>/g, '&gt;');

@@ -341,7 +341,7 @@ onUnmounted(() => {
               v-if="fullScreenTab === 'preview'"
               ref="fullscreenIframeRef"
               class="vcp-fullscreen-iframe w-full h-full border-none"
-              sandbox=""
+              sandbox="allow-scripts"
               loading="lazy"
               :srcdoc="sandboxHtml"
               :data-vcp-image-nonce="imageNonce"
@@ -483,7 +483,7 @@ onUnmounted(() => {
         <iframe
           ref="inlineIframeRef"
           class="vcp-inline-iframe w-full h-full border-none no-swipe"
-          sandbox=""
+          sandbox="allow-scripts"
           loading="lazy"
           :srcdoc="sandboxHtml"
           :data-vcp-image-nonce="imageNonce"

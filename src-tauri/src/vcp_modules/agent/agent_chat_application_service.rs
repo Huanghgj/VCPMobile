@@ -30,6 +30,19 @@ fn history_tail_matches_user_message(history: &[ChatMessage], user_message: &Cha
         })
 }
 
+fn context_history_message_limit(context_token_limit: i32) -> usize {
+    const MIN_HISTORY_MESSAGES: usize = 24;
+    const MAX_HISTORY_MESSAGES: usize = 240;
+    const TOKENS_PER_MESSAGE_BUDGET: usize = 1_500;
+
+    if context_token_limit <= 0 {
+        return 96;
+    }
+
+    ((context_token_limit as usize) / TOKENS_PER_MESSAGE_BUDGET)
+        .clamp(MIN_HISTORY_MESSAGES, MAX_HISTORY_MESSAGES)
+}
+
 #[tauri::command]
 pub async fn handle_agent_chat_message(
     app_handle: AppHandle,
@@ -96,7 +109,9 @@ pub async fn internal_process_agent_chat_message(
     let mut history = message_service::load_chat_text_history_for_context(
         &app_handle,
         &topic_id,
-        None,
+        Some(context_history_message_limit(
+            agent_config.context_token_limit,
+        )),
         None,
         true, // include_extracted_text: 组装上下文发送给 VCP 时需要包含附件提取文本内容
     )

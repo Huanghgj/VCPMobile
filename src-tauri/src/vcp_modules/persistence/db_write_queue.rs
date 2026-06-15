@@ -525,18 +525,19 @@ impl DbWriteQueue {
 
             if !render_chunk.is_empty() {
                 let mut sql_render = String::from(
-                    "INSERT INTO render_cache (topic_id, msg_id, render_content, updated_at) VALUES ",
+                    "INSERT INTO render_cache (topic_id, msg_id, content_hash, render_content, updated_at) VALUES ",
                 );
 
                 for i in 0..render_chunk.len() {
                     if i > 0 {
                         sql_render.push_str(", ");
                     }
-                    sql_render.push_str("(?, ?, ?, ?)");
+                    sql_render.push_str("(?, ?, ?, ?, ?)");
                 }
 
                 sql_render.push_str(
                     " ON CONFLICT(topic_id, msg_id) DO UPDATE SET
+                        content_hash = excluded.content_hash,
                         render_content = excluded.render_content,
                         updated_at = excluded.updated_at",
                 );
@@ -547,6 +548,7 @@ impl DbWriteQueue {
                 for (idx, msg) in render_chunk {
                     params_render.push(Box::new(topic_id.to_string()));
                     params_render.push(Box::new(msg.id.clone()));
+                    params_render.push(Box::new(content_hashes[idx].clone()));
                     params_render.push(Box::new(render_bytes[idx].clone()));
                     params_render.push(Box::new(now));
                 }

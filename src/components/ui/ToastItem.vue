@@ -9,6 +9,7 @@ const props = defineProps<{
 }>();
 
 const store = useNotificationStore();
+const isActionRunning = ref(false);
 
 const getIcon = (type: string) => {
   switch (type) {
@@ -63,7 +64,18 @@ const swipeStyle = computed(() => {
 });
 
 const handleClick = () => {
+  if (props.toast.actions?.length) return;
   dismissToast(props.toast.id);
+};
+
+const handleAction = async (action: NonNullable<VcpNotification['actions']>[number]) => {
+  if (isActionRunning.value) return;
+  isActionRunning.value = true;
+  try {
+    await store.executeAction(props.toast.id, action);
+  } finally {
+    isActionRunning.value = false;
+  }
 };
 </script>
 
@@ -99,6 +111,19 @@ const handleClick = () => {
           @mousedown.stop>
           {{ toast.message }}
         </p>
+
+        <div v-if="toast.actions && toast.actions.length > 0" class="mt-2 grid grid-cols-2 gap-1.5">
+          <button
+            v-for="act in toast.actions"
+            :key="act.label"
+            class="rounded-md px-2 py-1.5 text-[10px] font-bold text-white shadow-sm active:scale-95 disabled:opacity-60"
+            :class="act.color"
+            :disabled="isActionRunning"
+            @click.stop="handleAction(act)"
+          >
+            {{ act.label }}
+          </button>
+        </div>
       </div>
     </div>
 

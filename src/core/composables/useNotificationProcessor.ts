@@ -25,6 +25,20 @@ export interface FilterRule {
 export function useNotificationProcessor() {
   const store = useNotificationStore();
 
+  const getApprovalPayload = (payload: any) => {
+    if (payload?.type === 'tool_approval_request' && payload.data) {
+      return payload;
+    }
+    if (
+      payload?.type === 'vcp-info-message' &&
+      payload.data?.type === 'tool_approval_request' &&
+      payload.data?.data
+    ) {
+      return payload.data;
+    }
+    return null;
+  };
+
   const stringifyCompact = (value: any, maxLength = 160) => {
     if (value === null || typeof value === 'undefined') return '';
     const text = typeof value === 'string' ? value : JSON.stringify(value);
@@ -263,6 +277,11 @@ export function useNotificationProcessor() {
     detail.label === '原始数据' || detail.label === '额外字段';
 
   const buildVcpInfoNotification = (payload: any): Partial<VcpNotification> => {
+    const approvalPayload = getApprovalPayload(payload);
+    if (approvalPayload) {
+      return buildToolApprovalNotification(approvalPayload);
+    }
+
     const data = payload.data || payload;
     const infoType = String(data.type || 'VCP_INFO');
     const meta: NonNullable<VcpNotification['meta']> = [];
@@ -596,6 +615,34 @@ export function useNotificationProcessor() {
     return result;
   };
 
+  const buildToolApprovalNotification = (payload: any): Partial<VcpNotification> => {
+    const approvalData = payload.data || {};
+    const requestId = typeof approvalData.requestId === 'string' ? approvalData.requestId.trim() : '';
+    const toolName = approvalData.toolName || approvalData.tool_name || 'Unknown';
+    const args = approvalData.args || {};
+    const command = args.command || args.cmd || stringifyCompact(args, 220);
+    const maid = approvalData.maid || approvalData.agentName || approvalData.agent || 'N/A';
+
+    return {
+      id: requestId ? `tool-approval-${requestId}` : `tool-approval-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      title: `审核请求: ${toolName}`,
+      message: `助手: ${maid}\n命令: ${command}\n时间: ${approvalData.timestamp || 'Just now'}`,
+      type: 'warning',
+      category: 'approval',
+      infoType: 'tool_approval_request',
+      tags: ['工具审核', String(toolName)],
+      isPreformatted: true,
+      duration: 0,
+      actions: [
+        { label: '允许', value: true, color: 'bg-green-500 shadow-lg shadow-green-500/20' },
+        { label: '拒绝', value: false, color: 'bg-red-500 shadow-lg shadow-red-500/20' }
+      ],
+      rawPayload: payload,
+      silent: false,
+      historyOnly: false,
+    };
+  };
+
   /**
    * 全局消息过滤引擎 (对标桌面端 filterManager.js)
    * 允许根据标题、内容或原始负载拦截/修改消息展示行为
@@ -680,6 +727,11 @@ export function useNotificationProcessor() {
 
     if (payload.type === 'vcp-info-status') {
       return { silent: true };
+    }
+
+    const approvalPayload = getApprovalPayload(payload);
+    if (approvalPayload) {
+      return buildToolApprovalNotification(approvalPayload);
     }
 
     if (payload.type === 'vcp-info-message') {
@@ -839,16 +891,7 @@ export function useNotificationProcessor() {
     }
     // 5. tool_approval_request: 审核请求
     else if (payload.type === 'tool_approval_request' && payload.data) {
-      const approvalData = payload.data;
-      type = 'warning';
-      title = `🛠️ 审核请求: ${approvalData.toolName || 'Unknown'}`;
-      message = `助手: ${approvalData.maid || 'N/A'}\n命令: ${approvalData.args?.command || JSON.stringify(approvalData.args || {})}\n时间: ${approvalData.timestamp || 'Just now'}`;
-      isPreformatted = true;
-      duration = 0;
-      actions = [
-        { label: '允许', value: true, color: 'bg-green-500 shadow-lg shadow-green-500/20' },
-        { label: '拒绝', value: false, color: 'bg-red-500 shadow-lg shadow-red-500/20' }
-      ];
+      return buildToolApprovalNotification(payload);
     }
     // 6. 默认回退 (Generic fallback)
     else {

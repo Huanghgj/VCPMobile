@@ -26,12 +26,12 @@ function getStatusLabel(status: string): string {
       <span class="vcp-tool-call-summary-icon">🧾</span>
       <span class="vcp-tool-call-summary-title">本轮工具调用摘要</span>
     </div>
-    
+
     <div v-if="block.items && block.items.length > 0" class="vcp-tool-call-summary-list">
-      <span 
-        v-for="(item, index) in block.items" 
-        :key="index" 
-        class="vcp-tool-call-summary-chip" 
+      <span
+        v-for="(item, index) in block.items"
+        :key="index"
+        class="vcp-tool-call-summary-chip"
         :class="`status-${item.status}`"
       >
         <span class="vcp-tool-call-summary-tool">{{ item.tool_name }}</span>

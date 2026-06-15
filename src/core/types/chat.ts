@@ -146,7 +146,7 @@ export interface TailFrame {
  * HistoryChunk 接口定义，用于 Channel 流式加载
  */
 export interface HistoryChunk {
-  message: ChatMessage;
+  message?: ChatMessage | null;
   index: number;
   is_last: boolean;
 }

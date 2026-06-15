@@ -19,9 +19,10 @@ export const useRagObserverStore = defineStore('ragObserver', () => {
   const connectionStatus = ref<ConnectionStatus>('closed');
   const metadataList = ref<VcpInfoMetadata[]>([]);
   const triggerSpectrumAnimation = ref(false);
-  
+
   let unlistenFn: UnlistenFn | null = null;
   let listenerSessionId = 0;
+  let animationResetTimer: ReturnType<typeof setTimeout> | null = null;
 
   // 从后端初始化拉取历史 metadata
   const fetchMetadataList = async () => {
@@ -67,8 +68,12 @@ export const useRagObserverStore = defineStore('ragObserver', () => {
   // 触发一次频谱微动画
   const triggerAnimation = () => {
     triggerSpectrumAnimation.value = true;
-    setTimeout(() => {
+    if (animationResetTimer) {
+      clearTimeout(animationResetTimer);
+    }
+    animationResetTimer = setTimeout(() => {
       triggerSpectrumAnimation.value = false;
+      animationResetTimer = null;
     }, 1500); // 持续 1.5 秒
   };
 
@@ -94,7 +99,7 @@ export const useRagObserverStore = defineStore('ragObserver', () => {
       if (!payload || typeof payload !== 'object') return;
 
       const type = payload.type;
-      
+
       if (type === 'vcp-info-status') {
         if (payload.source === 'VCPInfo' && payload.status) {
           connectionStatus.value = payload.status as ConnectionStatus;
@@ -119,6 +124,11 @@ export const useRagObserverStore = defineStore('ragObserver', () => {
       unlistenFn();
       unlistenFn = null;
     }
+    if (animationResetTimer) {
+      clearTimeout(animationResetTimer);
+      animationResetTimer = null;
+    }
+    triggerSpectrumAnimation.value = false;
   };
 
   return {
