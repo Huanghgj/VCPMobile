@@ -12,6 +12,7 @@ import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import android.os.PowerManager
 
 /**
  * 流式响应前台保活服务
@@ -25,6 +26,11 @@ import androidx.core.app.NotificationCompat
  * - 流结束立即自毁，绝不空占
  */
 class StreamKeepaliveService : Service() {
+
+    private var isKeepaliveModeActive = false
+    private var currentStreamName = ""
+    private var wakeLock: PowerManager.WakeLock? = null
+
     companion object {
         const val CHANNEL_ID = "vcp_stream_keepalive"
         const val NOTIFICATION_ID = 0x53545201 // "STR" + 01
@@ -34,12 +40,6 @@ class StreamKeepaliveService : Service() {
 
         @Volatile
         var isServiceRunning = false
-
-        @Volatile
-        var isKeepaliveModeActive = false
-
-        @Volatile
-        var currentStreamName = ""
 
         /**
          * 构造启动该服务的 Intent
@@ -110,6 +110,19 @@ class StreamKeepaliveService : Service() {
             return START_NOT_STICKY
         }
 
+        if (isKeepaliveModeActive || currentStreamName.isNotEmpty()) {
+            val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+            if (wakeLock == null) {
+                wakeLock = powerManager.newWakeLock(
+                    PowerManager.PARTIAL_WAKE_LOCK,
+                    "VcpMobile::StreamWakeLock"
+                ).apply {
+                    acquire(10 * 60 * 1000L) // 限制最大超时 10 分钟以防电池耗尽
+                }
+                Log.i(TAG, "WakeLock acquired for stream: $currentStreamName")
+            }
+        }
+
         return START_STICKY
     }
 
@@ -120,6 +133,12 @@ class StreamKeepaliveService : Service() {
             @Suppress("DEPRECATION")
             stopForeground(true)
         }
+        wakeLock?.let {
+            if (it.isHeld) {
+                it.release()
+            }
+        }
+        wakeLock = null
         isServiceRunning = false
         isKeepaliveModeActive = false
         currentStreamName = ""
@@ -172,12 +191,18 @@ class StreamKeepaliveService : Service() {
         }
         val cleanTitle = agentName.replace("[数据同步]", "").replace("[预渲染重建]", "").trim()
 
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(if (cleanTitle.isEmpty()) "VCP Mobile" else cleanTitle)
             .setContentText(contentText)
             .setSmallIcon(applicationInfo.icon)
             .setOngoing(true)
+            .setOnlyAlertOnce(true)
             .setContentIntent(openPendingIntent)
-            .build()
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            builder.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE)
+        }
+
+        return builder.build()
     }
 }

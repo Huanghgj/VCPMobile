@@ -7,8 +7,8 @@ use vcp_modules::agent_chat_application_service::{
     handle_agent_chat_message, handle_assistant_chat_stream,
 };
 use vcp_modules::agent_service::{
-    create_agent, delete_agent, get_agents, read_agent_config, save_agent_config,
-    update_agent_config,
+    create_agent, delete_agent, get_agents, get_assistants_snapshot, read_agent_config,
+    save_agent_config, update_agent_config,
 };
 use vcp_modules::avatar_service::{get_avatar, save_avatar_data, store_dominant_color};
 use vcp_modules::chat_manager::{
@@ -66,6 +66,10 @@ use vcp_modules::update_manager::{check_for_update, download_update, install_upd
 use vcp_modules::vcp_client::{
     interruptGroupTurn, interruptRequest, sendToVCP, test_vcp_connection, ActiveRequests,
     CancelledGroupTurns,
+};
+use vcp_modules::vcp_info_service::{
+    clear_vcp_info, get_vcp_info_connection_status, get_vcp_info_metadata_list,
+    get_vcp_info_payload, init_vcp_info_connection,
 };
 use vcp_modules::vcp_log_service::{
     init_vcp_log_connection, send_vcp_log_message, set_vcp_log_heartbeat,
@@ -249,6 +253,7 @@ pub fn run() {
             set_topic_unread,
             regenerate_topic_response,
             get_agents,
+            get_assistants_snapshot,
             read_agent_config,
             save_agent_config,
             update_agent_config,
@@ -287,6 +292,11 @@ pub fn run() {
             init_vcp_log_connection,
             send_vcp_log_message,
             set_vcp_log_heartbeat,
+            init_vcp_info_connection,
+            get_vcp_info_connection_status,
+            get_vcp_info_metadata_list,
+            get_vcp_info_payload,
+            clear_vcp_info,
             get_system_snapshot,
             get_emoticon_library,
             regenerate_emoticon_library,

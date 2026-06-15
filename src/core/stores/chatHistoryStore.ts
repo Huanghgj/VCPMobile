@@ -4,9 +4,11 @@ import { invoke, Channel } from "@tauri-apps/api/core";
 import { useChatSessionStore } from "./chatSessionStore";
 import { useChatStreamStore } from "./chatStreamStore";
 import { useAttachmentStore } from "./attachmentStore";
+import { useAssistantStore } from "./assistant";
 import { useSettingsStore } from "./settings";
 import { useTopicStore } from "./topicListManager";
 import { clearMessageCache } from "../utils/astRenderer";
+import { acquireScreenKeep } from "../composables/useScreenKeeper";
 import { preloadMessageImages } from "../utils/messageAssetPreloader";
 import type { ChatMessage, HistoryChunk, ContentBlock } from "../types/chat";
 
@@ -25,11 +27,46 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
   // 用于标记当前是否正在“编辑重发”某条历史消息
   const editingOriginalMessageId = ref<string | null>(null);
 
+  // 用于防止并发加载与话题切换导致竞态的消息拉取中止控制器 (AbortController)
+  let currentLoadAbortController: AbortController | null = null;
+
   const sessionStore = useChatSessionStore();
   const streamStore = useChatStreamStore();
   const attachmentStore = useAttachmentStore();
+  const assistantStore = useAssistantStore();
   const settingsStore = useSettingsStore();
   const topicStore = useTopicStore();
+
+  const summarizeTopic = async () => {
+    if (!sessionStore.currentTopicId || !sessionStore.currentSelectedItem?.id) return;
+
+    const topicId = sessionStore.currentTopicId;
+    const ownerId = sessionStore.currentSelectedItem.id;
+    const ownerType = sessionStore.currentSelectedItem.type;
+
+    const topic = topicStore.topics.find((t) => t.id === topicId);
+    const isDefaultName = topic && /^(新话题|新会话) \d{2}:\d{2}:\d{2}$/.test(topic.name);
+    const messageCount = currentChatHistory.value.filter((m) => m.role !== "system").length;
+
+    if (!isDefaultName || messageCount < 4) return;
+
+    try {
+      const agentName =
+        assistantStore.agents.find((agent: any) => agent.id === ownerId)?.name || "AI";
+      const newTitle = await invoke<string>("summarize_topic", {
+        ownerId,
+        ownerType,
+        topicId,
+        agentName,
+      });
+
+      if (newTitle) {
+        await topicStore.updateTopicTitle(ownerId, ownerType, topicId, newTitle);
+      }
+    } catch (e) {
+      console.error("[ChatHistoryStore] AI Summary failed:", e);
+    }
+  };
 
   /**
    * 加载聊天历史
@@ -48,6 +85,17 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     loading.value = true;
     isLoadingHistory.value = true;
     const loadSequence = ++historyLoadSequence;
+
+    if (currentLoadAbortController) {
+      currentLoadAbortController.abort();
+    }
+    const controller = new AbortController();
+    currentLoadAbortController = controller;
+    const { signal } = controller;
+
+    let pendingHistory: ChatMessage[] = [];
+    let flushRafId: number | null = null;
+
     try {
       const requestedTopicId = topicId;
       const isStaleLoad = () => loadSequence !== historyLoadSequence;
@@ -66,14 +114,38 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
         }
       };
 
+      let lastFlushTime = 0;
+      const FLUSH_INTERVAL = 33.3; // 30Hz
+
+      const flushHistory = (force = false) => {
+        if (pendingHistory.length === 0) return;
+        const now = performance.now();
+        if (force || now - lastFlushTime >= FLUSH_INTERVAL) {
+          currentChatHistory.value = [...currentChatHistory.value, ...pendingHistory];
+          pendingHistory = [];
+          lastFlushTime = now;
+        }
+      };
+
+      const scheduleHistoryFlush = () => {
+        if (flushRafId) return;
+        flushRafId = requestAnimationFrame(() => {
+          flushRafId = null;
+          flushHistory(false);
+          if (pendingHistory.length > 0) {
+            scheduleHistoryFlush();
+          }
+        });
+      };
+
       channel.onmessage = (chunk) => {
         if (isStaleLoad()) {
           completeLoad();
           return;
         }
 
-        // 1. 会话一致性校验：如果用户在加载中途切换了话题，丢弃后续消息
-        if (sessionStore.currentTopicId !== requestedTopicId && requestedTopicId !== null) {
+        // 1. 唯一性与话题一致性防御性校验：若请求已中止，或当前话题已被切换，直接丢弃该过时流数据
+        if (signal.aborted || sessionStore.currentTopicId !== requestedTopicId) {
           cancelledByTopicChange = true;
           completeLoad();
           return;
@@ -90,8 +162,9 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
             currentChatHistory.value = [];
             hasMoreHistory.value = true;
           }
-          currentChatHistory.value.push(msgToUse);
+          pendingHistory.push(msgToUse);
           receivedCount++;
+          scheduleHistoryFlush();
         } else {
           buffer.push(msgToUse);
           receivedCount++;
@@ -105,6 +178,11 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
               hasMoreHistory.value = false;
             }
           } else {
+            if (flushRafId !== null) {
+              cancelAnimationFrame(flushRafId);
+              flushRafId = null;
+            }
+            flushHistory(true);
             historyOffset.value = receivedCount;
             if (receivedCount < limit) {
               hasMoreHistory.value = false;
@@ -145,8 +223,8 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
         `[ChatHistoryStore] Loaded ${loadedCount} messages [${loadType}] for ${ownerId}, topic: ${topicId}`,
       );
 
-      if (sessionStore.currentTopicId !== requestedTopicId && requestedTopicId !== null) {
-        console.warn(`[ChatHistoryStore] Topic changed during load, discarding results.`);
+      if (signal.aborted || sessionStore.currentTopicId !== topicId) {
+        console.warn(`[ChatHistoryStore] Topic changed or request aborted during load, discarding results.`);
         return;
       }
 
@@ -160,6 +238,13 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     } catch (e) {
       console.error("[ChatHistoryStore] Failed to stream history:", e);
     } finally {
+      if (currentLoadAbortController === controller) {
+        currentLoadAbortController = null;
+      }
+      if (flushRafId !== null) {
+        cancelAnimationFrame(flushRafId);
+        flushRafId = null;
+      }
       if (loadSequence === historyLoadSequence) {
         loading.value = false;
         isLoadingHistory.value = false;
@@ -198,6 +283,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
 
     const agentId = sessionStore.currentSelectedItem.id;
     const topicId = sessionStore.currentTopicId;
+    acquireScreenKeep();
     try {
       const compiledBlocks = await invoke<ContentBlock[]>("append_single_message", {
         ownerId: sessionStore.currentSelectedItem.id,
@@ -226,6 +312,11 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
           if (tid === sessionStore.currentTopicId && !currentChatHistory.value.some(m => m.id === msg.id)) {
             currentChatHistory.value.push(msg);
             currentChatHistory.value.sort((a, b) => a.timestamp - b.timestamp);
+          }
+        },
+        onStreamFinished: (_messageId, tid) => {
+          if (tid === sessionStore.currentTopicId) {
+            summarizeTopic();
           }
         }
       });
@@ -410,6 +501,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     const countToDelete = currentChatHistory.value.length - (lastUserMsgIndex + 1);
     currentChatHistory.value = currentChatHistory.value.slice(0, lastUserMsgIndex + 1);
     topicStore.decrementTopicMsgCount(topicId, countToDelete);
+    acquireScreenKeep();
 
     // 3. 调用后端重构后的重生接口
     try {
@@ -419,6 +511,11 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
           if (tid === sessionStore.currentTopicId && !currentChatHistory.value.some(m => m.id === msg.id)) {
             currentChatHistory.value.push(msg);
             currentChatHistory.value.sort((a, b) => a.timestamp - b.timestamp);
+          }
+        },
+        onStreamFinished: (_messageId, tid) => {
+          if (tid === sessionStore.currentTopicId) {
+            summarizeTopic();
           }
         }
       });
@@ -499,6 +596,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     sendMessage,
     deleteMessage,
     triggerGeneration,
+    summarizeTopic,
     updateMessageContent,
     regenerateResponse,
     fetchRawContent,

@@ -10,4 +10,5 @@ pub mod settings_manager;
 pub mod stream_service_guard;
 pub mod utils;
 pub mod vcp_client;
+pub mod vcp_info_service;
 pub mod vcp_log_service;

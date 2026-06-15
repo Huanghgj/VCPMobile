@@ -1,7 +1,7 @@
 {
   "name": "vcp-mobile",
   "private": true,
-  "version": "1.0.4",
+  "version": "1.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -29,6 +29,7 @@
     "lucide-vue-next": "^0.576.0",
     "marked": "^18.0.4",
     "mermaid": "^11.14.0",
+    "morphdom": "^2.7.8",
     "pinia": "^3.0.4",
     "pinia-plugin-persistedstate": "^4.7.1",
     "sortablejs": "^1.15.7",

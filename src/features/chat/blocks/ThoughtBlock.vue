@@ -1,15 +1,30 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, ref, watch } from "vue";
 import { Brain, ChevronDown, ChevronUp, Loader2 } from "lucide-vue-next";
 import { renderMarkdownNodes } from "../../../core/utils/astRenderer";
 import type { ContentBlock } from "../../../core/types/chat";
 
-const props = defineProps<{
-  block: ContentBlock;
-  messageId: string;
-}>();
+const props = withDefaults(
+  defineProps<{
+    block: ContentBlock;
+    messageId: string;
+    defaultExpanded?: boolean;
+  }>(),
+  {
+    defaultExpanded: undefined,
+  },
+);
 
-const isExpanded = ref(!props.block.is_complete);
+const isExpanded = ref(props.defaultExpanded ?? !props.block.is_complete);
+
+watch(
+  () => props.defaultExpanded,
+  (newVal) => {
+    if (newVal !== undefined) {
+      isExpanded.value = newVal;
+    }
+  },
+);
 
 const toggleExpand = () => {
   isExpanded.value = !isExpanded.value;
@@ -50,9 +65,15 @@ function escapeHtml(text: string): string {
           {{ title }}
           <Loader2 v-if="!block.is_complete" :size="10" class="custom-spin" />
         </span>
-        <span v-if="!isExpanded" class="vcp-thought-summary">{{ summary }}</span>
+        <span v-if="!isExpanded" class="vcp-thought-summary">{{
+          summary
+        }}</span>
       </span>
-      <component :is="isExpanded ? ChevronUp : ChevronDown" :size="14" class="opacity-40 ml-auto" />
+      <component
+        :is="isExpanded ? ChevronUp : ChevronDown"
+        :size="14"
+        class="opacity-40 ml-auto"
+      />
     </button>
 
     <div v-show="isExpanded" class="vcp-thought-content animate-slide-down">
@@ -70,7 +91,11 @@ function escapeHtml(text: string): string {
 
 <style scoped>
 .vcp-thought-block {
-  background: color-mix(in srgb, var(--secondary-bg) 80%, transparent) !important;
+  background: color-mix(
+    in srgb,
+    var(--secondary-bg) 80%,
+    transparent
+  ) !important;
   border-radius: 10px !important;
   border: 1px solid color-mix(in srgb, var(--primary-text) 10%, transparent);
   margin: 8px 0 !important;
@@ -80,7 +105,9 @@ function escapeHtml(text: string): string {
   width: 100%;
   max-width: 100%;
   overflow: hidden;
-  transition: background-color 0.2s ease, border-color 0.2s ease;
+  transition:
+    background-color 0.2s ease,
+    border-color 0.2s ease;
 }
 
 html.dark .vcp-thought-block {
@@ -187,7 +214,6 @@ html.dark .vcp-thought-block {
 
 .custom-spin {
   animation: vcp-spin 1s linear infinite;
-  /* 提升至 GPU 合成层 */
   will-change: transform;
   transform: translate3d(0, 0, 0);
 }

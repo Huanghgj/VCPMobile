@@ -81,12 +81,11 @@ pub async fn orchestrate_chat_context(
 /// -------------------------------------------------------------
 /// 为了防范 LLM 的 BPE 分词器 (Tokenizer) 将 "元数据前缀" 与 "消息正文" 的首个单词
 /// 强行融合成单个不可预知的 Token，从而导致指示词语义降级甚至产生幻觉，
-/// 我们在 "时间元数据"、"发言人消歧元数据" 与 "消息内容正文" 之间，
+/// 我们在 "发言人消歧元数据" 与 "消息内容正文" 之间，
 /// 强行硬编码级联插入了物理换行符 `\n`。这在字节层面上彻底切断了前缀与正文的融合通道。
 ///
 /// 格式示意：
-/// [Time: 2026-05-30 11:30]\n       <--- 物理换行 1：阻断时间与发言人特征融合
-/// [Sender的发言]:\n                <--- 物理换行 2：阻断发言人与正文特征融合
+/// [Sender的发言]:\n                <--- 物理换行：阻断发言人与正文特征融合
 /// 这是正文内容...
 ///
 /// 📂 附件/多模态与内联物理隔离逻辑：
@@ -101,116 +100,161 @@ pub fn assemble_history_for_vcp(
     is_group: bool,
     enable_time_anchoring: bool,
 ) -> Vec<Value> {
-    history
+    let mut result = Vec::new();
+
+    for msg in history
         .iter()
         .filter(|msg| !msg.is_thinking.unwrap_or(false))
-        .map(|msg| {
-            use chrono::TimeZone;
-            let formatted_time = if let Some(dt) = chrono::Local
-                .timestamp_millis_opt(msg.timestamp as i64)
-                .single()
-            {
-                dt.format("%Y-%m-%d %H:%M").to_string()
-            } else {
-                chrono::Local::now().format("%Y-%m-%d %H:%M").to_string()
-            };
+    {
+        use chrono::TimeZone;
+        let formatted_time = if let Some(dt) = chrono::Local
+            .timestamp_millis_opt(msg.timestamp as i64)
+            .single()
+        {
+            dt.format("%Y-%m-%d %H:%M").to_string()
+        } else {
+            chrono::Local::now().format("%Y-%m-%d %H:%M").to_string()
+        };
 
-            let mut combined_text = String::new();
+        let mut combined_text = String::new();
 
-            // 2. 发言人消歧前缀 (元数据 B) + 物理换行 2
-            if is_group {
-                let speaker_name = msg
-                    .name
-                    .as_ref()
-                    .filter(|name| !name.is_empty())
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        if msg.role == "user" {
-                            "User".to_string()
-                        } else {
-                            "AI".to_string()
-                        }
-                    });
-                combined_text.push_str(&format!("[{}的发言]:\n", speaker_name));
-            }
-
-            // 3. 核心消息正文
-            combined_text.push_str(&msg.content);
-
-            let mut content_parts = Vec::new();
-
-            if let Some(attachments) = &msg.attachments {
-                for att in attachments {
-                    // 1. 处理提取的文本内容 (文档类)
-                    if let Some(text) = &att.extracted_text {
-                        if !text.is_empty() {
-                            combined_text.push_str(&format!(
-                                "\n\n[附加文件: {}]\n{}\n[/附加文件结束: {}]",
-                                att.name, text, att.name
-                            ));
-                        }
+        // 2. 发言人消歧前缀 (元数据 B) + 物理换行 2
+        if is_group {
+            let speaker_name = msg
+                .name
+                .as_ref()
+                .filter(|name| !name.is_empty())
+                .cloned()
+                .unwrap_or_else(|| {
+                    if msg.role == "user" {
+                        "User".to_string()
+                    } else {
+                        "AI".to_string()
                     }
+                });
+            combined_text.push_str(&format!("[{}的发言]:\n", speaker_name));
+        }
 
-                    // 2. 处理多模态文件 (图片/音频/视频)
-                    let mime = &att.r#type;
-                    let is_image = mime.starts_with("image/");
-                    let is_audio = mime.starts_with("audio/");
-                    let is_video = mime.starts_with("video/");
+        // 3. 核心消息正文
+        combined_text.push_str(&msg.content);
 
-                    if is_image || is_audio || is_video {
-                        let path = if !att.internal_path.is_empty() {
-                            att.internal_path.clone()
-                        } else {
-                            att.src.clone()
-                        };
+        let mut content_parts = Vec::new();
 
-                        if is_image {
-                            combined_text.push_str(&format!("\n\n[附加图片: {}]", att.name));
-                        } else {
-                            combined_text.push_str(&format!("\n\n[附加文件: {}]", att.name));
-                        }
-
-                        content_parts.push(json!({
-                            "type": "local_file",
-                            "path": path,
-                            "mime": mime,
-                            "name": att.name
-                        }));
-                    } else if att.extracted_text.is_none() {
-                        combined_text.push_str(&format!("\n\n[附加文件: {}]", att.name));
+        if let Some(attachments) = &msg.attachments {
+            for att in attachments {
+                // 1. 处理提取的文本内容 (文档类)
+                if let Some(text) = &att.extracted_text {
+                    if !text.is_empty() {
+                        combined_text.push_str(&format!(
+                            "\n\n[附加文件: {}]\n{}\n[/附加文件结束: {}]",
+                            att.internal_path, text, att.name
+                        ));
                     }
                 }
+
+                // 2. 处理多模态文件 (图片/音频/视频)
+                let mime = &att.r#type;
+                let is_image = mime.starts_with("image/");
+                let is_audio = mime.starts_with("audio/");
+                let is_video = mime.starts_with("video/");
+
+                if is_image || is_audio || is_video {
+                    let path = if !att.internal_path.is_empty() {
+                        att.internal_path.clone()
+                    } else {
+                        att.src.clone()
+                    };
+
+                    if is_image {
+                        combined_text
+                            .push_str(&format!("\n\n[附加图片: {}] (文件名: {})", path, att.name));
+                    } else {
+                        combined_text
+                            .push_str(&format!("\n\n[附加文件: {}] (文件名: {})", path, att.name));
+                    }
+
+                    content_parts.push(json!({
+                        "type": "local_file",
+                        "path": path,
+                        "mime": mime,
+                        "name": att.name
+                    }));
+                } else if att.extracted_text.is_none() {
+                    let path = if !att.internal_path.is_empty() {
+                        att.internal_path.clone()
+                    } else {
+                        att.src.clone()
+                    };
+                    combined_text
+                        .push_str(&format!("\n\n[附加文件: {}] (文件名: {})", path, att.name));
+                }
             }
+        }
 
-            // 4. 追加末尾时间锚定 (元数据 A - XML 标签格式)
-            if enable_time_anchoring {
-                combined_text.push_str(&format!(
-                    "\n<message_time>{}</message_time>",
-                    formatted_time
-                ));
-            }
+        // 4. 新版时间锚定机制 (元数据 A - 伪系统/user内联块格式)
+        if enable_time_anchoring && msg.role == "user" {
+            // 对于 user 消息块，直接在内部注入
+            let username = msg
+                .name
+                .as_deref()
+                .filter(|n| !n.is_empty())
+                .unwrap_or("User");
+            combined_text.push_str(&format!(
+                "\n<system_meta>[系统提示]：{}发送于{}.</system_meta>",
+                username, formatted_time
+            ));
+        }
 
-            if !combined_text.trim().is_empty() {
-                content_parts.insert(
-                    0,
-                    json!({
-                        "type": "text",
-                        "text": combined_text
-                    }),
-                );
-            }
+        if !combined_text.trim().is_empty() {
+            content_parts.insert(
+                0,
+                json!({
+                    "type": "text",
+                    "text": combined_text
+                }),
+            );
+        }
 
-            let final_content = if content_parts.len() == 1 && content_parts[0]["type"] == "text" {
-                content_parts[0]["text"].clone()
-            } else {
-                json!(content_parts)
-            };
+        let final_content = if content_parts.len() == 1 && content_parts[0]["type"] == "text" {
+            content_parts[0]["text"].clone()
+        } else {
+            json!(content_parts)
+        };
 
-            json!({
+        let mut val = json!({
+            "role": msg.role,
+            "name": msg.name,
+            "content": final_content
+        });
+        if !msg.id.is_empty() {
+            val["__vcpchatTimestampMeta"] = json!({
+                "messageId": msg.id,
                 "role": msg.role,
-                "name": msg.name,
-                "content": final_content
-            })
-        })
-        .collect()
+                "timestamp": msg.timestamp,
+                "contentHash": msg.content_hash
+            });
+        }
+
+        // 将当前消息推入结果列表
+        result.push(val);
+
+        // 如果是 非user 消息且启用了时间锚定，在后面追加一个伪系统 user 块
+        if enable_time_anchoring && msg.role != "user" {
+            let agent_name = msg
+                .name
+                .as_deref()
+                .filter(|n| !n.is_empty())
+                .unwrap_or("AI");
+            let pseudo_user_msg = json!({
+                "role": "user",
+                "content": format!(
+                    "<system_meta>[系统提示]：上条消息由{}发送于{}.</system_meta>",
+                    agent_name, formatted_time
+                )
+            });
+            result.push(pseudo_user_msg);
+        }
+    }
+
+    result
 }

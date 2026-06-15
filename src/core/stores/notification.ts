@@ -143,9 +143,14 @@ export const useNotificationStore = defineStore('notification', () => {
         n => n.id === payload.id && (Date.now() - n.timestamp) < 30_000
       );
       if (recentHistory) {
-        // 更新历史条目时间戳，但不弹出新 Toast
+        // 更新历史条目核心字段，但不弹出新 Toast
         recentHistory.timestamp = Date.now();
+        recentHistory.title = payload.title || recentHistory.title;
+        recentHistory.type = payload.type || recentHistory.type;
         recentHistory.message = payload.message || recentHistory.message;
+        recentHistory.isPreformatted = payload.isPreformatted !== undefined ? payload.isPreformatted : recentHistory.isPreformatted;
+        recentHistory.actions = payload.actions || recentHistory.actions;
+        recentHistory.rawPayload = payload.rawPayload || recentHistory.rawPayload;
         return;
       }
     }
@@ -208,7 +213,7 @@ export const useNotificationStore = defineStore('notification', () => {
    * 执行通知动作（如：审批）
    * 将业务逻辑从 UI 组件下沉到 Store，确保状态一致性
    */
-  const executeAction = async (notificationId: string, action: { label: string; value: any }) => {
+  const executeAction = async (notificationId: string, action: { label: string; value: any }, reason?: string) => {
     const item = historyList.value.find(n => n.id === notificationId);
     if (!item) return;
 
@@ -219,12 +224,18 @@ export const useNotificationStore = defineStore('notification', () => {
         return;
       }
 
+      const trimmedReason = reason?.trim();
+      const responseData: any = {
+        requestId: requestId.trim(),
+        approved: action.value,
+      };
+      if (trimmedReason) {
+        responseData.reason = trimmedReason;
+      }
+
       const response = {
         type: 'tool_approval_response',
-        data: {
-          requestId: requestId.trim(),
-          approved: action.value
-        }
+        data: responseData
       };
 
       try {
@@ -233,7 +244,7 @@ export const useNotificationStore = defineStore('notification', () => {
 
         // 处理后 UI 反馈：清空按钮并从 Toast 移除
         item.actions = [];
-        item.message = `[已处理] 操作: ${action.label}`;
+        item.message = `[已处理] 操作: ${action.label}${trimmedReason ? ` (理由: ${trimmedReason})` : ''}`;
         activeToasts.value = activeToasts.value.filter(t => t.id !== item.id);
         clearToastTimer(item.id);
       } catch (e) {

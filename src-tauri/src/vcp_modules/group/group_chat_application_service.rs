@@ -1,7 +1,7 @@
 // group_chat_application_service.rs: 编排群聊工作流
 // 职责: 1. 读取配置 2. 保存消息 3. 决策发言者 4. 组装上下文 5. 执行 AI 调用 6. 发射事件
 
-use crate::vcp_modules::agent_service::{read_agent_config, AgentConfigState};
+use crate::vcp_modules::agent_service::{read_agent_config_internal, AgentConfigState};
 use crate::vcp_modules::chat_manager::ChatMessage;
 use crate::vcp_modules::db_manager::DbState;
 use crate::vcp_modules::group_context_assembler::assemble_group_context;
@@ -69,13 +69,8 @@ pub async fn internal_process_group_chat_message(
     // 2. 加载成员配置
     let mut active_member_configs = Vec::new();
     for member_id in &group_config.members {
-        if let Ok(cfg) = read_agent_config(
-            app_handle.clone(),
-            agent_state.clone(),
-            member_id.clone(),
-            Some(false),
-        )
-        .await
+        if let Ok(cfg) =
+            read_agent_config_internal(&app_handle, &agent_state, member_id, Some(false)).await
         {
             active_member_configs.push(cfg);
         }
@@ -94,17 +89,13 @@ pub async fn internal_process_group_chat_message(
         .await?;
     }
 
-    // 为了给 AI 决策提供上下文，我们只读取最新的 20 条（或按需分配）
-    let recent_history_for_decision = message_service::load_chat_history_internal(
+    // 为了给 AI 决策提供上下文，我们只轻量读取最新的 8 条纯文本和附件（不加载任何 UI 渲染数据）
+    let recent_history_for_decision = message_service::load_chat_text_history_for_context(
         &app_handle,
-        &group_id,
-        "group",
         &topic_id,
         Some(8), // 限制上下文长度
         None,
-        true,
         false, // include_extracted_text: 决策发言者不需要大体积的提取文本内容
-        false, // include_ui_render_data: 决策不需要 blocks/shell
     )
     .await?;
 
@@ -130,17 +121,13 @@ pub async fn internal_process_group_chat_message(
         return Ok(json!({"status": "no_ai_response"}));
     }
 
-    // 提前加载全量历史记录作为接力上下文的基础
-    let mut full_history_for_context = message_service::load_chat_history_internal(
+    // 提前加载轻量级全量纯文本和附件历史记录作为接力上下文的基础 (从底层隔离 UI 渲染反序列化和 Shell 计算)
+    let mut full_history_for_context = message_service::load_chat_text_history_for_context(
         &app_handle,
-        &group_id,
-        "group",
         &topic_id,
         None, // 加载全部用于 VCP 上下文
         None,
-        true,
-        true,  // include_extracted_text: 组装群聊上下文发送给 VCP 时需要包含附件提取文本内容
-        false, // include_ui_render_data: 发请求不需要 blocks/shell
+        true, // include_extracted_text: 组装群聊上下文发送给 VCP 时需要包含附件提取文本内容
     )
     .await?;
 
@@ -287,6 +274,7 @@ pub async fn internal_process_group_chat_message(
                     Some(&agent_id),
                     Some(&agent_name),
                     stream_channel.clone(),
+                    Some(agent_id.clone()),
                 )
                 .await?;
 

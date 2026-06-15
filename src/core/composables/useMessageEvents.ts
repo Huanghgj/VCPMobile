@@ -95,7 +95,37 @@ export function useMessageEvents(containerRef: Ref<HTMLElement | null>) {
       return;
     }
 
-    // 3. 外部链接只允许明确的 http/https，其他协议阻断浏览器默认行为。
+    // 3. 气泡内普通图片点击劫持 (排除带有 vcp-emoticon 的表情包以及消息附件缩略图)
+    if (target.tagName.toLowerCase() === "img") {
+      const isEmoticon = target.classList.contains("vcp-emoticon");
+      const isAttachment = target.closest(".vcp-attachment-preview") !== null;
+
+      if (!isEmoticon && !isAttachment) {
+        e.preventDefault();
+        e.stopPropagation();
+
+        const src = target.getAttribute("src") || "";
+        const alt = target.getAttribute("alt") || "";
+        const title = target.getAttribute("title") || "";
+
+        // 动态引入查看器 Composable，消灭潜在的 Vue 组件循环引用
+        import("./useRenderedImageViewer")
+          .then(({ openRenderedImageViewer }) => {
+            openRenderedImageViewer({
+              src,
+              alt,
+              title,
+              sourceLabel: "聊天图片",
+            });
+          })
+          .catch((err) => {
+            console.error("[useMessageEvents] Failed to open RenderedImageViewer:", err);
+          });
+        return;
+      }
+    }
+
+    // 4. 外部链接只允许明确的 http/https，其他协议阻断浏览器默认行为。
     const externalLink = target.closest('a[href]');
     if (externalLink) {
       e.preventDefault();

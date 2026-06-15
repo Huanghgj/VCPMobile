@@ -9,12 +9,35 @@ import { useNotificationStore } from "../../core/stores/notification";
 import { useMessageEvents } from "../../core/composables/useMessageEvents";
 import { useEmoticonFixer } from "../../core/composables/useEmoticonFixer";
 import { renderMarkdownNodes } from "../../core/utils/astRenderer";
-import { getKatexRenderer, getMermaidRenderer } from "../../core/utils/renderLibraryPreloader";
-import { useContentProcessor } from "../../core/composables/useContentProcessor";
+import {
+  getKatexRenderer,
+  getMermaidRenderer,
+} from "../../core/utils/renderLibraryPreloader";
+import {
+  applyFrame,
+  cleanupRegistry,
+  rebuildSnapshot,
+} from "../../core/utils/astExecutor";
+import { useMessageStyleInjector } from "../../core/composables/useMessageStyleInjector";
 import { Copy, Edit2, RotateCcw, Trash2, StopCircle } from "lucide-vue-next";
+import morphdom from "morphdom";
 
 const { processEmoticonsInContainer } = useEmoticonFixer();
 const mermaidCache = new Map<string, string>();
+const MAX_MERMAID_CACHE_SIZE = 30;
+
+function setMermaidCache(key: string, value: string) {
+  if (mermaidCache.has(key)) {
+    mermaidCache.delete(key);
+  } else if (mermaidCache.size >= MAX_MERMAID_CACHE_SIZE) {
+    const firstKey = mermaidCache.keys().next().value;
+    if (firstKey !== undefined) {
+      mermaidCache.delete(firstKey);
+    }
+  }
+  mermaidCache.set(key, value);
+}
+
 const renderingMermaids = new Set<string>();
 
 // UI Components
@@ -28,6 +51,8 @@ import AttachmentPreview from "./attachment/AttachmentPreview.vue";
 import ToolBlock from "./blocks/ToolBlock.vue";
 import ThoughtBlock from "./blocks/ThoughtBlock.vue";
 import HtmlPreviewBlock from "./blocks/HtmlPreviewBlock.vue";
+import ToolSummaryBlock from "./blocks/ToolSummaryBlock.vue";
+import MermaidFullScreenViewer from "./blocks/MermaidFullScreenViewer.vue";
 
 const props = defineProps<{
   message: ChatMessage;
@@ -40,6 +65,67 @@ const notificationStore = useNotificationStore();
 const historyStore = useChatHistoryStore();
 const sessionStore = useChatSessionStore();
 const streamStore = useChatStreamStore();
+
+function isAstDebugEnabled(): boolean {
+  return Boolean(import.meta.env.DEV && (window as any).__VCP_AST_DEBUG__);
+}
+
+function astDebugLog(...args: unknown[]): void {
+  if (isAstDebugEnabled()) {
+    console.warn(...args);
+  }
+}
+
+// === AST Diff Feature Flags & Refs ===
+const tailSandboxRef = ref<HTMLElement | null>(null);
+const enableAstDiff = ref(true); // Feature Flag, 默认开启
+const useAstForCurrentTail = computed(() => {
+  return (
+    enableAstDiff.value &&
+    (!!props.message.tailFrame ||
+      !!props.message.tailBlock?.nodes ||
+      !!props.message.tailSnapshot)
+  );
+});
+let lastAppliedFrameSeq = 0;
+let localTailEpoch = -1;
+let localTailRevision = -1;
+let astFailureCount = 0;
+let lastSandbox: HTMLElement | null = null;
+
+function getTailSnapshotNodes() {
+  return props.message.tailSnapshot || props.message.tailBlock?.nodes || [];
+}
+
+function rebuildTailSnapshot(sandbox: HTMLElement): void {
+  rebuildSnapshot(getTailSnapshotNodes(), props.message.id, sandbox);
+  localTailEpoch = props.message.tailFrame?.epoch ?? localTailEpoch;
+  localTailRevision = props.message.tailFrame?.revision ?? localTailRevision;
+}
+
+function handleAstFrameFailure(sandbox: HTMLElement, reason: string): void {
+  astFailureCount += 1;
+  astDebugLog(
+    `[AST Diff Recovery] ${props.message.id}: ${reason}. failureCount=${astFailureCount}`,
+  );
+  if (getTailSnapshotNodes().length > 0) {
+    rebuildTailSnapshot(sandbox);
+    // 【意图性设计说明】：此处直接 return 退出，不执行下方的关闭降级逻辑，是有意为之的保活设计。
+    // 在流式输出过程中，哪怕某些中间帧的 AST 增量解析/渲染出现临时局部错乱报错，我们也优先依赖
+    // rebuildTailSnapshot() 在微任务/渲染帧内进行全量快照重刷，而不是彻底降级退回到普通 HTML
+    // 渲染（那会导致流式组件切换、DOM 物理销毁重建以及严重的布局物理抖动和输入框焦点丢失）。
+    return;
+  }
+  if (astFailureCount >= 2) {
+    enableAstDiff.value = false;
+    cleanupRegistry(props.message.id);
+  }
+}
+
+// === Mermaid FullScreen States ===
+const isMermaidFullScreen = ref(false);
+const activeMermaidSvg = ref("");
+const activeMermaidSource = ref("");
 
 // === Shell Properties (Pre-computed in Rust) ===
 const shell = computed(() => props.message.shell);
@@ -68,44 +154,207 @@ const shouldRenderRawContentFallback = computed(() => {
   return !props.message.tailBlock && !props.message.tailContent;
 });
 
+// === <!--brk--> 消息分条拆分算法 ===
+
+function isBrkNode(node: any): boolean {
+  if (
+    (node.type === "raw_html" || node.type === "raw_html_inline") &&
+    node.content
+  ) {
+    const trimmed = node.content.trim().replace(/\s+/g, "");
+    return trimmed === "<!--brk-->";
+  }
+  return false;
+}
+
+function isBrkBlock(block: ContentBlock): boolean {
+  if (!isPlainBlock(block.type)) return false;
+
+  if (block.content) {
+    const trimmed = block.content.trim().replace(/\s+/g, "");
+    if (trimmed === "<!--brk-->") return true;
+  }
+
+  if (block.nodes && block.nodes.length > 0) {
+    const groups = splitMarkdownNodes(block.nodes);
+    return groups.length === 0;
+  }
+
+  return false;
+}
+
+function splitMarkdownNodes(nodes: any[]): any[][] {
+  const result: any[][] = [];
+  let currentGroup: any[] = [];
+
+  for (const node of nodes) {
+    if (isBrkNode(node)) {
+      if (currentGroup.length > 0) {
+        result.push(currentGroup);
+        currentGroup = [];
+      }
+    } else {
+      currentGroup.push(node);
+    }
+  }
+
+  if (currentGroup.length > 0) {
+    result.push(currentGroup);
+  }
+  return result;
+}
+
+interface BubbleGroup {
+  id: string;
+  blocks: ContentBlock[];
+  isTail?: boolean;
+}
+
+const messageBubbles = computed(() => {
+  const list: BubbleGroup[] = [];
+  let currentBlocks: ContentBlock[] = [];
+  let bubbleIndex = 0;
+
+  const pushCurrentGroup = () => {
+    if (currentBlocks.length > 0) {
+      list.push({
+        id: `${props.message.id}-bubble-${bubbleIndex++}`,
+        blocks: [...currentBlocks],
+      });
+      currentBlocks = [];
+    }
+  };
+
+  const isUserMsg = shell.value?.isUser;
+
+  if (props.message.blocks && props.message.blocks.length > 0) {
+    for (const block of props.message.blocks) {
+      if (!isPlainBlock(block.type) || isUserMsg) {
+        currentBlocks.push(block);
+        continue;
+      }
+
+      // 🆕 优先判定这个块是否整体就是一个 brk 物理分割块 (支持纯文本及 AST 状态双重鉴定)
+      if (isBrkBlock(block)) {
+        pushCurrentGroup();
+        continue; // 过滤掉 <!--brk--> 本身不渲染
+      }
+
+      if (block.nodes && block.nodes.length > 0) {
+        const nodeGroups = splitMarkdownNodes(block.nodes);
+        if (nodeGroups.length > 1) {
+          nodeGroups.forEach((groupNodes, idx) => {
+            const newBlock: ContentBlock = {
+              ...block,
+              nodes: groupNodes,
+              hash:
+                block.hash !== undefined
+                  ? `${block.hash}-split-${idx}`
+                  : undefined,
+            };
+            currentBlocks.push(newBlock);
+            if (idx < nodeGroups.length - 1) {
+              pushCurrentGroup();
+            }
+          });
+        } else if (nodeGroups.length === 0) {
+          // 🆕 兜底：如果内部 AST 切分结果为 0 也是纯分割块
+          pushCurrentGroup();
+        } else {
+          currentBlocks.push(block);
+        }
+      } else {
+        currentBlocks.push(block);
+      }
+    }
+  }
+
+  pushCurrentGroup();
+
+  // 🆕 流式状态下，如果最后一个稳定块是个 brk 块，我们需要额外追加一个空的气泡组以供 tailBlock 打字渲染
+  const lastBlockIsBrk =
+    props.message.blocks &&
+    props.message.blocks.length > 0 &&
+    (() => {
+      const last = props.message.blocks[props.message.blocks.length - 1];
+      return last ? isBrkBlock(last) : false;
+    })();
+
+  if (isStreaming.value && props.message.tailBlock && lastBlockIsBrk) {
+    list.push({
+      id: `${props.message.id}-bubble-${bubbleIndex++}`,
+      blocks: [],
+    });
+  }
+
+  // 兜底：如果整个消息 blocks 为空
+  if (list.length === 0) {
+    list.push({
+      id: `${props.message.id}-bubble-0`,
+      blocks: [],
+    });
+  }
+
+  return list;
+});
+
 // === Event Delegation ===
 const messageContentRef = ref<HTMLElement | null>(null);
 useMessageEvents(messageContentRef);
 
 // === Block Rendering Helper ===
 function isPlainBlock(type: string): boolean {
-  return [
-    "markdown",
-    "diary",
-    "role-divider",
-    "button-click",
-  ].includes(type);
+  return ["markdown", "diary", "role-divider", "button-click"].includes(type);
 }
 
 function renderBlockHtml(block: ContentBlock): string {
   switch (block.type) {
     case "markdown":
       if (block.nodes && block.nodes.length > 0) {
+        if (
+          block.nodes.length === 1 &&
+          block.nodes[0].type === "raw_html" &&
+          block.nodes[0].content?.trimStart().toLowerCase().startsWith("<style")
+        ) {
+          const content = block.nodes[0].content;
+          let cssContent = "";
+          content.replace(
+            /<style\b[^>]*>([\s\S]*?)(?:<\/style>|$)/gi,
+            (_, css) => {
+              cssContent += css.trim() + "\n";
+              return "";
+            },
+          );
+          if (cssContent.trim().length > 0) {
+            injectScopedCss(cssContent, props.message.id);
+          }
+          return ""; // Keep unclosed style invisible in chat body
+        }
         return `<div class="vcp-markdown-block">${renderMarkdownNodes(block.nodes, props.message.id, block.hash)}</div>`;
       }
       return `<div class="vcp-markdown-block"><p>${escapeHtml(block.content || "")}</p></div>`;
 
     case "diary": {
-      const diaryContent = (block.nodes && block.nodes.length > 0)
-        ? renderMarkdownNodes(block.nodes, props.message.id, block.hash)
-        : escapeHtml(block.content || "");
+      const diaryContent =
+        block.nodes && block.nodes.length > 0
+          ? renderMarkdownNodes(block.nodes, props.message.id, block.hash)
+          : escapeHtml(block.content || "");
       return `
         <div class="vcp-diary-block">
           <div class="vcp-diary-header">
             <span class="vcp-diary-title">Maid's Diary</span>
-            ${block.date ? `<span class="vcp-diary-date">${escapeHtml(block.date)}</span>` : ''}
+            ${block.date ? `<span class="vcp-diary-date">${escapeHtml(block.date)}</span>` : ""}
           </div>
-          ${block.maid ? `
+          ${
+            block.maid
+              ? `
             <div class="vcp-diary-maid-info">
               <span class="diary-maid-label">Maid:</span>
               <span class="vcp-diary-maid-name">${escapeHtml(block.maid)}</span>
             </div>
-          ` : ''}
+          `
+              : ""
+          }
           <div class="vcp-diary-content vcp-markdown-block">${diaryContent}</div>
         </div>
       `;
@@ -160,24 +409,75 @@ function escapeHtml(text: string): string {
     .replace(/'/g, "&#039;");
 }
 
+const openMermaidFullScreen = (svgHtml: string, sourceCode: string) => {
+  activeMermaidSvg.value = svgHtml;
+  activeMermaidSource.value = sourceCode;
+  isMermaidFullScreen.value = true;
+};
+
+function enhanceMermaid(el: HTMLElement, sourceCode: string) {
+  if (!el || el.dataset.vcpMermaidEnhanced === "true") return;
+
+  const svg = el.querySelector("svg");
+  if (!svg) return;
+
+  el.dataset.vcpMermaidEnhanced = "true";
+
+  // 给 SVG 设置基础样式，使其自适应显示
+  svg.removeAttribute("style");
+  svg.style.maxWidth = "100%";
+  svg.style.height = "auto";
+  svg.style.display = "block";
+  svg.style.margin = "0 auto";
+
+  // 创建包裹层
+  const wrapper = document.createElement("div");
+  wrapper.className =
+    "vcp-mermaid-wrapper group relative my-3 overflow-hidden rounded-xl border border-black/5 dark:border-white/10 bg-black/5 dark:bg-white/5 p-4 transition-all duration-300 active:scale-[0.99] cursor-pointer";
+
+  // 创建全屏按钮
+  const fullscreenBtn = document.createElement("button");
+  fullscreenBtn.type = "button";
+  fullscreenBtn.className =
+    "absolute top-3 right-3 z-10 flex items-center justify-center w-8 h-8 rounded-lg border border-black/5 dark:border-white/10 bg-white/80 dark:bg-black/80 text-gray-500 dark:text-gray-400 opacity-0 group-hover:opacity-100 active:scale-90 transition-all duration-200 cursor-pointer shadow-sm";
+  fullscreenBtn.innerHTML = '<div class="i-ph:arrows-out-bold w-4 h-4"></div>';
+  fullscreenBtn.title = "全屏查看图表";
+
+  wrapper.addEventListener("click", (e) => {
+    e.stopPropagation();
+    openMermaidFullScreen(svg.outerHTML, sourceCode);
+  });
+
+  wrapper.addEventListener("dblclick", (e) => {
+    e.stopPropagation();
+  });
+
+  el.textContent = "";
+  wrapper.appendChild(fullscreenBtn);
+  wrapper.appendChild(svg);
+  el.appendChild(wrapper);
+}
+
 // === Heavy Content Rendering (KaTeX inline math + Mermaid) ===
 const renderHeavyContent = async () => {
-  // 消息处于活跃流中时完全跳过重渲染（KaTeX/Mermaid/Emoticon），
-  // 与当前话题无关，确保多并发流式话题切换时行为一致
-  if (isMessageInActiveStream.value) return;
   await nextTick();
   if (!messageContentRef.value) return;
 
   // 1. KaTeX math (inline + display mode, rendered inside markdown blocks via v-html)
-  const mathElements = messageContentRef.value.querySelectorAll('.vcp-math-inline[data-latex], .vcp-math-block[data-latex]');
+  const mathElements = Array.from(
+    messageContentRef.value.querySelectorAll(
+      ".vcp-math-inline[data-latex], .vcp-math-block[data-latex]",
+    ),
+  ).filter((el) => !el.closest(".streaming-tail"));
+
   if (mathElements.length > 0) {
     try {
       const katex = await getKatexRenderer();
       mathElements.forEach((el) => {
-        if (el.querySelector('.katex')) return; // already rendered
-        const latex = el.getAttribute('data-latex');
+        if (el.querySelector(".katex")) return; // already rendered
+        const latex = el.getAttribute("data-latex");
         if (!latex) return;
-        const isDisplay = el.classList.contains('vcp-math-block');
+        const isDisplay = el.classList.contains("vcp-math-block");
         katex.render(latex, el as HTMLElement, {
           throwOnError: false,
           strict: false,
@@ -185,47 +485,70 @@ const renderHeavyContent = async () => {
         });
       });
     } catch (e) {
-      console.error('[MessageRenderer] KaTeX render failed:', e);
+      console.error("[MessageRenderer] KaTeX render failed:", e);
     }
   }
 
   // 2. Mermaid diagrams
-  const mermaidPlaceholders = messageContentRef.value.querySelectorAll('.mermaid-placeholder');
+  const mermaidPlaceholders = Array.from(
+    messageContentRef.value.querySelectorAll(
+      ".mermaid-placeholder, pre.mermaid, code.language-mermaid",
+    ),
+  ).filter((el) => !el.closest(".streaming-tail"));
+
   if (mermaidPlaceholders.length > 0) {
     try {
       const mermaid = await getMermaidRenderer();
       for (const el of Array.from(mermaidPlaceholders)) {
         const placeholder = el as HTMLElement;
-        if (placeholder.querySelector('svg')) continue; // already rendered
-        // Use innerHTML (HTML-escaped code) as stable cache key
+        const wrapper = placeholder.closest(".vcp-mermaid-wrapper");
+        if (wrapper && wrapper.querySelector("svg")) continue; // already rendered & enhanced
+        if (placeholder.querySelector("svg")) continue; // already rendered
+
+        // Use innerHTML as stable cache key
         const codeKey = placeholder.innerHTML;
         // Skip if already being rendered by a concurrent call
         if (renderingMermaids.has(codeKey)) continue;
         // Skip if Vue has replaced this element out of the DOM
         if (!messageContentRef.value.contains(placeholder)) continue;
+
         // Use cache to avoid re-rendering the same diagram
         if (mermaidCache.has(codeKey)) {
-          placeholder.innerHTML = mermaidCache.get(codeKey)!;
-          placeholder.classList.remove('mermaid-placeholder');
-          placeholder.classList.add('mermaid');
+          const cachedSvg = mermaidCache.get(codeKey)!;
+          placeholder.innerHTML = cachedSvg;
+          placeholder.classList.remove("mermaid-placeholder");
+          placeholder.classList.add("mermaid");
+          enhanceMermaid(placeholder, placeholder.dataset.mermaidSource || "");
           continue;
         }
+
         renderingMermaids.add(codeKey);
         try {
-          placeholder.classList.remove('mermaid-placeholder');
-          placeholder.classList.add('mermaid');
+          const sourceCode = placeholder.textContent || "";
+          placeholder.dataset.mermaidSource = sourceCode; // 保存原始源码
+
+          placeholder.classList.remove("mermaid-placeholder");
+          placeholder.classList.add("mermaid");
           await mermaid.run({ nodes: [placeholder] });
-          mermaidCache.set(codeKey, placeholder.innerHTML);
+
+          const renderedSvg = placeholder.innerHTML;
+          setMermaidCache(codeKey, renderedSvg); // 缓存纯 SVG
+
+          enhanceMermaid(placeholder, sourceCode);
         } catch (e: any) {
           const errorMsg = e?.str || e?.message || String(e);
-          console.error('[MessageRenderer] Mermaid render failed:', errorMsg, e);
-          placeholder.innerHTML = `<div class="text-red-500 text-[10px]">图表渲染失败: ${escapeHtml(errorMsg)}</div>`;
+          console.error(
+            "[MessageRenderer] Mermaid render failed:",
+            errorMsg,
+            e,
+          );
+          placeholder.innerHTML = `<div class="text-red-500 text-[10px] p-4 rounded-xl border border-red-500/10 bg-red-500/5">图表渲染失败: ${escapeHtml(errorMsg)}</div>`;
         } finally {
           renderingMermaids.delete(codeKey);
         }
       }
     } catch (e) {
-      console.error('[MessageRenderer] Mermaid load failed:', e);
+      console.error("[MessageRenderer] Mermaid load failed:", e);
     }
   }
 
@@ -242,21 +565,17 @@ const renderHeavyContent = async () => {
 watch(
   () => props.message.blocks,
   () => {
-    if (isMessageInActiveStream.value) return;
     renderHeavyContent();
   },
-  { immediate: true }
+  { immediate: true },
 );
 
 // 消息真正离开活跃流后统一执行一次重渲染，确保 KaTeX/Mermaid/Emoticon 正确渲染
-watch(
-  isMessageInActiveStream,
-  (inStream, wasInStream) => {
-    if (wasInStream && !inStream) {
-      renderHeavyContent();
-    }
+watch(isMessageInActiveStream, (inStream, wasInStream) => {
+  if (wasInStream && !inStream) {
+    renderHeavyContent();
   }
-);
+});
 
 // === Context Menu ===
 const showMessageContextMenu = async () => {
@@ -276,6 +595,23 @@ const showMessageContextMenu = async () => {
     return await historyStore.fetchRawContent(props.message.id);
   };
 
+  // 1. 如果不是流式，编辑消息移动到首位
+  if (!isStreaming.value) {
+    actions.push({
+      label: "编辑消息",
+      icon: Edit2,
+      handler: async () => {
+        const fullText = await getFullText();
+        overlayStore.openEditor({
+          initialValue: fullText || "",
+          onSave: (newContent: string) =>
+            historyStore.updateMessageContent(props.message.id, newContent),
+        });
+      },
+    });
+  }
+
+  // 2. 复制内容紧随其后
   actions.push({
     label: "复制内容",
     icon: Copy,
@@ -291,6 +627,7 @@ const showMessageContextMenu = async () => {
     },
   });
 
+  // 3. 其他非流式操作
   if (!isStreaming.value) {
     actions.push({
       label: "重新渲染",
@@ -299,7 +636,10 @@ const showMessageContextMenu = async () => {
         try {
           await historyStore.reRenderMessage(
             props.message.id,
-            props.message.topicId || props.message.topic_id || sessionStore.currentTopicId || ""
+            props.message.topicId ||
+              props.message.topic_id ||
+              sessionStore.currentTopicId ||
+              "",
           );
           notificationStore.addNotification({
             type: "success",
@@ -315,18 +655,6 @@ const showMessageContextMenu = async () => {
             toastOnly: true,
           });
         }
-      },
-    });
-
-    actions.push({
-      label: "编辑消息",
-      icon: Edit2,
-      handler: async () => {
-        const fullText = await getFullText();
-        overlayStore.openEditor({
-          initialValue: fullText || "",
-          onSave: (newContent: string) => historyStore.updateMessageContent(props.message.id, newContent),
-        });
       },
     });
 
@@ -359,7 +687,10 @@ const showMessageContextMenu = async () => {
     },
   });
 
-  overlayStore.openContextMenu(actions, shell.value?.isUser ? "User" : "Assistant");
+  overlayStore.openContextMenu(
+    actions,
+    shell.value?.isUser ? "User" : "Assistant",
+  );
 };
 
 function formatTime(ts: number) {
@@ -373,7 +704,7 @@ function formatTime(ts: number) {
 }
 
 // === Style Block CSS Injection ===
-const { injectScopedCss, removeScopedCss } = useContentProcessor();
+const { injectScopedCss, removeScopedCss } = useMessageStyleInjector();
 let injectedStyleSignature = "";
 
 watch(
@@ -386,8 +717,12 @@ watch(
       }
       return;
     }
-    const styleBlocks = blocks.filter((block) => block.type === "style" && block.content);
-    const styleSignature = styleBlocks.map((block) => block.hash || block.content).join("|");
+    const styleBlocks = blocks.filter(
+      (block) => block.type === "style" && block.content,
+    );
+    const styleSignature = styleBlocks
+      .map((block) => block.hash || block.content)
+      .join("|");
     if (!styleSignature) {
       if (injectedStyleSignature) {
         removeScopedCss(props.message.id);
@@ -403,125 +738,407 @@ watch(
       injectScopedCss(block.content || "", props.message.id);
     }
   },
-  { immediate: true }
+  { immediate: true },
+);
+
+// === Stream Tail Morphdom Smooth Rendering ===
+const tailRootRef = ref<HTMLElement | null>(null);
+const fallbackTailSignature = computed(() => {
+  const block = props.message.tailBlock;
+  if (!block) return "";
+
+  const contentSignal =
+    block.hash !== undefined && block.hash !== null
+      ? String(block.hash)
+      : block.content || "";
+
+  return [block.type, contentSignal, block.nodes?.length ?? 0].join("|");
+});
+
+watch(
+  fallbackTailSignature,
+  () => {
+    const newTailBlock = props.message.tailBlock;
+    if (useAstForCurrentTail.value) return; // 🆕 启用 AST Diff 且有节点时跳过 Morphdom
+    if (!newTailBlock || !isPlainBlock(newTailBlock.type)) return;
+    nextTick(() => {
+      if (!tailRootRef.value) return;
+      const html = renderBlockHtml(newTailBlock);
+
+      // 实时提取未闭合/已闭合的 <style> 并物理抹除以防 morphdom 崩溃
+      let cssContent = "";
+      const processedHtml = html.replace(
+        /<style\b[^>]*>([\s\S]*?)(?:<\/style>|$)/gi,
+        (_, css) => {
+          cssContent += css.trim() + "\n";
+          return ""; // 从正文 HTML 中抹除 style 标签
+        },
+      );
+
+      if (cssContent.trim().length > 0) {
+        injectScopedCss(cssContent, props.message.id);
+      }
+
+      try {
+        morphdom(tailRootRef.value, `<div>${processedHtml}</div>`, {
+          childrenOnly: true,
+          getNodeKey: (node: Node) => {
+            if (!node || node.nodeType !== 1) return undefined;
+            const el = node as Element;
+            return el.id || el.getAttribute("data-vcp-key") || undefined;
+          },
+          onBeforeElUpdated: (fromEl: HTMLElement, toEl: HTMLElement) => {
+            if (fromEl.isEqualNode(toEl)) return false;
+
+            // 1. 保留可能存在的过渡/动画 class，防止 morphdom 移除它们
+            const animClasses = [
+              "vcp-stream-element-fade-in",
+              "animate-fade-in",
+              "vcp-stream-content-pulse",
+            ];
+            for (const cls of animClasses) {
+              if (fromEl.classList.contains(cls)) {
+                toEl.classList.add(cls);
+              }
+            }
+
+            // 2. 保留媒体播放状态
+            if (fromEl.tagName === "VIDEO" || fromEl.tagName === "AUDIO") {
+              const mediaEl = fromEl as HTMLMediaElement;
+              if (!mediaEl.paused) return false;
+            }
+
+            // 3. 保留输入焦点
+            if (fromEl === document.activeElement) {
+              requestAnimationFrame(() => {
+                if (toEl && typeof toEl.focus === "function") toEl.focus();
+              });
+            }
+
+            // 4. 保留已加载图片的可见性和状态，防止重新加载闪烁
+            if (fromEl.tagName === "IMG") {
+              const fromImg = fromEl as HTMLImageElement;
+              const toImg = toEl as HTMLImageElement;
+              if (fromImg.onerror && !toImg.onerror)
+                toImg.onerror = fromImg.onerror;
+              if (fromImg.onload && !toImg.onload)
+                toImg.onload = fromImg.onload;
+              if (fromImg.style.visibility)
+                toImg.style.visibility = fromImg.style.visibility;
+              if (fromImg.complete && fromImg.naturalWidth > 0) return false;
+            }
+
+            return true;
+          },
+        });
+      } catch (e) {
+        console.debug("[TailMorphdom] Skipped frame:", e);
+      }
+    });
+  },
+  { immediate: true, flush: "post" },
+);
+
+// === AST Diff Executor ===
+
+watch(
+  [
+    () => props.message.tailFrame,
+    () => props.message.tailSnapshot,
+    tailSandboxRef,
+  ],
+  ([frame, _snapshot, sandbox]) => {
+    astDebugLog(
+      `[AST Diff Watch] Msg ${props.message.id} frame=${frame ? frame.frameSeq : "none"}, mutations=${frame?.mutations?.length || 0}, sandbox=${sandbox ? "Ready" : "Null"}, epoch=${frame?.epoch}, revision=${frame?.revision}`,
+    );
+
+    if (!useAstForCurrentTail.value || !sandbox) {
+      if (lastSandbox) {
+        cleanupRegistry(props.message.id);
+        lastSandbox.innerHTML = "";
+        lastSandbox = null;
+      }
+      return;
+    }
+
+    if (lastSandbox !== sandbox) {
+      cleanupRegistry(props.message.id);
+      sandbox.innerHTML = "";
+      lastAppliedFrameSeq = 0;
+      localTailEpoch = -1;
+      localTailRevision = -1;
+      lastSandbox = sandbox;
+      if (getTailSnapshotNodes().length > 0) {
+        rebuildTailSnapshot(sandbox);
+        astFailureCount = 0;
+      }
+    }
+
+    if (!frame) {
+      return;
+    }
+
+    if (frame.frameSeq <= lastAppliedFrameSeq) {
+      return;
+    }
+
+    const incomingEpoch = frame.epoch ?? 0;
+    const incomingRevision = frame.revision ?? -1;
+    const epochChanged = incomingEpoch !== localTailEpoch;
+    const explicitReset = frame.reset === true || epochChanged;
+
+    if (explicitReset) {
+      sandbox.innerHTML = "";
+      cleanupRegistry(props.message.id);
+      localTailEpoch = incomingEpoch;
+      localTailRevision = incomingRevision;
+      lastAppliedFrameSeq = frame.frameSeq;
+      astFailureCount = 0;
+
+      const snapshot = frame.snapshot || getTailSnapshotNodes();
+      if (snapshot.length > 0) {
+        rebuildSnapshot(snapshot, props.message.id, sandbox);
+        return;
+      }
+    }
+
+    const mutations = frame.mutations || [];
+    if (mutations.length === 0) {
+      lastAppliedFrameSeq = frame.frameSeq;
+      localTailRevision = incomingRevision;
+      return;
+    }
+
+    astDebugLog(
+      `[AST Diff Apply] Executing frame ${frame.frameSeq} (${mutations.length} mutations) for ${props.message.id}`,
+    );
+    const result = applyFrame(mutations, props.message.id, sandbox);
+    if (result.ok) {
+      lastAppliedFrameSeq = frame.frameSeq;
+      localTailRevision = incomingRevision;
+      astFailureCount = 0;
+    } else {
+      handleAstFrameFailure(
+        sandbox,
+        result.failed?.reason || "applyFrame failed",
+      );
+    }
+  },
+  { flush: "post", immediate: true },
 );
 
 onUnmounted(() => {
   removeScopedCss(props.message.id);
+  cleanupRegistry(props.message.id);
 });
 </script>
 
 <template>
-  <div v-longpress="showMessageContextMenu"
-    class="vcp-message-item flex flex-col w-full mb-6 animate-fade-in px-1 min-w-0" :data-message-id="message.id"
-    :data-role="message.role">
+  <div
+    ref="messageContentRef"
+    v-longpress="showMessageContextMenu"
+    class="vcp-message-item flex flex-col w-full mb-6 animate-fade-in px-1 min-w-0"
+    :data-message-id="message.id"
+    :data-role="message.role"
+  >
+    <!-- 统一的气泡循环渲染列表 -->
+    <template v-for="(bubble, bubbleIndex) in messageBubbles" :key="bubble.id">
+      <template v-if="shell">
+        <MessageHeader
+          :is-user="shell.isUser"
+          :display-name="shell.displayName"
+          :name-style="{ color: shell.avatarColor }"
+          :owner-type="shell.isUser ? 'user' : 'agent'"
+          :owner-id="shell.isUser ? 'user_avatar' : message.agentId || agentId"
+          :avatar-dominant-color="shell.avatarColor"
+        />
 
-    <MessageHeader
-      v-if="shell"
-      :is-user="shell.isUser"
-      :display-name="shell.displayName"
-      :name-style="{ color: shell.avatarColor }"
-      :owner-type="shell.isUser ? 'user' : 'agent'"
-      :owner-id="shell.isUser ? 'user_avatar' : (message.agentId || agentId)"
-      :avatar-dominant-color="shell.avatarColor"
-    />
+        <ChatBubble
+          :is-user="shell.isUser"
+          :is-streaming="
+            isStreaming && bubbleIndex === messageBubbles.length - 1
+          "
+          :bubble-style="{
+            '--dynamic-color': shell.avatarColor,
+          }"
+          :class="bubbleIndex > 0 ? 'mt-2' : ''"
+        >
+          <!-- 初始思考指示灯：仅在此活跃气泡没有任何已确认 blocks，且仍在流式并未吐出 tail 时显示 -->
+          <ThinkingIndicator
+            v-if="
+              isStreaming &&
+              bubbleIndex === messageBubbles.length - 1 &&
+              (!message.blocks || message.blocks.length === 0) &&
+              !message.tailBlock &&
+              !message.tailContent
+            "
+          />
 
-    <ChatBubble
-      v-if="shell"
-      :is-user="shell.isUser"
-      :is-streaming="isStreaming"
-      :bubble-style="{
-        '--dynamic-color': shell.avatarColor,
-      }"
-    >
-      <ThinkingIndicator v-if="isStreaming && (!message.blocks || message.blocks.length === 0) && !message.tailBlock && !message.tailContent" />
+          <div
+            class="vcp-content-blocks space-y-2 min-w-0 w-full overflow-hidden"
+          >
+            <template v-if="bubble.blocks && bubble.blocks.length > 0">
+              <template
+                v-for="(block, index) in bubble.blocks"
+                :key="getBlockKey(block, index)"
+              >
+                <!-- v-memo=[index] 保证已稳定块零开销：Vue 缓存 VNode 子树，不重渲染、不触碰 DOM -->
+                <div v-memo="[getBlockKey(block, index)]">
+                  <div
+                    v-if="isPlainBlock(block.type)"
+                    v-html="renderBlockHtml(block)"
+                  />
 
-      <div ref="messageContentRef" class="vcp-content-blocks space-y-2 min-w-0 w-full overflow-hidden">
-        <template v-if="message.blocks && message.blocks.length > 0">
-          <template v-for="(block, index) in message.blocks" :key="getBlockKey(block, index)">
-            <!-- v-memo=[index] 保证已稳定块零开销：Vue 缓存 VNode 子树，不重渲染、不触碰 DOM -->
-            <div v-memo="[getBlockKey(block, index)]">
+                  <ToolBlock
+                    v-else-if="
+                      block.type === 'tool-use' || block.type === 'tool-result'
+                    "
+                    :type="block.type"
+                    :content="block.content"
+                    :block="block"
+                    :default-expanded="isMessageInActiveStream"
+                  />
+
+                  <ThoughtBlock
+                    v-else-if="block.type === 'thought'"
+                    :block="block"
+                    :message-id="message.id"
+                    :default-expanded="isMessageInActiveStream"
+                  />
+
+                  <HtmlPreviewBlock
+                    v-else-if="block.type === 'html-preview'"
+                    :content="block.content || ''"
+                    :highlighted-content="block.highlighted_content"
+                    :message-id="message.id"
+                    :is-streaming="isStreaming"
+                    :is-active-stream="isMessageInActiveStream"
+                  />
+
+                  <ToolSummaryBlock
+                    v-else-if="block.type === 'tool-call-summary'"
+                    :block="block"
+                  />
+                </div>
+              </template>
+            </template>
+            <template
+              v-else-if="bubbleIndex === 0 && shouldRenderRawContentFallback"
+            >
+              <div class="vcp-markdown-block select-text">
+                <p>{{ message.content }}</p>
+              </div>
+            </template>
+
+            <!-- 尾部流式推测渲染（只对最后一个活跃气泡生效，且正在流式、有 tailBlock 时渲染，完美拼合在气泡正文末尾） -->
+            <div
+              v-if="
+                isStreaming &&
+                bubbleIndex === messageBubbles.length - 1 &&
+                message.tailBlock
+              "
+              class="streaming-tail opacity-90"
+            >
               <div
-                v-if="isPlainBlock(block.type)"
-                v-html="renderBlockHtml(block)"
+                v-if="
+                  useAstForCurrentTail && isPlainBlock(message.tailBlock.type)
+                "
+              >
+                <div
+                  :ref="
+                    (el) => {
+                      tailSandboxRef = el as HTMLElement | null;
+                    }
+                  "
+                  class="vcp-markdown-block vcp-ast-sandbox"
+                />
+              </div>
+              <div
+                v-else-if="
+                  !useAstForCurrentTail && isPlainBlock(message.tailBlock.type)
+                "
+                :ref="
+                  (el) => {
+                    tailRootRef = el as HTMLElement | null;
+                  }
+                "
+                class="vcp-markdown-block"
               />
-
               <ToolBlock
-                v-else-if="block.type === 'tool-use' || block.type === 'tool-result'"
-                :type="block.type"
-                :content="block.content"
-                :block="block"
+                v-else-if="
+                  message.tailBlock.type === 'tool-use' ||
+                  message.tailBlock.type === 'tool-result'
+                "
+                :type="message.tailBlock.type"
+                :content="message.tailBlock.content"
+                :block="message.tailBlock"
+                :default-expanded="isMessageInActiveStream"
               />
-
               <ThoughtBlock
-                v-else-if="block.type === 'thought'"
-                :block="block"
+                v-else-if="message.tailBlock.type === 'thought'"
+                :block="message.tailBlock"
                 :message-id="message.id"
+                :default-expanded="isMessageInActiveStream"
               />
-
               <HtmlPreviewBlock
-                v-else-if="block.type === 'html-preview'"
-                :content="block.content || ''"
-                :highlighted-content="block.highlighted_content"
+                v-else-if="message.tailBlock.type === 'html-preview'"
+                :content="message.tailBlock.content || ''"
+                :highlighted-content="message.tailBlock.highlighted_content"
                 :message-id="message.id"
                 :is-streaming="isStreaming"
                 :is-active-stream="isMessageInActiveStream"
               />
+              <ToolSummaryBlock
+                v-else-if="message.tailBlock.type === 'tool-call-summary'"
+                :block="message.tailBlock"
+              />
+            </div>
+            <div
+              v-if="
+                isStreaming &&
+                bubbleIndex === messageBubbles.length - 1 &&
+                message.tailContent &&
+                (!message.tailBlock || !isPlainBlock(message.tailBlock.type))
+              "
+              class="opacity-70 italic animate-pulse"
+            >
+              {{ message.tailContent }}
+            </div>
+          </div>
+
+          <AttachmentPreview
+            v-if="
+              bubbleIndex === 0 &&
+              message.attachments &&
+              message.attachments.length > 0
+            "
+            :attachments="message.attachments"
+            class="pt-3 border-t border-black/5 dark:border-white/5"
+          />
+
+          <StreamingTag
+            v-if="isStreaming && bubbleIndex === messageBubbles.length - 1"
+          />
+
+          <template #footer>
+            <div
+              class="text-[9px] mt-1.5 px-1 opacity-50 font-mono tracking-tighter w-full"
+              :class="shell.isUser ? 'text-right' : 'text-left'"
+            >
+              {{ formatTime(message.timestamp) }}
             </div>
           </template>
-        </template>
-        <template v-else-if="shouldRenderRawContentFallback">
-          <div class="vcp-markdown-block select-text">
-            <p>{{ message.content }}</p>
-          </div>
-        </template>
-
-        <!-- 流式尾部高画质推测渲染 (Speculative Rendering) -->
-        <div v-if="isStreaming && message.tailBlock" class="streaming-tail opacity-90">
-          <div
-            v-if="isPlainBlock(message.tailBlock.type)"
-            v-html="renderBlockHtml(message.tailBlock)"
-          />
-          <ToolBlock
-            v-else-if="message.tailBlock.type === 'tool-use' || message.tailBlock.type === 'tool-result'"
-            :type="message.tailBlock.type"
-            :content="message.tailBlock.content"
-            :block="message.tailBlock"
-          />
-          <ThoughtBlock
-            v-else-if="message.tailBlock.type === 'thought'"
-            :block="message.tailBlock"
-            :message-id="message.id"
-          />
-          <HtmlPreviewBlock
-            v-else-if="message.tailBlock.type === 'html-preview'"
-            :content="message.tailBlock.content || ''"
-            :highlighted-content="message.tailBlock.highlighted_content"
-            :message-id="message.id"
-            :is-streaming="isStreaming"
-            :is-active-stream="isMessageInActiveStream"
-          />
-        </div>
-        <div v-else-if="isStreaming && message.tailContent && message.blocks && message.blocks.length > 0" class="opacity-70 italic animate-pulse">
-          {{ message.tailContent }}
-        </div>
-      </div>
-
-      <AttachmentPreview
-        v-if="message.attachments && message.attachments.length > 0"
-        :attachments="message.attachments"
-        class="pt-3 border-t border-black/5 dark:border-white/5"
-      />
-
-      <StreamingTag v-if="isStreaming" />
-
-      <template #footer>
-        <div class="text-[9px] mt-1.5 px-1 opacity-50 font-mono tracking-tighter w-full"
-          :class="shell.isUser ? 'text-right' : 'text-left'">
-          {{ formatTime(message.timestamp) }}
-        </div>
+        </ChatBubble>
       </template>
-    </ChatBubble>
+    </template>
+
+    <!-- Mermaid FullScreen Viewer -->
+    <MermaidFullScreenViewer
+      :visible="isMermaidFullScreen"
+      :svg-html="activeMermaidSvg"
+      :source-code="activeMermaidSource"
+      @close="isMermaidFullScreen = false"
+    />
   </div>
 </template>
 
@@ -537,7 +1154,13 @@ onUnmounted(() => {
 }
 
 @keyframes fadeIn {
-  from { opacity: 0; transform: translateY(10px) scale(0.98); }
-  to { opacity: 1; transform: translateY(0) scale(1); }
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
 }
 </style>

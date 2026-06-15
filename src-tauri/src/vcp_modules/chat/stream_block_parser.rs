@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::vcp_modules::content_parser::{
-    BlockType, ToolResultDetail, BUTTON_CLICK, /* extraction helpers */
+    BlockType, ToolCallSummaryItem, ToolResultDetail, BUTTON_CLICK, /* extraction helpers */
     CONTENT_REGEX, DATE_REGEX, DIARY_END, DIARY_START, GENERIC_CODE_FENCE_END,
     GENERIC_CODE_FENCE_START, HTML_DOC_END, HTML_DOC_START, HTML_FENCE_START, KV_REGEX, MAID_REGEX,
     ROLE_DIVIDER, STYLE_TAG_END, STYLE_TAG_START, THINK_END, THINK_START, THOUGHT_END,
@@ -72,6 +72,12 @@ pub enum StreamBlock {
     Style { content: String, hash: String },
     #[serde(rename = "button-click")]
     ButtonClick { content: String, hash: String },
+    #[serde(rename = "tool-call-summary")]
+    ToolCallSummary {
+        items: Vec<ToolCallSummaryItem>,
+        raw_content: String,
+        hash: String,
+    },
 }
 
 impl StreamBlock {
@@ -155,6 +161,18 @@ impl StreamBlock {
 
     pub fn style(content: String, hash: String) -> Self {
         Self::Style { content, hash }
+    }
+
+    pub fn tool_call_summary(
+        items: Vec<ToolCallSummaryItem>,
+        raw_content: String,
+        hash: String,
+    ) -> Self {
+        Self::ToolCallSummary {
+            items,
+            raw_content,
+            hash,
+        }
     }
 
     #[allow(dead_code)]
@@ -264,7 +282,13 @@ impl StreamBlockParser {
         let (mut blocks, tail) = self.process(full_text);
         let trimmed = tail.trim();
         if !trimmed.is_empty() {
-            let nodes = crate::vcp_modules::pre_renderer::parse_markdown_to_ast(trimmed);
+            let nodes = if crate::vcp_modules::content_parser::is_html_tag_block(trimmed) {
+                vec![crate::vcp_modules::pre_renderer::MarkdownNode::raw_html(
+                    trimmed.to_string(),
+                )]
+            } else {
+                crate::vcp_modules::pre_renderer::parse_markdown_to_ast(trimmed)
+            };
             let hash = HashAggregator::compute_content_hash(trimmed);
             blocks.push(StreamBlock::markdown(
                 trimmed.to_string(),
@@ -347,7 +371,7 @@ impl StreamBlockParser {
 /// 在文本中寻找最早出现的特种块起始标记
 /// 返回 (start_offset, end_offset, BlockType)
 fn find_earliest_start_marker(text: &str) -> Option<(usize, usize, BlockType)> {
-    let checks: [(&regex::Regex, BlockType); 11] = [
+    let checks: [(&regex::Regex, BlockType); 12] = [
         (&TOOL_START, BlockType::Tool),
         (&THOUGHT_START, BlockType::Thought),
         (&THINK_START, BlockType::Think),
@@ -361,6 +385,10 @@ fn find_earliest_start_marker(text: &str) -> Option<(usize, usize, BlockType)> {
         (
             &crate::vcp_modules::content_parser::HTML_CONTAINER_OPEN_RE,
             BlockType::HtmlContainer,
+        ),
+        (
+            &crate::vcp_modules::content_parser::TOOL_CALL_SUMMARY_START,
+            BlockType::ToolCallSummary,
         ),
     ];
 
@@ -431,6 +459,9 @@ fn find_end_marker(
         BlockType::Think => THINK_END.find(search_area),
         BlockType::ToolResult => TOOL_RESULT_END.find(search_area),
         BlockType::Diary => DIARY_END.find(search_area),
+        BlockType::ToolCallSummary => {
+            crate::vcp_modules::content_parser::TOOL_CALL_SUMMARY_END.find(search_area)
+        }
         BlockType::HtmlFence | BlockType::CodeFence => GENERIC_CODE_FENCE_END.find(search_area),
         BlockType::HtmlDoc => HTML_DOC_END.find(search_area),
         BlockType::HtmlContainer => unreachable!(),
@@ -513,6 +544,11 @@ fn build_stream_block(
             let hash =
                 HashAggregator::compute_content_hash(&format!("{}:{}:{}", maid, date, content));
             StreamBlock::diary(maid, date, content, Some(nodes), hash)
+        }
+        BlockType::ToolCallSummary => {
+            let items = crate::vcp_modules::content_parser::parse_tool_call_summary(inner_content);
+            let hash = HashAggregator::compute_content_hash(inner_content);
+            StreamBlock::tool_call_summary(items, inner_content.to_string(), hash)
         }
         BlockType::HtmlFence | BlockType::HtmlDoc => {
             let hash = HashAggregator::compute_content_hash(inner_content);
@@ -603,58 +639,12 @@ fn split_markdown_paragraphs(text: &str) -> (Vec<StreamBlock>, String) {
             ));
         }
 
-        // 针对留下的 tail，进行“句级”自适应切分兜底
-        let (mut extra_blocks, final_tail) = check_sentence_precipitation(tail);
-        blocks.append(&mut extra_blocks);
-
-        // 检查 inline button clicks
         let blocks = extract_inline_buttons(blocks);
-        (blocks, final_tail)
+        (blocks, tail.to_string())
     } else {
-        // 全程没有 \n\n，进行句级自适应切分兜底
-        let (blocks, final_tail) = check_sentence_precipitation(text);
-        let blocks = extract_inline_buttons(blocks);
-        (blocks, final_tail)
+        // 全程没有 \n\n，直接以 tail 形式返回
+        (Vec::new(), text.to_string())
     }
-}
-
-/// 辅助函数：当未分段文本超过阈值时，利用句尾标点强行截断沉淀
-fn check_sentence_precipitation(text: &str) -> (Vec<StreamBlock>, String) {
-    const PRECIPITATE_THRESHOLD: usize = 500; // 500字阻尼线
-
-    if text.len() < PRECIPITATE_THRESHOLD {
-        return (Vec::new(), text.to_string());
-    }
-
-    // 寻找距离 500 字最近的一个句尾标点（。 ！ ？ . ! ?）
-    let punctuations = ['。', '！', '？', '…', '.', '!', '?'];
-    let mut cut_index = None;
-
-    for (i, ch) in text.char_indices().rev() {
-        // 保留至少 200 个字节（大约几十个汉字）作为 tail，保证打字机打出的文字有连续视效
-        if i < 200 {
-            break;
-        }
-        if punctuations.contains(&ch) {
-            cut_index = Some(i + ch.len_utf8());
-            break;
-        }
-    }
-
-    if let Some(idx) = cut_index {
-        let stable_part = &text[..idx];
-        let tail_part = &text[idx..];
-
-        let trimmed = stable_part.trim();
-        if !trimmed.is_empty() {
-            let nodes = crate::vcp_modules::pre_renderer::parse_markdown_to_ast(trimmed);
-            let hash = HashAggregator::compute_content_hash(trimmed);
-            let block = StreamBlock::markdown(trimmed.to_string(), Some(nodes), hash);
-            return (vec![block], tail_part.to_string());
-        }
-    }
-
-    (Vec::new(), text.to_string())
 }
 
 /// 从 Markdown 块中提取内联按钮点击
@@ -876,26 +866,36 @@ mod tests {
     #[test]
     fn test_streaming_typewriter_incremental_precipitation() {
         let mut parser = StreamBlockParser::new();
+        let padding = "这里是一段用来填充文本长度以达到测试新设定之八百字节双换行沉淀阈值物理条件的垫片数据。".repeat(10);
 
         // 模拟第 1 帧：输出到代码块开头，未闭合
-        let frame_1 = "### 维度二：代码高亮\n\n测试流式传输未闭合时：\n\n```rust";
-        let (blocks_1, tail_1) = parser.process(frame_1);
+        let frame_1 = format!(
+            "{}### 维度二：代码高亮\n\n测试流式传输未闭合时：\n\n```rust",
+            padding
+        );
+        let (blocks_1, tail_1) = parser.process(&frame_1);
         println!("Frame 1 - Blocks: {}, Tail: {:?}", blocks_1.len(), tail_1);
         // 应该成功沉淀出前面的两个 Markdown 块（因 \n\n 物理分段），且 tail 只包含 ```rust
         assert_eq!(blocks_1.len(), 2);
         assert_eq!(tail_1, "```rust");
 
         // 模拟第 2 帧：代码块流式增量增长，仍未闭合
-        let frame_2 = "### 维度二：代码高亮\n\n测试流式传输未闭合时：\n\n```rust\nuse tokio;\n";
-        let (blocks_2, tail_2) = parser.process(frame_2);
+        let frame_2 = format!(
+            "{}### 维度二：代码高亮\n\n测试流式传输未闭合时：\n\n```rust\nuse tokio;\n",
+            padding
+        );
+        let (blocks_2, tail_2) = parser.process(&frame_2);
         println!("Frame 2 - Blocks: {}, Tail: {:?}", blocks_2.len(), tail_2);
         // 应该没有任何新的 blocks（因为前段已经沉淀，后段未闭合），且 tail 应该是增量代码块且去掉了前段
         assert_eq!(blocks_2.len(), 0);
         assert_eq!(tail_2, "```rust\nuse tokio;\n");
 
         // 模拟第 3 帧：流式代码块闭合
-        let frame_3 = "### 维度二：代码高亮\n\n测试流式传输未闭合时：\n\n```rust\nuse tokio;\n```";
-        let (blocks_3, tail_3) = parser.process(frame_3);
+        let frame_3 = format!(
+            "{}### 维度二：代码高亮\n\n测试流式传输未闭合时：\n\n```rust\nuse tokio;\n```",
+            padding
+        );
+        let (blocks_3, tail_3) = parser.process(&frame_3);
         println!("Frame 3 - Blocks: {}, Tail: {:?}", blocks_3.len(), tail_3);
         // 应该成功闭合代码块并将其沉淀，且 tail 为空
         assert_eq!(blocks_3.len(), 1);

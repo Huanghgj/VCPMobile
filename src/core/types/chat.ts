@@ -38,6 +38,11 @@ export type InlineNode = {
   hash?: string | number;
 };
 
+export interface ToolCallSummaryItem {
+  tool_name: string;
+  status: string;
+}
+
 export interface ContentBlock {
   type:
   | "markdown"
@@ -49,7 +54,8 @@ export interface ContentBlock {
   | "html-preview"
   | "role-divider"
   | "style"
-  | "math";
+  | "math"
+  | "tool-call-summary";
   content?: string;
   nodes?: MarkdownNode[]; // For type: "markdown", "diary", "thought"
   tool_name?: string;
@@ -64,6 +70,8 @@ export interface ContentBlock {
   is_end?: boolean;
   display_mode?: boolean;
   highlighted_content?: string;
+  items?: ToolCallSummaryItem[]; // For type: "tool-call-summary"
+  raw_content?: string;          // For type: "tool-call-summary"
   hash?: string | number;
 }
 
@@ -111,6 +119,27 @@ export interface ChatMessage {
   // 以下为纯前端运行时 UI 状态 (Ephemeral)，绝不进行持久化
   tailContent?: string;      // Aurora: 尾随区 Markdown (高频变动)
   tailBlock?: ContentBlock;
+  tailFrame?: TailFrame;
+  tailSnapshot?: MarkdownNode[];
+}
+
+export type AstMutation =
+  | { op: "add"; id: string; parent: string; node: MarkdownNode }
+  | { op: "add_inline"; id: string; parent: string; node: InlineNode }
+  | { op: "text"; id: string; value: string }
+  | { op: "append"; id: string; chunk: string }
+  | { op: "prop"; id: string; key: string; value: string }
+  | { op: "replace"; id: string; node: MarkdownNode }
+  | { op: "replace_inline"; id: string; node: InlineNode }
+  | { op: "remove"; id: string };
+
+export interface TailFrame {
+  epoch: number;
+  revision: number;
+  frameSeq: number;
+  reset?: boolean;
+  snapshot?: MarkdownNode[];
+  mutations: AstMutation[];
 }
 
 /**
@@ -174,6 +203,8 @@ export interface AuroraUpdate {
   tail?: string;
   tailChanged?: boolean;
   contentDelta?: string;
+  tailFrame?: TailFrame;
+  tailSnapshot?: MarkdownNode[];
   content?: string;
 }
 

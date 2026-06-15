@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from 'vue';
+import { ref, watch } from 'vue';
 import { useSidebarSwipe } from '../../core/composables/useSidebarSwipe';
 import { useLayoutStore } from '../../core/stores/layout';
 import { useOverlayStore } from '../../core/stores/overlay';
@@ -17,6 +17,11 @@ const sessionStore = useChatSessionStore();
 
 const activeTab = ref<'agents' | 'topics'>('agents');
 const searchQuery = ref('');
+
+// 切换 Tab 时清空搜索框
+watch(activeTab, () => {
+  searchQuery.value = '';
+});
 
 const sidebarRef = ref<HTMLElement | null>(null);
 
@@ -69,7 +74,7 @@ const openSettings = () => {
       </template>
 
       <template v-if="activeTab === 'topics'">
-        <TopicList @select-topic="handleSelectTopic" />
+        <TopicList :searchQuery="searchQuery" @select-topic="handleSelectTopic" />
       </template>
     </div>
 
@@ -117,6 +122,7 @@ const openSettings = () => {
   bottom: 0;
   width: 82vw;
   max-width: 340px;
+  background-color: var(--secondary-bg);
   background-color: color-mix(in srgb, var(--secondary-bg) 97%, transparent);
   transition: transform 0.4s cubic-bezier(0.16, 1, 0.3, 1);
   z-index: var(--layer-drawer);

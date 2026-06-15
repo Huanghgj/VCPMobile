@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onUnmounted } from 'vue';
+import { ref, computed, onUnmounted } from "vue";
 import {
   ChevronDown,
   ChevronUp,
@@ -16,22 +16,31 @@ import {
   BookOpen,
   Video,
   Cpu,
-  Terminal
-} from 'lucide-vue-next';
-import type { VcpNotification } from '../../core/stores/notification';
-import { useNotificationPresentation } from './composables/useNotificationPresentation';
+  Terminal,
+} from "lucide-vue-next";
+import type { VcpNotification } from "../../core/stores/notification";
+import { useNotificationPresentation } from "./composables/useNotificationPresentation";
 
 const props = defineProps<{
   item: VcpNotification;
 }>();
 
 const emit = defineEmits<{
-  (e: 'delete', id: string): void;
-  (e: 'action', payload: { id: string; action: { label: string; value: boolean; color: string } }): void;
+  (e: "delete", id: string): void;
+  (
+    e: "action",
+    payload: {
+      id: string;
+      action: { label: string; value: boolean; color: string };
+      reason?: string;
+    },
+  ): void;
 }>();
 
-type StructuredRow = NonNullable<NonNullable<VcpNotification['structured']>['rows']>[number];
-type StructuredMetric = NonNullable<StructuredRow['metrics']>[number];
+type StructuredRow = NonNullable<
+  NonNullable<VcpNotification["structured"]>["rows"]
+>[number];
+type StructuredMetric = NonNullable<StructuredRow["metrics"]>[number];
 type DetailChip = { label: string; value: string };
 type GenericStructuredRow = {
   title: string;
@@ -41,10 +50,12 @@ type GenericStructuredRow = {
   details: DetailChip[];
 };
 
-const { formatTime, getTypeColor, copyToClipboard } = useNotificationPresentation();
+const { formatTime, getTypeColor, getActionButtonClass, copyToClipboard } =
+  useNotificationPresentation();
 
 const isDetailsExpanded = ref(false);
 const isCopied = ref(false);
+const reasonText = ref("");
 const touchStartX = ref(0);
 const touchStartY = ref(0);
 const swipeOffset = ref(0);
@@ -107,8 +118,16 @@ const resetSwipe = () => {
 };
 
 const triggerDelete = () => {
-  emit('delete', props.item.id);
+  emit("delete", props.item.id);
   resetSwipe();
+};
+
+const handleAction = (action: {
+  label: string;
+  value: boolean;
+  color: string;
+}) => {
+  emit("action", { id: props.item.id, action, reason: reasonText.value });
 };
 
 const handleCopy = async () => {
@@ -127,11 +146,13 @@ onUnmounted(() => {
   if (copyResetTimer) clearTimeout(copyResetTimer);
 });
 
-const rawPayloadText = computed(() => JSON.stringify(props.item.rawPayload || props.item, null, 2));
+const rawPayloadText = computed(() =>
+  JSON.stringify(props.item.rawPayload || props.item, null, 2),
+);
 
 const stringifyCompactValue = (value: unknown, maxLength = 180) => {
-  const text = typeof value === 'string' ? value : JSON.stringify(value);
-  if (!text) return '';
+  const text = typeof value === "string" ? value : JSON.stringify(value);
+  if (!text) return "";
   return text.length > maxLength ? `${text.substring(0, maxLength)}...` : text;
 };
 
@@ -141,35 +162,47 @@ const stringifyRowField = (value: unknown) => {
 };
 
 const normalizeMetricValue = (value: unknown) => {
-  if (typeof value === 'number' && Number.isFinite(value)) return value.toFixed(4);
-  if (typeof value === 'string' && value.trim()) return value.trim();
-  return '';
+  if (typeof value === "number" && Number.isFinite(value))
+    return value.toFixed(4);
+  if (typeof value === "string" && value.trim()) return value.trim();
+  return "";
 };
 
 const getCategoryIcon = (item: VcpNotification) => {
-  const cat = (item.category || '').toLowerCase();
-  const infoType = (item.infoType || '').toLowerCase();
+  const cat = (item.category || "").toLowerCase();
+  const infoType = (item.infoType || "").toLowerCase();
   const rawType = item.rawPayload?.type;
   const kind = item.structured?.kind;
-  if (rawType === 'tool_approval_request' || infoType === 'tool_approval_request' || item.actions?.length) return ShieldAlert;
-  if (cat === 'rag') return Database;
-  if (cat === 'meta' || kind === 'thinking') return Brain;
-  if (cat === 'dream' || kind === 'dream') return Moon;
-  if (cat === 'agent' || kind === 'private_chat') return MessageSquare;
-  if (cat === 'tool') return Wrench;
-  if (cat === 'dailynote') return BookOpen;
-  if (cat === 'video') return Video;
-  if (cat === 'system') return Cpu;
+  if (
+    rawType === "tool_approval_request" ||
+    infoType === "tool_approval_request" ||
+    item.actions?.length
+  )
+    return ShieldAlert;
+  if (cat === "rag") return Database;
+  if (cat === "meta" || kind === "thinking") return Brain;
+  if (cat === "dream" || kind === "dream") return Moon;
+  if (cat === "agent" || kind === "private_chat") return MessageSquare;
+  if (cat === "tool") return Wrench;
+  if (cat === "dailynote") return BookOpen;
+  if (cat === "video") return Video;
+  if (cat === "system") return Cpu;
   return Terminal;
 };
 
 const ragResults = computed(() => {
-  if (props.item.structured?.kind === 'rag' && props.item.structured.rows) {
+  if (props.item.structured?.kind === "rag" && props.item.structured.rows) {
     return props.item.structured.rows.map((row: StructuredRow) => {
-      const distMetric = row.metrics?.find((m: StructuredMetric) => m.label.toLowerCase().includes('dist') || m.label.toLowerCase().includes('geo'));
-      const scoreMetric = row.metrics?.find((m: StructuredMetric) => m.label.toLowerCase().includes('score'));
+      const distMetric = row.metrics?.find(
+        (m: StructuredMetric) =>
+          m.label.toLowerCase().includes("dist") ||
+          m.label.toLowerCase().includes("geo"),
+      );
+      const scoreMetric = row.metrics?.find((m: StructuredMetric) =>
+        m.label.toLowerCase().includes("score"),
+      );
 
-      let distanceStr = '';
+      let distanceStr = "";
       let isEst = false;
 
       const explicitDistance = normalizeMetricValue(row.distance);
@@ -180,15 +213,15 @@ const ragResults = computed(() => {
       } else if (scoreMetric) {
         const score = parseFloat(scoreMetric.value);
         if (!isNaN(score) && score > 0) {
-          distanceStr = ((1 / score) - 1).toFixed(4);
+          distanceStr = (1 / score - 1).toFixed(4);
           isEst = true;
         }
       }
 
       const detailChips: DetailChip[] = [
-        row.source ? { label: 'source', value: row.source } : null,
-        row.path ? { label: 'path', value: row.path } : null,
-        row.snippet ? { label: 'snippet', value: row.snippet } : null,
+        row.source ? { label: "source", value: row.source } : null,
+        row.path ? { label: "path", value: row.path } : null,
+        row.snippet ? { label: "snippet", value: row.snippet } : null,
         ...(row.metrics || []),
       ].filter(Boolean) as DetailChip[];
 
@@ -206,7 +239,7 @@ const ragResults = computed(() => {
         chips: row.chips || [],
         distance: distanceStr,
         isEstimated: isEst,
-        details: detailChips
+        details: detailChips,
       };
     });
   }
@@ -215,27 +248,29 @@ const ragResults = computed(() => {
 
 const genericStructuredRows = computed<GenericStructuredRow[]>(() => {
   const structured = props.item.structured;
-  if (!structured || ['rag', 'thinking', 'dream'].includes(structured.kind)) return [];
+  if (!structured || ["rag", "thinking", "dream"].includes(structured.kind))
+    return [];
 
-  const rows: Array<Partial<StructuredRow> & { title: string }> = structured.rows?.length
+  const rows: Array<Partial<StructuredRow> & { title: string }> = structured
+    .rows?.length
     ? structured.rows.map((row) => ({
-      ...row,
-      title: stringifyCompactValue(row.title) || 'detail',
-    }))
+        ...row,
+        title: stringifyCompactValue(row.title) || "detail",
+      }))
     : Object.entries(props.item.rawPayload?.data || props.item.rawPayload || {})
-      .filter(([key]) => !['type', 'timestamp'].includes(key))
-      .slice(0, 6)
-      .map(([key, value]) => ({
-        title: key,
-        body: stringifyCompactValue(value),
-      }));
+        .filter(([key]) => !["type", "timestamp"].includes(key))
+        .slice(0, 6)
+        .map(([key, value]) => ({
+          title: key,
+          body: stringifyCompactValue(value),
+        }));
 
   return rows.map((row) => {
     const metadata = row.metadata ?? (row as any).meta;
     const details: DetailChip[] = [
-      row.source ? { label: 'source', value: row.source } : null,
-      row.path ? { label: 'path', value: row.path } : null,
-      row.snippet ? { label: 'snippet', value: row.snippet } : null,
+      row.source ? { label: "source", value: row.source } : null,
+      row.path ? { label: "path", value: row.path } : null,
+      row.snippet ? { label: "snippet", value: row.snippet } : null,
       ...(row.metrics || []),
     ].filter(Boolean) as DetailChip[];
 
@@ -259,8 +294,13 @@ const genericStructuredRows = computed<GenericStructuredRow[]>(() => {
 <template>
   <div class="relative overflow-hidden w-full select-none mb-2.5 px-3">
     <!-- Swipe Action Background -->
-    <div class="absolute inset-y-0 right-3 w-[70px] bg-rose-100/90 rounded-r-xl flex items-center justify-center border-l border-rose-200/50 z-0">
-      <button @click="triggerDelete" class="w-full h-full flex flex-col items-center justify-center text-rose-600 active:text-rose-800 transition-colors">
+    <div
+      class="absolute inset-y-0 right-3 w-[70px] bg-rose-100/90 rounded-r-xl flex items-center justify-center border-l border-rose-200/50 z-0"
+    >
+      <button
+        @click="triggerDelete"
+        class="w-full h-full flex flex-col items-center justify-center text-rose-600 active:text-rose-800 transition-colors"
+      >
         <Trash2 class="w-4 h-4" />
         <span class="text-[9px] mt-1 font-medium">删除</span>
       </button>
@@ -277,13 +317,30 @@ const genericStructuredRows = computed<GenericStructuredRow[]>(() => {
       <!-- Header -->
       <div class="flex items-start justify-between gap-2">
         <div class="flex items-center gap-1.5 min-w-0">
-          <span :class="['w-2 h-2 rounded-full shrink-0 shadow-sm', presentation.dot]"></span>
-          <component :is="getCategoryIcon(item)" class="w-3.5 h-3.5 text-slate-400 shrink-0" />
-          <span v-if="item.source" class="text-[9px] font-mono font-semibold text-pink-400 shrink-0 bg-pink-50 px-1 py-0.2 rounded">{{ item.source }}</span>
-          <h4 class="text-xs font-bold text-slate-800 truncate">{{ item.title }}</h4>
+          <span
+            :class="[
+              'w-2 h-2 rounded-full shrink-0 shadow-sm',
+              presentation.dot,
+            ]"
+          ></span>
+          <component
+            :is="getCategoryIcon(item)"
+            class="w-3.5 h-3.5 text-slate-400 shrink-0"
+          />
+          <span
+            v-if="item.source"
+            class="text-[9px] font-mono font-semibold text-pink-400 shrink-0 bg-pink-50 px-1 py-0.2 rounded"
+            >{{ item.source }}</span
+          >
+          <h4 class="text-xs font-bold text-slate-800 truncate">
+            {{ item.title }}
+          </h4>
         </div>
         <div class="flex items-center gap-1.5 shrink-0">
-          <span class="text-[9px] font-mono text-slate-400 bg-slate-50 px-1.5 py-0.5 rounded">{{ formatTime(item.timestamp) }}</span>
+          <span
+            class="text-[9px] font-mono text-slate-400 bg-slate-50 px-1.5 py-0.5 rounded"
+            >{{ formatTime(item.timestamp) }}</span
+          >
           <button
             @click="triggerDelete"
             class="p-1 rounded border border-slate-200 bg-white text-slate-400 hover:text-rose-600 hover:border-rose-200 active:bg-rose-50 transition-colors"
@@ -306,10 +363,18 @@ const genericStructuredRows = computed<GenericStructuredRow[]>(() => {
 
       <!-- Subtitle & Message -->
       <div class="mt-1.5 pl-3.5">
-        <p v-if="item.subtitle" class="text-[10px] text-slate-500 font-medium tracking-tight">{{ item.subtitle }}</p>
+        <p
+          v-if="item.subtitle"
+          class="text-[10px] text-slate-500 font-medium tracking-tight"
+        >
+          {{ item.subtitle }}
+        </p>
         <p
           class="text-xs text-slate-600 mt-1 leading-relaxed break-all whitespace-pre-wrap"
-          :class="{ 'font-mono bg-slate-50 p-2 rounded-lg border border-slate-100 text-[11px] text-slate-700': item.isPreformatted }"
+          :class="{
+            'font-mono bg-slate-50 p-2 rounded-lg border border-slate-100 text-[11px] text-slate-700':
+              item.isPreformatted,
+          }"
         >
           {{ item.message }}
         </p>
@@ -324,7 +389,11 @@ const genericStructuredRows = computed<GenericStructuredRow[]>(() => {
         >
           #{{ tag }}
         </span>
-        <div v-for="m in item.meta" :key="m.label" class="text-[9px] font-mono text-slate-400 flex items-center gap-1 bg-slate-50 px-1.5 py-0.5 rounded border border-slate-100">
+        <div
+          v-for="m in item.meta"
+          :key="m.label"
+          class="text-[9px] font-mono text-slate-400 flex items-center gap-1 bg-slate-50 px-1.5 py-0.5 rounded border border-slate-100"
+        >
           <span class="text-slate-500 font-medium">{{ m.label }}:</span>
           <span class="text-slate-700 font-bold">{{ m.value }}</span>
         </div>
@@ -333,10 +402,19 @@ const genericStructuredRows = computed<GenericStructuredRow[]>(() => {
       <!-- Structured Layouts -->
       <div class="mt-2.5 pl-3.5 space-y-2" v-if="item.structured">
         <!-- RAG Layout -->
-        <div v-if="item.structured.kind === 'rag'" class="border border-emerald-100 rounded-lg bg-emerald-50/40 p-2.5 space-y-2">
-          <div class="text-[9px] font-mono font-bold text-emerald-700 border-b border-emerald-100/60 pb-1 flex justify-between">
+        <div
+          v-if="item.structured.kind === 'rag'"
+          class="border border-emerald-100 rounded-lg bg-emerald-50/40 p-2.5 space-y-2"
+        >
+          <div
+            class="text-[9px] font-mono font-bold text-emerald-700 border-b border-emerald-100/60 pb-1 flex justify-between"
+          >
             <span>RAG 知识检索召回</span>
-            <span v-if="item.structured.summary" class="text-emerald-600 font-normal">{{ item.structured.summary }}</span>
+            <span
+              v-if="item.structured.summary"
+              class="text-emerald-600 font-normal"
+              >{{ item.structured.summary }}</span
+            >
           </div>
           <div class="space-y-2 max-h-[180px] overflow-y-auto pr-1">
             <div
@@ -345,18 +423,37 @@ const genericStructuredRows = computed<GenericStructuredRow[]>(() => {
               class="text-[11px] border-b border-emerald-100/30 last:border-0 pb-2 last:pb-0"
             >
               <div class="flex items-start justify-between gap-2">
-                <span class="text-slate-700 font-mono font-bold truncate max-w-[70%]">{{ row.title }}</span>
+                <span
+                  class="text-slate-700 font-mono font-bold truncate max-w-[70%]"
+                  >{{ row.title }}</span
+                >
                 <span
                   v-if="row.distance"
                   class="text-[9px] font-mono px-1.5 py-0.2 rounded bg-emerald-100 border border-emerald-200 text-emerald-800 font-semibold shrink-0"
                 >
-                  {{ row.isEstimated ? `dist≈${row.distance}` : `dist: ${row.distance}` }}
+                  {{
+                    row.isEstimated
+                      ? `dist≈${row.distance}`
+                      : `dist: ${row.distance}`
+                  }}
                 </span>
               </div>
-              <p v-if="row.subtitle" class="text-slate-400 text-[9px] truncate">{{ row.subtitle }}</p>
-              <p v-if="row.body" class="text-slate-600 text-[10px] mt-1 bg-white/80 p-1.5 rounded border border-emerald-100/40 font-mono leading-relaxed">{{ row.body }}</p>
+              <p v-if="row.subtitle" class="text-slate-400 text-[9px] truncate">
+                {{ row.subtitle }}
+              </p>
+              <p
+                v-if="row.body"
+                class="text-slate-600 text-[10px] mt-1 bg-white/80 p-1.5 rounded border border-emerald-100/40 font-mono leading-relaxed"
+              >
+                {{ row.body }}
+              </p>
               <div class="flex flex-wrap gap-1 mt-1" v-if="row.chips.length">
-                <span v-for="c in row.chips" :key="c" class="text-[8px] px-1 bg-emerald-100/50 text-emerald-700 rounded border border-emerald-100/30 font-medium">{{ c }}</span>
+                <span
+                  v-for="c in row.chips"
+                  :key="c"
+                  class="text-[8px] px-1 bg-emerald-100/50 text-emerald-700 rounded border border-emerald-100/30 font-medium"
+                  >{{ c }}</span
+                >
               </div>
               <div v-if="row.details.length" class="mt-1 grid gap-1">
                 <div
@@ -364,7 +461,9 @@ const genericStructuredRows = computed<GenericStructuredRow[]>(() => {
                   :key="`${detail.label}-${detail.value}`"
                   class="text-[8.5px] font-mono text-slate-500 bg-white/70 border border-emerald-100/40 rounded px-1 py-0.5 break-all"
                 >
-                  <span class="font-bold text-emerald-700">{{ detail.label }}:</span>
+                  <span class="font-bold text-emerald-700"
+                    >{{ detail.label }}:</span
+                  >
                   {{ detail.value }}
                 </div>
               </div>
@@ -373,22 +472,54 @@ const genericStructuredRows = computed<GenericStructuredRow[]>(() => {
         </div>
 
         <!-- Thinking Chain Layout -->
-        <div v-else-if="item.structured.kind === 'thinking'" class="border border-indigo-100 rounded-lg bg-indigo-50/40 p-2.5 space-y-2">
-          <div class="text-[9px] font-mono font-bold text-indigo-700 border-b border-indigo-100/60 pb-1">META THINKING CHAIN</div>
+        <div
+          v-else-if="item.structured.kind === 'thinking'"
+          class="border border-indigo-100 rounded-lg bg-indigo-50/40 p-2.5 space-y-2"
+        >
+          <div
+            class="text-[9px] font-mono font-bold text-indigo-700 border-b border-indigo-100/60 pb-1"
+          >
+            META THINKING CHAIN
+          </div>
           <div class="space-y-2 max-h-[160px] overflow-y-auto">
-            <div v-for="(row, idx) in item.structured.rows" :key="idx" class="text-[11px] pl-2.5 border-l-2 border-indigo-200">
+            <div
+              v-for="(row, idx) in item.structured.rows"
+              :key="idx"
+              class="text-[11px] pl-2.5 border-l-2 border-indigo-200"
+            >
               <div class="text-slate-700 font-bold">{{ row.title }}</div>
-              <p v-if="row.body" class="text-slate-500 text-[10px] mt-0.5 font-mono">{{ row.body }}</p>
+              <p
+                v-if="row.body"
+                class="text-slate-500 text-[10px] mt-0.5 font-mono"
+              >
+                {{ row.body }}
+              </p>
             </div>
           </div>
         </div>
 
         <!-- Dream Layout -->
-        <div v-else-if="item.structured.kind === 'dream'" class="border border-purple-100 rounded-lg bg-purple-50/40 p-2.5 space-y-2">
-          <div class="text-[9px] font-mono font-bold text-purple-700 border-b border-purple-100/60 pb-1">DREAM NARRATIVE</div>
-          <p v-if="item.structured.summary" class="text-xs text-purple-800 italic leading-relaxed bg-white/40 p-1.5 rounded">"{{ item.structured.summary }}"</p>
+        <div
+          v-else-if="item.structured.kind === 'dream'"
+          class="border border-purple-100 rounded-lg bg-purple-50/40 p-2.5 space-y-2"
+        >
+          <div
+            class="text-[9px] font-mono font-bold text-purple-700 border-b border-purple-100/60 pb-1"
+          >
+            DREAM NARRATIVE
+          </div>
+          <p
+            v-if="item.structured.summary"
+            class="text-xs text-purple-800 italic leading-relaxed bg-white/40 p-1.5 rounded"
+          >
+            "{{ item.structured.summary }}"
+          </p>
           <div class="space-y-1 max-h-[140px] overflow-y-auto">
-            <div v-for="(row, idx) in item.structured.rows" :key="idx" class="text-[10px] text-slate-600 flex items-start gap-1">
+            <div
+              v-for="(row, idx) in item.structured.rows"
+              :key="idx"
+              class="text-[10px] text-slate-600 flex items-start gap-1"
+            >
               <span class="text-purple-500 font-bold shrink-0">•</span>
               <span>{{ row.body || row.title }}</span>
             </div>
@@ -396,13 +527,30 @@ const genericStructuredRows = computed<GenericStructuredRow[]>(() => {
         </div>
 
         <!-- Generic Structured Layout -->
-        <div v-else class="border border-slate-100 rounded-lg bg-slate-50/60 p-2.5 space-y-2">
-          <div class="text-[9px] font-mono font-bold text-slate-600 border-b border-slate-200/60 pb-1 flex justify-between gap-2">
+        <div
+          v-else
+          class="border border-slate-100 rounded-lg bg-slate-50/60 p-2.5 space-y-2"
+        >
+          <div
+            class="text-[9px] font-mono font-bold text-slate-600 border-b border-slate-200/60 pb-1 flex justify-between gap-2"
+          >
             <span>{{ item.structured.kind.toUpperCase() }}</span>
-            <span v-if="item.structured.summary" class="text-slate-500 font-normal truncate">{{ item.structured.summary }}</span>
+            <span
+              v-if="item.structured.summary"
+              class="text-slate-500 font-normal truncate"
+              >{{ item.structured.summary }}</span
+            >
           </div>
-          <div v-if="item.structured.chips?.length" class="flex flex-wrap gap-1">
-            <span v-for="chip in item.structured.chips" :key="chip" class="text-[8px] px-1 bg-white/80 text-slate-600 rounded border border-slate-200 font-medium">{{ chip }}</span>
+          <div
+            v-if="item.structured.chips?.length"
+            class="flex flex-wrap gap-1"
+          >
+            <span
+              v-for="chip in item.structured.chips"
+              :key="chip"
+              class="text-[8px] px-1 bg-white/80 text-slate-600 rounded border border-slate-200 font-medium"
+              >{{ chip }}</span
+            >
           </div>
           <div class="space-y-2 max-h-[180px] overflow-y-auto pr-1">
             <div
@@ -411,12 +559,29 @@ const genericStructuredRows = computed<GenericStructuredRow[]>(() => {
               class="text-[11px] border-b border-slate-200/50 last:border-0 pb-2 last:pb-0"
             >
               <div class="flex items-start justify-between gap-2">
-                <span class="text-slate-700 font-mono font-bold truncate max-w-[75%]">{{ row.title }}</span>
-                <span v-if="row.subtitle" class="text-[9px] font-mono text-slate-400 shrink-0">{{ row.subtitle }}</span>
+                <span
+                  class="text-slate-700 font-mono font-bold truncate max-w-[75%]"
+                  >{{ row.title }}</span
+                >
+                <span
+                  v-if="row.subtitle"
+                  class="text-[9px] font-mono text-slate-400 shrink-0"
+                  >{{ row.subtitle }}</span
+                >
               </div>
-              <p v-if="row.body" class="text-slate-600 text-[10px] mt-1 bg-white/80 p-1.5 rounded border border-slate-100 font-mono leading-relaxed break-all whitespace-pre-wrap">{{ row.body }}</p>
+              <p
+                v-if="row.body"
+                class="text-slate-600 text-[10px] mt-1 bg-white/80 p-1.5 rounded border border-slate-100 font-mono leading-relaxed break-all whitespace-pre-wrap"
+              >
+                {{ row.body }}
+              </p>
               <div v-if="row.chips.length" class="flex flex-wrap gap-1 mt-1">
-                <span v-for="chip in row.chips" :key="chip" class="text-[8px] px-1 bg-slate-100 text-slate-600 rounded border border-slate-200/70 font-medium">{{ chip }}</span>
+                <span
+                  v-for="chip in row.chips"
+                  :key="chip"
+                  class="text-[8px] px-1 bg-slate-100 text-slate-600 rounded border border-slate-200/70 font-medium"
+                  >{{ chip }}</span
+                >
               </div>
               <div v-if="row.details.length" class="mt-1 grid gap-1">
                 <div
@@ -424,7 +589,9 @@ const genericStructuredRows = computed<GenericStructuredRow[]>(() => {
                   :key="`${detail.label}-${detail.value}`"
                   class="text-[8.5px] font-mono text-slate-500 bg-white/70 border border-slate-100 rounded px-1 py-0.5 break-all"
                 >
-                  <span class="font-bold text-slate-700">{{ detail.label }}:</span>
+                  <span class="font-bold text-slate-700"
+                    >{{ detail.label }}:</span
+                  >
                   {{ detail.value }}
                 </div>
               </div>
@@ -434,20 +601,40 @@ const genericStructuredRows = computed<GenericStructuredRow[]>(() => {
       </div>
 
       <!-- Approval Actions -->
-      <div v-if="item.actions && item.actions.length > 0" class="mt-3 pl-3.5 flex gap-2">
-        <button
-          v-for="act in item.actions"
-          :key="act.label"
-          @click="emit('action', { id: item.id, action: act })"
-          class="flex-1 py-2 rounded-lg text-xs font-bold border transition-all duration-150 text-center active:scale-95 motion-reduce:transition-none"
-          :class="[
-            act.color?.includes('red') || act.label.includes('拒绝') || act.label.toLowerCase().includes('deny')
-              ? 'bg-rose-50 hover:bg-rose-100 text-rose-600 border-rose-200 active:bg-rose-200/50'
-              : 'bg-emerald-500 hover:bg-emerald-600 text-white border-emerald-600 active:bg-emerald-700 shadow-sm shadow-emerald-100'
-          ]"
+      <div
+        v-if="item.actions && item.actions.length > 0"
+        class="mt-3 pl-3.5 flex flex-col gap-2"
+      >
+        <div
+          v-if="item.rawPayload?.type === 'tool_approval_request'"
+          class="flex flex-col gap-1"
         >
-          {{ act.label }}
-        </button>
+          <textarea
+            v-model="reasonText"
+            placeholder="可选：告诉 AI 为什么通过或拒绝"
+            maxlength="1000"
+            class="w-full text-[10px] p-2 rounded-lg border border-amber-100 bg-amber-50/30 text-slate-700 placeholder:text-slate-400 focus:outline-none focus:border-amber-300 resize-none"
+            style="line-height: 1.4; height: calc(3.5 * 1.4em + 16px)"
+            @touchstart.stop
+            @touchmove.stop
+            @touchend.stop
+            @keydown.stop
+          />
+          <span class="text-[9px] text-slate-400 leading-snug"
+            >拒绝时建议填写可执行的修正建议，最多 1000 字。</span
+          >
+        </div>
+        <div class="flex gap-2">
+          <button
+            v-for="act in item.actions"
+            :key="act.label"
+            @click="handleAction(act)"
+            class="flex-1 py-2 rounded-lg text-xs font-bold border transition-all duration-150 text-center active:scale-95 motion-reduce:transition-none"
+            :class="getActionButtonClass(act)"
+          >
+            {{ act.label }}
+          </button>
+        </div>
       </div>
 
       <!-- Collapsible Details & Raw Payload -->
@@ -456,22 +643,34 @@ const genericStructuredRows = computed<GenericStructuredRow[]>(() => {
           @click="isDetailsExpanded = !isDetailsExpanded"
           class="flex items-center gap-1 text-[9px] text-slate-400 hover:text-slate-600 font-mono font-semibold transition-colors"
         >
-          <component :is="isDetailsExpanded ? ChevronUp : ChevronDown" class="w-3 h-3" />
-          <span>{{ isDetailsExpanded ? '收起系统详情' : '展开系统详情' }}</span>
+          <component
+            :is="isDetailsExpanded ? ChevronUp : ChevronDown"
+            class="w-3 h-3"
+          />
+          <span>{{ isDetailsExpanded ? "收起系统详情" : "展开系统详情" }}</span>
         </button>
 
         <div v-if="isDetailsExpanded" class="mt-2 space-y-2">
           <!-- Details List -->
-          <div v-if="item.details && item.details.length > 0" class="space-y-1.5 bg-slate-50 p-2.5 rounded-lg border border-slate-100">
+          <div
+            v-if="item.details && item.details.length > 0"
+            class="space-y-1.5 bg-slate-50 p-2.5 rounded-lg border border-slate-100"
+          >
             <div
               v-for="d in item.details"
               :key="d.label"
               class="text-[10px] flex flex-col gap-0.5 border-b border-slate-200/40 last:border-0 pb-1.5 last:pb-0"
             >
-              <span class="text-slate-400 font-mono font-bold">{{ d.label }}</span>
+              <span class="text-slate-400 font-mono font-bold">{{
+                d.label
+              }}</span>
               <span
                 class="text-slate-700 break-all leading-normal"
-                :class="{ 'font-mono text-slate-600 bg-white p-1 rounded border border-slate-100': d.mono, 'whitespace-pre-wrap': d.multiline }"
+                :class="{
+                  'font-mono text-slate-600 bg-white p-1 rounded border border-slate-100':
+                    d.mono,
+                  'whitespace-pre-wrap': d.multiline,
+                }"
               >
                 {{ d.value }}
               </span>
@@ -479,18 +678,28 @@ const genericStructuredRows = computed<GenericStructuredRow[]>(() => {
           </div>
 
           <!-- Raw Payload -->
-          <div v-if="item.rawPayload" class="relative bg-slate-50 rounded-lg border border-slate-100 p-2.5">
-            <div class="flex items-center justify-between border-b border-slate-200/50 pb-1.5 mb-1.5">
-              <span class="text-[8px] font-mono font-bold text-slate-400">RAW PAYLOAD</span>
+          <div
+            v-if="item.rawPayload"
+            class="relative bg-slate-50 rounded-lg border border-slate-100 p-2.5"
+          >
+            <div
+              class="flex items-center justify-between border-b border-slate-200/50 pb-1.5 mb-1.5"
+            >
+              <span class="text-[8px] font-mono font-bold text-slate-400"
+                >RAW PAYLOAD</span
+              >
               <button
                 @click="handleCopy"
                 class="flex items-center gap-1 text-[8px] text-slate-500 hover:text-slate-700 bg-white px-2 py-0.5 rounded border border-slate-200 active:bg-slate-100 transition-colors"
               >
                 <component :is="isCopied ? Check : Copy" class="w-2.5 h-2.5" />
-                <span>{{ isCopied ? '已复制' : '复制' }}</span>
+                <span>{{ isCopied ? "已复制" : "复制" }}</span>
               </button>
             </div>
-            <pre class="text-[9px] font-mono text-slate-500 overflow-x-auto max-h-[120px] whitespace-pre-wrap break-all leading-relaxed">{{ rawPayloadText }}</pre>
+            <pre
+              class="text-[9px] font-mono text-slate-500 overflow-x-auto max-h-[120px] whitespace-pre-wrap break-all leading-relaxed"
+              >{{ rawPayloadText }}</pre
+            >
           </div>
         </div>
       </div>

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::Error as IoError;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::{ipc::Channel, AppHandle, Manager, Runtime};
@@ -261,11 +262,41 @@ pub async fn sendToVCP<R: Runtime>(
             agent_id,
             agent_name,
             Some(stream_channel),
+            agent_id.map(|s| s.to_string()),
         )
         .await?;
     }
 
     Ok(res)
+}
+
+fn extract_text_for_hash(content: &Value) -> String {
+    if let Some(s) = content.as_str() {
+        return s.to_string();
+    }
+    if let Some(arr) = content.as_array() {
+        let text_parts: Vec<String> = arr
+            .iter()
+            .filter(|part| part["type"].as_str() == Some("text"))
+            .filter_map(|part| part["text"].as_str())
+            .map(|s| s.to_string())
+            .collect();
+        return text_parts.join("\n");
+    }
+    if let Some(obj) = content.as_object() {
+        if let Some(s) = obj.get("text").and_then(|t| t.as_str()) {
+            return s.to_string();
+        }
+    }
+    String::new()
+}
+
+fn get_or_calculate_message_hash(content: &Value) -> String {
+    use crate::vcp_modules::infra::utils::calculate_sha256;
+
+    let text = extract_text_for_hash(content);
+    let hash = calculate_sha256(text.as_bytes());
+    format!("sha256:{}", hash)
 }
 
 /// 核心请求实现函数，可供 Tauri Command 或 内部 Rust 模块(如 GroupOrchestrator) 调用
@@ -290,7 +321,7 @@ pub async fn perform_vcp_request<R: Runtime>(
 
     // === 0. 数据验证和规范化 ===
     let mut messages: Vec<Value> = Vec::new();
-    for msg_val in payload.messages {
+    for msg_val in payload.messages.into_iter() {
         if !msg_val.is_object() {
             messages.push(json!({"role": "system", "content": "[Invalid message]"}));
             continue;
@@ -463,6 +494,7 @@ pub async fn perform_vcp_request<R: Runtime>(
         } else if !content.is_string() && !content.is_null() {
             msg["content"] = json!(content.to_string());
         }
+
         messages.push(msg);
     }
 
@@ -496,18 +528,66 @@ pub async fn perform_vcp_request<R: Runtime>(
 
     // === 4. 准备请求体 ===
     let is_stream = payload.model_config["stream"].as_bool().unwrap_or(false);
+    let mut message_timestamp_bindings = Vec::new();
+    for (index, msg) in messages.iter_mut().enumerate() {
+        let mut timestamp_meta = None;
+        if let Some(obj) = msg.as_object_mut() {
+            if let Some(meta) = obj.remove("__vcpchatTimestampMeta") {
+                timestamp_meta = Some(meta);
+            }
+        }
+        if let Some(meta) = timestamp_meta {
+            if let (Some(message_id), Some(role), Some(timestamp)) = (
+                meta.get("messageId").and_then(|id| id.as_str()),
+                meta.get("role").and_then(|r| r.as_str()),
+                meta.get("timestamp").and_then(|t| t.as_u64()),
+            ) {
+                use chrono::TimeZone;
+                let timestamp_iso =
+                    if let Some(dt) = chrono::Utc.timestamp_millis_opt(timestamp as i64).single() {
+                        dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                    } else {
+                        "".to_string()
+                    };
+
+                let final_content_val = msg.get("content").unwrap_or(&Value::Null);
+                let sent_message_hash = get_or_calculate_message_hash(final_content_val);
+
+                message_timestamp_bindings.push(json!({
+                    "messageId": message_id,
+                    "role": role,
+                    "timestamp": timestamp,
+                    "timestampIso": timestamp_iso,
+                    "source": "client_history",
+                    "sentMessageHash": sent_message_hash,
+                    "sentMessageIndex": index
+                }));
+            }
+        }
+    }
+
     let mut request_body = payload.model_config.clone();
     if let Some(obj) = request_body.as_object_mut() {
         obj.insert("messages".to_string(), json!(messages));
-        obj.insert("messageId".to_string(), json!(payload.message_id));
+        obj.insert("requestId".to_string(), json!(payload.message_id));
         obj.insert("stream".to_string(), json!(is_stream));
+        if !message_timestamp_bindings.is_empty() {
+            obj.insert(
+                "vcpchatExtensions".to_string(),
+                json!({
+                    "schemaVersion": 1,
+                    "messageMetadataMode": "hash_only",
+                    "messageTimestampBindings": message_timestamp_bindings
+                }),
+            );
+        }
     }
 
     // === 5. 配置网络请求 ===
     let client = Client::builder()
         // 不设 read_timeout：数小时自循环中，任何 read_timeout 都是定时炸弹
-        // tcp_keepalive(60s) 维持 TCP 层活性，防止 NAT/防火墙静默丢弃空闲连接
-        .tcp_keepalive(Duration::from_secs(60))
+        // tcp_keepalive(20s) 维持 TCP 层活性，防止 NAT/防火墙静默丢弃空闲连接
+        .tcp_keepalive(Duration::from_secs(20))
         .build()
         .map_err(|e| e.to_string())?;
 
@@ -532,31 +612,34 @@ pub async fn perform_vcp_request<R: Runtime>(
         let mut is_aborted = false;
         let mut abort_rx = abort_rx; // 取得所有权进入循环
         let mut aurora_buffer = AuroraBuffer::new();
-        let stream_render_interval = Duration::from_millis(180);
-        let mut last_aurora_render: Option<std::time::Instant> = None;
+        let mut pending_aurora_chunk = String::new();
+        let mut last_aurora_parse = std::time::Instant::now() - Duration::from_millis(33);
         let mut last_aurora_content_len = 0usize;
+        let aurora_has_rendered = AtomicBool::new(false);
         let mut reasoning_block_open = false;
+        const AURORA_PARSE_INTERVAL_MS: u128 = 33;
+        const AURORA_FORCE_PARSE_BYTES: usize = 1024;
 
         fn close_reasoning_block(
-            buffer: &mut AuroraBuffer,
+            pending_chunk: &mut String,
             full_content: &mut String,
             reasoning_block_open: &mut bool,
         ) {
             if *reasoning_block_open {
                 full_content.push_str("</think>");
-                buffer.append_chunk("</think>");
+                pending_chunk.push_str("</think>");
                 *reasoning_block_open = false;
             }
         }
 
-        // 辅助闭包：发送 Aurora 更新事件（稀疏序列化 + 正文增量）
-        let mut send_aurora_update = |buffer: &AuroraBuffer,
+        // 辅助闭包：发送 Aurora 更新事件。AST frame 是主路径，contentDelta 保留给旧前端兜底。
+        let mut send_aurora_update = |buffer: &mut AuroraBuffer,
                                       stable_changed: bool,
                                       tail_changed: bool,
                                       finish_reason: Option<String>,
                                       error: Option<String>| {
-            let include_full_content = finish_reason.is_some() || error.is_some();
-            let content_delta = if include_full_content {
+            let is_final = finish_reason.is_some() || error.is_some();
+            let content_delta = if is_final {
                 last_aurora_content_len = buffer.full_text.len();
                 None
             } else if buffer.full_text.len() > last_aurora_content_len {
@@ -566,6 +649,8 @@ pub async fn perform_vcp_request<R: Runtime>(
             } else {
                 None
             };
+            let tail_frame = buffer.take_tail_frame();
+            let tail_snapshot = tail_frame.as_ref().and_then(|frame| frame.snapshot.clone());
 
             let mut event = StreamEvent::aurora(
                 message_id_inner.clone(),
@@ -577,13 +662,37 @@ pub async fn perform_vcp_request<R: Runtime>(
                         .then(|| AuroraBuffer::balance_html_tags(&buffer.tail_content)),
                     tail_changed,
                     content_delta,
-                    content: include_full_content.then(|| buffer.full_text.clone()),
+                    tail_frame,
+                    tail_snapshot,
+                    content: is_final.then(|| buffer.full_text.clone()),
                 },
                 context_inner.clone(),
             );
             event.finish_reason = finish_reason;
             event.error = error;
             send_stream_event(event);
+            aurora_has_rendered.store(true, Ordering::Relaxed);
+        };
+
+        let flush_aurora_parse = |buffer: &mut AuroraBuffer,
+                                  pending_chunk: &mut String,
+                                  last_parse: &mut std::time::Instant,
+                                  force: bool|
+         -> (bool, bool) {
+            if pending_chunk.is_empty() {
+                return (false, false);
+            }
+            if !force
+                && last_parse.elapsed().as_millis() < AURORA_PARSE_INTERVAL_MS
+                && pending_chunk.len() < AURORA_FORCE_PARSE_BYTES
+            {
+                return (false, false);
+            }
+
+            buffer.append_chunk(pending_chunk);
+            pending_chunk.clear();
+            *last_parse = std::time::Instant::now();
+            buffer.process_queue()
         };
 
         let res_future = client
@@ -595,10 +704,11 @@ pub async fn perform_vcp_request<R: Runtime>(
 
         tokio::select! {
             _ = &mut abort_rx => {
-                                log::warn!("[VCPClient] Request aborted before response for message: {}", message_id_inner);
-                                close_reasoning_block(&mut aurora_buffer, &mut full_content, &mut reasoning_block_open);
-                                aurora_buffer.finalize();
-                send_aurora_update(&aurora_buffer, true, true, Some("cancelled_by_user".to_string()), Some("请求已中止".to_string()));
+                log::warn!("[VCPClient] Request aborted before response for message: {}", message_id_inner);
+                close_reasoning_block(&mut pending_aurora_chunk, &mut full_content, &mut reasoning_block_open);
+                flush_aurora_parse(&mut aurora_buffer, &mut pending_aurora_chunk, &mut last_aurora_parse, true);
+                aurora_buffer.finalize();
+                send_aurora_update(&mut aurora_buffer, true, true, Some("cancelled_by_user".to_string()), Some("请求已中止".to_string()));
                 active_requests_inner.remove(&message_id_inner);
                 return Ok((json!({ "fullContent": aurora_buffer.full_text, "streamingStarted": false }), true));
             }
@@ -609,21 +719,41 @@ pub async fn perform_vcp_request<R: Runtime>(
                         let reader = StreamReader::new(stream);
                         let mut lines = FramedRead::new(reader, LinesCodec::new_with_max_length(512 * 1024));
 
+                        let mut last_activity = std::time::Instant::now();
+                        let timeout_duration = Duration::from_secs(25);
+
                         loop {
+                            let sleep_future = tokio::time::sleep_until(tokio::time::Instant::from_std(last_activity + timeout_duration));
+                            tokio::pin!(sleep_future);
+
                             tokio::select! {
                                 // 核心修复：即使在等待数据的间隙，也能捕获中断信号
                                 _ = &mut abort_rx => {
                                     is_aborted = true;
                                     log::warn!("[VCPClient] Stream deep-polling detected abort for message: {}", message_id_inner);
-                                    close_reasoning_block(&mut aurora_buffer, &mut full_content, &mut reasoning_block_open);
+                                    close_reasoning_block(&mut pending_aurora_chunk, &mut full_content, &mut reasoning_block_open);
+                                    flush_aurora_parse(&mut aurora_buffer, &mut pending_aurora_chunk, &mut last_aurora_parse, true);
                                     aurora_buffer.finalize();
-                                    send_aurora_update(&aurora_buffer, true, true, Some("cancelled_by_user".to_string()), Some("请求已中止".to_string()));
+                                    send_aurora_update(&mut aurora_buffer, true, true, Some("cancelled_by_user".to_string()), Some("请求已中止".to_string()));
 
                                     // 显式清理，防止 race
                                     active_requests_inner.remove(&message_id_inner);
                                     break;
                                 }
+                                _ = &mut sleep_future => {
+                                    log::warn!("[VCPClient] Stream idle timeout (25s) reached for message: {}", message_id_inner);
+                                    flush_aurora_parse(&mut aurora_buffer, &mut pending_aurora_chunk, &mut last_aurora_parse, true);
+                                    aurora_buffer.finalize();
+                                    send_aurora_update(&mut aurora_buffer, true, true, Some("error".to_string()), Some("连接超时：超过 25 秒未收到服务器响应，自动关闭连接".to_string()));
+                                    send_stream_event(StreamEvent::error(
+                                        message_id_inner.clone(),
+                                        context_inner.clone(),
+                                        "连接超时：超过 25 秒未收到服务器响应，自动关闭连接".to_string(),
+                                    ));
+                                    break;
+                                }
                                 line_res = lines.next() => {
+                                    last_activity = std::time::Instant::now();
                                     match line_res {
                                         Some(Ok(line)) => {
                                             if line.trim().is_empty() { continue; }
@@ -631,9 +761,10 @@ pub async fn perform_vcp_request<R: Runtime>(
                                                 let data = line.trim_start_matches("data: ").trim();
                                                 if data == "[DONE]" {
                                                     log::debug!("[VCPClient] Stream finished normally with [DONE] for message: {}", message_id_inner);
-                                                    close_reasoning_block(&mut aurora_buffer, &mut full_content, &mut reasoning_block_open);
+                                                    close_reasoning_block(&mut pending_aurora_chunk, &mut full_content, &mut reasoning_block_open);
+                                                    flush_aurora_parse(&mut aurora_buffer, &mut pending_aurora_chunk, &mut last_aurora_parse, true);
                                                     aurora_buffer.finalize();
-                                                    send_aurora_update(&aurora_buffer, true, true, last_finish_reason.clone(), None);
+                                                    send_aurora_update(&mut aurora_buffer, true, true, last_finish_reason.clone(), None);
                                                     break;
                                                 }
                                                 if let Ok(chunk) = serde_json::from_str::<Value>(data) {
@@ -674,20 +805,21 @@ pub async fn perform_vcp_request<R: Runtime>(
                                                     }
 
                                                     if !text_chunk.is_empty() {
-                                                        aurora_buffer.append_chunk(&text_chunk);
-                                                        let should_render = last_aurora_render
-                                                            .is_none_or(|last| last.elapsed() >= stream_render_interval);
-                                                        if should_render {
-                                                            let (stable_changed, tail_changed) = aurora_buffer.process_queue();
-                                                            if stable_changed || tail_changed {
-                                                                send_aurora_update(&aurora_buffer, stable_changed, tail_changed, None, None);
-                                                                last_aurora_render = Some(std::time::Instant::now());
-                                                            }
+                                                        pending_aurora_chunk.push_str(&text_chunk);
+                                                        let (stable_changed, tail_changed) = flush_aurora_parse(
+                                                            &mut aurora_buffer,
+                                                            &mut pending_aurora_chunk,
+                                                            &mut last_aurora_parse,
+                                                            false,
+                                                        );
+                                                        let has_mutations = !aurora_buffer.pending_mutations.is_empty();
+                                                        if stable_changed || tail_changed || has_mutations {
+                                                            send_aurora_update(&mut aurora_buffer, stable_changed, tail_changed, None, None);
                                                         }
                                                     }
 
                                                     // Aurora 接管前才保留原始 data 事件作为兜底，避免每个 chunk 都跨 IPC 推送两套流式事件。
-                                                    if last_aurora_render.is_none() {
+                                                    if !aurora_has_rendered.load(Ordering::Relaxed) {
                                                         send_stream_event(StreamEvent::data(
                                                             message_id_inner.clone(),
                                                             chunk,
@@ -700,9 +832,10 @@ pub async fn perform_vcp_request<R: Runtime>(
                                         }
                                         Some(Err(e)) => {
                                             log::error!("[VCPClient] Stream read error: {:?}", e);
-                                            close_reasoning_block(&mut aurora_buffer, &mut full_content, &mut reasoning_block_open);
+                                            close_reasoning_block(&mut pending_aurora_chunk, &mut full_content, &mut reasoning_block_open);
+                                            flush_aurora_parse(&mut aurora_buffer, &mut pending_aurora_chunk, &mut last_aurora_parse, true);
                                             aurora_buffer.finalize();
-                                            send_aurora_update(&aurora_buffer, true, true, Some("error".to_string()), Some(format!("流读取错误: {}", e)));
+                                            send_aurora_update(&mut aurora_buffer, true, true, Some("error".to_string()), Some(format!("流读取错误: {}", e)));
                                             send_stream_event(StreamEvent::error(
                                                 message_id_inner.clone(),
                                                 context_inner.clone(),
@@ -713,14 +846,15 @@ pub async fn perform_vcp_request<R: Runtime>(
                                         }
                                         None => {
                                             // 修复：若此前已收到有效 chunk，则视为正常结束（对齐桌面端行为）
-                                            close_reasoning_block(&mut aurora_buffer, &mut full_content, &mut reasoning_block_open);
+                                            close_reasoning_block(&mut pending_aurora_chunk, &mut full_content, &mut reasoning_block_open);
+                                            flush_aurora_parse(&mut aurora_buffer, &mut pending_aurora_chunk, &mut last_aurora_parse, true);
                                             aurora_buffer.finalize();
                                             if !full_content.is_empty() || last_finish_reason.is_some() {
                                                 log::debug!("[VCPClient] Stream ended without [DONE] but content was received. Treating as normal end.");
-                                                send_aurora_update(&aurora_buffer, true, true, last_finish_reason.clone(), None);
+                                                send_aurora_update(&mut aurora_buffer, true, true, last_finish_reason.clone(), None);
                                             } else {
                                                 log::warn!("[VCPClient] Stream ended unexpectedly (None)");
-                                                send_aurora_update(&aurora_buffer, true, true, Some("error".to_string()), Some("网络连接意外断开".to_string()));
+                                                send_aurora_update(&mut aurora_buffer, true, true, Some("error".to_string()), Some("网络连接意外断开".to_string()));
                                                 send_stream_event(StreamEvent::error(
                                                     message_id_inner.clone(),
                                                     context_inner.clone(),

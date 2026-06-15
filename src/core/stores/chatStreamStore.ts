@@ -6,7 +6,7 @@ import { useChatSessionStore } from "./chatSessionStore";
 import { useAssistantStore } from "./assistant";
 import { useAvatarStore } from "./avatar";
 import { useTopicStore } from "./topicListManager";
-import type { ChatMessage, MessageShell } from "../types/chat";
+import type { ChatMessage, MessageShell, TailFrame } from "../types/chat";
 
 export const useChatStreamStore = defineStore("chatStream", () => {
   const streamingMessageId = ref<string | null>(null);
@@ -29,6 +29,49 @@ export const useChatStreamStore = defineStore("chatStream", () => {
   const terminalStreamMessageIds = new Set<string>();
   const streamBlockSignatures = new Map<string, string>();
   const streamTailSignatures = new Map<string, string>();
+
+  function isStreamDebugEnabled(): boolean {
+    return Boolean(import.meta.env.DEV && (window as any).__VCP_STREAM_DEBUG__);
+  }
+
+  function recordStreamTrace(data: any): void {
+    if (!isStreamDebugEnabled()) return;
+    if (!(window as any).__VCP_STREAM_TRACES__) {
+      (window as any).__VCP_STREAM_TRACES__ = [];
+    }
+    (window as any).__VCP_STREAM_TRACES__.push({
+      timestamp: performance.now(),
+      ...data,
+    });
+  }
+
+  function streamDebugLog(...args: unknown[]): void {
+    if (isStreamDebugEnabled()) {
+      console.warn(...args);
+    }
+  }
+
+  function mergeTailFrame(existing: TailFrame | null, incoming: TailFrame): TailFrame {
+    const incomingMutations = incoming.mutations || [];
+    if (!existing || incoming.reset || incoming.epoch !== existing.epoch) {
+      return {
+        ...incoming,
+        mutations: incoming.reset ? [] : [...incomingMutations],
+        snapshot: incoming.snapshot ? [...incoming.snapshot] : undefined,
+      };
+    }
+
+    return {
+      ...incoming,
+      reset: existing.reset || incoming.reset,
+      snapshot: incoming.snapshot || existing.snapshot,
+      mutations: [
+        ...(existing.reset ? [] : existing.mutations || []),
+        ...incomingMutations,
+      ],
+    };
+  }
+
   const cleanupTimers = new Set<ReturnType<typeof setTimeout>>();
 
   // ===== rAF 30Hz 帧合并直推暂存池 =====
@@ -38,6 +81,8 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     blocks: any[] | null;
     tailContent: string | null;
     tailBlock: any | null | undefined;
+    tailFrame: TailFrame | null;
+    tailSnapshot: any[] | null;
     animationFrameId: number | null;
     lastRenderTime: number;
   }>();
@@ -51,11 +96,15 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     blocks: any[] | null;
     tailContent: string | null;
     tailBlock: any | null | undefined;
+    tailFrame: TailFrame | null;
+    tailSnapshot: any[] | null;
   }) =>
     up.content !== null ||
     up.blocks !== null ||
     up.tailContent !== null ||
-    up.tailBlock !== undefined;
+    up.tailBlock !== undefined ||
+    up.tailFrame !== null ||
+    up.tailSnapshot !== null;
 
   const pauseRAFCommitsForBackground = () => {
     rAFPendingUpdates.forEach((up) => {
@@ -84,6 +133,8 @@ export const useChatStreamStore = defineStore("chatStream", () => {
           // 漏洞 1 修复：同步强刷收尾时，必须将暂存池中的 tail 字段强刷，绝不允许丢字闪烁
           if (up.tailContent !== null) msg.tailContent = up.tailContent;
           if (up.tailBlock !== undefined) msg.tailBlock = up.tailBlock;
+          if (up.tailSnapshot !== null) msg.tailSnapshot = up.tailSnapshot as any;
+          if (up.tailFrame !== null) msg.tailFrame = up.tailFrame;
         }
       }
       rAFPendingUpdates.delete(messageId);
@@ -289,6 +340,8 @@ export const useChatStreamStore = defineStore("chatStream", () => {
         blocks: null,
         tailContent: null,
         tailBlock: undefined,
+        tailFrame: null,
+        tailSnapshot: null,
         animationFrameId: null,
         lastRenderTime: 0,
       };
@@ -317,6 +370,8 @@ export const useChatStreamStore = defineStore("chatStream", () => {
           if (up.blocks !== null) m.blocks = up.blocks;
           if (up.tailContent !== null) m.tailContent = up.tailContent;
           if (up.tailBlock !== undefined) m.tailBlock = up.tailBlock;
+          if (up.tailSnapshot !== null) m.tailSnapshot = up.tailSnapshot as any;
+          if (up.tailFrame !== null) m.tailFrame = up.tailFrame;
         }
         up.lastRenderTime = now;
         // 重置当前帧内的合并暂存状态
@@ -324,6 +379,8 @@ export const useChatStreamStore = defineStore("chatStream", () => {
         up.blocks = null;
         up.tailContent = null;
         up.tailBlock = undefined;
+        up.tailFrame = null;
+        up.tailSnapshot = null;
         up.animationFrameId = null;
       } else {
         // 没到门槛，在下一屏幕物理刷新帧继续尝试
@@ -468,34 +525,35 @@ export const useChatStreamStore = defineStore("chatStream", () => {
       const aurora = event.aurora;
       if (aurora) {
         auroraActiveMessageIds.add(actualMessageId);
-        // === 🚀 开启流式时空录制（开发模式生效，Release 构建时自动摇树切除） ===
-        if (import.meta.env.DEV) {
-          if (!(window as any).__VCP_STREAM_TRACES__) {
-            (window as any).__VCP_STREAM_TRACES__ = [];
-          }
-          (window as any).__VCP_STREAM_TRACES__.push({
-            timestamp: performance.now(),
-            messageId: actualMessageId,
-            auroraPayload: {
-              stableChanged: aurora.stableChanged,
-              stableBlocksCount: aurora.stableBlocks?.length || 0,
-              stableBlocksHashes: aurora.stableBlocks?.map((b: any) => b.hash) || [],
-              tailChanged: aurora.tailChanged,
-              tailContent: aurora.tail || "",
-              tailBlockType: aurora.tailBlock?.type || null,
-              contentDeltaLength: aurora.contentDelta?.length || 0,
-            },
-            msgSnapshot: msg ? {
-              content: msg.content,
-              blocksCount: msg.blocks?.length || 0,
-              tailContent: msg.tailContent,
-            } : null
-          });
-        }
-        // ==========================
+        recordStreamTrace({
+          messageId: actualMessageId,
+          auroraPayload: {
+            stableChanged: aurora.stableChanged,
+            stableBlocksCount: aurora.stableBlocks?.length || 0,
+            stableBlocksHashes: aurora.stableBlocks?.map((b: any) => b.hash) || [],
+            tailChanged: aurora.tailChanged,
+            tailContent: aurora.tail || "",
+            tailBlockType: aurora.tailBlock?.type || null,
+            contentDeltaLength: aurora.contentDelta?.length || 0,
+            tailFrame: aurora.tailFrame ? {
+              epoch: aurora.tailFrame.epoch,
+              revision: aurora.tailFrame.revision,
+              frameSeq: aurora.tailFrame.frameSeq,
+              reset: aurora.tailFrame.reset,
+              mutationsCount: aurora.tailFrame.mutations?.length || 0,
+              hasSnapshot: !!aurora.tailFrame.snapshot,
+            } : null,
+          },
+          msgSnapshot: msg ? {
+            contentLength: msg.content?.length || 0,
+            blocksCount: msg.blocks?.length || 0,
+            tailContentLength: msg.tailContent?.length || 0,
+          } : null,
+        });
 
         // 1. 初始化或获取该 messageId 的帧合并状态
         const update = getRAFUpdate(actualMessageId);
+
 
         // 2. 覆盖写入暂存数据（稀疏合并）
         if (typeof aurora.content === "string") {
@@ -509,6 +567,16 @@ export const useChatStreamStore = defineStore("chatStream", () => {
             update.blocks = aurora.stableBlocks;
             streamBlockSignatures.set(actualMessageId, nextSignature);
           }
+        }
+        if (aurora.tailFrame) {
+          streamDebugLog(`[chatStreamStore] Received tailFrame seq=${aurora.tailFrame.frameSeq} mutations=${aurora.tailFrame.mutations?.length || 0} for ${actualMessageId}`);
+          update.tailFrame = mergeTailFrame(update.tailFrame, aurora.tailFrame);
+          if (aurora.tailFrame.snapshot) {
+            update.tailSnapshot = aurora.tailFrame.snapshot as any[];
+          }
+        }
+        if (aurora.tailSnapshot) {
+          update.tailSnapshot = aurora.tailSnapshot as any[];
         }
         if (aurora.tailChanged) {
           const nextTail = aurora.tail || "";
@@ -540,7 +608,6 @@ export const useChatStreamStore = defineStore("chatStream", () => {
       streamTailSignatures.delete(actualMessageId);
       if (finishReason) msg!.finishReason = finishReason;
 
-      removeSessionStream(itemId, topicId, actualMessageId);
       if (streamingMessageId.value === actualMessageId) streamingMessageId.value = null;
 
       if (type === "error" && !hadError && errorMsg && errorMsg !== "请求已中止") {
@@ -573,6 +640,8 @@ export const useChatStreamStore = defineStore("chatStream", () => {
           // 漏洞 1 终极解决：在最终编译树成功上屏后，才同步清空临时 tail，实现绝对零闪烁和无缝平滑交接
           msg!.tailContent = "";
           msg!.tailBlock = undefined;
+          msg!.tailFrame = undefined;
+          msg!.tailSnapshot = undefined;
 
           // === 🚀 输出流式诊断提示与回放指南（开发模式生效，Release 构建时自动摇树切除） ===
           if (import.meta.env.DEV) {
@@ -594,6 +663,9 @@ export const useChatStreamStore = defineStore("chatStream", () => {
         if (callbacks?.onStreamFinished) {
           callbacks.onStreamFinished(actualMessageId, topicId);
         }
+        removeSessionStream(itemId, topicId, actualMessageId);
+      } else {
+        removeSessionStream(itemId, topicId, actualMessageId);
       }
     }
   };
