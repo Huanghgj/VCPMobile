@@ -136,8 +136,8 @@ pub fn run() {
             let handle = app.handle().clone();
 
             // DbState 是大量启动期命令的硬依赖，必须在 WebView 有机会 invoke 之前完成注册。
-            let (pool, db_path) = tauri::async_runtime::block_on(init_db(&handle))
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            let (pool, db_path) =
+                tauri::async_runtime::block_on(init_db(&handle)).map_err(std::io::Error::other)?;
             app.manage(DbState {
                 pool,
                 path: db_path,

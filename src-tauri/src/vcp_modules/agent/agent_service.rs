@@ -174,12 +174,10 @@ pub async fn save_agent_config(
     // 🛡️ 防擦除合并：从内存缓存或数据库中加载原有的 system_prompt 以防空值覆写
     if let Some(cached) = state.caches.get(&agent_id) {
         agent.system_prompt = cached.value().system_prompt.clone();
-    } else {
-        if let Ok(db_config) =
-            read_agent_config_internal(&app_handle, &state, &agent_id, Some(false)).await
-        {
-            agent.system_prompt = db_config.system_prompt;
-        }
+    } else if let Ok(db_config) =
+        read_agent_config_internal(&app_handle, &state, &agent_id, Some(false)).await
+    {
+        agent.system_prompt = db_config.system_prompt;
     }
 
     internal_write_agent_config(&app_handle, &state, &agent_id, &agent, false, false).await

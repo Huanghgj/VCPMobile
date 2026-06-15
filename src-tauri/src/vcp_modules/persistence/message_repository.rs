@@ -7,6 +7,9 @@ use sqlx::Row;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc;
 
+type CachedMessageContent = (String, String, String, Vec<u8>);
+type CachedMessageBatch = Vec<CachedMessageContent>;
+
 pub struct MessageRenderCompiler;
 
 impl MessageRenderCompiler {
@@ -85,7 +88,7 @@ fn open_maintenance_rusqlite(db_path: &std::path::Path) -> Result<rusqlite::Conn
 /// 分页流式读取已有渲染缓存的消息的 (topic_id, msg_id, content_hash, content_bytes)，不做任何解压
 async fn stream_cached_message_contents(
     pool: &sqlx::SqlitePool,
-    tx: mpsc::Sender<(String, String, String, Vec<u8>)>,
+    tx: mpsc::Sender<CachedMessageContent>,
 ) -> Result<(), String> {
     let mut last_rowid = 0i64;
     const FETCH_SIZE: i64 = 500;
@@ -132,7 +135,7 @@ async fn stream_cached_message_contents(
 /// 通用批量 UPDATE Writer，带进度发射
 fn run_batch_update_writer(
     db_path: &std::path::Path,
-    mut rx: mpsc::Receiver<Vec<(String, String, String, Vec<u8>)>>,
+    mut rx: mpsc::Receiver<CachedMessageBatch>,
     update_sql: &str,
     progress_event: &str,
     app_handle: AppHandle,
@@ -215,7 +218,7 @@ pub async fn rebuild_all_pre_renders(app_handle: AppHandle) -> Result<(), String
     );
 
     let (tx_compiler, rx_compiler) = mpsc::channel::<(String, String, String, String)>(1000);
-    let (tx_writer, rx_writer) = mpsc::channel::<Vec<(String, String, String, Vec<u8>)>>(100);
+    let (tx_writer, rx_writer) = mpsc::channel::<CachedMessageBatch>(100);
     let total_count = total as usize;
 
     // --- Stage 3: Writer ---
@@ -279,7 +282,7 @@ pub async fn rebuild_all_pre_renders(app_handle: AppHandle) -> Result<(), String
 
     // --- Stage 1: Reader ---
     let reader_handle = tokio::spawn(async move {
-        let (tx_inner, mut rx_inner) = mpsc::channel::<(String, String, String, Vec<u8>)>(1000);
+        let (tx_inner, mut rx_inner) = mpsc::channel::<CachedMessageContent>(1000);
 
         let stream_handle = tokio::spawn(async move {
             let _ = stream_cached_message_contents(&pool, tx_inner).await;
