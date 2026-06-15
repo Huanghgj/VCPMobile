@@ -307,6 +307,20 @@ function isPlainBlock(type: string): boolean {
   return ["markdown", "diary", "role-divider", "button-click"].includes(type);
 }
 
+function isRenderableTailBlock(type?: string): boolean {
+  if (!type) return false;
+  return (
+    isPlainBlock(type) ||
+    [
+      "tool-use",
+      "tool-result",
+      "thought",
+      "html-preview",
+      "tool-call-summary",
+    ].includes(type)
+  );
+}
+
 function renderBlockHtml(block: ContentBlock): string {
   switch (block.type) {
     case "markdown":
@@ -1099,7 +1113,8 @@ onUnmounted(() => {
                 isStreaming &&
                 bubbleIndex === messageBubbles.length - 1 &&
                 message.tailContent &&
-                (!message.tailBlock || !isPlainBlock(message.tailBlock.type))
+                (!message.tailBlock ||
+                  !isRenderableTailBlock(message.tailBlock.type))
               "
               class="opacity-70 italic animate-pulse"
             >
