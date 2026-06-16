@@ -741,11 +741,6 @@ pub async fn perform_vcp_request<R: Runtime>(
                                                     "[图床URL: {}] (文件名: {})",
                                                     url, display_name
                                                 ));
-                                                new_parts.push(json!({
-                                                    "type": "image_url",
-                                                    "image_url": { "url": url }
-                                                }));
-                                                converted = true;
                                             }
                                             Err(e) => {
                                                 log::warn!(
@@ -757,7 +752,8 @@ pub async fn perform_vcp_request<R: Runtime>(
                                         }
                                     }
 
-                                    // 图片图床不可用时，保留旧行为：长边 > 1120px 时缩放，避免多模态 payload 过大
+                                    // 模型多模态输入保持使用 base64 data URL，避免部分渠道拒绝外部 HTTP image_url。
+                                    // 图床 URL 只作为文本上下文提供给 ComfyUI/工具调用使用。
                                     if !converted {
                                         let path_buf_clone = path_buf.clone();
                                         let app_clone = app.clone();
@@ -792,7 +788,7 @@ pub async fn perform_vcp_request<R: Runtime>(
                                         }
                                     }
                                 } else if media_kind == "video" {
-                                    // 视频：抽帧 → 每张帧作为 image_url；若图床可用则把帧上传为 HTTP URL
+                                    // 视频：抽帧 → 每张帧作为 base64 image_url；若图床可用则额外上传帧并提供文本 URL。
                                     let path_buf_clone = path_buf.clone();
                                     let app_clone = app.clone();
                                     match tokio::task::spawn_blocking(move || {
@@ -802,7 +798,6 @@ pub async fn perform_vcp_request<R: Runtime>(
                                     {
                                         Ok(Ok(frames)) => {
                                             for (frame_index, frame_url) in frames.into_iter().enumerate() {
-                                                let mut final_frame_url = frame_url.clone();
                                                 if let (Some(config), Some(client)) =
                                                     (image_host_config.as_ref(), image_host_client.as_ref())
                                                 {
@@ -822,7 +817,6 @@ pub async fn perform_vcp_request<R: Runtime>(
                                                     .await
                                                     {
                                                         Ok(url) => {
-                                                            final_frame_url = url.clone();
                                                             hosted_image_text_lines.push(format!(
                                                                 "[视频抽帧图床URL: {}] (文件名: {}, 帧: {})",
                                                                 url,
@@ -842,7 +836,7 @@ pub async fn perform_vcp_request<R: Runtime>(
                                                 }
                                                 new_parts.push(json!({
                                                     "type": "image_url",
-                                                    "image_url": { "url": final_frame_url }
+                                                    "image_url": { "url": frame_url }
                                                 }));
                                             }
                                             converted = true;
