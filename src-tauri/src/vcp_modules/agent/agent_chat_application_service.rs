@@ -1,5 +1,6 @@
 use crate::vcp_modules::agent_service::{read_agent_config_internal, AgentConfigState};
 use crate::vcp_modules::chat_manager::ChatMessage;
+use crate::vcp_modules::context_sanitizer::strip_thought_chains;
 use crate::vcp_modules::db_manager::DbState;
 use crate::vcp_modules::message_service;
 use crate::vcp_modules::stream_service_guard::StreamServiceGuard;
@@ -41,6 +42,14 @@ fn context_history_message_limit(context_token_limit: i32) -> usize {
 
     ((context_token_limit as usize) / TOKENS_PER_MESSAGE_BUDGET)
         .clamp(MIN_HISTORY_MESSAGES, MAX_HISTORY_MESSAGES)
+}
+
+fn sanitize_outbound_context_content(role: &str, content: &str) -> String {
+    if role == "assistant" {
+        strip_thought_chains(content)
+    } else {
+        content.to_string()
+    }
 }
 
 #[tauri::command]
@@ -274,9 +283,10 @@ pub async fn handle_assistant_chat_stream(
     }));
 
     for temp_msg in temp_messages {
+        let content = sanitize_outbound_context_content(&temp_msg.role, &temp_msg.content);
         messages.push(json!({
             "role": temp_msg.role,
-            "content": temp_msg.content
+            "content": content
         }));
     }
 
@@ -353,4 +363,24 @@ pub async fn handle_assistant_chat_stream(
     }
 
     Ok(json!({ "status": "sent", "messageId": thinking_id }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assistant_temp_message_thoughts_are_removed_from_context() {
+        let content =
+            sanitize_outbound_context_content("assistant", "正文<think>内部推理</think>结论");
+
+        assert_eq!(content, "正文结论");
+    }
+
+    #[test]
+    fn user_temp_message_think_examples_are_preserved() {
+        let content = sanitize_outbound_context_content("user", "请保留 <think>demo</think>");
+
+        assert_eq!(content, "请保留 <think>demo</think>");
+    }
 }

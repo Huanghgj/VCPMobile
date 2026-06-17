@@ -13,9 +13,13 @@ use std::time::{Duration, SystemTime};
 
 lazy_static! {
     /// 清理 VCP 元思考链的正则表达式
-    static ref THOUGHT_CHAIN_REGEX: Regex = Regex::new(r#"(?s)\[--- VCP元思考链(?::\s*"([^"]*)")?\s*---\].*?\[--- 元思考链结束 ---\]"#).unwrap();
-    /// 清理常规 <think> 标签的正则表达式
-    static ref CONVENTIONAL_THOUGHT_REGEX: Regex = Regex::new(r"(?is)<think>.*?</think>").unwrap();
+    static ref THOUGHT_CHAIN_REGEX: Regex = Regex::new(r#"(?ims)[ \t]*\[--- VCP元思考链(?::\s*[^\]]*?)?\s*---\].*?[ \t]*\[--- 元思考链结束 ---\][ \t]*\r?\n?"#).unwrap();
+    /// 清理未闭合 VCP 元思考链的正则表达式
+    static ref INCOMPLETE_THOUGHT_CHAIN_REGEX: Regex = Regex::new(r#"(?ims)[ \t]*\[--- VCP元思考链(?::\s*[^\]]*?)?\s*---\].*\z"#).unwrap();
+    /// 清理常规 <think>/<thinking> 标签的正则表达式
+    static ref CONVENTIONAL_THOUGHT_REGEX: Regex = Regex::new(r"(?is)<think(?:ing)?>.*?</think(?:ing)?>").unwrap();
+    /// 清理未闭合 <think>/<thinking> 标签的正则表达式
+    static ref INCOMPLETE_CONVENTIONAL_THOUGHT_REGEX: Regex = Regex::new(r"(?is)<think(?:ing)?>.*\z").unwrap();
     /// 简单检查是否包含 HTML 标签的正则表达式
     static ref HTML_CHECK_REGEX: Regex = Regex::new(r"<[^>]+>").unwrap();
     /// 清理多余空行（保留最多2个连续空行）的正则表达式
@@ -130,7 +134,13 @@ impl Default for ContextSanitizer {
 #[allow(dead_code)]
 pub fn strip_thought_chains(content: &str) -> String {
     let s = THOUGHT_CHAIN_REGEX.replace_all(content, "").to_string();
-    CONVENTIONAL_THOUGHT_REGEX.replace_all(&s, "").to_string()
+    let s = INCOMPLETE_THOUGHT_CHAIN_REGEX
+        .replace_all(&s, "")
+        .to_string();
+    let s = CONVENTIONAL_THOUGHT_REGEX.replace_all(&s, "").to_string();
+    INCOMPLETE_CONVENTIONAL_THOUGHT_REGEX
+        .replace_all(&s, "")
+        .to_string()
 }
 
 /// 核心算法：将 HTML 树转换为 VCP 风格的 Markdown
@@ -353,7 +363,31 @@ mod tests {
     #[test]
     fn test_strip_thoughts() {
         let input = "Hello [--- VCP元思考链: \"test\" ---] secret [--- 元思考链结束 ---] World <think>internal</think>";
-        assert_eq!(strip_thought_chains(input), "Hello  World ");
+        let stripped = strip_thought_chains(input);
+        assert!(stripped.contains("Hello"));
+        assert!(stripped.contains("World"));
+        assert!(!stripped.contains("secret"));
+        assert!(!stripped.contains("internal"));
+        assert!(!stripped.contains("VCP元思考链"));
+        assert!(!stripped.contains("<think>"));
+    }
+
+    #[test]
+    fn test_strip_thought_variants() {
+        let input = "A\n[--- VCP元思考链: test ---]\nsecret\n[--- 元思考链结束 ---]\nB <thinking>hidden</thinking> C";
+        let stripped = strip_thought_chains(input);
+        assert!(stripped.contains("A"));
+        assert!(stripped.contains("B"));
+        assert!(stripped.contains("C"));
+        assert!(!stripped.contains("secret"));
+        assert!(!stripped.contains("hidden"));
+        assert!(!stripped.contains("<thinking>"));
+    }
+
+    #[test]
+    fn test_strip_incomplete_thought_to_end() {
+        let input = "Visible\n<think>unfinished internal text";
+        assert_eq!(strip_thought_chains(input), "Visible\n");
     }
 
     #[test]

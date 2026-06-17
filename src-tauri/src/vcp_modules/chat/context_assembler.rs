@@ -1,4 +1,5 @@
 use crate::vcp_modules::chat_manager::ChatMessage;
+use crate::vcp_modules::context_sanitizer::strip_thought_chains;
 use serde_json::{json, Value};
 use sqlx::{Pool, Sqlite};
 
@@ -136,7 +137,12 @@ pub fn assemble_history_for_vcp(
         }
 
         // 3. 核心消息正文
-        combined_text.push_str(&msg.content);
+        let message_content = if msg.role == "assistant" {
+            strip_thought_chains(&msg.content)
+        } else {
+            msg.content.clone()
+        };
+        combined_text.push_str(&message_content);
 
         let mut content_parts = Vec::new();
 
@@ -257,4 +263,58 @@ pub fn assemble_history_for_vcp(
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(role: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            id: format!("{role}_msg"),
+            role: role.to_string(),
+            name: None,
+            content: content.to_string(),
+            timestamp: 1_700_000_000_000,
+            is_thinking: Some(false),
+            agent_id: None,
+            group_id: None,
+            topic_id: None,
+            is_group_message: None,
+            finish_reason: None,
+            attachments: None,
+            blocks: None,
+            shell: None,
+            content_hash: None,
+        }
+    }
+
+    #[test]
+    fn assistant_thoughts_are_removed_from_request_context() {
+        let history = vec![message(
+            "assistant",
+            "可见内容\n<think>内部推理</think>\n结论\n[--- VCP元思考链: test ---]\n隐藏\n[--- 元思考链结束 ---]\n末尾",
+        )];
+
+        let messages = assemble_history_for_vcp(&history, false, false);
+        let content = messages[0]["content"].as_str().unwrap();
+
+        assert!(content.contains("可见内容"));
+        assert!(content.contains("结论"));
+        assert!(content.contains("末尾"));
+        assert!(!content.contains("内部推理"));
+        assert!(!content.contains("隐藏"));
+        assert!(!content.contains("<think>"));
+        assert!(!content.contains("VCP元思考链"));
+    }
+
+    #[test]
+    fn user_think_examples_are_preserved_in_request_context() {
+        let history = vec![message("user", "请解释 `<think>demo</think>` 这个标签")];
+
+        let messages = assemble_history_for_vcp(&history, false, false);
+        let content = messages[0]["content"].as_str().unwrap();
+
+        assert!(content.contains("<think>demo</think>"));
+    }
 }
