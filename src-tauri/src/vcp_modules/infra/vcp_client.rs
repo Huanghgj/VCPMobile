@@ -417,6 +417,92 @@ fn append_hosted_image_lines(parts: &mut Vec<Value>, lines: Vec<String>) {
     );
 }
 
+fn ensure_media_translation_placeholder(parts: &mut Vec<Value>) {
+    const MEDIA_PLACEHOLDER: &str = "{{TransBase64}}";
+    const MEDIA_PLUS_PLACEHOLDER: &str = "{{TransBase64+}}";
+    let mut has_media_placeholder = false;
+
+    for part in parts.iter_mut() {
+        if part.get("type").and_then(|t| t.as_str()) != Some("text") {
+            continue;
+        }
+
+        if let Some(Value::String(text)) = part.get_mut("text") {
+            if text.contains(MEDIA_PLUS_PLACEHOLDER) {
+                *text = text.replace(MEDIA_PLUS_PLACEHOLDER, MEDIA_PLACEHOLDER);
+            }
+            if text.contains(MEDIA_PLACEHOLDER) {
+                has_media_placeholder = true;
+            }
+        }
+    }
+
+    if has_media_placeholder {
+        return;
+    }
+
+    if let Some(text_part) = parts
+        .iter_mut()
+        .find(|part| part.get("type").and_then(|t| t.as_str()) == Some("text"))
+    {
+        if let Some(Value::String(text)) = text_part.get_mut("text") {
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(MEDIA_PLACEHOLDER);
+            return;
+        }
+    }
+
+    parts.insert(
+        0,
+        json!({
+            "type": "text",
+            "text": MEDIA_PLACEHOLDER
+        }),
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_media_translation_placeholder;
+    use serde_json::json;
+
+    #[test]
+    fn video_placeholder_downgrades_all_plus_markers() {
+        let mut parts = vec![
+            json!({"type": "text", "text": "first {{TransBase64}}"}),
+            json!({"type": "image_url", "image_url": {"url": "data:video/mp4;base64,AAAA"}}),
+            json!({"type": "text", "text": "second {{TransBase64+}}"}),
+        ];
+
+        ensure_media_translation_placeholder(&mut parts);
+
+        assert_eq!(
+            parts[0].get("text").and_then(|value| value.as_str()),
+            Some("first {{TransBase64}}")
+        );
+        assert_eq!(
+            parts[2].get("text").and_then(|value| value.as_str()),
+            Some("second {{TransBase64}}")
+        );
+        let serialized = serde_json::to_string(&parts).unwrap();
+        assert!(!serialized.contains("{{TransBase64+}}"));
+    }
+
+    #[test]
+    fn video_placeholder_is_inserted_when_missing() {
+        let mut parts = vec![json!({"type": "text", "text": "hello"})];
+
+        ensure_media_translation_placeholder(&mut parts);
+
+        assert_eq!(
+            parts[0].get("text").and_then(|value| value.as_str()),
+            Some("hello\n{{TransBase64}}")
+        );
+    }
+}
+
 impl StreamEvent {
     pub fn data(message_id: String, chunk: Value, context: Option<Value>) -> Self {
         Self {
@@ -961,6 +1047,11 @@ pub async fn perform_vcp_request<R: Runtime>(
                                         }
                                     }
                                 } else if media_kind == "video" {
+                                    // 视频不能直通最终上游的 image_url；很多 OpenAI 兼容接口会 400。
+                                    // 这里只把完整视频交给 VCPToolBox 的 {{TransBase64}} 识别链路，
+                                    // 识别器会移除原始 data:video，并把转译文本交给最终模型。
+                                    ensure_media_translation_placeholder(&mut new_parts);
+
                                     if let (Some(config), Some(client)) =
                                         (image_host_config.as_ref(), image_host_client.as_ref())
                                     {
@@ -999,8 +1090,8 @@ pub async fn perform_vcp_request<R: Runtime>(
                                         }
                                     }
 
-                                    // VCPToolBox 的多模态处理器支持 data:video/*;base64 作为 image_url。
-                                    // 这里发送完整视频，避免抽帧导致模型无法读取连续时序/音轨信息。
+                                    // 通过 VCPToolBox 媒体预处理链路发送完整视频。
+                                    // 普通 {{TransBase64}} 会让服务器移除 data:video 原文，避免最终上游 400。
                                     let path_buf_clone = path_buf.clone();
                                     let declared_mime_clone = declared_mime.clone();
                                     match tokio::task::spawn_blocking(move || {
