@@ -48,13 +48,13 @@ pub fn convert_local_image_for_multimodal<R: Runtime>(
             );
             let output_path = Path::new(&res.path);
 
-            let webp_bytes = std::fs::read(output_path)
+            let jpeg_bytes = std::fs::read(output_path)
                 .map_err(|e| format!("Failed to read processed image: {}", e))?;
 
             let _ = std::fs::remove_file(output_path);
 
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&webp_bytes);
-            Ok(format!("data:image/webp;base64,{}", b64))
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg_bytes);
+            Ok(format!("data:image/jpeg;base64,{}", b64))
         })() {
             Ok(data_url) => return Ok(data_url),
             Err(e) => {

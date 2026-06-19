@@ -822,8 +822,8 @@ pub fn clear_upload_cache(app_handle: &AppHandle) {
             log::info!("[FileManager] Upload cache cleared.");
         }
 
-        // 2. 🌟多媒体零拷贝转码垃圾碎片冷启动清理防线（Sweeper）🌟
-        // 遍历整个 cache_dir，只要文件/目录名匹配 img_*.webp、aud_*.aac 或以 vid_ 开头的一律物理抹除，彻底防止碎屑泄露
+        // 2. 多媒体零拷贝转码垃圾碎片冷启动清理防线（Sweeper）
+        // 遍历整个 cache_dir，只要文件/目录名匹配 img_*.jpg/img_*.webp、aud_*.aac 或以 vid_ 开头的一律物理抹除，防止碎片泄露。
         if cache_dir.exists() && cache_dir.is_dir() {
             if let Ok(entries) = fs::read_dir(&cache_dir) {
                 let mut cleared_files = 0;
@@ -831,7 +831,8 @@ pub fn clear_upload_cache(app_handle: &AppHandle) {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     let file_name = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
-                    if (file_name.starts_with("img_") && file_name.ends_with(".webp"))
+                    if (file_name.starts_with("img_")
+                        && (file_name.ends_with(".jpg") || file_name.ends_with(".webp")))
                         || (file_name.starts_with("aud_") && file_name.ends_with(".aac"))
                         || (file_name.starts_with("camera_") && file_name.ends_with(".jpg"))
                         || (file_name.starts_with("pick_") && file_name.ends_with("_temp"))

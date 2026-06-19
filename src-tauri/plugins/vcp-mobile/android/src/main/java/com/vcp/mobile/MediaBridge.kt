@@ -3,6 +3,8 @@ package com.vcp.mobile
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Color
 import android.graphics.Matrix
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
@@ -27,8 +29,8 @@ object MediaBridge {
     private val fileIoExecutor = Executors.newFixedThreadPool(4)
 
     /**
-     * 异步图片缩放与 WebP 压缩
-     * 长边等比例缩放到 1120 包络框内，小图不放大。80% 质量。
+     * 异步图片缩放与 JPEG 压缩
+     * 长边等比例缩放到 1120 包络框内，小图不放大。90% 质量。
      */
     fun processImageAsync(
         inputPath: String,
@@ -38,6 +40,7 @@ object MediaBridge {
         fileIoExecutor.execute {
             var rawBitmap: Bitmap? = null
             var scaledBitmap: Bitmap? = null
+            var outputBitmap: Bitmap? = null
             try {
                 val file = File(inputPath)
                 if (!file.exists()) {
@@ -83,18 +86,23 @@ object MediaBridge {
                 } else {
                     decodedBitmap
                 }
-                val outputBitmap = scaledBitmap
-
-                // 5. 写入 WebP
-                val uploadsDir = File(context.cacheDir, "uploads").apply { mkdirs() }
-                val outFile = File(uploadsDir, "img_" + UUID.randomUUID().toString() + ".webp")
-                FileOutputStream(outFile).use { out ->
-                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
-                        outputBitmap.compress(Bitmap.CompressFormat.WEBP_LOSSY, 80, out)
-                    } else {
-                        @Suppress("DEPRECATION")
-                        outputBitmap.compress(Bitmap.CompressFormat.WEBP, 80, out)
+                val scaled = scaledBitmap ?: throw Exception("Failed to scale image bitmap")
+                outputBitmap = if (scaled.hasAlpha()) {
+                    Bitmap.createBitmap(scaled.width, scaled.height, Bitmap.Config.ARGB_8888).also { flattened ->
+                        val canvas = Canvas(flattened)
+                        canvas.drawColor(Color.WHITE)
+                        canvas.drawBitmap(scaled, 0f, 0f, null)
                     }
+                } else {
+                    scaled
+                }
+
+                // 5. 写入 JPEG，避免部分 OpenAI 兼容上游拒绝 image/webp data URL。
+                val uploadsDir = File(context.cacheDir, "uploads").apply { mkdirs() }
+                val outFile = File(uploadsDir, "img_" + UUID.randomUUID().toString() + ".jpg")
+                val bitmapForOutput = outputBitmap ?: throw Exception("Failed to prepare output bitmap")
+                FileOutputStream(outFile).use { out ->
+                    bitmapForOutput.compress(Bitmap.CompressFormat.JPEG, 90, out)
                 }
 
                 Log.d(TAG, "Image scale success: ${outFile.absolutePath} (${targetW}x${targetH})")
@@ -103,9 +111,12 @@ object MediaBridge {
                 Log.e(TAG, "Image scale error", e)
                 callback(Result.failure(e))
             } finally {
-                // Bitmap 是 Native 内存大户，异常也要立刻榨干释放，别在主人手机里湿黏黏地泄漏喵♡
+                // Bitmap 占用 native 内存，异常路径也要及时释放。
                 if (scaledBitmap != null && scaledBitmap !== rawBitmap) {
                     scaledBitmap.recycle()
+                }
+                if (outputBitmap != null && outputBitmap !== scaledBitmap) {
+                    outputBitmap.recycle()
                 }
                 rawBitmap?.recycle()
             }
