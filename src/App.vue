@@ -54,6 +54,7 @@ interface PickedFileInfo {
   size: number;
   hash: string;
   thumbnailPath?: string;
+  internalPath?: string;
 }
 
 const themeStore = useThemeStore();
@@ -124,7 +125,7 @@ const prepareShareFiles = async () => {
   if (files.length > 0) {
     try {
       console.log(`[App] Registering ${files.length} shared file(s)...`);
-      const results = await invoke<PickedFileInfo[]>(
+      const pickedFiles = await invoke<PickedFileInfo[]>(
         "plugin:vcp-mobile|register_shared_files",
         {
           files: files.map((f) => ({
@@ -133,6 +134,28 @@ const prepareShareFiles = async () => {
             fileName: f.fileName,
           })),
         }
+      );
+      const results = await Promise.all(
+        pickedFiles.map(async (file) => {
+          const registered = await invoke<any>("register_local_file", {
+            localPath: file.path,
+            originalName: file.name,
+            mimeType: file.mime || "application/octet-stream",
+            thumbnailPath: file.thumbnailPath || null,
+            stableId: null,
+            expectedHash: file.hash || null,
+          });
+
+          return {
+            path: registered.internalPath || file.path,
+            internalPath: registered.internalPath || file.path,
+            name: registered.name || file.name,
+            mime: registered.type || file.mime || "application/octet-stream",
+            size: registered.size ?? file.size,
+            hash: registered.hash || file.hash,
+            thumbnailPath: registered.thumbnailPath || file.thumbnailPath,
+          } satisfies PickedFileInfo;
+        })
       );
       pendingSharedFiles.value = results;
       console.log("[App] Shared files registered:", results);

@@ -88,21 +88,22 @@ export const useChatStreamStore = defineStore("chatStream", () => {
 
   // ===== 低功耗流式帧合并暂存池 =====
   // 流式事件可能高于人眼可读速度；用 timer + 单次 rAF 合并提交，避免每个物理刷新帧空转轮询。
-  const rAFPendingUpdates = new Map<
-    string,
-    {
-      content: string | null;
-      blocks: any[] | null;
-      tailContent: string | null;
-      tailBlock: any | null | undefined;
-      tailFrame: TailFrame | null;
-      tailSnapshot: any[] | null;
-      animationFrameId: number | null;
-      renderTimerId: ReturnType<typeof setTimeout> | null;
-      lastRenderTime: number;
-    }
-  >();
+  type PendingStreamUpdate = {
+    content: string | null;
+    blocks: any[] | null;
+    tailContent: string | null;
+    tailBlock: any | null | undefined;
+    tailFrame: TailFrame | null;
+    tailSnapshot: any[] | null;
+    animationFrameId: number | null;
+    renderTimerId: ReturnType<typeof setTimeout> | null;
+    fallbackTimerId: ReturnType<typeof setTimeout> | null;
+    lastRenderTime: number;
+  };
+
+  const rAFPendingUpdates = new Map<string, PendingStreamUpdate>();
   const STREAM_RENDER_INTERVAL_MS = 66.7; // 约 15Hz：移动端流式可读且显著降低 DOM/AST diff 唤醒频率
+  const STREAM_RENDER_MAX_LATENCY_MS = 180; // WebView 忙碌时 rAF 可能延迟，超过该时间强制提交 pending 帧
 
   const isDocumentHidden = () =>
     typeof document !== "undefined" && document.hidden;
@@ -125,6 +126,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
   const cancelScheduledCommit = (up: {
     animationFrameId: number | null;
     renderTimerId: ReturnType<typeof setTimeout> | null;
+    fallbackTimerId?: ReturnType<typeof setTimeout> | null;
   }) => {
     if (up.animationFrameId !== null) {
       cancelAnimationFrame(up.animationFrameId);
@@ -133,6 +135,10 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     if (up.renderTimerId !== null) {
       clearTimeout(up.renderTimerId);
       up.renderTimerId = null;
+    }
+    if (up.fallbackTimerId !== undefined && up.fallbackTimerId !== null) {
+      clearTimeout(up.fallbackTimerId);
+      up.fallbackTimerId = null;
     }
   };
 
@@ -389,6 +395,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
         tailSnapshot: null,
         animationFrameId: null,
         renderTimerId: null,
+        fallbackTimerId: null,
         lastRenderTime: 0,
       };
       rAFPendingUpdates.set(messageId, update);
@@ -400,6 +407,11 @@ export const useChatStreamStore = defineStore("chatStream", () => {
   const commitPendingUpdate = (messageId: string) => {
     const up = rAFPendingUpdates.get(messageId);
     if (!up || isDocumentHidden()) return;
+
+    if (up.fallbackTimerId !== null) {
+      clearTimeout(up.fallbackTimerId);
+      up.fallbackTimerId = null;
+    }
 
     // 满足低功耗节流间隔后，触发 Vue 响应式写入进行重绘
     const m = activeStreamMessages.get(messageId);
@@ -430,6 +442,24 @@ export const useChatStreamStore = defineStore("chatStream", () => {
       isDocumentHidden()
     ) {
       return;
+    }
+
+    if (update.fallbackTimerId === null) {
+      update.fallbackTimerId = setTimeout(() => {
+        const up = rAFPendingUpdates.get(messageId);
+        if (!up) return;
+        up.fallbackTimerId = null;
+        if (isDocumentHidden() || !hasPendingRAFData(up)) return;
+        if (up.animationFrameId !== null) {
+          cancelAnimationFrame(up.animationFrameId);
+          up.animationFrameId = null;
+        }
+        if (up.renderTimerId !== null) {
+          clearTimeout(up.renderTimerId);
+          up.renderTimerId = null;
+        }
+        commitPendingUpdate(messageId);
+      }, STREAM_RENDER_MAX_LATENCY_MS);
     }
 
     const requestCommitFrame = () => {

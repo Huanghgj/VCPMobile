@@ -11,6 +11,7 @@ export interface PickedFileInfo {
   size: number;
   hash: string;
   thumbnailPath?: string;
+  internalPath?: string;
 }
 
 export const useChatSessionStore = defineStore("chatSession", () => {

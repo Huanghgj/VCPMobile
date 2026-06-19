@@ -98,6 +98,10 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     try {
       const requestedTopicId = topicId;
       const isStaleLoad = () => loadSequence !== historyLoadSequence;
+      const canApplyLoad = () =>
+        !signal.aborted &&
+        !isStaleLoad() &&
+        sessionStore.currentTopicId === requestedTopicId;
       const channel = new Channel<HistoryChunk>();
       const buffer: ChatMessage[] = [];
       let receivedCount = 0;
@@ -118,6 +122,12 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
 
       const flushHistory = (force = false) => {
         if (pendingHistory.length === 0) return;
+        if (!canApplyLoad()) {
+          pendingHistory = [];
+          cancelledByTopicChange = true;
+          completeLoad();
+          return;
+        }
         const now = performance.now();
         if (force || now - lastFlushTime >= FLUSH_INTERVAL) {
           currentChatHistory.value = [...currentChatHistory.value, ...pendingHistory];
@@ -131,25 +141,20 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
         flushRafId = requestAnimationFrame(() => {
           flushRafId = null;
           flushHistory(false);
-          if (pendingHistory.length > 0) {
+          if (pendingHistory.length > 0 && canApplyLoad()) {
             scheduleHistoryFlush();
           }
         });
       };
 
       channel.onmessage = (chunk) => {
-        if (isStaleLoad()) {
-          completeLoad();
-          return;
-        }
-
-        // 1. 唯一性与话题一致性防御性校验：若请求已中止，或当前话题已被切换，直接丢弃该过时流数据
-        if (signal.aborted || sessionStore.currentTopicId !== requestedTopicId) {
+        if (!canApplyLoad()) {
           cancelledByTopicChange = true;
           completeLoad();
           return;
         }
 
+        // 1. 唯一性与话题一致性防御性校验：若请求已中止，或当前话题已被切换，直接丢弃该过时流数据
         if (!chunk.message) {
           if (chunk.is_last) {
             if (offset === 0) {
@@ -182,6 +187,11 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
         }
 
         if (chunk.is_last) {
+          if (!canApplyLoad()) {
+            cancelledByTopicChange = true;
+            completeLoad();
+            return;
+          }
           if (offset > 0) {
             currentChatHistory.value = [...buffer, ...currentChatHistory.value];
             historyOffset.value += buffer.length;
@@ -212,7 +222,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
         onMessage: channel,
       });
 
-      if (isStaleLoad() || sessionStore.currentTopicId !== requestedTopicId || cancelledByTopicChange) {
+      if (!canApplyLoad() || cancelledByTopicChange) {
         completeLoad();
         return;
       }
@@ -234,7 +244,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
         `[ChatHistoryStore] Loaded ${loadedCount} messages [${loadType}] for ${ownerId}, topic: ${topicId}`,
       );
 
-      if (signal.aborted || sessionStore.currentTopicId !== topicId) {
+      if (!canApplyLoad()) {
         console.warn(`[ChatHistoryStore] Topic changed or request aborted during load, discarding results.`);
         return;
       }
@@ -271,6 +281,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     // 切换话题时强制重置分页状态，避免旧话题状态污染
     historyOffset.value = 0;
     hasMoreHistory.value = true;
+    currentChatHistory.value = [];
     await loadHistory(ownerId, ownerType, topicId, 5, 0);
   };
 

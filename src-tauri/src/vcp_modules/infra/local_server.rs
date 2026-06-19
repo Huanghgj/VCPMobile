@@ -7,43 +7,18 @@ use axum::{
     routing::get,
     Router,
 };
-use dashmap::DashMap;
 use futures_util::{sink::SinkExt, stream::StreamExt};
 use serde_json::{json, Value};
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::net::SocketAddr;
 use tauri::{
     http::{header, Request, StatusCode},
     AppHandle, Manager,
 };
-use tokio::sync::{oneshot, watch};
+use tokio::sync::watch;
 
 #[derive(Clone)]
 struct AppState {
     app_handle: AppHandle,
-}
-
-fn abort_active_request_with_retry(
-    active_requests: Arc<DashMap<String, oneshot::Sender<()>>>,
-    message_id: String,
-) {
-    tauri::async_runtime::spawn(async move {
-        for attempt in 0..20 {
-            if let Some((_, abort_tx)) = active_requests.remove(&message_id) {
-                let _ = abort_tx.send(());
-                return;
-            }
-
-            // thinking 事件可能比 ActiveRequests 注册更早，短暂重试可覆盖注册竞态。
-            if attempt < 19 {
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-        }
-
-        log::warn!(
-            "[LocalServer/WS] Failed to abort disconnected assistant stream: {}",
-            message_id
-        );
-    });
 }
 
 /// 服务器句柄：持有此句柄可触发优雅关闭
@@ -191,9 +166,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 match socket_msg {
                                     Some(Ok(Message::Close(_))) | None => {
                                         if let Some(message_id) = last_message_id.take() {
-                                            abort_active_request_with_retry(
+                                            crate::vcp_modules::vcp_client::schedule_interrupt_request_with_retry(
                                                 active_requests_for_abort.clone(),
                                                 message_id,
+                                                "floating_socket_closed",
                                             );
                                         }
                                         break;
@@ -201,9 +177,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     Some(Err(e)) => {
                                         log::warn!("[LocalServer/WS] Floating socket receive error: {}", e);
                                         if let Some(message_id) = last_message_id.take() {
-                                            abort_active_request_with_retry(
+                                            crate::vcp_modules::vcp_client::schedule_interrupt_request_with_retry(
                                                 active_requests_for_abort.clone(),
                                                 message_id,
+                                                "floating_socket_error",
                                             );
                                         }
                                         break;
@@ -232,9 +209,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         if sender.send(Message::Text(event_json)).await.is_err() {
                             // WebSocket 断开后立即中止对应流式请求，避免后台继续耗电。
                             if let Some(message_id) = last_message_id.take() {
-                                abort_active_request_with_retry(
+                                crate::vcp_modules::vcp_client::schedule_interrupt_request_with_retry(
                                     active_requests_for_abort.clone(),
                                     message_id,
+                                    "floating_socket_send_failed",
                                 );
                             }
                             break;

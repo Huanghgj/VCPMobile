@@ -1,5 +1,4 @@
 use crate::vcp_modules::media_processor::convert_local_image_for_multimodal;
-use base64::Engine as _;
 use dashmap::{DashMap, DashSet};
 use futures_util::StreamExt;
 use futures_util::TryStreamExt;
@@ -29,6 +28,7 @@ use crate::vcp_modules::settings_manager::{create_default_settings, Settings};
 /// 该模块对应原项目的 modules/vcpClient.js，负责处理所有与 VCP 服务器的通信。
 /// 包含动态路由、上下文注入（音乐、UI 规范）、流式 SSE 解析以及请求中止机制。
 static IMAGE_HOST_UPLOAD_CACHE: LazyLock<DashMap<String, String>> = LazyLock::new(DashMap::new);
+static MEDIA_HOST_UPLOAD_CACHE: LazyLock<DashMap<String, String>> = LazyLock::new(DashMap::new);
 
 /// 请求参数结构体
 #[derive(Debug, Deserialize)]
@@ -174,6 +174,16 @@ fn image_extension_for_mime(mime: &str) -> &'static str {
         "image/svg+xml" => "svg",
         "image/bmp" => "bmp",
         "image/x-icon" | "image/vnd.microsoft.icon" => "ico",
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
+        "video/quicktime" => "mov",
+        "video/x-matroska" => "mkv",
+        "video/x-msvideo" => "avi",
+        "video/x-ms-wmv" => "wmv",
+        "video/x-flv" => "flv",
+        "video/3gpp" => "3gp",
+        "video/3gpp2" => "3g2",
+        "video/mp2t" => "ts",
         _ => "png",
     }
 }
@@ -202,6 +212,18 @@ fn image_mime_for_path(path: &std::path::Path, declared_mime: &str) -> String {
         guessed.to_string()
     } else {
         "image/png".to_string()
+    }
+}
+
+fn video_mime_for_path(path: &std::path::Path, declared_mime: &str) -> String {
+    if declared_mime.starts_with("video/") {
+        return declared_mime.to_string();
+    }
+    let guessed = mime_guess::from_path(path).first_or_octet_stream();
+    if guessed.type_().as_str() == "video" {
+        guessed.to_string()
+    } else {
+        "video/mp4".to_string()
     }
 }
 
@@ -245,8 +267,8 @@ async fn post_image_to_host(
     file_name: &str,
     trace_id: &str,
 ) -> Result<String, String> {
-    if !mime.starts_with("image/") {
-        return Err(format!("unsupported image MIME: {}", mime));
+    if !mime.starts_with("image/") && !mime.starts_with("video/") {
+        return Err(format!("unsupported media MIME: {}", mime));
     }
 
     let safe_name = safe_upload_file_name(file_name, mime);
@@ -300,6 +322,39 @@ async fn post_image_to_host(
         .ok_or_else(|| "image host upload response did not include url/key".to_string())
 }
 
+async fn upload_video_path_to_host(
+    client: &Client,
+    config: &ImageHostConfig,
+    path: &std::path::Path,
+    declared_mime: &str,
+    file_name: &str,
+    trace_id: &str,
+) -> Result<String, String> {
+    let cache_key = format!("{}|video-path|{}", config.cache_scope(), path.display());
+    if let Some(cached) = MEDIA_HOST_UPLOAD_CACHE.get(&cache_key) {
+        return Ok(cached.value().clone());
+    }
+
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .map_err(|e| format!("video metadata read failed: {}", e))?;
+    const MEDIA_HOST_MAX_BYTES: u64 = 220 * 1024 * 1024;
+    if metadata.len() > MEDIA_HOST_MAX_BYTES {
+        return Err(format!(
+            "video file is too large for ImageServer upload: {} bytes",
+            metadata.len()
+        ));
+    }
+
+    let mime = video_mime_for_path(path, declared_mime);
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|e| format!("video file read failed: {}", e))?;
+    let url = post_image_to_host(client, config, bytes, &mime, file_name, trace_id).await?;
+    MEDIA_HOST_UPLOAD_CACHE.insert(cache_key, url.clone());
+    Ok(url)
+}
+
 async fn upload_image_path_to_host(
     client: &Client,
     config: &ImageHostConfig,
@@ -331,33 +386,6 @@ async fn upload_image_path_to_host(
     let url = post_image_to_host(client, config, bytes, &mime, file_name, trace_id).await?;
     IMAGE_HOST_UPLOAD_CACHE.insert(cache_key, url.clone());
     Ok(url)
-}
-
-fn decode_image_data_url(data_url: &str) -> Result<(String, Vec<u8>), String> {
-    let (meta, data) = data_url
-        .split_once(',')
-        .ok_or_else(|| "image data URL is missing comma separator".to_string())?;
-    let mime = meta
-        .strip_prefix("data:")
-        .and_then(|rest| rest.split(';').next())
-        .filter(|mime| mime.starts_with("image/"))
-        .ok_or_else(|| "image data URL is not image/*".to_string())?;
-    let compact = data.replace(char::is_whitespace, "");
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(compact)
-        .map_err(|e| format!("image data URL base64 decode failed: {}", e))?;
-    Ok((mime.to_string(), bytes))
-}
-
-async fn upload_image_data_url_to_host(
-    client: &Client,
-    config: &ImageHostConfig,
-    data_url: &str,
-    file_name: &str,
-    trace_id: &str,
-) -> Result<String, String> {
-    let (mime, bytes) = decode_image_data_url(data_url)?;
-    post_image_to_host(client, config, bytes, &mime, file_name, trace_id).await
 }
 
 fn append_hosted_image_lines(parts: &mut Vec<Value>, lines: Vec<String>) {
@@ -449,6 +477,146 @@ impl StreamEvent {
     }
 }
 
+#[derive(Clone, Debug)]
+struct RemoteInterruptContext {
+    interrupt_url: String,
+    api_key: String,
+    request_id: String,
+}
+
+static REMOTE_INTERRUPT_CONTEXTS: LazyLock<DashMap<String, RemoteInterruptContext>> =
+    LazyLock::new(DashMap::new);
+
+fn interrupt_url_for_request(url_str: &str) -> Option<String> {
+    let mut url = Url::parse(url_str).ok()?;
+    url.set_path("/v1/interrupt");
+    url.set_query(None);
+    url.set_fragment(None);
+    Some(url.to_string())
+}
+
+fn register_remote_interrupt_context(message_id: &str, vcp_url: &str, api_key: &str) {
+    let Some(interrupt_url) = interrupt_url_for_request(vcp_url) else {
+        log::warn!(
+            "[VCPClient] Failed to build remote interrupt URL for messageId: {}",
+            message_id
+        );
+        return;
+    };
+
+    REMOTE_INTERRUPT_CONTEXTS.insert(
+        message_id.to_string(),
+        RemoteInterruptContext {
+            interrupt_url,
+            api_key: api_key.to_string(),
+            request_id: message_id.to_string(),
+        },
+    );
+}
+
+async fn post_remote_interrupt(ctx: RemoteInterruptContext) {
+    let masked_url = mask_image_url_for_log(&ctx.interrupt_url);
+    let client = match Client::builder()
+        .timeout(Duration::from_millis(1500))
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            log::warn!(
+                "[VCPClient] Failed to create remote interrupt client for {}: {}",
+                ctx.request_id,
+                e
+            );
+            return;
+        }
+    };
+
+    match client
+        .post(&ctx.interrupt_url)
+        .header(AUTHORIZATION, format!("Bearer {}", ctx.api_key))
+        .header(CONTENT_TYPE, "application/json")
+        .json(&json!({
+            "requestId": ctx.request_id,
+            "messageId": ctx.request_id
+        }))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            log::info!(
+                "[VCPClient] Remote VCP interrupt accepted for {} via {}",
+                ctx.request_id,
+                masked_url
+            );
+        }
+        Ok(resp) => {
+            log::warn!(
+                "[VCPClient] Remote VCP interrupt returned {} for {} via {}",
+                resp.status(),
+                ctx.request_id,
+                masked_url
+            );
+        }
+        Err(e) => {
+            log::warn!(
+                "[VCPClient] Remote VCP interrupt failed for {} via {}: {}",
+                ctx.request_id,
+                masked_url,
+                e
+            );
+        }
+    }
+}
+
+fn spawn_remote_interrupt(message_id: &str) {
+    let Some(ctx) = REMOTE_INTERRUPT_CONTEXTS
+        .get(message_id)
+        .map(|entry| entry.clone())
+    else {
+        log::warn!(
+            "[VCPClient] No remote interrupt context found for messageId: {}",
+            message_id
+        );
+        return;
+    };
+
+    tauri::async_runtime::spawn(post_remote_interrupt(ctx));
+}
+
+pub fn schedule_interrupt_request_with_retry(
+    active_requests: Arc<DashMap<String, oneshot::Sender<()>>>,
+    message_id: String,
+    reason: &'static str,
+) {
+    tauri::async_runtime::spawn(async move {
+        for attempt in 0..20 {
+            if let Some((_, sender)) = active_requests.remove(&message_id) {
+                log::info!(
+                    "[VCPClient] Interrupting request {} after {} attempt(s), reason={}",
+                    message_id,
+                    attempt + 1,
+                    reason
+                );
+                spawn_remote_interrupt(&message_id);
+                let _ = sender.send(());
+                REMOTE_INTERRUPT_CONTEXTS.remove(&message_id);
+                return;
+            }
+
+            if attempt < 19 {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+
+        log::warn!(
+            "[VCPClient] Request {} was not found after retrying interrupt, reason={}",
+            message_id,
+            reason
+        );
+        REMOTE_INTERRUPT_CONTEXTS.remove(&message_id);
+    });
+}
+
 /// 全局活跃请求管理器，使用 DashMap 存储中止信号发送端
 /// messageId -> oneshot::Sender
 pub struct ActiveRequests(pub Arc<DashMap<String, oneshot::Sender<()>>>);
@@ -478,6 +646,7 @@ impl ActiveRequestGuard {
 impl Drop for ActiveRequestGuard {
     fn drop(&mut self) {
         self.requests.remove(&self.message_id);
+        REMOTE_INTERRUPT_CONTEXTS.remove(&self.message_id);
     }
 }
 
@@ -681,11 +850,15 @@ pub async fn perform_vcp_request<R: Runtime>(
                             let path_buf = std::path::PathBuf::from(&clean_path);
 
                             let mut converted = false;
+                            let mut fallback_text = format!("[附件文件: {}]", display_name);
                             if path_buf.exists() {
                                 // 优先使用附件注册时记录的 MIME，后备才看扩展名。
                                 // Android 相册/文件选择器有时给的是无后缀临时文件名，仅靠扩展名会误判。
-                                let declared_mime =
-                                    obj.get("mime").and_then(|m| m.as_str()).unwrap_or("");
+                                let declared_mime = obj
+                                    .get("mime")
+                                    .and_then(|m| m.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
                                 let ext = path_buf
                                     .extension()
                                     .and_then(|e| e.to_str())
@@ -721,7 +894,7 @@ pub async fn perform_vcp_request<R: Runtime>(
                                             client,
                                             config,
                                             &path_buf,
-                                            declared_mime,
+                                            &declared_mime,
                                             display_name,
                                             &format!(
                                                 "{}-m{}-{}",
@@ -788,64 +961,76 @@ pub async fn perform_vcp_request<R: Runtime>(
                                         }
                                     }
                                 } else if media_kind == "video" {
-                                    // 视频：抽帧 → 每张帧作为 base64 image_url；若图床可用则额外上传帧并提供文本 URL。
+                                    if let (Some(config), Some(client)) =
+                                        (image_host_config.as_ref(), image_host_client.as_ref())
+                                    {
+                                        match upload_video_path_to_host(
+                                            client,
+                                            config,
+                                            &path_buf,
+                                            &declared_mime,
+                                            display_name,
+                                            &format!(
+                                                "{}-m{}-{}-video",
+                                                request_message_id,
+                                                msg_index,
+                                                new_parts.len()
+                                            ),
+                                        )
+                                        .await
+                                        {
+                                            Ok(url) => {
+                                                log::info!(
+                                                    "[VCPClient] Video uploaded to ImageServer for multimodal payload: {}",
+                                                    mask_image_url_for_log(&url)
+                                                );
+                                                hosted_image_text_lines.push(format!(
+                                                    "[视频图床URL: {}] (文件名: {})",
+                                                    url, display_name
+                                                ));
+                                            }
+                                            Err(e) => {
+                                                log::warn!(
+                                                    "[VCPClient] ImageServer video upload failed for {:?}: {}. Keeping inline base64 video payload.",
+                                                    path_buf,
+                                                    e
+                                                );
+                                            }
+                                        }
+                                    }
+
+                                    // VCPToolBox 的多模态处理器支持 data:video/*;base64 作为 image_url。
+                                    // 这里发送完整视频，避免抽帧导致模型无法读取连续时序/音轨信息。
                                     let path_buf_clone = path_buf.clone();
-                                    let app_clone = app.clone();
+                                    let declared_mime_clone = declared_mime.clone();
                                     match tokio::task::spawn_blocking(move || {
-                                        crate::vcp_modules::media_processor::process_video_for_multimodal(&app_clone, &path_buf_clone)
+                                        crate::vcp_modules::media_processor::convert_local_video_for_multimodal(
+                                            &path_buf_clone,
+                                            &declared_mime_clone,
+                                        )
                                     })
                                     .await
                                     {
-                                        Ok(Ok(frames)) => {
-                                            for (frame_index, frame_url) in frames.into_iter().enumerate() {
-                                                if let (Some(config), Some(client)) =
-                                                    (image_host_config.as_ref(), image_host_client.as_ref())
-                                                {
-                                                    match upload_image_data_url_to_host(
-                                                        client,
-                                                        config,
-                                                        &frame_url,
-                                                        &format!("{}-frame-{}.jpg", display_name, frame_index + 1),
-                                                        &format!(
-                                                            "{}-m{}-{}-frame{}",
-                                                            request_message_id,
-                                                            msg_index,
-                                                            new_parts.len(),
-                                                            frame_index + 1
-                                                        ),
-                                                    )
-                                                    .await
-                                                    {
-                                                        Ok(url) => {
-                                                            hosted_image_text_lines.push(format!(
-                                                                "[视频抽帧图床URL: {}] (文件名: {}, 帧: {})",
-                                                                url,
-                                                                display_name,
-                                                                frame_index + 1
-                                                            ));
-                                                        }
-                                                        Err(e) => {
-                                                            log::warn!(
-                                                                "[VCPClient] ImageServer upload failed for video frame {} of {:?}: {}. Falling back to base64 frame.",
-                                                                frame_index + 1,
-                                                                path_buf,
-                                                                e
-                                                            );
-                                                        }
-                                                    }
-                                                }
-                                                new_parts.push(json!({
-                                                    "type": "image_url",
-                                                    "image_url": { "url": frame_url }
-                                                }));
-                                            }
+                                        Ok(Ok(video_url)) => {
+                                            new_parts.push(json!({
+                                                "type": "image_url",
+                                                "image_url": { "url": video_url }
+                                            }));
                                             converted = true;
                                         }
                                         Ok(Err(e)) => {
-                                            log::warn!("[VCPClient] Video frame extraction failed for {:?}: {}", path_buf, e);
+                                            log::warn!("[VCPClient] Video conversion failed for {:?}: {}", path_buf, e);
+                                            fallback_text = format!(
+                                                "[视频附件发送失败: {}] (原因: {})",
+                                                display_name, e
+                                            );
                                         }
                                         Err(e) => {
-                                            log::warn!("[VCPClient] Video processing task panicked: {}", e);
+                                            log::warn!("[VCPClient] Video conversion task panicked: {}", e);
+                                            fallback_text = format!(
+                                                "[视频附件发送失败: {}] (原因: {})",
+                                                display_name, e
+                                            );
                                         }
                                     }
                                 } else if media_kind == "audio" {
@@ -880,7 +1065,7 @@ pub async fn perform_vcp_request<R: Runtime>(
                             if !converted {
                                 new_parts.push(json!({
                                     "type": "text",
-                                    "text": format!("[附件文件: {}]", display_name)
+                                    "text": fallback_text
                                 }));
                             }
                         }
@@ -999,6 +1184,7 @@ pub async fn perform_vcp_request<R: Runtime>(
 
     // 创建并注册中止信号
     let (abort_tx, abort_rx) = oneshot::channel();
+    register_remote_interrupt_context(&payload.message_id, &payload.vcp_url, &payload.vcp_api_key);
     active_requests.insert(payload.message_id.clone(), abort_tx);
     let _guard = ActiveRequestGuard::new(active_requests.clone(), payload.message_id.clone());
 
@@ -1355,7 +1541,9 @@ pub fn interruptRequest(
             "[VCPClient] Found AbortController for messageId: {}, aborting...",
             message_id
         );
+        spawn_remote_interrupt(&message_id);
         let _ = sender.send(());
+        REMOTE_INTERRUPT_CONTEXTS.remove(&message_id);
         log::info!(
             "[VCPClient] Request interrupted for messageId: {}. Remaining active requests: {}",
             message_id,

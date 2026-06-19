@@ -140,7 +140,10 @@ watch(
       attachmentStore.stagedAttachments.unshift({
         id: stableId,
         type: file.mime || "application/octet-stream",
-        src: displaySrc,
+        src: file.internalPath || file.path,
+        internalPath: file.internalPath || file.path,
+        thumbnailPath: file.thumbnailPath,
+        resolvedSrc: displaySrc || undefined,
         name: file.name,
         size: file.size,
         hash: file.hash,
