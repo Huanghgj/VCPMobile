@@ -6,7 +6,8 @@ import {
   Plus,
   Bug,
   Trash2,
-  Boxes
+  Boxes,
+  NotebookPen
 } from 'lucide-vue-next';
 import SlidePage from '../../components/ui/SlidePage.vue';
 import { useNotificationStore } from '../../core/stores/notification';
@@ -62,6 +63,13 @@ const openDistributedView = () => {
   emit('close');
   requestAnimationFrame(() => {
     overlayStore.openDistributed();
+  });
+};
+
+const openDiaryView = () => {
+  emit('close');
+  requestAnimationFrame(() => {
+    overlayStore.openDiary();
   });
 };
 
@@ -335,13 +343,20 @@ const injectMockNotification = (type: 'rag' | 'thinking' | 'approval' | 'error')
       <NotificationStatusBar />
 
       <!-- Quick Actions -->
-      <div class="px-3 py-2 border-b border-pink-100/60 bg-white/40 shrink-0">
+      <div class="px-3 py-2 border-b border-pink-100/60 bg-white/40 shrink-0 grid grid-cols-2 gap-2">
         <button
           class="w-full py-2.5 px-3 rounded-lg bg-pink-500 text-white flex items-center justify-center gap-2 active:scale-[0.98] transition-transform shadow-sm shadow-pink-200"
           @click="openDistributedView"
         >
           <Boxes class="w-3.5 h-3.5" />
           <span class="font-bold text-xs leading-none">插件中心</span>
+        </button>
+        <button
+          class="w-full py-2.5 px-3 rounded-lg bg-violet-500 text-white flex items-center justify-center gap-2 active:scale-[0.98] transition-transform shadow-sm shadow-violet-200"
+          @click="openDiaryView"
+        >
+          <NotebookPen class="w-3.5 h-3.5" />
+          <span class="font-bold text-xs leading-none">日记本</span>
         </button>
       </div>
 
