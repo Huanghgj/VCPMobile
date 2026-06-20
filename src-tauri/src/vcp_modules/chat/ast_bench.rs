@@ -69,6 +69,7 @@ fn as_open_code_fence(content: &str) -> String {
 /// 这是决定 8KB 上限的关键数据：一帧（一次 process_queue）在 tail 达到某尺寸时的总开销。
 /// 由于 CodeBlock 走整节点 Replace，每帧都会把整块重新 parse/hash/serialize。
 #[test]
+#[ignore = "manual perf benchmark; requires local fixture scripts/tail-test/v1.1.0-aurora-genesis.html (run via cargo test --profile perf -- --ignored --nocapture)"]
 fn bench_tail_single_frame_pipeline() {
     let html = load_genesis_html();
     println!("\n====== 基准 1：单帧全链路开销（代码块路径，未闭合 ```html 围栏）======");
@@ -133,6 +134,7 @@ fn bench_tail_single_frame_pipeline() {
 
 /// 基准 2：syntect 高亮开销（决定 4096 流式高亮阈值是否合理）。
 #[test]
+#[ignore = "manual perf benchmark; requires local fixture scripts/tail-test/v1.1.0-aurora-genesis.html (run via cargo test --profile perf -- --ignored --nocapture)"]
 fn bench_tail_syntect_highlight() {
     let html = load_genesis_html();
     println!("\n====== 基准 2：syntect 高亮开销（highlight_code_block, lang=html）======");
@@ -160,6 +162,7 @@ fn bench_tail_syntect_highlight() {
 /// 单帧全链路（parse+diff+serialize）。汇报总耗时、帧数、单帧均值/峰值。
 /// 这是"30 帧缓冲累计开销"的直接量化。
 #[test]
+#[ignore = "manual perf benchmark; requires local fixture scripts/tail-test/v1.1.0-aurora-genesis.html (run via cargo test --profile perf -- --ignored --nocapture)"]
 fn bench_tail_cumulative_stream() {
     let html = load_genesis_html();
     // 典型 SSE delta 约 20~80 字节；取 48B 作为代表（偏保守，帧数偏多 = 开销偏高）。
@@ -230,6 +233,7 @@ fn bench_tail_cumulative_stream() {
 /// 基准 4：端到端 AuroraBuffer —— 用真实管道喂入增长的代码块，验证整链路（含
 /// take_tail_frame 的 reset/snapshot 逻辑）的真实开销，而非孤立函数。
 #[test]
+#[ignore = "manual perf benchmark; requires local fixture scripts/tail-test/v1.1.0-aurora-genesis.html (run via cargo test --profile perf -- --ignored --nocapture)"]
 fn bench_tail_end_to_end_aurora() {
     let html = load_genesis_html();
     const CHUNK_BYTES: usize = 48;

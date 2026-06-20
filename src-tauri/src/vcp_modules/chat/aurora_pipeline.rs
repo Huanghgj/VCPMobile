@@ -284,11 +284,6 @@ mod tests {
             other => panic!("expected markdown block, got {:?}", other),
         }
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     /// 构造一个超过 MAX_SPECULATIVE_TAIL_AST_BYTES 的、非 HTML 起始的纯文本代码块 tail，
     /// 验证 #1c 降级行为：tail_block 仍带纯文本 content（绝不留白），且不再逐帧自增 epoch。
