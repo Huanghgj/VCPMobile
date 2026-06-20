@@ -153,7 +153,7 @@ pub fn assemble_history_for_vcp(
                     if !text.is_empty() {
                         combined_text.push_str(&format!(
                             "\n\n[附加文件: {}]\n{}\n[/附加文件结束: {}]",
-                            att.internal_path, text, att.name
+                            att.name, text, att.name
                         ));
                     }
                 }
@@ -289,6 +289,13 @@ mod tests {
         }
     }
 
+    fn system_count(messages: &[Value]) -> usize {
+        messages
+            .iter()
+            .filter(|msg| msg["role"].as_str() == Some("system"))
+            .count()
+    }
+
     #[test]
     fn assistant_thoughts_are_removed_from_request_context() {
         let history = vec![message(
@@ -316,5 +323,74 @@ mod tests {
         let content = messages[0]["content"].as_str().unwrap();
 
         assert!(content.contains("<think>demo</think>"));
+    }
+
+    #[tokio::test]
+    async fn orchestrated_context_includes_system_prompt_every_time() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE tarven_rules (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                rule_type TEXT NOT NULL,
+                is_enabled INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                wrap INTEGER NOT NULL,
+                role TEXT,
+                depth INTEGER,
+                position TEXT,
+                sort_order INTEGER NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let history = vec![
+            message("user", "第一轮问题"),
+            message("assistant", "第一轮回答"),
+            message("user", "第二轮问题"),
+        ];
+
+        let first_messages = orchestrate_chat_context(
+            &pool,
+            &history,
+            "topic_test",
+            "AgentA",
+            "agent",
+            "固定系统提示词".to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+        let second_messages = orchestrate_chat_context(
+            &pool,
+            &history,
+            "topic_test",
+            "AgentA",
+            "agent",
+            "固定系统提示词".to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(system_count(&first_messages), 1);
+        assert_eq!(first_messages[0]["role"].as_str(), Some("system"));
+        assert_eq!(
+            first_messages[0]["content"].as_str(),
+            Some("固定系统提示词")
+        );
+        assert_eq!(system_count(&second_messages), 1);
+        assert_eq!(second_messages[0]["role"].as_str(), Some("system"));
+        assert_eq!(
+            second_messages[0]["content"].as_str(),
+            Some("固定系统提示词")
+        );
     }
 }

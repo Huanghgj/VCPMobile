@@ -82,14 +82,18 @@ fn edit_distance(s1: &str, s2: &str) -> usize {
 }
 
 fn get_similarity(s1: &str, s2: &str) -> f64 {
-    let l1 = s1.chars().count();
-    let l2 = s2.chars().count();
+    // 必须基于与 edit_distance 相同的小写化字符串来计算长度。
+    // 否则某些 Unicode 字符在小写化时会扩展字符数（如 'İ' -> "i̇"），
+    // 导致 edit_distance 超过 longer_length，引发 usize 下溢 panic。
+    let s1_lower = s1.to_lowercase();
+    let s2_lower = s2.to_lowercase();
+    let l1 = s1_lower.chars().count();
+    let l2 = s2_lower.chars().count();
     let longer_length = std::cmp::max(l1, l2);
     if longer_length == 0 {
         return 1.0;
     }
-    (longer_length - edit_distance(s1.to_lowercase().as_str(), s2.to_lowercase().as_str())) as f64
-        / longer_length as f64
+    (longer_length - edit_distance(&s1_lower, &s2_lower)) as f64 / longer_length as f64
 }
 
 /// 提取 URL 信息 (对齐 JS: extractEmoticonInfo)
@@ -384,4 +388,27 @@ pub async fn fix_emoticon_url<R: Runtime>(
     }
 
     Ok(original_src)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn similarity_identical_is_one() {
+        assert_eq!(get_similarity("abc", "abc"), 1.0);
+    }
+
+    #[test]
+    fn similarity_case_insensitive() {
+        assert_eq!(get_similarity("ABC", "abc"), 1.0);
+    }
+
+    #[test]
+    fn similarity_handles_case_expanding_unicode_without_panic() {
+        // 'İ' (U+0130) 在小写化时扩展为两个字符 "i̇"。
+        // 回归测试：确保不会因 longer_length 与 edit_distance 字符数口径不一致而下溢 panic。
+        let score = get_similarity("İ", "X");
+        assert!((0.0..=1.0).contains(&score), "score out of range: {score}");
+    }
 }

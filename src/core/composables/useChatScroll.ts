@@ -261,6 +261,42 @@ export function useChatScroll(options: UseChatScrollOptions) {
     });
   };
 
+  // --- 回前台自愈：复位可能被 WebView 丢帧卡死的 rAF 守卫 ---
+  // 应用切到后台时，已排程但未执行的 requestAnimationFrame 回调可能被 WebView 丢弃，
+  // 导致 scrollRafId / scrollThrottleId 永久停留在非 null，从而让 ResizeObserver 与
+  // scroll 回调彻底失效（表现为：回前台后流式不再自动跟随、上滑无法加载、话题刷新卡死）。
+  // 这里在真正回到前台时强制复位守卫并重新评估一次布局，确保管线自愈。
+  const recoverScrollPipelineOnResume = () => {
+    if (scrollRafId !== null) {
+      cancelAnimationFrame(scrollRafId);
+      scrollRafId = null;
+    }
+    if (scrollThrottleId !== null) {
+      cancelAnimationFrame(scrollThrottleId);
+      scrollThrottleId = null;
+    }
+    // 重新评估一次内容高度，恢复流式追加期间的自动跟随
+    requestAnimationFrame(() => handleContentChange());
+  };
+
+  const onVcpLifecycleResume = (e: Event) => {
+    if ((e as CustomEvent).detail?.state === "resume") {
+      recoverScrollPipelineOnResume();
+    }
+  };
+  const onVisibilityResume = () => {
+    if (typeof document !== "undefined" && !document.hidden) {
+      recoverScrollPipelineOnResume();
+    }
+  };
+
+  if (typeof window !== "undefined") {
+    window.addEventListener("vcp-lifecycle", onVcpLifecycleResume);
+  }
+  if (typeof document !== "undefined") {
+    document.addEventListener("visibilitychange", onVisibilityResume);
+  }
+
   // --- 监听 messageListRef 变化，自动设置/清理事件与 Observer ---
   const stopWatchListRef = watch(messageListRef, (el, oldEl) => {
     if (oldEl) {
@@ -313,6 +349,10 @@ export function useChatScroll(options: UseChatScrollOptions) {
       cancelAnimationFrame(scrollRafId);
       scrollRafId = null;
     }
+    if (scrollThrottleId) {
+      cancelAnimationFrame(scrollThrottleId);
+      scrollThrottleId = null;
+    }
     if (loadMoreDebounceId) {
       clearTimeout(loadMoreDebounceId);
       loadMoreDebounceId = null;
@@ -340,6 +380,12 @@ export function useChatScroll(options: UseChatScrollOptions) {
     if (loadMoreDebounceId) {
       clearTimeout(loadMoreDebounceId);
       loadMoreDebounceId = null;
+    }
+    if (typeof window !== "undefined") {
+      window.removeEventListener("vcp-lifecycle", onVcpLifecycleResume);
+    }
+    if (typeof document !== "undefined") {
+      document.removeEventListener("visibilitychange", onVisibilityResume);
     }
     if (messageListRef.value) {
       messageListRef.value.removeEventListener("scroll", onScroll);

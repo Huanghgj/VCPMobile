@@ -94,6 +94,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
 
     let pendingHistory: ChatMessage[] = [];
     let flushRafId: number | null = null;
+    let completeWatchdogId: ReturnType<typeof setTimeout> | null = null;
 
     try {
       const requestedTopicId = topicId;
@@ -237,7 +238,28 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
         return;
       }
 
-      await completePromise;
+      // 安全兜底：completePromise 依赖通道投递的 is_last 事件来 resolve。
+      // 在「后台冻结 → 回前台」等场景下，WebView 可能丢弃该通道事件，导致此处永久挂起，
+      // 进而把 loading / isLoadingHistory 卡死、目标话题停留在空白（表现为“话题无法切换”）。
+      // 这里加一道看门狗：超时后强刷已收到的消息并放行，保证加载状态一定能复位。
+      const completeWatchdog = new Promise<void>((resolve) => {
+        completeWatchdogId = setTimeout(() => {
+          completeWatchdogId = null;
+          if (!isLoadCompleted) {
+            console.warn(
+              `[ChatHistoryStore] Completion watchdog fired for topic ${requestedTopicId}; forcing flush & release.`,
+            );
+            flushHistory(true);
+            completeLoad();
+          }
+          resolve();
+        }, 15000);
+      });
+      await Promise.race([completePromise, completeWatchdog]);
+      if (completeWatchdogId !== null) {
+        clearTimeout(completeWatchdogId);
+        completeWatchdogId = null;
+      }
 
       const loadedCount = offset === 0 ? total : buffer.length;
       console.log(
@@ -261,6 +283,10 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     } finally {
       if (currentLoadAbortController === controller) {
         currentLoadAbortController = null;
+      }
+      if (completeWatchdogId !== null) {
+        clearTimeout(completeWatchdogId);
+        completeWatchdogId = null;
       }
       if (flushRafId !== null) {
         cancelAnimationFrame(flushRafId);

@@ -44,36 +44,45 @@ export function useAudioRecorder() {
       }
 
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      audioChunks = [];
-      recordingDuration.value = 0;
-      audioBlob.value = null;
 
-      const mimeType = getSupportedMimeType();
-      const options = mimeType ? { mimeType } : undefined;
+      try {
+        audioChunks = [];
+        recordingDuration.value = 0;
+        audioBlob.value = null;
 
-      mediaRecorder = new MediaRecorder(stream, options);
+        const mimeType = getSupportedMimeType();
+        const options = mimeType ? { mimeType } : undefined;
 
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data && event.data.size > 0) {
-          audioChunks.push(event.data);
-        }
-      };
+        mediaRecorder = new MediaRecorder(stream, options);
 
-      mediaRecorder.onstop = () => {
-        const mimeTypeUsed = mediaRecorder?.mimeType || 'audio/webm';
-        audioBlob.value = new Blob(audioChunks, { type: mimeTypeUsed });
-        
-        // 释放音轨流以关闭物理麦克风占用指示灯
+        mediaRecorder.ondataavailable = (event) => {
+          if (event.data && event.data.size > 0) {
+            audioChunks.push(event.data);
+          }
+        };
+
+        mediaRecorder.onstop = () => {
+          const mimeTypeUsed = mediaRecorder?.mimeType || 'audio/webm';
+          audioBlob.value = new Blob(audioChunks, { type: mimeTypeUsed });
+
+          // 释放音轨流以关闭物理麦克风占用指示灯
+          stream.getTracks().forEach((track) => track.stop());
+        };
+
+        mediaRecorder.start(250); // 每 250ms 切割一次，防止内存泄露且保障数据连续性
+        startTime = Date.now();
+        isRecording.value = true;
+
+        timerInterval = window.setInterval(() => {
+          recordingDuration.value = Math.round((Date.now() - startTime) / 1000);
+        }, 1000);
+      } catch (setupErr) {
+        // 构造/启动 MediaRecorder 失败时，必须显式释放已获取的音轨，
+        // 否则物理麦克风会保持占用（红色指示灯常亮）。
         stream.getTracks().forEach((track) => track.stop());
-      };
-
-      mediaRecorder.start(250); // 每 250ms 切割一次，防止内存泄露且保障数据连续性
-      startTime = Date.now();
-      isRecording.value = true;
-
-      timerInterval = window.setInterval(() => {
-        recordingDuration.value = Math.round((Date.now() - startTime) / 1000);
-      }, 1000);
+        mediaRecorder = null;
+        throw setupErr;
+      }
 
     } catch (err) {
       console.error('[AudioRecorder] Failed to start recording:', err);

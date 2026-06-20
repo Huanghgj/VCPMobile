@@ -214,6 +214,8 @@ pub async fn internal_process_group_chat_message(
         // 构造请求载荷
         let mut model_config = json!({
             "model": model_to_use,
+            "max_tokens": speaker.max_output_tokens,
+            "contextTokenLimit": speaker.context_token_limit,
             "stream": true
         });
         if speaker.use_temperature {

@@ -505,8 +505,47 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     }
   };
 
+  // 回前台时同步强刷所有挂起的流式合并帧。
+  // Android 上真正的前后台信号是 Kotlin 派发的 `vcp-lifecycle` 事件（document.hidden 不一定可靠），
+  // 若仅依赖 rAF 重排，回前台后可能因丢帧导致最后一段流式内容迟迟不上屏（“流式渲染刷新异常”）。
+  // 这里在前台恢复时直接把暂存数据写入响应式消息，保证立即上屏。
+  const flushAllPendingCommitsForResume = () => {
+    rAFPendingUpdates.forEach((up, messageId) => {
+      cancelScheduledCommit(up);
+      const m = activeStreamMessages.get(messageId);
+      if (m) {
+        if (up.content !== null) m.content = up.content;
+        if (up.blocks !== null) m.blocks = up.blocks;
+        if (up.tailContent !== null) m.tailContent = up.tailContent;
+        if (up.tailBlock !== undefined) m.tailBlock = up.tailBlock;
+        if (up.tailSnapshot !== null) m.tailSnapshot = up.tailSnapshot as any;
+        if (up.tailFrame !== null) m.tailFrame = up.tailFrame;
+      }
+      up.content = null;
+      up.blocks = null;
+      up.tailContent = null;
+      up.tailBlock = undefined;
+      up.tailFrame = null;
+      up.tailSnapshot = null;
+      up.lastRenderTime = performance.now();
+    });
+  };
+
+  const handleVcpLifecycle = (e: Event) => {
+    const state = (e as CustomEvent).detail?.state;
+    if (state === "resume") {
+      flushAllPendingCommitsForResume();
+      resumeRAFCommitsForForeground();
+    } else if (state === "stop" || state === "pause") {
+      pauseRAFCommitsForBackground();
+    }
+  };
+
   if (typeof document !== "undefined") {
     document.addEventListener("visibilitychange", handleVisibilityChange);
+  }
+  if (typeof window !== "undefined") {
+    window.addEventListener("vcp-lifecycle", handleVcpLifecycle);
   }
 
   /**
@@ -877,6 +916,9 @@ export const useChatStreamStore = defineStore("chatStream", () => {
   onScopeDispose(() => {
     if (typeof document !== "undefined") {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
+    }
+    if (typeof window !== "undefined") {
+      window.removeEventListener("vcp-lifecycle", handleVcpLifecycle);
     }
     cleanupTimers.forEach(clearTimeout);
     cleanupTimers.clear();
