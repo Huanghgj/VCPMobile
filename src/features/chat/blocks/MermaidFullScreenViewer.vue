@@ -335,15 +335,9 @@ const exportToGallery = () => {
       leave-from-class="translate-y-0 opacity-100"
       leave-to-class="translate-y-10 opacity-0"
     >
-      <div
-        v-if="visible"
-        class="fixed inset-0 z-viewer flex flex-col select-none overflow-hidden pb-[env(safe-area-inset-bottom)]"
-        :class="
-          themeStore.isDarkResolved
-            ? 'bg-[#0d1117] text-gray-200'
-            : 'bg-[#f8fafc] text-gray-800'
-        "
-      >
+      <div v-if="visible" class="fixed inset-0 z-viewer flex flex-col select-none overflow-hidden pb-[calc(var(--vcp-safe-bottom,48px))]"
+        :class="themeStore.isDarkResolved ? 'bg-[#0d1117] text-gray-200' : 'bg-[#f8fafc] text-gray-800'">
+        
         <!-- Header -->
         <div
           class="h-14 flex items-center justify-between px-4 border-b pt-[env(safe-area-inset-top)] box-content"
@@ -463,19 +457,13 @@ const exportToGallery = () => {
         </div>
 
         <!-- Floating Control Bar (No Backdrop Blur, Solid background) -->
-        <div
-          class="absolute bottom-6 left-1/2 -translate-x-1/2 flex items-center gap-1 px-3 py-2 rounded-xl border shadow-xl z-20"
-          :class="
-            themeStore.isDarkResolved
-              ? 'border-white/10 bg-[#1e293b] text-gray-200'
-              : 'border-black/10 bg-white text-gray-800'
-          "
-        >
-          <button
-            @click="zoomOut"
-            class="p-2 active:scale-90 transition-all hover:opacity-80"
-            title="缩小"
-          >
+        <div class="absolute left-1/2 -translate-x-1/2 flex items-center gap-1 px-3 py-2 rounded-xl border shadow-xl z-20"
+          :style="{ bottom: `calc(var(--vcp-safe-bottom, 48px) + 24px)` }"
+          :class="themeStore.isDarkResolved 
+            ? 'border-white/10 bg-[#1e293b] text-gray-200' 
+            : 'border-black/10 bg-white text-gray-800'">
+          
+          <button @click="zoomOut" class="p-2 active:scale-90 transition-all hover:opacity-80" title="缩小">
             <div class="i-ph:minus-bold w-4.5 h-4.5"></div>
           </button>
 

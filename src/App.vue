@@ -25,6 +25,21 @@ import {
   suspendPhysicalScreenKeep,
 } from "./core/composables/useScreenKeeper";
 
+// Native safe-area bridge: CSS env(safe-area-inset-bottom) often reports 0
+// on Android WebView even when viewport-fit=cover is set. This takes the real
+// value from WindowInsetsCompat (always accurate) and overrides --vcp-safe-bottom
+// directly, replacing the static 48px floor defined in themes.css.
+const handleSafeAreaInset = (e: Event) => {
+  const detail = (e as CustomEvent<{ safeAreaBottom?: number }>).detail;
+  if (detail && typeof detail.safeAreaBottom === 'number' && detail.safeAreaBottom > 0) {
+    const dpr = window.devicePixelRatio || 1;
+    document.documentElement.style.setProperty(
+      '--vcp-safe-bottom',
+      `${Math.round(detail.safeAreaBottom / dpr)}px`,
+    );
+  }
+};
+
 // Layout Components
 import PermissionGate from "./components/layout/PermissionGate.vue";
 import BootScreen from "./components/layout/BootScreen.vue";
@@ -434,6 +449,7 @@ onMounted(async () => {
   window.addEventListener("vcp-lifecycle", handleVcpLifecycle);
   window.addEventListener("vcp-floating-ball-click", handleFloatingBallClick);
   window.addEventListener("vcp-share-intent", handleShareIntent);
+  window.addEventListener("vcp-keyboard-inset", handleSafeAreaInset);
 
   // 初始化全局表情包修复器
   initGlobalFixer();
@@ -488,6 +504,7 @@ onUnmounted(() => {
     handleFloatingBallClick
   );
   window.removeEventListener("vcp-share-intent", handleShareIntent);
+  window.removeEventListener("vcp-keyboard-inset", handleSafeAreaInset);
 });
 </script>
 
@@ -653,7 +670,11 @@ body,
 }
 
 .mb-safe {
-  margin-bottom: var(--vcp-safe-bottom, 20px);
+  margin-bottom: var(--vcp-safe-bottom, 48px);
+}
+
+.pb-safe {
+  padding-bottom: var(--vcp-safe-bottom, 48px);
 }
 
 /* 全局动画暂停：切到后台时由 JS 添加此 class 到 <html> */

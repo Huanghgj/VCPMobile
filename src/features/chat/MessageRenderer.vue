@@ -80,11 +80,18 @@ function astDebugLog(...args: unknown[]): void {
 const tailSandboxRef = ref<HTMLElement | null>(null);
 const enableAstDiff = ref(true); // Feature Flag, 默认开启
 const useAstForCurrentTail = computed(() => {
+  if (!enableAstDiff.value) return false;
+  // 超长 tail 降级保护：当后端因 tail 超过推测渲染上限（64KB）而停止产出 AST 节点时，
+  // tailBlock 会是一个 plain 类型但 nodes 为空的纯文本块。此时必须走原始 tailContent 路径，
+  // 否则 AST 沙箱会因无快照/无指令而留白。判定依据：有 plain tailBlock 却无 nodes。
+  const tb = props.message.tailBlock;
+  if (tb && isPlainBlock(tb.type) && (!tb.nodes || tb.nodes.length === 0)) {
+    return false;
+  }
   return (
-    enableAstDiff.value &&
-    (!!props.message.tailFrame ||
-      !!props.message.tailBlock?.nodes ||
-      !!props.message.tailSnapshot)
+    !!props.message.tailFrame ||
+    !!props.message.tailBlock?.nodes ||
+    !!props.message.tailSnapshot
   );
 });
 let lastAppliedFrameSeq = 0;
@@ -94,7 +101,10 @@ let astFailureCount = 0;
 let lastSandbox: HTMLElement | null = null;
 
 function getTailSnapshotNodes() {
-  return props.message.tailSnapshot || props.message.tailBlock?.nodes || [];
+  // 恢复/重建优先用 tailBlock.nodes（当前帧的完整 tail AST，与后端 prev_tail_ast 的 diff 基线
+  // 完全一致），而非 tailSnapshot（仅在 epoch reset 时刷新，增量增长期间已过期）。
+  // 用过期快照重建会导致 registry 与后端基线错位，后续增量 mutation 接连失败甚至成环。
+  return props.message.tailBlock?.nodes || props.message.tailSnapshot || [];
 }
 
 function rebuildTailSnapshot(sandbox: HTMLElement): void {
@@ -154,13 +164,8 @@ const shouldRenderRawContentFallback = computed(() => {
   return !props.message.tailBlock && !props.message.tailContent;
 });
 
-// === <!--brk--> 消息分条拆分算法 ===
-
 function isBrkNode(node: any): boolean {
-  if (
-    (node.type === "raw_html" || node.type === "raw_html_inline") &&
-    node.content
-  ) {
+  if (node.type === "raw_html" && node.content) {
     const trimmed = node.content.trim().replace(/\s+/g, "");
     return trimmed === "<!--brk-->";
   }
@@ -186,19 +191,32 @@ function isBrkBlock(block: ContentBlock): boolean {
 function splitMarkdownNodes(nodes: any[]): any[][] {
   const result: any[][] = [];
   let currentGroup: any[] = [];
-
+  let hasBrk = false;
+  let htmlDepth = 0;
+  
   for (const node of nodes) {
-    if (isBrkNode(node)) {
-      if (currentGroup.length > 0) {
-        result.push(currentGroup);
-        currentGroup = [];
+    if (node.type === "raw_html" && node.content) {
+      const content = node.content.trim().toLowerCase();
+      if (content.startsWith("<div") && !content.endsWith("/>") && !content.includes("</div>")) {
+        htmlDepth++;
       }
+      if (content.startsWith("</div")) {
+        htmlDepth = Math.max(0, htmlDepth - 1);
+      }
+    }
+
+    if (isBrkNode(node) && htmlDepth === 0) {
+      result.push(currentGroup);
+      currentGroup = [];
+      hasBrk = true;
     } else {
       currentGroup.push(node);
     }
   }
-
-  if (currentGroup.length > 0) {
+  
+  if (hasBrk && currentGroup.length === 0) {
+    result.push([]);
+  } else if (currentGroup.length > 0) {
     result.push(currentGroup);
   }
   return result;
@@ -884,8 +902,13 @@ watch(
       localTailRevision = -1;
       lastSandbox = sandbox;
       if (getTailSnapshotNodes().length > 0) {
-        rebuildTailSnapshot(sandbox);
+        rebuildTailSnapshot(sandbox); // 内部已将 localTailEpoch/Revision 同步到当前 frame
         astFailureCount = 0;
+        // 认领当前帧，避免下方 reset 分支对同一帧重复重建（新 sandbox 时 localTailEpoch 刚被重置，
+        // epochChanged 必为真，会触发第二次全量重建）。重建已用当前完整 tail AST，无需再来一次。
+        if (frame) {
+          lastAppliedFrameSeq = frame.frameSeq;
+        }
       }
     }
 

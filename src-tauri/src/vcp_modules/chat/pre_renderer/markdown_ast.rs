@@ -62,13 +62,6 @@ pub enum MarkdownNode {
         #[serde(skip_serializing_if = "Option::is_none")]
         hash: Option<u64>,
     },
-
-    #[serde(rename = "mermaid")]
-    MermaidPlaceholder {
-        code: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        hash: Option<u64>,
-    },
 }
 
 /// 行内元素
@@ -115,11 +108,8 @@ pub enum InlineNode {
         hash: Option<u64>,
     },
 
-    #[serde(rename = "line_break")]
-    LineBreak,
-
-    #[serde(rename = "soft_break")]
-    SoftBreak,
+    #[serde(rename = "break")]
+    Break,
 
     #[serde(rename = "inline_math")]
     InlineMath {
@@ -130,9 +120,13 @@ pub enum InlineNode {
     },
 
     // VCP 魔法标记
-    #[serde(rename = "quoted_text")]
-    QuotedText {
-        children: Vec<InlineNode>,
+    #[serde(rename = "vcp_custom")]
+    VcpCustom {
+        kind: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        value: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        children: Option<Vec<InlineNode>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         hash: Option<u64>,
     },
@@ -143,12 +137,6 @@ pub enum InlineNode {
         #[serde(skip_serializing_if = "Option::is_none")]
         hash: Option<u64>,
     },
-
-    #[serde(rename = "highlight_tag")]
-    HighlightTag { value: String }, // #标签
-
-    #[serde(rename = "alert_tag")]
-    AlertTag { value: String }, // !告警
 
     #[serde(rename = "raw_html_inline")]
     RawHtmlInline {
@@ -169,7 +157,6 @@ impl MarkdownNode {
             MarkdownNode::Table { hash, .. } => *hash,
             MarkdownNode::ThematicBreak => None,
             MarkdownNode::RawHtml { hash, .. } => *hash,
-            MarkdownNode::MermaidPlaceholder { hash, .. } => *hash,
         }
     }
 
@@ -233,10 +220,6 @@ impl MarkdownNode {
         }
     }
 
-    pub fn mermaid(code: String) -> Self {
-        Self::MermaidPlaceholder { code, hash: None }
-    }
-
     pub fn compute_hash(&self) -> u64 {
         let mut hasher = rustc_hash::FxHasher::default();
         std::hash::Hash::hash(self, &mut hasher);
@@ -253,7 +236,6 @@ impl MarkdownNode {
             MarkdownNode::Table { hash, .. } => *hash = Some(h),
             MarkdownNode::ThematicBreak => {}
             MarkdownNode::RawHtml { hash, .. } => *hash = Some(h),
-            MarkdownNode::MermaidPlaceholder { hash, .. } => *hash = Some(h),
         }
     }
 
@@ -311,13 +293,10 @@ impl InlineNode {
             InlineNode::Code { .. } => None,
             InlineNode::Link { hash, .. } => *hash,
             InlineNode::Image { hash, .. } => *hash,
-            InlineNode::LineBreak => None,
-            InlineNode::SoftBreak => None,
+            InlineNode::Break => None,
             InlineNode::InlineMath { hash, .. } => *hash,
-            InlineNode::QuotedText { hash, .. } => *hash,
+            InlineNode::VcpCustom { hash, .. } => *hash,
             InlineNode::Strikethrough { hash, .. } => *hash,
-            InlineNode::HighlightTag { .. } => None,
-            InlineNode::AlertTag { .. } => None,
             InlineNode::RawHtmlInline { hash, .. } => *hash,
         }
     }
@@ -364,14 +343,6 @@ impl InlineNode {
         }
     }
 
-    pub fn line_break() -> Self {
-        Self::LineBreak
-    }
-
-    pub fn soft_break() -> Self {
-        Self::SoftBreak
-    }
-
     pub fn inline_math(content: String, display_mode: bool) -> Self {
         Self::InlineMath {
             content,
@@ -380,8 +351,14 @@ impl InlineNode {
         }
     }
 
-    pub fn quoted_text(children: Vec<InlineNode>) -> Self {
-        Self::QuotedText {
+    pub fn vcp_custom(
+        kind: String,
+        value: Option<String>,
+        children: Option<Vec<InlineNode>>,
+    ) -> Self {
+        Self::VcpCustom {
+            kind,
+            value,
             children,
             hash: None,
         }
@@ -394,12 +371,8 @@ impl InlineNode {
         }
     }
 
-    pub fn highlight_tag(value: String) -> Self {
-        Self::HighlightTag { value }
-    }
-
-    pub fn alert_tag(value: String) -> Self {
-        Self::AlertTag { value }
+    pub fn r#break() -> Self {
+        Self::Break
     }
 
     pub fn raw_html_inline(content: String) -> Self {
@@ -423,13 +396,10 @@ impl InlineNode {
             InlineNode::Code { .. } => {}
             InlineNode::Link { hash, .. } => *hash = Some(h),
             InlineNode::Image { hash, .. } => *hash = Some(h),
-            InlineNode::LineBreak => {}
-            InlineNode::SoftBreak => {}
+            InlineNode::Break => {}
             InlineNode::InlineMath { hash, .. } => *hash = Some(h),
-            InlineNode::QuotedText { hash, .. } => *hash = Some(h),
+            InlineNode::VcpCustom { hash, .. } => *hash = Some(h),
             InlineNode::Strikethrough { hash, .. } => *hash = Some(h),
-            InlineNode::HighlightTag { .. } => {}
-            InlineNode::AlertTag { .. } => {}
             InlineNode::RawHtmlInline { hash, .. } => *hash = Some(h),
         }
     }
@@ -439,9 +409,15 @@ impl InlineNode {
             InlineNode::Strong { children, .. }
             | InlineNode::Emphasis { children, .. }
             | InlineNode::Link { children, .. }
-            | InlineNode::QuotedText { children, .. }
             | InlineNode::Strikethrough { children, .. } => {
                 for c in children {
+                    c.compute_hashes_recursively();
+                }
+            }
+            InlineNode::VcpCustom {
+                children: Some(ch), ..
+            } => {
+                for c in ch {
                     c.compute_hashes_recursively();
                 }
             }
@@ -552,10 +528,6 @@ impl std::hash::Hash for MarkdownNode {
                 state.write_u8(7);
                 content.hash(state);
             }
-            MarkdownNode::MermaidPlaceholder { code, hash: _ } => {
-                state.write_u8(8);
-                code.hash(state);
-            }
         }
     }
 }
@@ -623,11 +595,8 @@ impl std::hash::Hash for InlineNode {
                 title.hash(state);
                 needs_asset_conversion.hash(state);
             }
-            InlineNode::LineBreak => {
+            InlineNode::Break => {
                 state.write_u8(6);
-            }
-            InlineNode::SoftBreak => {
-                state.write_u8(7);
             }
             InlineNode::InlineMath {
                 content,
@@ -638,12 +607,19 @@ impl std::hash::Hash for InlineNode {
                 content.hash(state);
                 display_mode.hash(state);
             }
-            InlineNode::QuotedText { children, hash } => {
-                state.write_u8(9);
+            InlineNode::VcpCustom {
+                kind,
+                value,
+                children,
+                hash,
+            } => {
+                state.write_u8(14);
+                kind.hash(state);
+                value.hash(state);
                 if let Some(h) = hash {
                     state.write_u64(*h);
-                } else {
-                    for c in children {
+                } else if let Some(ch) = children {
+                    for c in ch {
                         c.hash(state);
                     }
                 }
@@ -658,14 +634,7 @@ impl std::hash::Hash for InlineNode {
                     }
                 }
             }
-            InlineNode::HighlightTag { value } => {
-                state.write_u8(11);
-                value.hash(state);
-            }
-            InlineNode::AlertTag { value } => {
-                state.write_u8(12);
-                value.hash(state);
-            }
+
             InlineNode::RawHtmlInline { content, hash: _ } => {
                 state.write_u8(13);
                 content.hash(state);
