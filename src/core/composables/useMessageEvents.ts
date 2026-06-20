@@ -28,6 +28,13 @@ export function useMessageEvents(containerRef: Ref<HTMLElement | null>) {
       return;
     }
 
+    // 用户发送的附件（图片/视频/文件）有自身的点击处理（AttachmentPreview → AttachmentViewer）。
+    // 全局消息内容点击器必须完全避让，否则会与之叠加：例如点击自己发的图片会同时打开
+    // AttachmentViewer 与 RenderedImageViewer 两个查看器。
+    if (target.closest('.vcp-attachment-preview')) {
+      return;
+    }
+
     // 1. VCP 按钮点击 (e.g., [[点击按钮:xxx]])
     const vcpButton = target.closest('[data-vcp-button]');
     if (vcpButton) {
