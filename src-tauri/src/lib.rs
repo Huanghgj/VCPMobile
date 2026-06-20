@@ -21,6 +21,10 @@ use vcp_modules::context_injection::{
 };
 use vcp_modules::context_sanitizer::ContextSanitizer;
 use vcp_modules::db_manager::{init_db, DbState};
+use vcp_modules::diary_manager::{
+    diary_associative_discovery, diary_delete_folder, diary_delete_notes, diary_list_folders,
+    diary_list_notes, diary_move_notes, diary_read_note, diary_save_note, diary_search,
+};
 use vcp_modules::emoticon_manager::{
     fix_emoticon_url, get_emoticon_library, regenerate_emoticon_library,
 };
@@ -301,6 +305,15 @@ pub fn run() {
             get_emoticon_library,
             regenerate_emoticon_library,
             fix_emoticon_url,
+            diary_list_folders,
+            diary_list_notes,
+            diary_read_note,
+            diary_save_note,
+            diary_move_notes,
+            diary_delete_notes,
+            diary_delete_folder,
+            diary_search,
+            diary_associative_discovery,
             get_core_status,
             get_last_error,
             get_sync_status,

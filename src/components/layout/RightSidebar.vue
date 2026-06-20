@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue';
-import { X, Trash2, Bug, Sparkles } from 'lucide-vue-next';
+import { X, Trash2, Bug, Sparkles, NotebookPen } from 'lucide-vue-next';
 import { useNotificationStore } from '../../core/stores/notification';
 import { useNotificationProcessor } from '../../core/composables/useNotificationProcessor';
 import { useSidebarSwipe } from '../../core/composables/useSidebarSwipe';
@@ -199,9 +199,14 @@ watch(
           <Sparkles :size="14" class="text-blue-400" />
           <span class="font-bold text-[11px] leading-none">灵视中心</span>
         </button>
-        <div class="col-span-1 border border-dashed border-black/10 dark:border-white/10 rounded-full flex items-center justify-center text-[10px] opacity-25 text-primary-text py-3">
-          <span>待开发</span>
-        </div>
+        <button
+          class="col-span-1 py-3 px-4 rounded-full transition-all text-white flex items-center justify-center gap-2 hover:opacity-90 active:scale-95 shadow-md border border-black/5 dark:border-white/5"
+          style="background-color: #7c5cbf"
+          @click="overlayStore.openDiary()"
+        >
+          <NotebookPen :size="14" class="text-white" />
+          <span class="font-bold text-[11px] leading-none">日记本</span>
+        </button>
         <div class="col-span-1 border border-dashed border-black/10 dark:border-white/10 rounded-full flex items-center justify-center text-[10px] opacity-25 text-primary-text py-3">
           <span>待开发</span>
         </div>
