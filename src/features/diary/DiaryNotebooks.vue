@@ -69,7 +69,7 @@ watch(
   (f) => {
     selectMode.value = false;
     selected.value = new Set();
-    if (f) diary.loadNotes(f).catch(() => {});
+    if (f) diary.loadNotes(f, true).catch(() => {});
   },
   { immediate: true },
 );

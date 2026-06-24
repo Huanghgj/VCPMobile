@@ -32,6 +32,9 @@ const loadingFolders = ref(false);
 const loadingTimeline = ref(false);
 const loadingNotes = ref<Record<string, boolean>>({});
 const lastError = ref<string | null>(null);
+let foldersRequestSeq = 0;
+let timelineRequestSeq = 0;
+const notesRequestSeq: Record<string, number> = {};
 
 function note(err: unknown): string {
   return typeof err === "string" ? err : (err as any)?.message || String(err);
@@ -40,39 +43,52 @@ function note(err: unknown): string {
 export function useDiary() {
   const loadFolders = async (force = false): Promise<string[]> => {
     if (foldersLoaded.value && !force) return folders.value;
+    const seq = ++foldersRequestSeq;
     loadingFolders.value = true;
     lastError.value = null;
     try {
-      folders.value = await invoke<string[]>("diary_list_folders");
-      foldersLoaded.value = true;
+      const nextFolders = await invoke<string[]>("diary_list_folders");
+      if (seq === foldersRequestSeq) {
+        folders.value = nextFolders;
+        foldersLoaded.value = true;
+      }
     } catch (e) {
       lastError.value = note(e);
       throw e;
     } finally {
-      loadingFolders.value = false;
+      if (seq === foldersRequestSeq) {
+        loadingFolders.value = false;
+      }
     }
     return folders.value;
   };
 
   const loadNotes = async (folder: string, force = false): Promise<DiaryNote[]> => {
     if (notesByFolder.value[folder] && !force) return notesByFolder.value[folder];
+    const seq = (notesRequestSeq[folder] || 0) + 1;
+    notesRequestSeq[folder] = seq;
     loadingNotes.value = { ...loadingNotes.value, [folder]: true };
     lastError.value = null;
     try {
       const list = await invoke<DiaryNote[]>("diary_list_notes", { folder });
-      notesByFolder.value = { ...notesByFolder.value, [folder]: list };
+      if (seq === notesRequestSeq[folder]) {
+        notesByFolder.value = { ...notesByFolder.value, [folder]: list };
+      }
       return list;
     } catch (e) {
       lastError.value = note(e);
       throw e;
     } finally {
-      loadingNotes.value = { ...loadingNotes.value, [folder]: false };
+      if (seq === notesRequestSeq[folder]) {
+        loadingNotes.value = { ...loadingNotes.value, [folder]: false };
+      }
     }
   };
 
   // 时间线：拉全部本子 → 并发拉各本子条目 → 合并按 lastModified 倒序
   const loadTimeline = async (force = false): Promise<DiaryEntry[]> => {
     if (timeline.value.length > 0 && !force) return timeline.value;
+    const seq = ++timelineRequestSeq;
     loadingTimeline.value = true;
     lastError.value = null;
     try {
@@ -93,13 +109,17 @@ export function useDiary() {
         const tb = Date.parse(b.lastModified) || 0;
         return tb - ta;
       });
-      timeline.value = merged;
+      if (seq === timelineRequestSeq) {
+        timeline.value = merged;
+      }
       return merged;
     } catch (e) {
       lastError.value = note(e);
       throw e;
     } finally {
-      loadingTimeline.value = false;
+      if (seq === timelineRequestSeq) {
+        loadingTimeline.value = false;
+      }
     }
   };
 
@@ -107,7 +127,9 @@ export function useDiary() {
     invoke<string>("diary_read_note", { folder, file });
 
   const saveNote = async (folder: string, file: string, content: string): Promise<void> => {
+    const wasKnownFolder = folders.value.includes(folder);
     await invoke("diary_save_note", { folder, file, content });
+    if (!wasKnownFolder) foldersLoaded.value = false;
     invalidate(folder);
   };
 
@@ -130,6 +152,7 @@ export function useDiary() {
   const deleteNotes = async (notes: DiaryNoteRef[]): Promise<DiaryMutationResult> => {
     const res = await invoke<any>("diary_delete_notes", { notes });
     notes.forEach((n) => invalidate(n.folder));
+    foldersLoaded.value = false;
     return { ok: res?.deleted ?? [], errors: res?.errors ?? [] };
   };
 
@@ -177,12 +200,19 @@ export function useDiary() {
 
   // 失效某本子缓存 + 时间线（下次重新聚合）
   function invalidate(folder: string) {
+    notesRequestSeq[folder] = (notesRequestSeq[folder] || 0) + 1;
+    timelineRequestSeq++;
     delete notesByFolder.value[folder];
     notesByFolder.value = { ...notesByFolder.value };
     timeline.value = [];
   }
 
   const invalidateAll = () => {
+    foldersRequestSeq++;
+    timelineRequestSeq++;
+    Object.keys(notesRequestSeq).forEach((folder) => {
+      notesRequestSeq[folder] = (notesRequestSeq[folder] || 0) + 1;
+    });
     foldersLoaded.value = false;
     notesByFolder.value = {};
     timeline.value = [];

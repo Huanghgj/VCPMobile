@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch } from "vue";
+import { ref, computed, watch, onMounted, onUnmounted } from "vue";
 import SlidePage from "../../components/ui/SlidePage.vue";
 import { useModalHistory } from "../../core/composables/useModalHistory";
 import { X, ChevronLeft, Search, Plus, Clock, BookText } from "lucide-vue-next";
@@ -23,6 +23,7 @@ const query = ref("");
 const currentFolder = ref<string | null>(null);
 const openEntry = ref<{ folder: string; file: string } | null>(null);
 const editorMode = ref<"view" | "new">("view");
+const refreshKey = ref(0);
 
 // ── 内部导航（与 modalStack 集成，硬件返回逐级关闭）──
 const enterFolder = (folder: string) => {
@@ -74,22 +75,44 @@ const headerTitle = computed(() => {
   return "日记本";
 });
 
-// 打开页面时预热数据
+const refreshDiary = async () => {
+  await diary.loadTimeline(true).catch(() => {});
+  if (currentFolder.value) {
+    await diary.loadNotes(currentFolder.value, true).catch(() => {});
+  }
+};
+
+const onRemoteDiaryChanged = () => {
+  diary.invalidateAll();
+  if (props.isOpen) {
+    refreshKey.value++;
+    refreshDiary();
+  }
+};
+
+// 打开页面时强制拉新；服务端 DailyNote 可能在页面外部写入，不能复用旧缓存。
 watch(
   () => props.isOpen,
   (open) => {
     if (open) {
-      diary.loadTimeline().catch(() => {});
-      diary.loadFolders().catch(() => {});
+      diary.invalidateAll();
+      refreshDiary();
     }
   },
   { immediate: true },
 );
 
 const onEntryChanged = () => {
-  diary.loadTimeline(true).catch(() => {});
-  if (currentFolder.value) diary.loadNotes(currentFolder.value, true).catch(() => {});
+  refreshDiary();
 };
+
+onMounted(() => {
+  window.addEventListener("vcp-diary-changed", onRemoteDiaryChanged);
+});
+
+onUnmounted(() => {
+  window.removeEventListener("vcp-diary-changed", onRemoteDiaryChanged);
+});
 </script>
 
 <template>
@@ -160,6 +183,7 @@ const onEntryChanged = () => {
         <DiaryTimeline
           v-show="mode === 'timeline'"
           :query="query"
+          :refresh-key="refreshKey"
           @open="openNote"
         />
         <DiaryNotebooks

@@ -28,7 +28,6 @@ use crate::vcp_modules::settings_manager::{create_default_settings, Settings};
 /// 该模块对应原项目的 modules/vcpClient.js，负责处理所有与 VCP 服务器的通信。
 /// 包含动态路由、上下文注入（音乐、UI 规范）、流式 SSE 解析以及请求中止机制。
 static IMAGE_HOST_UPLOAD_CACHE: LazyLock<DashMap<String, String>> = LazyLock::new(DashMap::new);
-static MEDIA_HOST_UPLOAD_CACHE: LazyLock<DashMap<String, String>> = LazyLock::new(DashMap::new);
 
 /// 请求参数结构体
 #[derive(Debug, Deserialize)]
@@ -215,18 +214,6 @@ fn image_mime_for_path(path: &std::path::Path, declared_mime: &str) -> String {
     }
 }
 
-fn video_mime_for_path(path: &std::path::Path, declared_mime: &str) -> String {
-    if declared_mime.starts_with("video/") {
-        return declared_mime.to_string();
-    }
-    let guessed = mime_guess::from_path(path).first_or_octet_stream();
-    if guessed.type_().as_str() == "video" {
-        guessed.to_string()
-    } else {
-        "video/mp4".to_string()
-    }
-}
-
 fn trim_upload_error_body(body: &str) -> String {
     let compact = body.trim().replace('\n', " ");
     let mut chars = compact.chars();
@@ -320,39 +307,6 @@ async fn post_image_to_host(
         .filter(|url| !url.trim().is_empty())
         .or_else(|| upload.key.map(|key| config.public_url_for_key(&key)))
         .ok_or_else(|| "image host upload response did not include url/key".to_string())
-}
-
-async fn upload_video_path_to_host(
-    client: &Client,
-    config: &ImageHostConfig,
-    path: &std::path::Path,
-    declared_mime: &str,
-    file_name: &str,
-    trace_id: &str,
-) -> Result<String, String> {
-    let cache_key = format!("{}|video-path|{}", config.cache_scope(), path.display());
-    if let Some(cached) = MEDIA_HOST_UPLOAD_CACHE.get(&cache_key) {
-        return Ok(cached.value().clone());
-    }
-
-    let metadata = tokio::fs::metadata(path)
-        .await
-        .map_err(|e| format!("video metadata read failed: {}", e))?;
-    const MEDIA_HOST_MAX_BYTES: u64 = 220 * 1024 * 1024;
-    if metadata.len() > MEDIA_HOST_MAX_BYTES {
-        return Err(format!(
-            "video file is too large for ImageServer upload: {} bytes",
-            metadata.len()
-        ));
-    }
-
-    let mime = video_mime_for_path(path, declared_mime);
-    let bytes = tokio::fs::read(path)
-        .await
-        .map_err(|e| format!("video file read failed: {}", e))?;
-    let url = post_image_to_host(client, config, bytes, &mime, file_name, trace_id).await?;
-    MEDIA_HOST_UPLOAD_CACHE.insert(cache_key, url.clone());
-    Ok(url)
 }
 
 async fn upload_image_path_to_host(
@@ -961,44 +915,6 @@ pub async fn perform_vcp_request<R: Runtime>(
                                         }
                                     }
                                 } else if media_kind == "video" {
-                                    if let (Some(config), Some(client)) =
-                                        (image_host_config.as_ref(), image_host_client.as_ref())
-                                    {
-                                        match upload_video_path_to_host(
-                                            client,
-                                            config,
-                                            &path_buf,
-                                            &declared_mime,
-                                            display_name,
-                                            &format!(
-                                                "{}-m{}-{}-video",
-                                                request_message_id,
-                                                msg_index,
-                                                new_parts.len()
-                                            ),
-                                        )
-                                        .await
-                                        {
-                                            Ok(url) => {
-                                                log::info!(
-                                                    "[VCPClient] Video uploaded to ImageServer for multimodal payload: {}",
-                                                    mask_image_url_for_log(&url)
-                                                );
-                                                hosted_image_text_lines.push(format!(
-                                                    "[视频图床URL: {}] (文件名: {})",
-                                                    url, display_name
-                                                ));
-                                            }
-                                            Err(e) => {
-                                                log::warn!(
-                                                    "[VCPClient] ImageServer video upload failed for {:?}: {}. Keeping inline base64 video payload.",
-                                                    path_buf,
-                                                    e
-                                                );
-                                            }
-                                        }
-                                    }
-
                                     let path_buf_clone = path_buf.clone();
                                     let declared_mime_clone = declared_mime.clone();
                                     match tokio::task::spawn_blocking(move || {

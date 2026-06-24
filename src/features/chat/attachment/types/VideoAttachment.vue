@@ -6,25 +6,20 @@
     size="auto"
     @remove="emit('remove', index)"
   >
-    <!-- 可解析出播放地址时，直接在聊天内容里内联播放视频 -->
-    <div v-if="playableSrc" class="vcp-video-attachment p-1">
-      <video
-        :src="playableSrc"
-        :poster="posterSrc || undefined"
-        controls
-        playsinline
-        preload="metadata"
-        class="block w-full max-w-[260px] max-h-[320px] rounded-lg bg-black no-swipe"
-        @click.stop
-      ></video>
-      <div class="mt-1 px-0.5 text-[10px] opacity-50 truncate max-w-[260px] leading-none">
-        VIDEO • {{ formatSize(file.size) }}
-      </div>
-    </div>
-
-    <!-- 兜底：无法解析出本地播放地址时，退化为图标卡片（点击走外部打开） -->
-    <div v-else class="flex items-center gap-2.5 px-2.5 py-2 min-w-[120px] max-w-[160px]">
+    <div class="flex items-center gap-2.5 px-2.5 py-2 min-w-[120px] max-w-[180px]">
       <div class="relative w-7 h-7 shrink-0 rounded flex items-center justify-center bg-blue-500/10 dark:bg-blue-400/10 border border-blue-500/20 dark:border-blue-400/20">
+        <img
+          v-if="posterSrc"
+          :src="posterSrc"
+          :alt="displayName"
+          class="absolute inset-0 w-full h-full object-cover rounded"
+          loading="lazy"
+          decoding="async"
+        />
+        <div
+          v-if="posterSrc"
+          class="absolute inset-0 rounded bg-black/25"
+        ></div>
         <svg
           width="14"
           height="14"
@@ -34,7 +29,7 @@
           stroke-width="2"
           stroke-linecap="round"
           stroke-linejoin="round"
-          class="text-blue-500 dark:text-blue-400"
+          class="text-blue-500 dark:text-blue-400 relative z-[1]"
         >
           <polygon points="23 7 16 12 23 17 23 7"></polygon>
           <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>
@@ -83,15 +78,6 @@ const resolveLocalSrc = (raw?: string): string => {
     return "";
   }
 };
-
-// 优先使用上层已解析好的 resolvedSrc，否则从 internalPath / src 现算。
-const playableSrc = computed(() => {
-  const pre = props.file.resolvedSrc;
-  if (pre && (pre.startsWith("http") || pre.startsWith("data:") || pre.startsWith("blob:") || pre.startsWith("asset:") || pre.includes("/asset/") || pre.includes("asset.localhost"))) {
-    return pre;
-  }
-  return resolveLocalSrc(props.file.internalPath || props.file.src);
-});
 
 // 缩略图作为首帧封面（若有），减少未播放时的黑屏。
 const posterSrc = computed(() => resolveLocalSrc(props.file.thumbnailPath));

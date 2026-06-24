@@ -2,7 +2,7 @@
 import { computed, ref, watch, onUnmounted } from "vue";
 import { useDiary, type DiaryEntry } from "./useDiary";
 
-const props = defineProps<{ query?: string }>();
+const props = defineProps<{ query?: string; refreshKey?: number }>();
 const emit = defineEmits<{ open: [folder: string, file: string] }>();
 
 const diary = useDiary();
@@ -16,8 +16,9 @@ let debounceTimer: number | null = null;
 const isSearch = computed(() => !!(props.query || "").trim());
 
 const runSearch = async () => {
-  const q = (props.query || "").trim();
-  if (!q) {
+  const requestQuery = (props.query || "").trim();
+  const requestFolder = activeFolder.value || undefined;
+  if (!requestQuery) {
     searchResults.value = [];
     searching.value = false;
     return;
@@ -25,7 +26,13 @@ const runSearch = async () => {
   searching.value = true;
   searchError.value = null;
   try {
-    searchResults.value = await diary.searchEntries(q, activeFolder.value || undefined);
+    const results = await diary.searchEntries(requestQuery, requestFolder);
+    if (
+      requestQuery === (props.query || "").trim() &&
+      requestFolder === (activeFolder.value || undefined)
+    ) {
+      searchResults.value = results;
+    }
   } catch (e: any) {
     searchError.value = typeof e === "string" ? e : e?.message || "搜索失败";
     searchResults.value = [];
@@ -45,9 +52,13 @@ watch([() => props.query, activeFolder], () => {
   searching.value = true;
   debounceTimer = window.setTimeout(runSearch, 300);
 });
-onUnmounted(() => {
-  if (debounceTimer) clearTimeout(debounceTimer);
-});
+
+watch(
+  () => props.refreshKey,
+  () => {
+    if (isSearch.value) runSearch();
+  },
+);
 
 const timelineFiltered = computed<DiaryEntry[]>(() =>
   activeFolder.value
@@ -76,6 +87,10 @@ const fmtDate = (iso: string) => {
 };
 
 const retry = () => (isSearch.value ? runSearch() : diary.loadTimeline(true).catch(() => {}));
+
+onUnmounted(() => {
+  if (debounceTimer) clearTimeout(debounceTimer);
+});
 </script>
 
 <template>

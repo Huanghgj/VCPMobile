@@ -51,6 +51,10 @@ export function useNotificationProcessor() {
     return text.length > maxLength ? `${text.substring(0, maxLength)}...` : text;
   };
 
+  const notifyDiaryChanged = () => {
+    window.dispatchEvent(new CustomEvent('vcp-diary-changed'));
+  };
+
   const hasDetailLabel = (details: NonNullable<VcpNotification['details']>, label: string) =>
     details.some((detail) => detail.label === label);
 
@@ -844,6 +848,10 @@ export function useNotificationProcessor() {
             isPreformatted = false;
           }
         } catch (e) { }
+
+        if (vcpData.tool_name === 'DailyNote' && vcpData.status === 'success') {
+          notifyDiaryChanged();
+        }
       } else if (vcpData.source === 'DistPluginManager' || vcpData.source === 'Distributed') {
         title = '分布式服务器';
         message = vcpData.content || JSON.stringify(vcpData);
@@ -882,6 +890,7 @@ export function useNotificationProcessor() {
       type = noteData.status === 'success' ? 'success' : 'info';
       message = noteData.message || (noteData.status === 'success' ? '日记已成功创建。' : `日记处理状态: ${noteData.status || '未知'}`);
       isPreformatted = false;
+      if (noteData.status === 'success') notifyDiaryChanged();
     }
     // 4. connection_ack: 连接确认
     else if (payload.type === 'connection_ack' && payload.message) {
