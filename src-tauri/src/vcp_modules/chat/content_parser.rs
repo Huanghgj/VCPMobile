@@ -924,6 +924,34 @@ pub fn is_html_tag_block(text: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn nodes_contain_yaml_code(nodes: &[MarkdownNode]) -> bool {
+        nodes.iter().any(|node| match node {
+            MarkdownNode::CodeBlock { lang, code, .. } => {
+                lang.as_deref() == Some("yaml") && code.contains("- name: 家宽分组")
+            }
+            MarkdownNode::Blockquote { children, .. } => nodes_contain_yaml_code(children),
+            MarkdownNode::List { items, .. } => items
+                .iter()
+                .any(|item_nodes| nodes_contain_yaml_code(item_nodes)),
+            _ => false,
+        })
+    }
+
+    fn block_contains_yaml_code(block: &ContentBlock) -> bool {
+        match block {
+            ContentBlock::Markdown {
+                nodes: Some(nodes), ..
+            }
+            | ContentBlock::Thought {
+                nodes: Some(nodes), ..
+            }
+            | ContentBlock::Diary {
+                nodes: Some(nodes), ..
+            } => nodes_contain_yaml_code(nodes),
+            _ => false,
+        }
+    }
+
     #[test]
     fn test_parse_content_style_blocks() {
         // 1. 正常的独立行 <style> 应该被正确解析为 Style 块
@@ -945,5 +973,34 @@ mod tests {
             ContentBlock::Markdown { .. } => {}
             _ => panic!("Expected Markdown block, got {:?}", blocks[0]),
         }
+    }
+
+    #[test]
+    fn test_parse_content_html_container_with_stuck_code_fence() {
+        let raw = r#"<think>
+先分析。
+</think><div id="vcp-root" style="padding:20px;">
+<p>要是想留着这个功能，就在proxy-groups里补一个：</p>
+
+</div>```yaml
+  - name: 家宽分组
+    type: select
+    use:
+      - proxy4
+```
+
+<p>放在手动选择那个组前面就行。</p>
+</div>"#;
+
+        let blocks = parse_content(raw);
+
+        assert!(matches!(
+            blocks.first(),
+            Some(ContentBlock::Thought { theme, .. }) if theme == "思考过程"
+        ));
+        assert!(
+            blocks.iter().any(block_contains_yaml_code),
+            "expected persisted content parser to keep stuck fence as yaml code block, got {blocks:#?}"
+        );
     }
 }

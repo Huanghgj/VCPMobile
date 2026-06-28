@@ -9,6 +9,9 @@ lazy_static! {
     static ref FENCE_RE: Regex =
         Regex::new(r"(?m)^[ \t]*```[a-zA-Z0-9-]*[ \t]*\r?$").unwrap();
 
+    static ref HTML_AWARE_FENCE_RE: Regex =
+        Regex::new(r"(?im)(?:^[ \t]*|</(?:div|section|article|header|footer|main|aside|figure|figcaption)>[ \t]*)(?P<fence>```[a-zA-Z0-9-]*[ \t]*\r?$)").unwrap();
+
     // 合并 LaTeX 匹配：[ ... ] 和 ( ... )
     static ref MATH_RE: Regex = Regex::new(r"(?s)\\\[(?P<display>.*?)\\\]|\\\((?P<inline>.*?)\\\)").unwrap();
 
@@ -23,6 +26,9 @@ lazy_static! {
     static ref INLINE_CODE_RE: Regex = Regex::new(r"(?m)`+[^`\n\r]+`+").unwrap();
 
     static ref COMMENT_RE: Regex = Regex::new(r"(?s)<!--[\s\S]*?(?:-->|$)").unwrap();
+
+    static ref HTML_CONTAINER_CLOSE_BEFORE_FENCE_RE: Regex =
+        Regex::new(r"(?im)^[ \t]*</(?:div|section|article|header|footer|main|aside|figure|figcaption)>[ \t]*(?P<fence>```[a-zA-Z0-9-]*[ \t]*\r?$)").unwrap();
 
     // 仅在 字母/数字 + ** + 标点 的模式下注入零宽空格，修复 CommonMark left-flanking 判定失效。
     // 前驱限定为 [\p{L}\p{N}] 确保不会误触发闭合符号（闭合 ** 前驱通常是标点或 \u{200B}）。
@@ -41,6 +47,24 @@ fn fix_flanking_delimiters(text: &str) -> String {
     FLANKING_FIX_LEFT
         .replace_all(text, "${1}${2}\u{200B}${3}")
         .into_owned()
+}
+
+/// 修复模型常见的混合渲染断口：
+///
+/// ```text
+/// </div>```yaml
+/// ...
+/// ```
+///
+/// 这类输出通常是为了从 HTML 容器临时切回 Markdown 围栏，但在本端 AST 渲染里
+/// HTML 容器本身支持 Markdown 子节点。保留这个提前闭合标签会把外层样式容器截断，
+/// 还会让后续围栏不再位于行首而无法按代码块解析。
+fn normalize_container_breaking_code_fences(text: &str) -> Cow<'_, str> {
+    if !text.contains("```") || !text.contains("</") {
+        return Cow::Borrowed(text);
+    }
+
+    HTML_CONTAINER_CLOSE_BEFORE_FENCE_RE.replace_all(text, "$fence")
 }
 
 /// 剥除块级 $$ 公式行的多余前导缩进，防止 pulldown-cmark 将其误判为缩进代码块。
@@ -301,6 +325,26 @@ fn is_void_html_tag(tag: &str) -> bool {
     )
 }
 
+fn collect_code_fence_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let markers: Vec<std::ops::Range<usize>> = HTML_AWARE_FENCE_RE
+        .captures_iter(text)
+        .filter_map(|cap| cap.name("fence").map(|m| m.start()..m.end()))
+        .collect();
+
+    let mut ranges = Vec::new();
+    let mut cursor = 0;
+    while cursor < markers.len() {
+        let start = markers[cursor].start;
+        let end = markers
+            .get(cursor + 1)
+            .map(|marker| marker.end)
+            .unwrap_or(text.len());
+        ranges.push(start..end);
+        cursor += 2;
+    }
+    ranges
+}
+
 /// 从字符串末尾向前查找匹配的 HTML 闭标签，返回 (close_start, close_end)
 pub(crate) fn find_matching_close_tag(
     text: &str,
@@ -310,16 +354,10 @@ pub(crate) fn find_matching_close_tag(
     let mut depth = 1;
     let search_area = &text[start_pos..];
 
-    // 预先收集 search_area 中所有标准代码围栏的物理范围（支持流式未闭合边界）
-    let mut fence_ranges = Vec::new();
-    let mut fence_iter = FENCE_RE.find_iter(search_area);
-    while let Some(start) = fence_iter.next() {
-        if let Some(end) = fence_iter.next() {
-            fence_ranges.push(start.start()..end.end());
-        } else {
-            fence_ranges.push(start.start()..search_area.len());
-        }
-    }
+    // 预先收集 search_area 中所有代码围栏的物理范围（支持流式未闭合边界）。
+    // 模型有时会输出 `</div>```yaml`，这里把后半段 ```yaml 也视作围栏起点，
+    // 防止后续真正的 HTML 闭合标签被误判在未闭合代码块内部。
+    let fence_ranges = collect_code_fence_ranges(search_area);
 
     // 预先收集 search_area 中所有 HTML 注释的物理范围（支持流式未闭合注释边界）
     let mut comment_ranges = Vec::new();
@@ -330,14 +368,6 @@ pub(crate) fn find_matching_close_tag(
     for cap in TAG_SCANNER.captures_iter(search_area) {
         let full_match = cap.get(0).unwrap();
         let cap_start = full_match.start();
-
-        // 跨越围栏防御：如果在开始标签之后、当前扫描标签之前横跨了代码围栏的起点，
-        // 说明已经穿透跨越了代码块边界，必须立即强行终止，防止吞噬黑洞
-        for range in &fence_ranges {
-            if range.start > 0 && range.start < cap_start {
-                return None;
-            }
-        }
 
         // 健壮性防御：如果当前扫描到的 HTML 标签处于代码块围栏内部，直接跳过
         if fence_ranges.iter().any(|range| range.contains(&cap_start)) {
@@ -363,6 +393,10 @@ pub(crate) fn find_matching_close_tag(
 
         if tag_name.eq_ignore_ascii_case(tag) {
             if is_close_tag {
+                if depth == 1 && close_tag_is_followed_by_code_fence(search_area, full_match.end())
+                {
+                    continue;
+                }
                 depth -= 1;
                 if depth == 0 {
                     let full_match = cap.get(0).unwrap();
@@ -374,6 +408,14 @@ pub(crate) fn find_matching_close_tag(
         }
     }
     None
+}
+
+fn close_tag_is_followed_by_code_fence(search_area: &str, relative_end: usize) -> bool {
+    let Some(rest) = search_area.get(relative_end..) else {
+        return false;
+    };
+    let line_tail = rest.split_once('\n').map_or(rest, |(line, _)| line);
+    FENCE_RE.is_match(line_tail.trim_start_matches([' ', '\t']))
 }
 
 /// 后处理：将 AST 中的占位符替换为开标签 + 子节点 + 闭标签
@@ -430,7 +472,8 @@ fn parse_markdown_to_ast_opt(text: &str, is_streaming: bool) -> Vec<MarkdownNode
 }
 
 fn parse_markdown_to_ast_impl(text: &str, is_streaming: bool) -> Vec<MarkdownNode> {
-    let text_fixed = fix_flanking_delimiters(text);
+    let text = normalize_container_breaking_code_fences(text);
+    let text_fixed = fix_flanking_delimiters(text.as_ref());
     let text = preprocess_latex_math(&text_fixed);
     let text = strip_display_math_indent(text.as_ref());
     let (text, containers) = extract_html_containers(text.as_ref());
@@ -977,4 +1020,69 @@ fn process_text_magic(text: &str) -> Vec<InlineNode> {
     }
 
     nodes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn contains_yaml_code_block(nodes: &[MarkdownNode]) -> bool {
+        nodes.iter().any(|node| match node {
+            MarkdownNode::CodeBlock { lang, code, .. } => {
+                lang.as_deref() == Some("yaml") && code.contains("- name: 家宽分组")
+            }
+            MarkdownNode::Blockquote { children, .. } => contains_yaml_code_block(children),
+            MarkdownNode::List { items, .. } => items
+                .iter()
+                .any(|item_nodes| contains_yaml_code_block(item_nodes)),
+            _ => false,
+        })
+    }
+
+    fn contains_raw_html(nodes: &[MarkdownNode], needle: &str) -> bool {
+        nodes.iter().any(|node| match node {
+            MarkdownNode::RawHtml { content, .. } => content.contains(needle),
+            MarkdownNode::Blockquote { children, .. } => contains_raw_html(children, needle),
+            MarkdownNode::List { items, .. } => items
+                .iter()
+                .any(|item_nodes| contains_raw_html(item_nodes, needle)),
+            _ => false,
+        })
+    }
+
+    #[test]
+    fn parses_html_container_with_close_tag_stuck_to_code_fence() {
+        let input = r#"<div id="vcp-root" style="padding:20px;">
+<p>改法有俩：</p>
+<p>要是想留着这个功能，就在proxy-groups里补一个：</p>
+
+</div>```yaml
+  - name: 家宽分组
+    type: select
+    use:
+      - proxy4
+```
+
+<p>放在手动选择那个组前面就行。</p>
+</div>"#;
+
+        let nodes = parse_markdown_to_ast(input);
+
+        assert!(matches!(
+            nodes.first(),
+            Some(MarkdownNode::RawHtml { content, .. }) if content.contains("id=\"vcp-root\"")
+        ));
+        assert!(
+            contains_yaml_code_block(&nodes),
+            "expected stuck fence after </div> to render as yaml code block, got {nodes:#?}"
+        );
+        assert!(
+            contains_raw_html(&nodes, "放在手动选择那个组前面就行"),
+            "expected content after code fence to remain inside rendered AST, got {nodes:#?}"
+        );
+        assert!(
+            contains_raw_html(&nodes, "</div>"),
+            "expected outer HTML container to retain a closing tag, got {nodes:#?}"
+        );
+    }
 }

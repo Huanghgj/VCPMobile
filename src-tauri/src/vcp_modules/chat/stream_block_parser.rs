@@ -787,6 +787,34 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    fn nodes_contain_yaml_code(nodes: &[MarkdownNode]) -> bool {
+        nodes.iter().any(|node| match node {
+            MarkdownNode::CodeBlock { lang, code, .. } => {
+                lang.as_deref() == Some("yaml") && code.contains("- name: 家宽分组")
+            }
+            MarkdownNode::Blockquote { children, .. } => nodes_contain_yaml_code(children),
+            MarkdownNode::List { items, .. } => items
+                .iter()
+                .any(|item_nodes| nodes_contain_yaml_code(item_nodes)),
+            _ => false,
+        })
+    }
+
+    fn stream_block_contains_yaml_code(block: &StreamBlock) -> bool {
+        match block {
+            StreamBlock::Markdown {
+                nodes: Some(nodes), ..
+            }
+            | StreamBlock::Thought {
+                nodes: Some(nodes), ..
+            }
+            | StreamBlock::Diary {
+                nodes: Some(nodes), ..
+            } => nodes_contain_yaml_code(nodes),
+            _ => false,
+        }
+    }
+
     fn load_tail_test_document() -> String {
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let candidates = [
@@ -925,5 +953,35 @@ mod tests {
             }
             other => panic!("expected thought block, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_finalize_html_container_with_stuck_code_fence() {
+        let raw = r#"<think>
+先分析。
+</think><div id="vcp-root" style="padding:20px;">
+<p>要是想留着这个功能，就在proxy-groups里补一个：</p>
+
+</div>```yaml
+  - name: 家宽分组
+    type: select
+    use:
+      - proxy4
+```
+
+<p>放在手动选择那个组前面就行。</p>
+</div>"#;
+
+        let mut parser = StreamBlockParser::new();
+        let blocks = parser.finalize(raw);
+
+        assert!(matches!(
+            blocks.first(),
+            Some(StreamBlock::Thought { theme, .. }) if theme == "思考过程"
+        ));
+        assert!(
+            blocks.iter().any(stream_block_contains_yaml_code),
+            "expected stream parser to keep stuck fence as yaml code block, got {blocks:#?}"
+        );
     }
 }
