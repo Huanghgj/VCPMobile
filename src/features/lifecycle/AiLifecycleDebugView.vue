@@ -114,6 +114,16 @@ const statusLabel = (status?: string) => ({
   failed: "失败",
 }[status || ""] || status || "静默");
 
+const jobStatusLabel = (status?: string) => ({
+  scheduled: "等待执行",
+  running: "执行中",
+  completed: "已完成",
+  failed: "失败",
+  cancelled: "已取消",
+}[status || ""] || status || "未知");
+
+const recentLifecycleJobs = computed(() => scheduler.historyJobs.slice(0, 30));
+
 const formatTime = (timestamp?: number | null) => {
   if (!timestamp) return "从未";
   return new Date(timestamp).toLocaleString();
@@ -200,12 +210,15 @@ watch(
     if (lifecycle.isRunning) lifecycle.startTimer();
   },
 );
-watch(() => props.isOpen, () => startClock(), { immediate: true });
+watch(() => props.isOpen, (isOpen) => {
+  startClock();
+  if (isOpen) scheduler.refreshJobHistory().catch(console.error);
+}, { immediate: true });
 
 onMounted(() => {
   document.addEventListener("visibilitychange", handleVisibilityChange);
   refreshRuntimeStatus().catch(console.error);
-  scheduler.refreshJobs().catch(console.error);
+  Promise.all([scheduler.refreshJobs(), scheduler.refreshJobHistory()]).catch(console.error);
 });
 
 onUnmounted(() => {
@@ -466,6 +479,46 @@ onUnmounted(() => {
         </SettingsCard>
 
         <SettingsCard>
+          <div class="flex items-center gap-2 mb-3">
+            <Clock3 :size="15" class="opacity-60" />
+            <h3 class="text-[12px] font-black uppercase tracking-[0.12em] opacity-70">调度任务记录</h3>
+          </div>
+          <div v-if="recentLifecycleJobs.length === 0" class="text-xs opacity-45 py-6 text-center">
+            暂无调度任务记录
+          </div>
+          <div v-else class="space-y-2">
+            <article v-for="job in recentLifecycleJobs" :key="job.jobId" class="life-log">
+              <div class="flex items-center justify-between gap-2">
+                <span class="font-mono text-[10px] opacity-50">
+                  {{ formatTime(job.completedAt || job.updatedAt || job.scheduledAt) }}
+                </span>
+                <span
+                  class="life-pill"
+                  :class="{
+                    ok: job.status === 'completed',
+                    active: job.status === 'scheduled' || job.status === 'running',
+                    warn: job.status === 'failed' || job.status === 'cancelled',
+                  }"
+                >
+                  {{ jobStatusLabel(job.status) }}
+                </span>
+              </div>
+              <p class="mt-1 text-xs font-semibold leading-relaxed">{{ job.intent }}</p>
+              <p class="mt-1 text-[10px] opacity-50">
+                {{ job.action }} · {{ job.ownerType }} · 尝试 {{ job.attemptCount }}/{{ job.maxAttempts }}
+              </p>
+              <p v-if="job.failureReason" class="mt-1 text-[11px] text-rose-400 leading-relaxed">
+                {{ job.failureReason }}
+              </p>
+              <div v-if="job.sourceMessageId || job.responseMessageId" class="life-job-ids">
+                <code v-if="job.sourceMessageId">来源 {{ job.sourceMessageId }}</code>
+                <code v-if="job.responseMessageId">回复 {{ job.responseMessageId }}</code>
+              </div>
+            </article>
+          </div>
+        </SettingsCard>
+
+        <SettingsCard>
           <div class="flex items-center justify-between mb-3">
             <h3 class="text-[12px] font-black uppercase tracking-[0.12em] opacity-70">Decision Log</h3>
             <button class="life-icon-btn" @click="lifecycle.clearLogs">
@@ -530,8 +583,10 @@ onUnmounted(() => {
 .life-stats { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:0; }.life-stats div { padding:8px 4px; text-align:center; border-right:1px solid color-mix(in srgb,currentColor 7%,transparent); display:flex; flex-direction:column; }.life-stats div:last-child { border-right:0; }.life-stats strong { font-size:18px; font-weight:750; }.life-stats span { font-size:9px; opacity:.4; }
 .life-kv { min-height:36px; display:flex; align-items:center; justify-content:space-between; gap:12px; border-bottom:1px solid color-mix(in srgb,currentColor 6%,transparent); font-size:11px; }.life-kv:last-child { border-bottom:0; }.life-kv span { opacity:.42; }.life-kv strong { max-width:65%; text-align:right; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:650; }
 .life-pill,.life-signal { padding:4px 8px; border-radius:99px; background:color-mix(in srgb,currentColor 7%,transparent); font-size:9px; font-weight:700; }.life-pill.ok { color:#30a14e; background:rgba(48,161,78,.12); }
+.life-pill.active { color:#3478f6; background:rgba(52,120,246,.12); }.life-pill.warn { color:#e58b00; background:rgba(255,159,10,.1); }
 .life-message { padding:10px 11px; border-radius:11px; line-height:1.55; background:color-mix(in srgb,currentColor 5%,transparent); }.life-message.warn { color:#e58b00; background:rgba(255,159,10,.1); }
 .life-log { padding:11px; border-radius:12px; background:color-mix(in srgb,currentColor 4%,transparent); }.life-icon-btn { width:32px; height:32px; display:grid; place-items:center; border-radius:50%; background:color-mix(in srgb,currentColor 6%,transparent); }
+.life-job-ids { margin-top:8px; display:flex; flex-direction:column; gap:3px; }.life-job-ids code { font-size:9px; line-height:1.4; opacity:.45; overflow-wrap:anywhere; }
 .life-reveal-enter-active,.life-reveal-leave-active { transition:opacity .16s ease,transform .16s ease; }.life-reveal-enter-from,.life-reveal-leave-to { opacity:0; transform:translateY(-3px); }
 .life-last-section { margin-bottom:4px; }
 @media (min-width:700px) { .ai-life-debug > main { width:min(620px,100%); margin:0 auto; } }

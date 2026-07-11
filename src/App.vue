@@ -484,7 +484,10 @@ onMounted(async () => {
       }
     });
     unlistenLifecycleJobs = await listen("vcp-lifecycle-jobs-changed", () => {
-      lifecycleSchedulerStore.refreshJobs()
+      Promise.all([
+        lifecycleSchedulerStore.refreshJobs(),
+        lifecycleSchedulerStore.refreshJobHistory(),
+      ])
         .then(() => lifecycleSchedulerStore.syncNativeWakeup())
         .catch((err) => console.error("[Lifecycle] Failed to refresh scheduled jobs:", err));
     });

@@ -1245,8 +1245,16 @@ pub async fn finalize_stream_message<R: tauri::Runtime>(
         {
             Ok(blocks) => Some(blocks),
             Err(e) => {
-                log::error!("[StreamFinalizer] Failed to patch agent message: {}", e);
-                None
+                let error = format!("[StreamFinalizer] Failed to persist agent message: {}", e);
+                log::error!("{}", error);
+                if let Some(chan) = stream_channel.as_ref() {
+                    let _ = chan.send(crate::vcp_modules::vcp_client::StreamEvent::error(
+                        message_id.clone(),
+                        None,
+                        error.clone(),
+                    ));
+                }
+                return Err(error);
             }
         }
     } else {
@@ -1262,8 +1270,16 @@ pub async fn finalize_stream_message<R: tauri::Runtime>(
         {
             Ok(blocks) => Some(blocks),
             Err(e) => {
-                log::error!("[StreamFinalizer] Failed to append group message: {}", e);
-                None
+                let error = format!("[StreamFinalizer] Failed to persist group message: {}", e);
+                log::error!("{}", error);
+                if let Some(chan) = stream_channel.as_ref() {
+                    let _ = chan.send(crate::vcp_modules::vcp_client::StreamEvent::error(
+                        message_id.clone(),
+                        None,
+                        error.clone(),
+                    ));
+                }
+                return Err(error);
             }
         }
     };

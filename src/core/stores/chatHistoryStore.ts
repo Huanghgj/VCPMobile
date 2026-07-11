@@ -375,7 +375,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
   const invokeGenerationRequestForTarget = async (
     userMsg: ChatMessage,
     target: { ownerId: string; ownerType: "agent" | "group"; topicId: string },
-  ) => {
+  ): Promise<{ started: true; messageId?: string }> => {
     const agentId = target.ownerId;
     const topicId = target.topicId;
 
@@ -398,7 +398,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     });
 
     if (target.ownerType === "group") {
-      await invoke("handle_group_chat_message", {
+      const result = await invoke<{ messageId?: string }>("handle_group_chat_message", {
         payload: {
           groupId: target.ownerId,
           topicId,
@@ -408,8 +408,9 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
         },
         streamChannel
       });
+      return { started: true, messageId: result?.messageId };
     } else {
-      await invoke("handle_agent_chat_message", {
+      const result = await invoke<{ messageId?: string }>("handle_agent_chat_message", {
         payload: {
           agentId,
           topicId,
@@ -419,18 +420,18 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
         },
         streamChannel
       });
+      return { started: true, messageId: result?.messageId };
     }
-
-    return true;
   };
 
   const invokeGenerationRequest = async (userMsg: ChatMessage) => {
     if (!sessionStore.currentSelectedItem || !sessionStore.currentTopicId) return false;
-    return invokeGenerationRequestForTarget(userMsg, {
+    const result = await invokeGenerationRequestForTarget(userMsg, {
       ownerId: sessionStore.currentSelectedItem.id,
       ownerType: sessionStore.currentSelectedItem.type === "group" ? "group" : "agent",
       topicId: sessionStore.currentTopicId,
     });
+    return result.started;
   };
 
   /**
@@ -516,7 +517,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
   }) => {
     const sessionKey = job.ownerId + ":" + job.topicId;
     if (!job.intent.trim() || (streamStore.sessionActiveStreams[sessionKey]?.length || 0) > 0) {
-      return false;
+      return null;
     }
     const now = Date.now();
     const prompt = [
@@ -538,11 +539,12 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
       groupId: job.ownerType === "group" ? job.ownerId : undefined,
       isGroupMessage: job.ownerType === "group",
     };
-    return invokeGenerationRequestForTarget(userMsg, {
+    const result = await invokeGenerationRequestForTarget(userMsg, {
       ownerId: job.ownerId,
       ownerType: job.ownerType,
       topicId: job.topicId,
     });
+    return result.messageId || null;
   };
 
   const injectDebugAssistantRenderProbe = async (

@@ -28,7 +28,9 @@ pub struct LifecycleJob {
     pub attempt_count: i64,
     pub max_attempts: i64,
     pub source_message_id: Option<String>,
+    pub response_message_id: Option<String>,
     pub failure_reason: Option<String>,
+    pub completed_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +75,7 @@ pub async fn setup_lifecycle_tables(pool: &Pool<Sqlite>) -> Result<(), String> {
             attempt_count INTEGER NOT NULL DEFAULT 0,
             max_attempts INTEGER NOT NULL DEFAULT 3,
             source_message_id TEXT,
+            response_message_id TEXT,
             idempotency_key TEXT NOT NULL UNIQUE,
             failure_reason TEXT,
             created_at BIGINT NOT NULL,
@@ -83,6 +86,21 @@ pub async fn setup_lifecycle_tables(pool: &Pool<Sqlite>) -> Result<(), String> {
     .execute(pool)
     .await
     .map_err(|e| e.to_string())?;
+
+    let columns = sqlx::query("PRAGMA table_info(lifecycle_jobs)")
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let has_response_message_id = columns
+        .iter()
+        .any(|row| row.get::<String, _>("name") == "response_message_id");
+    if !has_response_message_id {
+        sqlx::query("ALTER TABLE lifecycle_jobs ADD COLUMN response_message_id TEXT")
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_lifecycle_jobs_due
          ON lifecycle_jobs(status, scheduled_at)",
@@ -126,7 +144,9 @@ fn row_to_job(row: &sqlx::sqlite::SqliteRow) -> Result<LifecycleJob, String> {
         attempt_count: row.try_get("attempt_count").map_err(|e| e.to_string())?,
         max_attempts: row.try_get("max_attempts").map_err(|e| e.to_string())?,
         source_message_id: row.try_get("source_message_id").ok(),
+        response_message_id: row.try_get("response_message_id").ok(),
         failure_reason: row.try_get("failure_reason").ok(),
+        completed_at: row.try_get("completed_at").ok(),
     })
 }
 
@@ -193,7 +213,7 @@ pub async fn list_lifecycle_jobs(
     include_finished: Option<bool>,
 ) -> Result<Vec<LifecycleJob>, String> {
     let rows = if include_finished.unwrap_or(false) {
-        sqlx::query("SELECT * FROM lifecycle_jobs ORDER BY scheduled_at ASC LIMIT 200")
+        sqlx::query("SELECT * FROM lifecycle_jobs ORDER BY updated_at DESC LIMIT 200")
             .fetch_all(&state.pool)
             .await
     } else {
@@ -288,18 +308,65 @@ pub async fn claim_due_lifecycle_jobs(
 pub async fn complete_lifecycle_job(
     state: State<'_, DbState>,
     job_id: String,
+    response_message_id: String,
 ) -> Result<(), String> {
+    complete_job(&state.pool, &job_id, &response_message_id).await
+}
+
+async fn complete_job(
+    pool: &Pool<Sqlite>,
+    job_id: &str,
+    response_message_id: &str,
+) -> Result<(), String> {
+    let response_message_id = response_message_id.trim();
+    if response_message_id.is_empty() {
+        return Err("生命周期任务缺少回复消息 ID".to_string());
+    }
+
     let now = Utc::now().timestamp_millis();
-    sqlx::query(
-        "UPDATE lifecycle_jobs SET status = 'completed', completed_at = ?, lease_until = NULL,
-         failure_reason = NULL, updated_at = ? WHERE job_id = ?",
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+    let topic_id: Option<String> = sqlx::query_scalar(
+        "SELECT topic_id FROM lifecycle_jobs WHERE job_id = ? AND status = 'running' LIMIT 1",
     )
-    .bind(now)
-    .bind(now)
     .bind(job_id)
-    .execute(&state.pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|e| e.to_string())?;
+    let topic_id = topic_id.ok_or_else(|| "生命周期任务不存在或不在执行中".to_string())?;
+
+    let response_exists: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM messages
+         WHERE msg_id = ? AND topic_id = ? AND role = 'assistant' AND deleted_at IS NULL
+         LIMIT 1",
+    )
+    .bind(response_message_id)
+    .bind(&topic_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+    if response_exists.is_none() {
+        return Err(format!(
+            "生命周期回复尚未持久化: topic_id={}, message_id={}",
+            topic_id, response_message_id
+        ));
+    }
+
+    let result = sqlx::query(
+        "UPDATE lifecycle_jobs SET status = 'completed', completed_at = ?, lease_until = NULL,
+         response_message_id = ?, failure_reason = NULL, updated_at = ?
+         WHERE job_id = ? AND status = 'running'",
+    )
+    .bind(now)
+    .bind(response_message_id)
+    .bind(now)
+    .bind(job_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+    if result.rows_affected() != 1 {
+        return Err("生命周期任务完成状态更新失败".to_string());
+    }
+    tx.commit().await.map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -447,5 +514,169 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn setup_migrates_existing_lifecycle_table() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE lifecycle_jobs (
+                job_id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL,
+                owner_type TEXT NOT NULL,
+                topic_id TEXT NOT NULL,
+                responder_agent_id TEXT,
+                action TEXT NOT NULL,
+                intent TEXT NOT NULL,
+                condition_json TEXT,
+                status TEXT NOT NULL DEFAULT 'scheduled',
+                scheduled_at BIGINT NOT NULL,
+                lease_until BIGINT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL DEFAULT 3,
+                source_message_id TEXT,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                failure_reason TEXT,
+                created_at BIGINT NOT NULL,
+                updated_at BIGINT NOT NULL,
+                completed_at BIGINT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        setup_lifecycle_tables(&pool).await.unwrap();
+
+        let columns = sqlx::query("PRAGMA table_info(lifecycle_jobs)")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert!(columns
+            .iter()
+            .any(|row| row.get::<String, _>("name") == "response_message_id"));
+        setup_lifecycle_tables(&pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn completed_job_records_persisted_assistant_message() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        setup_lifecycle_tables(&pool).await.unwrap();
+        sqlx::query(
+            "CREATE TABLE messages (
+                msg_id TEXT PRIMARY KEY,
+                topic_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                deleted_at BIGINT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let job = insert_job(
+            &pool,
+            CreateLifecycleJobInput {
+                owner_id: "agent-1".to_string(),
+                owner_type: "agent".to_string(),
+                topic_id: "topic-1".to_string(),
+                responder_agent_id: Some("agent-1".to_string()),
+                action: "continue_message".to_string(),
+                intent: "继续对话".to_string(),
+                condition: None,
+                scheduled_at: Utc::now().timestamp_millis() + 1_000,
+                source_message_id: Some("source-1".to_string()),
+                max_attempts: Some(3),
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE lifecycle_jobs SET status = 'running' WHERE job_id = ?")
+            .bind(&job.job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO messages (msg_id, topic_id, role) VALUES ('reply-1', 'topic-1', 'assistant')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        complete_job(&pool, &job.job_id, "reply-1").await.unwrap();
+
+        let row = sqlx::query(
+            "SELECT status, response_message_id, completed_at FROM lifecycle_jobs WHERE job_id = ?",
+        )
+        .bind(&job.job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<String, _>("status"), "completed");
+        assert_eq!(row.get::<String, _>("response_message_id"), "reply-1");
+        assert!(row.get::<Option<i64>, _>("completed_at").is_some());
+    }
+
+    #[tokio::test]
+    async fn job_cannot_complete_before_assistant_message_is_persisted() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        setup_lifecycle_tables(&pool).await.unwrap();
+        sqlx::query(
+            "CREATE TABLE messages (
+                msg_id TEXT PRIMARY KEY,
+                topic_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                deleted_at BIGINT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let job = insert_job(
+            &pool,
+            CreateLifecycleJobInput {
+                owner_id: "agent-1".to_string(),
+                owner_type: "agent".to_string(),
+                topic_id: "topic-1".to_string(),
+                responder_agent_id: Some("agent-1".to_string()),
+                action: "continue_message".to_string(),
+                intent: "继续对话".to_string(),
+                condition: None,
+                scheduled_at: Utc::now().timestamp_millis() + 1_000,
+                source_message_id: Some("source-1".to_string()),
+                max_attempts: Some(3),
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE lifecycle_jobs SET status = 'running' WHERE job_id = ?")
+            .bind(&job.job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let error = complete_job(&pool, &job.job_id, "missing-reply")
+            .await
+            .unwrap_err();
+        assert!(error.contains("尚未持久化"));
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM lifecycle_jobs WHERE job_id = ?")
+                .bind(&job.job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "running");
     }
 }

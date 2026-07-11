@@ -20,13 +20,16 @@ export interface LifecycleJob {
   attemptCount: number;
   maxAttempts: number;
   sourceMessageId?: string;
+  responseMessageId?: string;
   failureReason?: string;
+  completedAt?: number;
 }
 
 const MAX_TIMER_DELAY_MS = 60_000;
 
 export const useLifecycleSchedulerStore = defineStore("lifecycleScheduler", () => {
   const jobs = ref<LifecycleJob[]>([]);
+  const historyJobs = ref<LifecycleJob[]>([]);
   const isRunning = ref(false);
   const isExecuting = ref(false);
   const lastCheckedAt = ref<number | null>(null);
@@ -50,6 +53,13 @@ export const useLifecycleSchedulerStore = defineStore("lifecycleScheduler", () =
       includeFinished: false,
     });
     return jobs.value;
+  };
+
+  const refreshJobHistory = async () => {
+    historyJobs.value = await invoke<LifecycleJob[]>("list_lifecycle_jobs", {
+      includeFinished: true,
+    });
+    return historyJobs.value;
   };
 
   const scheduleNextCheck = () => {
@@ -99,11 +109,14 @@ export const useLifecycleSchedulerStore = defineStore("lifecycleScheduler", () =
           continue;
         }
         try {
-          const completed = await historyStore.triggerScheduledLifecycleMessage(job);
-          if (!completed) {
+          const responseMessageId = await historyStore.triggerScheduledLifecycleMessage(job);
+          if (!responseMessageId) {
             throw new Error("目标会话正在生成或请求未启动");
           }
-          await invoke("complete_lifecycle_job", { jobId: job.jobId });
+          await invoke("complete_lifecycle_job", {
+            jobId: job.jobId,
+            responseMessageId,
+          });
         } catch (error) {
           await invoke("fail_lifecycle_job", {
             jobId: job.jobId,
@@ -112,7 +125,7 @@ export const useLifecycleSchedulerStore = defineStore("lifecycleScheduler", () =
           });
         }
       }
-      await refreshJobs();
+      await Promise.all([refreshJobs(), refreshJobHistory()]);
     } finally {
       isExecuting.value = false;
       await syncNativeWakeup();
@@ -123,7 +136,7 @@ export const useLifecycleSchedulerStore = defineStore("lifecycleScheduler", () =
   const start = async () => {
     if (isRunning.value) return;
     isRunning.value = true;
-    await refreshJobs();
+    await Promise.all([refreshJobs(), refreshJobHistory()]);
     await runDueJobs();
   };
 
@@ -139,18 +152,20 @@ export const useLifecycleSchedulerStore = defineStore("lifecycleScheduler", () =
 
   const cancelJob = async (jobId: string) => {
     await invoke("cancel_lifecycle_job", { jobId });
-    await refreshJobs();
+    await Promise.all([refreshJobs(), refreshJobHistory()]);
     await syncNativeWakeup();
     scheduleNextCheck();
   };
 
   return {
     jobs,
+    historyJobs,
     nextJob,
     isRunning,
     isExecuting,
     lastCheckedAt,
     refreshJobs,
+    refreshJobHistory,
     syncNativeWakeup,
     runDueJobs,
     start,
