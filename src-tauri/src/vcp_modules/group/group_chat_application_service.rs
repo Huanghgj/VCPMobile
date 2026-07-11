@@ -49,6 +49,16 @@ fn context_history_message_limit(context_token_limit: i32) -> usize {
         .clamp(MIN_HISTORY_MESSAGES, MAX_HISTORY_MESSAGES)
 }
 
+fn history_tail_matches_user_message(history: &[ChatMessage], user_message: &ChatMessage) -> bool {
+    history
+        .last()
+        .filter(|last| last.role == "user")
+        .is_some_and(|last| {
+            (!user_message.id.is_empty() && last.id == user_message.id)
+                || (!user_message.content.is_empty() && last.content == user_message.content)
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn internal_process_group_chat_message(
     app_handle: AppHandle,
@@ -103,7 +113,7 @@ pub async fn internal_process_group_chat_message(
     }
 
     // 为了给 AI 决策提供上下文，我们只轻量读取最新的 8 条纯文本和附件（不加载任何 UI 渲染数据）
-    let recent_history_for_decision = message_service::load_chat_text_history_for_context(
+    let mut recent_history_for_decision = message_service::load_chat_text_history_for_context(
         &app_handle,
         &topic_id,
         Some(8), // 限制上下文长度
@@ -111,6 +121,12 @@ pub async fn internal_process_group_chat_message(
         false, // include_extracted_text: 决策发言者不需要大体积的提取文本内容
     )
     .await?;
+
+    if !append_user_msg
+        && !history_tail_matches_user_message(&recent_history_for_decision, &user_message)
+    {
+        recent_history_for_decision.push(user_message.clone());
+    }
 
     // 4. 决策引擎：谁该说话？
     let speakers = if group_config.mode == "sequential" {
@@ -149,6 +165,17 @@ pub async fn internal_process_group_chat_message(
         true, // include_extracted_text: 组装群聊上下文发送给 VCP 时需要包含附件提取文本内容
     )
     .await?;
+
+    if !append_user_msg
+        && !history_tail_matches_user_message(&full_history_for_context, &user_message)
+    {
+        log::warn!(
+            "[GroupChatAppService] Latest user message missing from persisted history; injecting inline for request context. topic_id={}, user_msg_id={}",
+            topic_id,
+            user_message.id
+        );
+        full_history_for_context.push(user_message.clone());
+    }
 
     // 5. 串行异步调度 (约束：群聊内部必须串行)
     let mut final_new_msgs = Vec::new();

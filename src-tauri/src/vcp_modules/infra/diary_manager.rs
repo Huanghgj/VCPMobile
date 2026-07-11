@@ -77,10 +77,7 @@ async fn admin_ctx(app_handle: &AppHandle) -> Result<AdminCtx, String> {
 
 /// 统一发送并解析 JSON；非 2xx 时优先回传服务端 message/error 文案。
 async fn send_json(req: reqwest::RequestBuilder, url: &str) -> Result<Value, String> {
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| format!("请求失败: {}", e))?;
+    let resp = req.send().await.map_err(|e| format!("请求失败: {}", e))?;
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
 

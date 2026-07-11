@@ -2,6 +2,7 @@
 import { ref, onMounted, watch, computed, defineAsyncComponent } from "vue";
 import { useModalHistory } from "../../core/composables/useModalHistory";
 import { useSettingsStore, type AppSettings } from "../../core/stores/settings";
+import { useOverlayStore } from "../../core/stores/overlay";
 import SlidePage from "../../components/ui/SlidePage.vue";
 
 // 原子组件与高频子页面：静态 import，无需等待
@@ -39,6 +40,7 @@ const emit = defineEmits<{
 }>();
 
 const settingsStore = useSettingsStore();
+const overlayStore = useOverlayStore();
 const { registerModal, unregisterModal } = useModalHistory();
 const SUBPAGE_MODAL_ID = "SettingsSubPage";
 
@@ -298,6 +300,14 @@ watch(currentSubPage, (val) => {
                     <h3 class="text-[11px] font-black uppercase tracking-[0.15em] opacity-50 mb-3 px-1">AI 注入逻辑</h3>
                     <SettingsCard>
                       <AiLogicSettingsSection :settings="settings" />
+                      <div class="mt-3 pt-3 border-t border-black/5 dark:border-white/10">
+                        <SettingsRow
+                          title="AI 生命周期调试"
+                          description="手动触发心跳、查看门控原因和主动消息建议"
+                          clickable
+                          @click="overlayStore.openAiLifecycleDebug()"
+                        />
+                      </div>
                     </SettingsCard>
                   </div>
                   <div>

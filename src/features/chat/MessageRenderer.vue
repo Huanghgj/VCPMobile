@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch, nextTick, onUnmounted } from "vue";
+import { invoke } from "@tauri-apps/api/core";
 import type { ChatMessage, ContentBlock } from "../../core/types/chat";
 import { useOverlayStore } from "../../core/stores/overlay";
 import { useChatHistoryStore } from "../../core/stores/chatHistoryStore";
@@ -9,6 +10,7 @@ import { useNotificationStore } from "../../core/stores/notification";
 import { useMessageEvents } from "../../core/composables/useMessageEvents";
 import { useEmoticonFixer } from "../../core/composables/useEmoticonFixer";
 import { renderMarkdownNodes } from "../../core/utils/astRenderer";
+import { renderSafeMarkdown } from "../../core/utils/safeMarkdown";
 import {
   getKatexRenderer,
   getMermaidRenderer,
@@ -19,7 +21,7 @@ import {
   rebuildSnapshot,
 } from "../../core/utils/astExecutor";
 import { useMessageStyleInjector } from "../../core/composables/useMessageStyleInjector";
-import { Copy, Edit2, RotateCcw, Trash2, StopCircle } from "lucide-vue-next";
+import { Copy, Edit2, RotateCcw, Trash2, StopCircle, Bug } from "lucide-vue-next";
 import morphdom from "morphdom";
 
 const { processEmoticonsInContainer } = useEmoticonFixer();
@@ -79,6 +81,109 @@ function astDebugLog(...args: unknown[]): void {
 // === AST Diff Feature Flags & Refs ===
 const tailSandboxRef = ref<HTMLElement | null>(null);
 const enableAstDiff = ref(true); // Feature Flag, 默认开启
+
+function inlineNodesContainRawHtml(nodes?: any[]): boolean {
+  if (!nodes || nodes.length === 0) return false;
+  return nodes.some((node) => {
+    if (!node) return false;
+    if (node.type === "raw_html_inline") return true;
+    return inlineNodesContainRawHtml(node.children);
+  });
+}
+
+function markdownNodesContainRawHtml(nodes?: any[]): boolean {
+  if (!nodes || nodes.length === 0) return false;
+  return nodes.some((node) => {
+    if (!node) return false;
+    switch (node.type) {
+      case "raw_html":
+        return true;
+      case "paragraph":
+      case "heading":
+        return inlineNodesContainRawHtml(node.children);
+      case "blockquote":
+        return markdownNodesContainRawHtml(node.children);
+      case "list":
+        return (node.items || []).some((itemNodes: any[]) =>
+          markdownNodesContainRawHtml(itemNodes),
+        );
+      case "table":
+        return (
+          (node.header || []).some((cell: any[]) =>
+            inlineNodesContainRawHtml(cell),
+          ) ||
+          (node.rows || []).some((row: any[]) =>
+            row.some((cell: any[]) => inlineNodesContainRawHtml(cell)),
+          )
+        );
+      default:
+        return false;
+    }
+  });
+}
+
+function rawHtmlLooksLikeRichRoot(content?: string): boolean {
+  if (!content) return false;
+  return (
+    /id\s*=\s*["']vcp-root["']/i.test(content) ||
+    /data-vcp-probe\s*=/i.test(content) ||
+    /style\s*=/i.test(content) ||
+    /<(?:div|section|article|main|table|img|svg|canvas)\b/i.test(content)
+  );
+}
+
+function inlineNodesContainRichHtml(nodes?: any[]): boolean {
+  if (!nodes || nodes.length === 0) return false;
+  return nodes.some((node) => {
+    if (!node) return false;
+    if (node.type === "raw_html_inline") {
+      return rawHtmlLooksLikeRichRoot(node.content);
+    }
+    return inlineNodesContainRichHtml(node.children);
+  });
+}
+
+function markdownNodesContainRichHtml(nodes?: any[]): boolean {
+  if (!nodes || nodes.length === 0) return false;
+  return nodes.some((node) => {
+    if (!node) return false;
+    if (node.type === "raw_html") {
+      return rawHtmlLooksLikeRichRoot(node.content);
+    }
+    if (inlineNodesContainRichHtml(node.children)) return true;
+    if (markdownNodesContainRichHtml(node.children)) return true;
+    if ((node.items || []).some((itemNodes: any[]) => markdownNodesContainRichHtml(itemNodes))) {
+      return true;
+    }
+    if ((node.header || []).some((cell: any[]) => inlineNodesContainRichHtml(cell))) {
+      return true;
+    }
+    return (node.rows || []).some((row: any[]) =>
+      row.some((cell: any[]) => inlineNodesContainRichHtml(cell)),
+    );
+  });
+}
+
+function blockContainsRichHtml(block: ContentBlock): boolean {
+  if (block.type !== "markdown" && block.type !== "diary") return false;
+  if (markdownNodesContainRichHtml(block.nodes)) return true;
+  return rawHtmlLooksLikeRichRoot(block.content);
+}
+
+function tailFrameContainsRawHtml(): boolean {
+  const frame = props.message.tailFrame;
+  if (!frame) return false;
+  if (markdownNodesContainRawHtml(frame.snapshot)) return true;
+  return (frame.mutations || []).some((mutation: any) => {
+    if (markdownNodesContainRawHtml([mutation.node])) return true;
+    if (inlineNodesContainRawHtml([mutation.node])) return true;
+    if (mutation.children && markdownNodesContainRawHtml(mutation.children)) {
+      return true;
+    }
+    return false;
+  });
+}
+
 const useAstForCurrentTail = computed(() => {
   if (!enableAstDiff.value) return false;
   // 超长 tail 降级保护：当后端因 tail 超过推测渲染上限（64KB）而停止产出 AST 节点时，
@@ -86,6 +191,14 @@ const useAstForCurrentTail = computed(() => {
   // 否则 AST 沙箱会因无快照/无指令而留白。判定依据：有 plain tailBlock 却无 nodes。
   const tb = props.message.tailBlock;
   if (tb && isPlainBlock(tb.type) && (!tb.nodes || tb.nodes.length === 0)) {
+    return false;
+  }
+  const snapshotNodes =
+    tb?.nodes || props.message.tailSnapshot || props.message.tailFrame?.snapshot;
+  if (markdownNodesContainRawHtml(snapshotNodes)) {
+    return false;
+  }
+  if (tailFrameContainsRawHtml()) {
     return false;
   }
   return (
@@ -138,7 +251,15 @@ const activeMermaidSvg = ref("");
 const activeMermaidSource = ref("");
 
 // === Shell Properties (Pre-computed in Rust) ===
-const shell = computed(() => props.message.shell);
+const shell = computed(
+  () =>
+    props.message.shell ||
+    streamStore.computeShell({
+      role: props.message.role || "assistant",
+      agentId: props.message.agentId,
+      name: props.message.name,
+    }),
+);
 
 // === Streaming State ===
 
@@ -163,6 +284,13 @@ const shouldRenderRawContentFallback = computed(() => {
   if (!isStreaming.value) return true;
   return !props.message.tailBlock && !props.message.tailContent;
 });
+
+const renderedContentFallback = computed(() =>
+  renderSafeMarkdown(props.message.content || "", {
+    allowRichHtml: true,
+    allowStyleAttr: true,
+  }),
+);
 
 function isBrkNode(node: any): boolean {
   if (node.type === "raw_html" && node.content) {
@@ -224,8 +352,22 @@ function splitMarkdownNodes(nodes: any[]): any[][] {
 
 interface BubbleGroup {
   id: string;
-  blocks: ContentBlock[];
+  blocks: RenderedContentBlock[];
+  hasRichHtml: boolean;
   isTail?: boolean;
+}
+
+type RenderedContentBlock = ContentBlock & {
+  __renderKey: string;
+};
+
+function getBlockKey(block: ContentBlock, index: number): string {
+  const messageScope = props.message.id || "unknown-message";
+  if (block.hash !== undefined && block.hash !== null) {
+    return `${messageScope}-${block.type}-${String(block.hash)}-${index}`;
+  }
+  // Fallback for legacy data (index-based)
+  return `${messageScope}-${block.type}-idx-${index}`;
 }
 
 const messageBubbles = computed(() => {
@@ -235,9 +377,14 @@ const messageBubbles = computed(() => {
 
   const pushCurrentGroup = () => {
     if (currentBlocks.length > 0) {
+      const blocks = currentBlocks.map((block, index) => ({
+        ...block,
+        __renderKey: getBlockKey(block, index),
+      }));
       list.push({
         id: `${props.message.id}-bubble-${bubbleIndex++}`,
-        blocks: [...currentBlocks],
+        blocks,
+        hasRichHtml: blocks.some(blockContainsRichHtml),
       });
       currentBlocks = [];
     }
@@ -302,6 +449,7 @@ const messageBubbles = computed(() => {
     list.push({
       id: `${props.message.id}-bubble-${bubbleIndex++}`,
       blocks: [],
+      hasRichHtml: false,
     });
   }
 
@@ -310,6 +458,7 @@ const messageBubbles = computed(() => {
     list.push({
       id: `${props.message.id}-bubble-0`,
       blocks: [],
+      hasRichHtml: false,
     });
   }
 
@@ -339,6 +488,33 @@ function isRenderableTailBlock(type?: string): boolean {
   );
 }
 
+function getBubbleStyle(bubble: BubbleGroup): Record<string, string> {
+  const style: Record<string, string> = {
+    "--dynamic-color": shell.value?.avatarColor || "transparent",
+  };
+  if (!shell.value?.isUser && bubble.hasRichHtml) {
+    style["--assistant-bubble-bg"] = "transparent";
+    style["--agent-text"] = "inherit";
+    style["border-color"] = "transparent";
+    style["box-shadow"] = "none";
+    style["padding"] = "0";
+  }
+  return style;
+}
+
+function getMarkdownBlockShell(block: ContentBlock): { className: string; attrs: string } {
+  if (!blockContainsRichHtml(block)) {
+    return {
+      className: "vcp-markdown-block",
+      attrs: "",
+    };
+  }
+  return {
+    className: "vcp-markdown-block vcp-rich-html-block",
+    attrs: ' data-vcp-rich-html="true"',
+  };
+}
+
 function renderBlockHtml(block: ContentBlock): string {
   switch (block.type) {
     case "markdown":
@@ -362,15 +538,20 @@ function renderBlockHtml(block: ContentBlock): string {
           }
           return ""; // Keep unclosed style invisible in chat body
         }
-        return `<div class="vcp-markdown-block">${renderMarkdownNodes(block.nodes, props.message.id, block.hash)}</div>`;
+        const shell = getMarkdownBlockShell(block);
+        return `<div class="${shell.className}"${shell.attrs}>${renderMarkdownNodes(block.nodes, props.message.id, block.hash)}</div>`;
       }
-      return `<div class="vcp-markdown-block"><p>${escapeHtml(block.content || "")}</p></div>`;
+      const shell = getMarkdownBlockShell(block);
+      return `<div class="${shell.className}"${shell.attrs}>${renderSafeMarkdown(block.content || "", { allowRichHtml: true, allowStyleAttr: true })}</div>`;
 
     case "diary": {
       const diaryContent =
         block.nodes && block.nodes.length > 0
           ? renderMarkdownNodes(block.nodes, props.message.id, block.hash)
-          : escapeHtml(block.content || "");
+          : renderSafeMarkdown(block.content || "", {
+              allowRichHtml: true,
+              allowStyleAttr: true,
+            });
       return `
         <div class="vcp-diary-block">
           <div class="vcp-diary-header">
@@ -424,13 +605,251 @@ function renderBlockHtml(block: ContentBlock): string {
   }
 }
 
-function getBlockKey(block: ContentBlock, index: number): string {
-  const messageScope = props.message.id || "unknown-message";
-  if (block.hash !== undefined && block.hash !== null) {
-    return `${messageScope}-${block.type}-${String(block.hash)}-${index}`;
+function walkInlineDebug(nodes: any[] | undefined, stats: Record<string, number>) {
+  for (const node of nodes || []) {
+    if (!node?.type) continue;
+    stats[`inline:${node.type}`] = (stats[`inline:${node.type}`] || 0) + 1;
+    if (node.type === "raw_html_inline") {
+      stats.rawHtmlInline = (stats.rawHtmlInline || 0) + 1;
+    }
+    if (node.type === "image") {
+      stats.images = (stats.images || 0) + 1;
+    }
+    walkInlineDebug(node.children, stats);
   }
-  // Fallback for legacy data (index-based)
-  return `${messageScope}-${block.type}-idx-${index}`;
+}
+
+function walkMarkdownDebug(nodes: any[] | undefined, stats: Record<string, number>) {
+  for (const node of nodes || []) {
+    if (!node?.type) continue;
+    stats[`node:${node.type}`] = (stats[`node:${node.type}`] || 0) + 1;
+    if (node.type === "raw_html") {
+      stats.rawHtml = (stats.rawHtml || 0) + 1;
+    }
+    if (node.type === "code_block") {
+      stats.codeBlocks = (stats.codeBlocks || 0) + 1;
+    }
+    walkInlineDebug(node.children, stats);
+    walkMarkdownDebug(node.children, stats);
+    for (const item of node.items || []) walkMarkdownDebug(item, stats);
+    for (const cell of node.header || []) walkInlineDebug(cell, stats);
+    for (const row of node.rows || []) {
+      for (const cell of row || []) walkInlineDebug(cell, stats);
+    }
+  }
+}
+
+function summarizeBlocksForDebug(blocks: ContentBlock[] | undefined) {
+  const list = blocks || [];
+  const byType = list.reduce<Record<string, number>>((acc, block) => {
+    acc[block.type] = (acc[block.type] || 0) + 1;
+    return acc;
+  }, {});
+  const stats: Record<string, number> = {};
+  for (const block of list) {
+    if (block.type === "html-preview") stats.htmlPreview = (stats.htmlPreview || 0) + 1;
+    if (block.type === "button-click") stats.buttonClick = (stats.buttonClick || 0) + 1;
+    if (block.type === "style") stats.styleBlocks = (stats.styleBlocks || 0) + 1;
+    walkMarkdownDebug(block.nodes, stats);
+  }
+  return {
+    count: list.length,
+    byType,
+    stats,
+    blocks: list.map((block, index) => ({
+      index,
+      type: block.type,
+      hash: block.hash,
+      contentLength: block.content?.length || block.raw_content?.length || 0,
+      nodeCount: block.nodes?.length || 0,
+      hasRawHtml: markdownNodesContainRawHtml(block.nodes),
+      htmlPreviewLength: block.type === "html-preview" ? block.content?.length || 0 : undefined,
+      toolName: block.tool_name,
+      status: block.status,
+      role: block.role,
+      isEnd: block.is_end,
+    })),
+  };
+}
+
+function renderBlocksForDebug(blocks: ContentBlock[]): Array<Record<string, unknown>> {
+  return blocks.map((block, index) => {
+    let html = "";
+    let error = "";
+    try {
+      html = renderBlockHtml(block);
+    } catch (e) {
+      error = String(e);
+    }
+    return {
+      index,
+      type: block.type,
+      htmlLength: html.length,
+      startsWith: html.slice(0, 240),
+      containsRawTagText:
+        html.includes("&lt;div") ||
+        html.includes("&lt;img") ||
+        html.includes("&lt;style") ||
+        html.includes("&lt;button"),
+      containsRenderableTag:
+        /<(div|img|style|button|pre|code|p|section|article)\b/i.test(html),
+      error,
+    };
+  });
+}
+
+function readElementStyleForDebug(element: Element | null): Record<string, unknown> | null {
+  if (!(element instanceof HTMLElement)) return null;
+  const style = window.getComputedStyle(element);
+  const rect = element.getBoundingClientRect();
+  return {
+    tagName: element.tagName.toLowerCase(),
+    className: element.className,
+    inlineStyle: element.getAttribute("style") || "",
+    width: Math.round(rect.width),
+    height: Math.round(rect.height),
+    display: style.display,
+    position: style.position,
+    backgroundColor: style.backgroundColor,
+    color: style.color,
+    fontFamily: style.fontFamily,
+    fontSize: style.fontSize,
+    lineHeight: style.lineHeight,
+    padding: style.padding,
+    margin: style.margin,
+    borderRadius: style.borderRadius,
+    borderTopColor: style.borderTopColor,
+    opacity: style.opacity,
+    overflow: style.overflow,
+    whiteSpace: style.whiteSpace,
+  };
+}
+
+function readImagesForDebug(root: Element): Array<Record<string, unknown>> {
+  return Array.from(root.querySelectorAll("img")).map((img, index) => {
+    const rect = img.getBoundingClientRect();
+    const style = window.getComputedStyle(img);
+    return {
+      index,
+      src: img.currentSrc || img.src || "",
+      attrSrc: img.getAttribute("src") || "",
+      complete: img.complete,
+      naturalWidth: img.naturalWidth,
+      naturalHeight: img.naturalHeight,
+      renderedWidth: Math.round(rect.width),
+      renderedHeight: Math.round(rect.height),
+      display: style.display,
+      visibility: style.visibility,
+      opacity: style.opacity,
+    };
+  });
+}
+
+function readActualDomForDebug(): Record<string, unknown> {
+  const root = messageContentRef.value;
+  if (!root) {
+    return { mounted: false };
+  }
+
+  const contentRoot = root.querySelector(".vcp-content-blocks");
+  const target = contentRoot || root;
+  const vcpRoot = target.querySelector("#vcp-root");
+  const richBlock = target.querySelector("[data-vcp-rich-html='true']");
+  const bubble = root.querySelector(".vcp-bubble-container");
+  const html = target.innerHTML || "";
+  const text = target.textContent || "";
+  return {
+    mounted: true,
+    htmlLength: html.length,
+    textLength: text.length,
+    hasVcpRootElement: Boolean(vcpRoot),
+    hasRenderedImageElement: Boolean(target.querySelector("img")),
+    richBlock: readElementStyleForDebug(richBlock),
+    vcpRoot: readElementStyleForDebug(vcpRoot),
+    bubble: readElementStyleForDebug(bubble),
+    images: readImagesForDebug(target),
+    hasLiteralEscapedDivText: text.includes("<div") || text.includes("&lt;div"),
+    htmlStartsWith: html.slice(0, 800),
+    textStartsWith: text.slice(0, 800),
+  };
+}
+
+function buildRenderDebugReport(
+  rawContent: string,
+  reparsedBlocks: ContentBlock[],
+): string {
+  const currentBlocks = props.message.blocks || [];
+  const currentSummary = summarizeBlocksForDebug(currentBlocks);
+  const reparsedSummary = summarizeBlocksForDebug(reparsedBlocks);
+  const currentHtml = renderBlocksForDebug(currentBlocks);
+  const reparsedHtml = renderBlocksForDebug(reparsedBlocks);
+
+  return JSON.stringify(
+    {
+      message: {
+        id: props.message.id,
+        role: props.message.role,
+        name: props.message.name,
+        isStreaming: isStreaming.value,
+        hasContentOnMessage: Boolean(props.message.content),
+        rawContentLength: rawContent.length,
+        tailContentLength: props.message.tailContent?.length || 0,
+        tailBlockType: props.message.tailBlock?.type || null,
+        tailHasNodes: Boolean(props.message.tailBlock?.nodes?.length),
+        tailFrame: props.message.tailFrame
+          ? {
+              epoch: props.message.tailFrame.epoch,
+              revision: props.message.tailFrame.revision,
+              frameSeq: props.message.tailFrame.frameSeq,
+              reset: props.message.tailFrame.reset === true,
+              mutationCount: props.message.tailFrame.mutations?.length || 0,
+              snapshotCount: props.message.tailFrame.snapshot?.length || 0,
+            }
+          : null,
+      },
+      parserComparison: {
+        current: currentSummary,
+        reparsed: reparsedSummary,
+        sameBlockTypeSequence:
+          currentBlocks.map((block) => block.type).join(">") ===
+          reparsedBlocks.map((block) => block.type).join(">"),
+      },
+      frontEndRender: {
+        currentBlocks: currentHtml,
+        reparsedBlocks: reparsedHtml,
+      },
+      actualDom: readActualDomForDebug(),
+      rawContentPreview: rawContent.slice(0, 4000),
+      reparsedBlocks,
+      currentBlocks,
+    },
+    null,
+    2,
+  );
+}
+
+async function openRenderDebugReport(getFullText: () => Promise<string>) {
+  try {
+    const rawContent = await getFullText();
+    const reparsedBlocks = await invoke<ContentBlock[]>("process_message_content", {
+      content: rawContent,
+    });
+    overlayStore.openEditor({
+      title: "渲染解析诊断",
+      initialValue: buildRenderDebugReport(rawContent, reparsedBlocks),
+      readOnly: true,
+      showSave: false,
+      monospace: true,
+      placeholder: "正在生成诊断报告...",
+    });
+  } catch (e) {
+    notificationStore.addNotification({
+      type: "error",
+      title: "渲染解析失败",
+      message: String(e),
+      toastOnly: true,
+    });
+  }
 }
 
 function escapeHtml(text: string): string {
@@ -659,6 +1078,14 @@ const showMessageContextMenu = async () => {
       });
     },
   });
+
+  if (!shell.value?.isUser) {
+    actions.push({
+      label: "渲染解析诊断",
+      icon: Bug,
+      handler: () => openRenderDebugReport(getFullText),
+    });
+  }
 
   // 3. 其他非流式操作
   if (!isStreaming.value) {
@@ -996,9 +1423,7 @@ onUnmounted(() => {
           :is-streaming="
             isStreaming && bubbleIndex === messageBubbles.length - 1
           "
-          :bubble-style="{
-            '--dynamic-color': shell.avatarColor,
-          }"
+          :bubble-style="getBubbleStyle(bubble)"
           :class="bubbleIndex > 0 ? 'mt-2' : ''"
         >
           <!-- 初始思考指示灯：仅在此活跃气泡没有任何已确认 blocks，且仍在流式并未吐出 tail 时显示 -->
@@ -1017,11 +1442,10 @@ onUnmounted(() => {
           >
             <template v-if="bubble.blocks && bubble.blocks.length > 0">
               <template
-                v-for="(block, index) in bubble.blocks"
-                :key="getBlockKey(block, index)"
+                v-for="block in bubble.blocks"
+                :key="block.__renderKey"
               >
-                <!-- v-memo=[index] 保证已稳定块零开销：Vue 缓存 VNode 子树，不重渲染、不触碰 DOM -->
-                <div v-memo="[getBlockKey(block, index)]">
+                <div>
                   <div
                     v-if="isPlainBlock(block.type)"
                     v-html="renderBlockHtml(block)"
@@ -1063,9 +1487,10 @@ onUnmounted(() => {
             <template
               v-else-if="bubbleIndex === 0 && shouldRenderRawContentFallback"
             >
-              <div class="vcp-markdown-block select-text">
-                <p>{{ message.content }}</p>
-              </div>
+              <div
+                class="vcp-markdown-block select-text"
+                v-html="renderedContentFallback"
+              />
             </template>
 
             <!-- 尾部流式推测渲染（只对最后一个活跃气泡生效，且正在流式、有 tailBlock 时渲染，完美拼合在气泡正文末尾） -->

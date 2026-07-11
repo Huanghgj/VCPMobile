@@ -53,6 +53,11 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             system::acquire_wake_lock,
             system::release_wake_lock,
             system::start_network_monitoring,
+            system::get_lifecycle_runtime_status,
+            system::request_exact_alarm_access,
+            system::schedule_lifecycle_wakeup,
+            system::cancel_lifecycle_wakeup,
+            system::set_lifecycle_keepalive,
         ])
         .setup(|app, _api| {
             #[cfg(target_os = "android")]

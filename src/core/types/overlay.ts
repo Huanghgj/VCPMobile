@@ -20,5 +20,10 @@ export interface PromptConfig {
 
 export interface EditorConfig {
   initialValue: string;
-  onSave: (newContent: string) => void;
+  title?: string;
+  placeholder?: string;
+  readOnly?: boolean;
+  showSave?: boolean;
+  monospace?: boolean;
+  onSave?: (newContent: string) => void;
 }

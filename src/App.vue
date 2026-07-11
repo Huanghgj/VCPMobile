@@ -19,6 +19,8 @@ import { useAutoUpdate } from "./core/composables/useAutoUpdate";
 import { useChatSessionStore } from "./core/stores/chatSessionStore";
 import { useAssistantStore } from "./core/stores/assistant";
 import { useSettingsStore } from "./core/stores/settings";
+import { useAiLifecycleStore } from "./core/stores/aiLifecycle";
+import { useLifecycleSchedulerStore } from "./core/stores/lifecycleScheduler";
 import { isTauriRuntime } from "./core/utils/runtime";
 import {
   reapplyScreenKeepIfActive,
@@ -79,6 +81,8 @@ const layoutStore = useLayoutStore();
 const sessionStore = useChatSessionStore();
 const assistantStore = useAssistantStore();
 const settingsStore = useSettingsStore();
+const aiLifecycleStore = useAiLifecycleStore();
+const lifecycleSchedulerStore = useLifecycleSchedulerStore();
 const { processPayload } = useNotificationProcessor();
 const { initGlobalFixer } = useEmoticonFixer();
 const { isPromptOpen, updateInfo, handleConfirm, handleDismiss } =
@@ -273,6 +277,7 @@ const backgroundStyle = computed(() => {
 
 // 用于取消监听的清理函数
 let unlistenLog: (() => void) | null = null;
+let unlistenLifecycleJobs: (() => void) | null = null;
 let removeRouteGuard: (() => void) | null = null;
 let stopPendingShareReadyWatch: (() => void) | null = null;
 
@@ -374,6 +379,7 @@ const handleVcpLifecycle = (e: Event) => {
       "[Lifecycle] App moved to background, tuning heartbeat to 120s..."
     );
     suspendPhysicalScreenKeep(); // 休眠物理亮屏，达到省电效果
+    aiLifecycleStore.stopTimer();
     invoke("set_vcp_log_heartbeat", { intervalMs: 120000 }).catch((err) => {
       console.error("[Lifecycle] Failed to set background heartbeat:", err);
     });
@@ -390,7 +396,19 @@ const handleVcpLifecycle = (e: Event) => {
     lifecycleStore.hydrateSystemStatus().catch((err) => {
       console.error("[Lifecycle] Failed to hydrate system status:", err);
     });
+    if (aiLifecycleStore.config.enabled) {
+      aiLifecycleStore.startTimer();
+    }
+    lifecycleSchedulerStore.wake().catch((err) => {
+      console.error("[Lifecycle] Failed to run due lifecycle jobs:", err);
+    });
   }
+};
+
+const handleLifecycleWakeup = () => {
+  lifecycleSchedulerStore.wake().catch((err) => {
+    console.error("[Lifecycle] Native wakeup execution failed:", err);
+  });
 };
 
 const handleFloatingBallClick = async () => {
@@ -447,6 +465,7 @@ onMounted(async () => {
   window.addEventListener("vcp-hardware-back", handleExitRequest);
   document.addEventListener("visibilitychange", handleVisibilityChange);
   window.addEventListener("vcp-lifecycle", handleVcpLifecycle);
+  window.addEventListener("vcp-lifecycle-wakeup", handleLifecycleWakeup);
   window.addEventListener("vcp-floating-ball-click", handleFloatingBallClick);
   window.addEventListener("vcp-share-intent", handleShareIntent);
   window.addEventListener("vcp-keyboard-inset", handleSafeAreaInset);
@@ -464,6 +483,11 @@ onMounted(async () => {
         notificationStore.addNotification(processed);
       }
     });
+    unlistenLifecycleJobs = await listen("vcp-lifecycle-jobs-changed", () => {
+      lifecycleSchedulerStore.refreshJobs()
+        .then(() => lifecycleSchedulerStore.syncNativeWakeup())
+        .catch((err) => console.error("[Lifecycle] Failed to refresh scheduled jobs:", err));
+    });
   } else {
     console.info(
       "[App] Web preview runtime detected, skipping Tauri event listeners."
@@ -472,6 +496,18 @@ onMounted(async () => {
 
   // 2. 异步执行重度核心资源加载 (启动引导)
   await bootstrapApp();
+
+  if (!isAssistant.value && aiLifecycleStore.config.enabled) {
+    aiLifecycleStore.startTimer();
+  }
+  if (!isAssistant.value) {
+    await lifecycleSchedulerStore.start();
+    if (isTauriRuntime() && localStorage.getItem("vcp-lifecycle-keepalive") === "true") {
+      invoke("plugin:vcp-mobile|set_lifecycle_keepalive", { enabled: true }).catch((err) => {
+        console.error("[Lifecycle] Failed to restore lifecycle keepalive:", err);
+      });
+    }
+  }
 
   // Operation Dummy Root: Wait for router and inject dummy layer
   await router.isReady();
@@ -487,6 +523,8 @@ onUnmounted(() => {
   document.documentElement.classList.remove("vcp-battery-static");
   if (unlistenLog) unlistenLog();
   unlistenLog = null;
+  if (unlistenLifecycleJobs) unlistenLifecycleJobs();
+  unlistenLifecycleJobs = null;
   if (removeRouteGuard) removeRouteGuard();
   removeRouteGuard = null;
   if (stopPendingShareReadyWatch) stopPendingShareReadyWatch();
@@ -499,12 +537,15 @@ onUnmounted(() => {
   window.removeEventListener("vcp-hardware-back", handleExitRequest);
   document.removeEventListener("visibilitychange", handleVisibilityChange);
   window.removeEventListener("vcp-lifecycle", handleVcpLifecycle);
+  window.removeEventListener("vcp-lifecycle-wakeup", handleLifecycleWakeup);
   window.removeEventListener(
     "vcp-floating-ball-click",
     handleFloatingBallClick
   );
   window.removeEventListener("vcp-share-intent", handleShareIntent);
   window.removeEventListener("vcp-keyboard-inset", handleSafeAreaInset);
+  aiLifecycleStore.stopTimer();
+  lifecycleSchedulerStore.stop();
 });
 </script>
 

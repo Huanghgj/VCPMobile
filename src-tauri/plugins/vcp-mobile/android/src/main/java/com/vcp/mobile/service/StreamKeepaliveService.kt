@@ -35,6 +35,8 @@ class StreamKeepaliveService : Service() {
         const val EXTRA_AGENT_NAME = "agent_name"
         const val EXTRA_IS_KEEPALIVE_MODE = "is_keepalive_mode"
         private const val TAG = "VcpMobileService"
+        private const val PREFS = "vcp_lifecycle_scheduler"
+        private const val KEY_KEEPALIVE = "keepalive_enabled"
 
         @Volatile
         var isServiceRunning = false
@@ -57,6 +59,31 @@ class StreamKeepaliveService : Service() {
                 }
             }
         }
+
+        fun isKeepaliveRequested(context: Context): Boolean =
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getBoolean(KEY_KEEPALIVE, false)
+
+        fun persistKeepaliveRequested(context: Context, enabled: Boolean) {
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean(KEY_KEEPALIVE, enabled)
+                .apply()
+        }
+
+        fun restoreRequestedKeepalive(context: Context) {
+            if (!isKeepaliveRequested(context)) return
+            val intent = createIntent(context, "", true)
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    androidx.core.content.ContextCompat.startForegroundService(context, intent)
+                } else {
+                    context.startService(intent)
+                }
+            } catch (error: Exception) {
+                Log.w(TAG, "Unable to restore lifecycle keepalive", error)
+            }
+        }
     }
 
     override fun onCreate() {
@@ -66,9 +93,13 @@ class StreamKeepaliveService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent == null) {
+            isKeepaliveModeActive = isKeepaliveRequested(this)
+        }
         if (intent != null) {
             if (intent.hasExtra(EXTRA_IS_KEEPALIVE_MODE)) {
                 isKeepaliveModeActive = intent.getBooleanExtra(EXTRA_IS_KEEPALIVE_MODE, false)
+                persistKeepaliveRequested(this, isKeepaliveModeActive)
             }
             if (intent.hasExtra(EXTRA_AGENT_NAME)) {
                 currentStreamName = intent.getStringExtra(EXTRA_AGENT_NAME) ?: ""
@@ -114,7 +145,7 @@ class StreamKeepaliveService : Service() {
             return START_NOT_STICKY
         }
 
-        if (isKeepaliveModeActive || currentStreamName.isNotEmpty()) {
+        if (currentStreamName.isNotEmpty()) {
             val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
             if (wakeLock == null) {
                 wakeLock = powerManager.newWakeLock(

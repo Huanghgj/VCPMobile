@@ -13,7 +13,7 @@ const props = defineProps<{
 }>();
 
 const themeStore = useThemeStore();
-const isPreviewing = ref(false); // 默认开启代码模式，减小开销
+const isPreviewing = ref(!props.isStreaming);
 const isFullScreen = ref(false);
 const fullScreenTab = ref<"code" | "preview">("code");
 const inlineIframeRef = ref<HTMLIFrameElement | null>(null);
@@ -32,6 +32,15 @@ watch(isFullScreen, (newVal) => {
     unregisterModal(modalId);
   }
 });
+
+watch(
+  () => props.isStreaming,
+  (streaming) => {
+    if (!streaming) {
+      isPreviewing.value = true;
+    }
+  },
+);
 
 // 代码预览转义处理 (优先使用后端预渲染 syntect 高亮，无值时回退为安全 HTML 转义)
 const highlightedCode = computed(() => {

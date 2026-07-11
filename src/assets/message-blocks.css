@@ -50,6 +50,51 @@
     "Noto Color Emoji";
 }
 
+.vcp-rich-html-block {
+  width: 100%;
+  max-width: min(100%, 720px);
+  opacity: 1;
+  color: inherit;
+  font-size: 0.9375rem;
+  line-height: normal;
+}
+
+.vcp-rich-html-block > #vcp-root,
+.vcp-rich-html-block [id="vcp-root"] {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  padding: 18px;
+  border-radius: 14px;
+  background: #faf8f5;
+  color: #3d2c1f;
+  font-family: "KaiTi", "PingFang SC", "Noto Serif CJK SC", serif;
+  line-height: 1.85;
+  overflow-wrap: break-word;
+  word-break: break-word;
+  white-space: normal;
+  opacity: 1;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.1);
+}
+
+html.dark .vcp-rich-html-block > #vcp-root,
+html.dark .vcp-rich-html-block [id="vcp-root"] {
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.24);
+}
+
+.vcp-rich-html-block p {
+  white-space: normal;
+}
+
+.vcp-rich-html-block img {
+  display: inline-block;
+  max-width: 100%;
+  height: auto;
+  vertical-align: middle;
+}
+
 /* --- Strong / Emphasis / Strikethrough --- */
 .vcp-markdown-block strong {
   font-weight: 700;
@@ -171,6 +216,12 @@
 }
 
 /* --- Code Block Container --- */
+.vcp-markdown-block .vcp-code-shell {
+  position: relative;
+  max-width: 100%;
+  margin: 8px 0;
+}
+
 .vcp-markdown-block pre {
   border-radius: 8px;
   background: #2b303b;
@@ -182,6 +233,69 @@
   max-width: 100%;
   font-size: 0.8em;
   line-height: 1.6;
+}
+
+.vcp-markdown-block .vcp-code-shell pre {
+  margin: 0;
+  padding-top: 34px;
+}
+
+.vcp-markdown-block .vcp-code-toolbar {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  left: 6px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  pointer-events: none;
+}
+
+.vcp-markdown-block .vcp-code-lang {
+  margin-right: auto;
+  max-width: min(50%, 220px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border-radius: 6px;
+  padding: 3px 7px;
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(255, 255, 255, 0.76);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.2;
+}
+
+.vcp-markdown-block .vcp-code-copy-btn {
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 6px;
+  background: rgba(15, 18, 24, 0.72);
+  color: rgba(255, 255, 255, 0.82);
+  cursor: pointer;
+  pointer-events: auto;
+  transition: background-color 120ms ease, color 120ms ease, transform 120ms ease;
+}
+
+.vcp-markdown-block .vcp-code-copy-btn:active {
+  transform: scale(0.96);
+}
+
+.vcp-markdown-block .vcp-code-copy-btn:hover,
+.vcp-markdown-block .vcp-code-copy-btn.is-copied {
+  background: rgba(255, 255, 255, 0.16);
+  color: #fff;
+}
+
+.vcp-markdown-block .vcp-code-copy-icon {
+  width: 15px;
+  height: 15px;
 }
 
 /* Code typography */

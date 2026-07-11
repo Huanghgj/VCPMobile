@@ -22,6 +22,7 @@ const DEFAULT_SUMMARY_MODEL: &str = "gemini-2.5-flash";
 const AI_REQUEST_TIMEOUT_SECS: u64 = 30;
 
 const MIN_MESSAGES_FOR_AUTO_SUMMARY: i32 = 2;
+const MAX_SUMMARY_CONTEXT_CHARS: usize = 24_000;
 
 #[derive(Debug, Clone)]
 struct TopicSummaryTarget {
@@ -180,32 +181,75 @@ async fn emit_persisted_topic_summary<R: Runtime>(
     );
 }
 
-async fn load_recent_topic_messages(
+async fn load_topic_messages_for_summary(
     db_pool: &Pool<Sqlite>,
     topic_id: &str,
-    limit: i64,
 ) -> Result<Vec<(String, String)>, String> {
     let rows = sqlx::query(
         "SELECT role, content FROM messages
          WHERE topic_id = ? AND deleted_at IS NULL
-         ORDER BY timestamp DESC, rowid DESC
-         LIMIT ?",
+         ORDER BY timestamp ASC, rowid ASC",
     )
     .bind(topic_id)
-    .bind(limit)
     .fetch_all(db_pool)
     .await
     .map_err(|e| e.to_string())?;
 
     let mut messages = Vec::with_capacity(rows.len());
-    for row in rows.into_iter().rev() {
+    for row in rows {
         let role: String = row.get("role");
+        if role == "system" {
+            continue;
+        }
         let content_bytes: Vec<u8> = row.get("content");
         let content = ContentCompressor::decompress(&content_bytes).unwrap_or_default();
-        messages.push((role, content));
+        let content = content.trim();
+        if !content.is_empty() {
+            messages.push((role, content.to_string()));
+        }
     }
 
     Ok(messages)
+}
+
+fn build_summary_context(
+    messages: Vec<(String, String)>,
+    user_name: &str,
+    agent_name: &str,
+) -> String {
+    let mut rendered: Vec<String> = messages
+        .into_iter()
+        .map(|(role, content)| {
+            let role_name = if role == "user" {
+                user_name
+            } else {
+                agent_name
+            };
+            format!("{}: {}", role_name, content)
+        })
+        .collect();
+
+    let full = rendered.join("\n");
+    if full.chars().count() <= MAX_SUMMARY_CONTEXT_CHARS {
+        return full;
+    }
+
+    let mut kept = Vec::new();
+    let mut total = 0usize;
+    while let Some(item) = rendered.pop() {
+        let item_len = item.chars().count() + 1;
+        if total + item_len > MAX_SUMMARY_CONTEXT_CHARS {
+            break;
+        }
+        total += item_len;
+        kept.push(item);
+    }
+    kept.reverse();
+
+    format!(
+        "[前方较早聊天记录因长度限制已省略，以下为本话题最近的完整连续片段]\n{}",
+        kept.join("\n")
+    )
 }
 
 pub async fn summarize_topic_if_needed<R: Runtime>(
@@ -353,28 +397,21 @@ pub async fn summarize_topic<R: Runtime>(
         return Err("VCP settings are missing".to_string());
     }
 
-    // 1. 获取最近消息 (最近4条)。标题总结只需要纯文本，避免触发 UI 渲染/附件加载。
+    // 1. 获取该话题的完整纯文本消息。标题总结不依赖前端当前分页状态。
     let db_state = app_handle.state::<crate::vcp_modules::db_manager::DbState>();
-    let messages = load_recent_topic_messages(&db_state.pool, &topic_id, 4).await?;
+    let messages = load_topic_messages_for_summary(&db_state.pool, &topic_id).await?;
 
     if messages.len() < 2 {
         return Err("Not enough messages to summarize".to_string());
     }
 
-    let mut recent_content = String::new();
-    for (role, content) in messages {
-        let role_name = if role == "user" {
-            settings.user_name.as_str()
-        } else {
-            agent_name.as_str()
-        };
-        recent_content.push_str(&format!("{}: {}\n", role_name, content));
-    }
+    let summary_context =
+        build_summary_context(messages, settings.user_name.as_str(), agent_name.as_str());
 
     // 2. 构造 Prompt
     let summary_prompt = format!(
         "[待总结聊天记录: {}]\n{}",
-        recent_content, DEFAULT_SUMMARY_PROMPT
+        summary_context, DEFAULT_SUMMARY_PROMPT
     );
 
     // 3. 调用 AI

@@ -1,6 +1,7 @@
 package com.vcp.mobile
 
 import android.app.Activity
+import android.app.AlarmManager
 import android.content.ContentValues
 import android.content.Context
 import android.content.IntentFilter
@@ -72,6 +73,15 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
 
         fun getInstance(): VcpMobilePlugin? {
             return instanceRef?.get()
+        }
+    }
+
+    fun emitLifecycleWakeup() {
+        activity.runOnUiThread {
+            webViewRef?.evaluateJavascript(
+                "window.dispatchEvent(new CustomEvent('vcp-lifecycle-wakeup'))",
+                null,
+            )
         }
     }
 
@@ -243,6 +253,74 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
     @Command
     fun requestOverlayPermission(invoke: Invoke) {
         floatingWindowManager.requestOverlayPermission()
+        invoke.resolve()
+    }
+
+    @Command
+    fun getLifecycleRuntimeStatus(invoke: Invoke) {
+        val powerManager = activity.getSystemService(Context.POWER_SERVICE) as PowerManager
+        val result = JSObject().apply {
+            put("exactAlarmAllowed", LifecycleAlarmManager.canScheduleExact(activity))
+            put("batteryOptimizationIgnored", powerManager.isIgnoringBatteryOptimizations(activity.packageName))
+            put("lifecycleKeepaliveActive", StreamKeepaliveService.isKeepaliveModeActive)
+            put("manufacturer", Build.MANUFACTURER ?: "unknown")
+        }
+        invoke.resolve(result)
+    }
+
+    @Command
+    fun requestExactAlarmAccess(invoke: Invoke) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            !LifecycleAlarmManager.canScheduleExact(activity)
+        ) {
+            try {
+                activity.startActivity(
+                    Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM).apply {
+                        data = Uri.parse("package:" + activity.packageName)
+                    },
+                )
+            } catch (_: Exception) {
+                activity.startActivity(Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM))
+            }
+        }
+        invoke.resolve()
+    }
+
+    @Command
+    fun scheduleLifecycleWakeup(invoke: Invoke) {
+        val args = invoke.parseArgs(ScheduleLifecycleWakeupArgs::class.java)
+        val result = JSObject().apply {
+            put("scheduled", LifecycleAlarmManager.schedule(activity, args.triggerAtMs))
+            put("exact", LifecycleAlarmManager.canScheduleExact(activity))
+        }
+        invoke.resolve(result)
+    }
+
+    @Command
+    fun cancelLifecycleWakeup(invoke: Invoke) {
+        LifecycleAlarmManager.cancel(activity)
+        invoke.resolve()
+    }
+
+    @Command
+    fun setLifecycleKeepalive(invoke: Invoke) {
+        val args = invoke.parseArgs(SetLifecycleKeepaliveArgs::class.java)
+        StreamKeepaliveService.persistKeepaliveRequested(activity, args.enabled)
+        val serviceIntent = StreamKeepaliveService.createIntent(activity, "", args.enabled)
+        if (args.enabled) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                ContextCompat.startForegroundService(activity, serviceIntent)
+            } else {
+                activity.startService(serviceIntent)
+            }
+        } else {
+            StreamKeepaliveService.isKeepaliveModeActive = false
+            if (StreamKeepaliveService.currentStreamName.isEmpty()) {
+                activity.stopService(serviceIntent)
+            } else {
+                activity.startService(serviceIntent)
+            }
+        }
         invoke.resolve()
     }
 
@@ -1913,4 +1991,14 @@ class GetSensorDataArgs {
 class RunRootCommandArgs {
     lateinit var command: String
     var timeoutMs: Int = 1500
+}
+
+@InvokeArg
+class ScheduleLifecycleWakeupArgs {
+    var triggerAtMs: Long = 0L
+}
+
+@InvokeArg
+class SetLifecycleKeepaliveArgs {
+    var enabled: Boolean = false
 }

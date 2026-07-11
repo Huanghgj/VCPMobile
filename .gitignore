@@ -40,7 +40,14 @@ VCPMobile.code-workspace
 
 # Large Assets & Scripts
 scripts/
+!scripts/
+scripts/*
+!scripts/build_android_arm64_release.cjs
 plans/Archive_Assets/
+.codex-remote-attachments/
+*.err.log
+*.out.log
+
 # Local Release Artifacts
 releases/
 vector/

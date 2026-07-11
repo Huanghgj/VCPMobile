@@ -5,6 +5,7 @@ use crate::vcp_modules::sync_hash::HashInitializer;
 use crate::vcp_modules::sync_logger::{LogLevel, SyncLogger};
 use crate::vcp_modules::sync_pipeline::{Phase1Metadata, Phase3Message, SyncPipeline};
 use crate::vcp_modules::sync_types::SyncDataType;
+use crate::vcp_modules::vcp_log_service::get_vcp_log_status_internal;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -1204,6 +1205,14 @@ pub async fn start_manual_sync(
         .swap(true, std::sync::atomic::Ordering::SeqCst)
     {
         return Err("同步已在进行中".to_string());
+    }
+
+    let log_status = get_vcp_log_status_internal().await;
+    if log_status != "connected" {
+        state
+            .is_syncing
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        return Err("VCPLog 未连接，请先建立 VCPLog 连接后再进行同步".to_string());
     }
 
     let (tx, rx) = mpsc::unbounded_channel::<SyncCommand>();

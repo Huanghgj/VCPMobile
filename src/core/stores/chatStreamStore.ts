@@ -36,6 +36,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
   const auroraActiveMessageIds = new Set<string>();
   const sealedStreamMessageIds = new Set<string>();
   const terminalStreamMessageIds = new Set<string>();
+  const lifecycleDirectiveHiddenMessageIds = new Set<string>();
   const streamBlockSignatures = new Map<string, string>();
   const streamTailSignatures = new Map<string, string>();
 
@@ -383,6 +384,16 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     tail?: string
   ) => tailBlock?.hash || `${tailBlock?.type || ""}:${tail || ""}`;
 
+  const blockNeedsCompiledNodes = (block: any) =>
+    block &&
+    ["markdown", "diary", "thought"].includes(block.type) &&
+    typeof block.content === "string" &&
+    block.content.length > 0 &&
+    (!Array.isArray(block.nodes) || block.nodes.length === 0);
+
+  const shouldCompileFinalBlocks = (blocks: any) =>
+    !Array.isArray(blocks) || blocks.some(blockNeedsCompiledNodes);
+
   const getRAFUpdate = (messageId: string) => {
     let update = rAFPendingUpdates.get(messageId);
     if (!update) {
@@ -588,6 +599,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
       streamBlockSignatures.delete(actualMessageId);
       streamTailSignatures.delete(actualMessageId);
       clearMessageCache(actualMessageId);
+      lifecycleDirectiveHiddenMessageIds.delete(actualMessageId);
       msg = reactive<ChatMessage>({
         id: actualMessageId,
         role: "assistant",
@@ -667,7 +679,14 @@ export const useChatStreamStore = defineStore("chatStream", () => {
 
       if (textChunk) {
         const update = getRAFUpdate(actualMessageId);
-        update.content = (update.content ?? msg!.content ?? "") + textChunk;
+        const combined = (update.content ?? msg!.content ?? "") + textChunk;
+        const lifecycleMarkerIndex = combined.indexOf("<<<[VCP_LIFECYCLE]>>>");
+        if (lifecycleMarkerIndex >= 0) {
+          lifecycleDirectiveHiddenMessageIds.add(actualMessageId);
+          update.content = combined.slice(0, lifecycleMarkerIndex).trimEnd();
+        } else if (!lifecycleDirectiveHiddenMessageIds.has(actualMessageId)) {
+          update.content = combined;
+        }
         scheduleRAFCommit(actualMessageId);
       }
     } else if (type === "aurora") {
@@ -710,10 +729,22 @@ export const useChatStreamStore = defineStore("chatStream", () => {
 
         // 2. 覆盖写入暂存数据（稀疏合并）
         if (typeof aurora.content === "string") {
-          update.content = aurora.content;
+          const lifecycleMarkerIndex = aurora.content.indexOf("<<<[VCP_LIFECYCLE]>>>");
+          if (lifecycleMarkerIndex >= 0) {
+            lifecycleDirectiveHiddenMessageIds.add(actualMessageId);
+            update.content = aurora.content.slice(0, lifecycleMarkerIndex).trimEnd();
+          } else if (!lifecycleDirectiveHiddenMessageIds.has(actualMessageId)) {
+            update.content = aurora.content;
+          }
         } else if (typeof aurora.contentDelta === "string") {
-          update.content =
-            (update.content ?? msg!.content ?? "") + aurora.contentDelta;
+          const combined = (update.content ?? msg!.content ?? "") + aurora.contentDelta;
+          const lifecycleMarkerIndex = combined.indexOf("<<<[VCP_LIFECYCLE]>>>");
+          if (lifecycleMarkerIndex >= 0) {
+            lifecycleDirectiveHiddenMessageIds.add(actualMessageId);
+            update.content = combined.slice(0, lifecycleMarkerIndex).trimEnd();
+          } else if (!lifecycleDirectiveHiddenMessageIds.has(actualMessageId)) {
+            update.content = combined;
+          }
         }
         if (aurora.stableChanged && aurora.stableBlocks) {
           const nextSignature = blocksSignature(aurora.stableBlocks);
@@ -739,6 +770,11 @@ export const useChatStreamStore = defineStore("chatStream", () => {
           update.tailSnapshot = aurora.tailSnapshot as any[];
         }
         if (aurora.tailChanged) {
+          if (lifecycleDirectiveHiddenMessageIds.has(actualMessageId)) {
+            update.tailContent = "";
+            update.tailBlock = null;
+            return;
+          }
           const nextTail = aurora.tail || "";
           const nextTailBlock = (aurora.tailBlock as any) || null;
           const nextTailSignature = tailSignature(
@@ -797,7 +833,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
         clearMessageCache(actualMessageId);
         try {
           // 如果后端已经带回了预渲染好的 blocks，直接使用，跳过冗余解析
-          if (event.blocks) {
+          if (event.blocks && !shouldCompileFinalBlocks(event.blocks)) {
             msg.blocks = event.blocks as any;
           } else {
             const compiledBlocks = await invoke("process_message_content", {
@@ -837,6 +873,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
           callbacks.onStreamFinished(actualMessageId, topicId);
         }
         removeSessionStream(itemId, topicId, actualMessageId);
+        lifecycleDirectiveHiddenMessageIds.delete(actualMessageId);
       } else {
         removeSessionStream(itemId, topicId, actualMessageId);
       }

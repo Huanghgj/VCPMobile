@@ -634,11 +634,12 @@ pub fn parse_content(raw_text: &str) -> Vec<ContentBlock> {
                 BlockType::HtmlContainer => {
                     let open_tag = &remaining[start_idx..end_idx];
                     let deindented_inner = crate::vcp_modules::chat::pre_renderer::markdown_parser::trim_common_leading_indent(inner_content);
+                    let markdown_inner = crate::vcp_modules::chat::pre_renderer::markdown_parser::strip_stuck_container_close_before_fence(&deindented_inner);
                     let mut nodes = vec![crate::vcp_modules::pre_renderer::MarkdownNode::raw_html(
                         open_tag.to_string(),
                     )];
                     nodes.extend(crate::vcp_modules::pre_renderer::parse_markdown_to_ast(
-                        &deindented_inner,
+                        markdown_inner.as_ref(),
                     ));
                     if is_complete {
                         if let (Some(s), Some(e)) = (end_marker_start, end_marker_end) {
@@ -923,6 +924,7 @@ pub fn is_html_tag_block(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vcp_modules::pre_renderer::markdown_ast::InlineNode;
 
     fn nodes_contain_yaml_code(nodes: &[MarkdownNode]) -> bool {
         nodes.iter().any(|node| match node {
@@ -937,6 +939,44 @@ mod tests {
         })
     }
 
+    fn collect_yaml_code_blocks(nodes: &[MarkdownNode], codes: &mut Vec<String>) {
+        for node in nodes {
+            match node {
+                MarkdownNode::CodeBlock { lang, code, .. } if lang.as_deref() == Some("yaml") => {
+                    codes.push(code.clone());
+                }
+                MarkdownNode::Blockquote { children, .. } => {
+                    collect_yaml_code_blocks(children, codes)
+                }
+                MarkdownNode::List { items, .. } => {
+                    for item_nodes in items {
+                        collect_yaml_code_blocks(item_nodes, codes);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn collect_yaml_code_blocks_from_blocks(blocks: &[ContentBlock]) -> Vec<String> {
+        let mut codes = Vec::new();
+        for block in blocks {
+            match block {
+                ContentBlock::Markdown {
+                    nodes: Some(nodes), ..
+                }
+                | ContentBlock::Thought {
+                    nodes: Some(nodes), ..
+                }
+                | ContentBlock::Diary {
+                    nodes: Some(nodes), ..
+                } => collect_yaml_code_blocks(nodes, &mut codes),
+                _ => {}
+            }
+        }
+        codes
+    }
+
     fn block_contains_yaml_code(block: &ContentBlock) -> bool {
         match block {
             ContentBlock::Markdown {
@@ -948,6 +988,169 @@ mod tests {
             | ContentBlock::Diary {
                 nodes: Some(nodes), ..
             } => nodes_contain_yaml_code(nodes),
+            _ => false,
+        }
+    }
+
+    fn contains_button_click(blocks: &[ContentBlock]) -> bool {
+        blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ButtonClick { .. }))
+    }
+
+    fn full_vcp_render_probe() -> &'static str {
+        r##"<think>
+Prepare a safe UI render probe with one tool call, one tool result, and a final HTML response.
+</think><<<[TOOL_REQUEST]>>>
+maid:「始」RenderProbe「末」,
+tool_name:「始」ImageProbe「末」,
+mode:「始」debug「末」,
+prompt:「始」safe render probe image「末」
+<<<[END_TOOL_REQUEST]>>>
+<<<[ROLE_DIVIDE_USER]>>>
+
+[[VCP调用结果信息汇总:
+- 工具名称: ImageProbe
+- 执行状态: ✅ SUCCESS
+- 返回内容: Debug image generated.
+
+详细信息：
+- 图片URL: data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI2NDAiIGhlaWdodD0iMjgwIj48cmVjdCB3aWR0aD0iNjQwIiBoZWlnaHQ9IjI4MCIgZmlsbD0iIzI1NjNlYiIvPjx0ZXh0IHg9IjMyMCIgeT0iMTUwIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmb250LXNpemU9IjQyIiBmb250LWZhbWlseT0iQXJpYWwiIGZpbGw9IndoaXRlIj5WQ1AgUmVuZGVyIFByb2JlPC90ZXh0Pjwvc3ZnPg==
+- 文件名: render-probe.svg
+
+图片预览：
+<img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI2NDAiIGhlaWdodD0iMjgwIj48cmVjdCB3aWR0aD0iNjQwIiBoZWlnaHQ9IjI4MCIgZmlsbD0iIzI1NjNlYiIvPjx0ZXh0IHg9IjMyMCIgeT0iMTUwIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmb250LXNpemU9IjQyIiBmb250LWZhbWlseT0iQXJpYWwiIGZpbGw9IndoaXRlIj5WQ1AgUmVuZGVyIFByb2JlPC90ZXh0Pjwvc3ZnPg==" alt="VCP Render Probe" width="300">
+
+VCP调用结果结束]]
+
+[本轮工具调用摘要:]
+ImageProbe 调用成功。
+[本轮工具调用摘要结束]
+
+<<<[END_ROLE_DIVIDE_USER]>>>
+
+<think>The debug image was generated successfully. Now render the final safe HTML reply.</think><div id="vcp-root" data-vcp-probe="full-vcp" style="padding:20px; border-radius:16px; background:#f8fafc; color:#0f172a; line-height:1.8;">
+
+<div style="text-align:center; font-size:12px; color:#64748b; border-bottom:1px dashed #cbd5e1; padding-bottom:8px; margin-bottom:16px;">
+VCP Render Probe · Full Tool Result Shape
+</div>
+
+<p>这个块必须作为 HTML 渲染，而不是把标签原样显示出来。</p>
+
+<img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI2NDAiIGhlaWdodD0iMjgwIj48cmVjdCB3aWR0aD0iNjQwIiBoZWlnaHQ9IjI4MCIgZmlsbD0iIzI1NjNlYiIvPjx0ZXh0IHg9IjMyMCIgeT0iMTUwIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmb250LXNpemU9IjQyIiBmb250LWZhbWlseT0iQXJpYWwiIGZpbGw9IndoaXRlIj5WQ1AgUmVuZGVyIFByb2JlPC90ZXh0Pjwvc3ZnPg==" alt="VCP Render Probe" style="width:100%; border-radius:12px; margin:12px 0;">
+
+<p>如果你能看到蓝色图片和这个浅色容器，说明最终 HTML 没有被工具结果或角色分隔符吞掉。</p>
+
+</div>"##
+    }
+
+    fn nodes_contain_raw_html(nodes: &[MarkdownNode], needle: &str) -> bool {
+        nodes.iter().any(|node| match node {
+            MarkdownNode::RawHtml { content, .. } => content.contains(needle),
+            MarkdownNode::Paragraph { children, .. } | MarkdownNode::Heading { children, .. } => {
+                inline_nodes_contain_raw_html(children, needle)
+            }
+            MarkdownNode::Blockquote { children, .. } => nodes_contain_raw_html(children, needle),
+            MarkdownNode::List { items, .. } => items
+                .iter()
+                .any(|item_nodes| nodes_contain_raw_html(item_nodes, needle)),
+            MarkdownNode::Table { header, rows, .. } => {
+                header
+                    .iter()
+                    .any(|cell| inline_nodes_contain_raw_html(cell, needle))
+                    || rows.iter().any(|row| {
+                        row.iter()
+                            .any(|cell| inline_nodes_contain_raw_html(cell, needle))
+                    })
+            }
+            _ => false,
+        })
+    }
+
+    fn inline_nodes_contain_raw_html(nodes: &[InlineNode], needle: &str) -> bool {
+        nodes.iter().any(|node| match node {
+            InlineNode::RawHtmlInline { content, .. } => content.contains(needle),
+            InlineNode::Strong { children, .. }
+            | InlineNode::Emphasis { children, .. }
+            | InlineNode::Strikethrough { children, .. }
+            | InlineNode::Link { children, .. } => inline_nodes_contain_raw_html(children, needle),
+            InlineNode::VcpCustom {
+                children: Some(children),
+                ..
+            } => inline_nodes_contain_raw_html(children, needle),
+            _ => false,
+        })
+    }
+
+    fn nodes_contain_plain_text(nodes: &[MarkdownNode], needle: &str) -> bool {
+        nodes.iter().any(|node| match node {
+            MarkdownNode::Paragraph { children, .. } | MarkdownNode::Heading { children, .. } => {
+                inline_nodes_contain_plain_text(children, needle)
+            }
+            MarkdownNode::Blockquote { children, .. } => nodes_contain_plain_text(children, needle),
+            MarkdownNode::List { items, .. } => items
+                .iter()
+                .any(|item_nodes| nodes_contain_plain_text(item_nodes, needle)),
+            MarkdownNode::Table { header, rows, .. } => {
+                header
+                    .iter()
+                    .any(|cell| inline_nodes_contain_plain_text(cell, needle))
+                    || rows.iter().any(|row| {
+                        row.iter()
+                            .any(|cell| inline_nodes_contain_plain_text(cell, needle))
+                    })
+            }
+            _ => false,
+        })
+    }
+
+    fn inline_nodes_contain_plain_text(nodes: &[InlineNode], needle: &str) -> bool {
+        nodes.iter().any(|node| match node {
+            InlineNode::Text { value } | InlineNode::Code { value } => value.contains(needle),
+            InlineNode::Strong { children, .. }
+            | InlineNode::Emphasis { children, .. }
+            | InlineNode::Strikethrough { children, .. }
+            | InlineNode::Link { children, .. } => {
+                inline_nodes_contain_plain_text(children, needle)
+            }
+            InlineNode::VcpCustom {
+                children: Some(children),
+                ..
+            } => inline_nodes_contain_plain_text(children, needle),
+            _ => false,
+        })
+    }
+
+    fn block_contains_raw_html(block: &ContentBlock, needle: &str) -> bool {
+        match block {
+            ContentBlock::Markdown {
+                nodes: Some(nodes), ..
+            }
+            | ContentBlock::Thought {
+                nodes: Some(nodes), ..
+            }
+            | ContentBlock::Diary {
+                nodes: Some(nodes), ..
+            } => nodes_contain_raw_html(nodes, needle),
+            _ => false,
+        }
+    }
+
+    fn block_contains_plain_text(block: &ContentBlock, needle: &str) -> bool {
+        match block {
+            ContentBlock::Markdown {
+                nodes: Some(nodes), ..
+            }
+            | ContentBlock::Thought {
+                nodes: Some(nodes), ..
+            }
+            | ContentBlock::Diary {
+                nodes: Some(nodes), ..
+            } => nodes_contain_plain_text(nodes, needle),
+            ContentBlock::Markdown {
+                content: Some(content),
+                ..
+            } => content.contains(needle),
             _ => false,
         }
     }
@@ -1001,6 +1204,138 @@ mod tests {
         assert!(
             blocks.iter().any(block_contains_yaml_code),
             "expected persisted content parser to keep stuck fence as yaml code block, got {blocks:#?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_content_inline_html_stuck_fence_does_not_swallow_tail() {
+        let raw = r#"AI render probe:
+
+The next boundary is intentionally stuck together:
+<div class="vcp-debug-probe"><strong>HTML container</strong></div>```yaml
+name: render-probe
+copy_button: should_not_send
+```
+
+<button data-vcp-ui-control="true" data-vcp-copy-code="render-probe">Copy code</button>
+
+[[点击按钮:继续]]
+
+- The YAML block above should render as a code block.
+- The copy button should not be sent as an AI button click."#;
+
+        let blocks = parse_content(raw);
+        let yaml_codes = collect_yaml_code_blocks_from_blocks(&blocks);
+
+        assert_eq!(
+            yaml_codes.len(),
+            1,
+            "expected exactly one yaml code block, got {blocks:#?}"
+        );
+        assert!(yaml_codes[0].contains("name: render-probe"));
+        assert!(yaml_codes[0].contains("copy_button: should_not_send"));
+        assert!(
+            !yaml_codes[0].contains("<button"),
+            "copy button HTML was swallowed by yaml code block: {blocks:#?}"
+        );
+        assert!(
+            !yaml_codes[0].contains("[[点击按钮:继续]]"),
+            "AI button marker was swallowed by yaml code block: {blocks:#?}"
+        );
+        assert!(
+            contains_button_click(&blocks),
+            "explicit VCP button marker should remain a sendable AI button: {blocks:#?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_content_full_vcp_tool_result_then_html_container() {
+        let blocks = parse_content(full_vcp_render_probe());
+
+        assert!(
+            blocks.iter().any(|block| matches!(
+                block,
+                ContentBlock::ToolUse { tool_name, .. } if tool_name == "ImageProbe"
+            )),
+            "expected tool request block in full VCP probe, got {blocks:#?}"
+        );
+        assert!(
+            blocks.iter().any(|block| matches!(
+                block,
+                ContentBlock::ToolResult { tool_name, status, .. }
+                    if tool_name == "ImageProbe" && status.contains("SUCCESS")
+            )),
+            "expected parsed tool result in full VCP probe, got {blocks:#?}"
+        );
+        assert!(
+            blocks.iter().any(|block| matches!(
+                block,
+                ContentBlock::RoleDivider { role, is_end, .. } if role == "user" && !is_end
+            )),
+            "expected ROLE_DIVIDE_USER start marker, got {blocks:#?}"
+        );
+        assert!(
+            blocks.iter().any(|block| matches!(
+                block,
+                ContentBlock::RoleDivider { role, is_end, .. } if role == "user" && *is_end
+            )),
+            "expected END_ROLE_DIVIDE_USER marker, got {blocks:#?}"
+        );
+        assert!(
+            blocks
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolCallSummary { .. })),
+            "expected tool call summary block, got {blocks:#?}"
+        );
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block_contains_raw_html(block, "id=\"vcp-root\"")),
+            "expected final vcp-root HTML container to remain raw HTML, got {blocks:#?}"
+        );
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block_contains_raw_html(block, "data-vcp-probe=\"full-vcp\"")),
+            "expected final full-vcp probe attribute to render as raw HTML, got {blocks:#?}"
+        );
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block_contains_raw_html(block, "data:image/svg+xml;base64")),
+            "expected final image tag to remain renderable raw HTML, got {blocks:#?}"
+        );
+        assert!(
+            !blocks
+                .iter()
+                .any(|block| block_contains_plain_text(block, "<div id=\"vcp-root\"")),
+            "final HTML container was downgraded to visible text, got {blocks:#?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_content_plain_html_button_is_not_button_click() {
+        let raw = r#"<div class="actions">
+<button type="button" data-vcp-copy-code="hello">复制代码</button>
+</div>
+
+普通 Markdown 继续在这里。"#;
+
+        let blocks = parse_content(raw);
+
+        assert!(
+            !contains_button_click(&blocks),
+            "plain HTML/UI buttons must not become AI button-click blocks: {blocks:#?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_content_vcp_button_marker_still_becomes_button_click() {
+        let blocks = parse_content("前文\n\n[[点击按钮:继续]]\n\n后文");
+
+        assert!(
+            contains_button_click(&blocks),
+            "explicit VCP button marker should still become a button-click block: {blocks:#?}"
         );
     }
 }

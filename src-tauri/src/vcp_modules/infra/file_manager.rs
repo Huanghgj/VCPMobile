@@ -755,6 +755,10 @@ pub async fn get_attachment_real_path(
     hash: String,
     original_name: String,
 ) -> Result<String, String> {
+    if !crate::vcp_modules::infra::utils::is_valid_cas_hash(&hash) {
+        return Err("Invalid Content-Addressable Storage (CAS) hash format".to_string());
+    }
+
     let attachments_dir = get_attachments_root_dir(&app_handle)?;
 
     let file_extension = std::path::Path::new(&original_name)
@@ -770,6 +774,7 @@ pub async fn get_attachment_real_path(
 
     let full_path = attachments_dir.join(internal_file_name);
     if full_path.exists() {
+        ensure_safe_path(&app_handle, &full_path)?;
         Ok(full_path.to_string_lossy().to_string())
     } else {
         Err("本地附件库中未找到该文件".to_string())

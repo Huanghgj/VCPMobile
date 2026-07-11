@@ -68,6 +68,8 @@ function renderNode(node: MarkdownNode, messageId: string): string {
       if (node.lang === 'mermaid') {
         return `<div class="mermaid-placeholder">${escapeHtml(node.code || '')}</div>`;
       }
+      const code = node.code || '';
+      const lang = node.lang || '';
       let html = node.highlighted_html;
       if (html) {
         // 兼容旧 AST：如果 highlighted_html 是 <pre><code> 包裹内层 <pre> 的嵌套结构，提取单层
@@ -78,9 +80,13 @@ function renderNode(node: MarkdownNode, messageId: string): string {
             html = `<pre class="vcp-code-block vcp-scrollable">${innerMatch[1]}</pre>`;
           }
         }
-        return sanitizeHighlightedCodeHtml(html);
+        return renderCodeShell(sanitizeHighlightedCodeHtml(html), code, lang);
       }
-      return `<pre class="vcp-code-block vcp-scrollable"><code>${escapeHtml(node.code || '')}</code></pre>`;
+      return renderCodeShell(
+        `<pre class="vcp-code-block vcp-scrollable"><code>${escapeHtml(code)}</code></pre>`,
+        code,
+        lang,
+      );
     }
     
     case 'blockquote':
@@ -188,6 +194,13 @@ function escapeHtml(text: string): string {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#039;');
+}
+
+function renderCodeShell(preHtml: string, code: string, lang: string): string {
+  const langLabel = lang
+    ? `<span class="vcp-code-lang">${escapeHtml(lang)}</span>`
+    : "";
+  return `<div class="vcp-code-shell"><div class="vcp-code-toolbar" data-vcp-ui-control="code-toolbar">${langLabel}<button type="button" class="vcp-code-copy-btn" data-vcp-ui-control="code-copy" data-vcp-copy-code="${escapeHtml(encodeURIComponent(code))}" data-vcp-copy-encoded="uri" title="复制代码" aria-label="复制代码"><span class="i-ph:copy-bold vcp-code-copy-icon" aria-hidden="true"></span></button></div>${preHtml}</div>`;
 }
 
 function sanitizeMarkdownHtml(html: string): string {

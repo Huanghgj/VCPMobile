@@ -224,6 +224,7 @@ pub async fn internal_process_agent_chat_message(
         }
         Err(e) => {
             log::error!("[AgentChatAppService] perform_vcp_request failed: {}", e);
+            return Err(e);
         }
     }
 
@@ -235,7 +236,9 @@ pub async fn internal_process_agent_chat_message(
 pub struct AssistantChatPayload {
     pub agent_id: String,
     pub temp_messages: Vec<crate::vcp_modules::chat::topic_service::TempMessage>,
+    #[serde(default)]
     pub vcp_url: String,
+    #[serde(default)]
     pub vcp_api_key: String,
     #[serde(default)]
     pub message_id: Option<String>,

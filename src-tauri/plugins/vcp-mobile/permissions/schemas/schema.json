@@ -325,6 +325,18 @@
           "markdownDescription": "Denies the cancel_download_notification command without any pre-configured scope."
         },
         {
+          "description": "Enables the cancel_lifecycle_wakeup command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-cancel-lifecycle-wakeup",
+          "markdownDescription": "Enables the cancel_lifecycle_wakeup command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cancel_lifecycle_wakeup command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-cancel-lifecycle-wakeup",
+          "markdownDescription": "Denies the cancel_lifecycle_wakeup command without any pre-configured scope."
+        },
+        {
           "description": "Enables the capture_window_snapshot command without any pre-configured scope.",
           "type": "string",
           "const": "allow-capture-window-snapshot",
@@ -407,6 +419,18 @@
           "type": "string",
           "const": "deny-get-gpu-status",
           "markdownDescription": "Denies the get_gpu_status command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_lifecycle_runtime_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-lifecycle-runtime-status",
+          "markdownDescription": "Enables the get_lifecycle_runtime_status command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_lifecycle_runtime_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-lifecycle-runtime-status",
+          "markdownDescription": "Denies the get_lifecycle_runtime_status command without any pre-configured scope."
         },
         {
           "description": "Enables the get_network_status command without any pre-configured scope.",
@@ -517,6 +541,18 @@
           "markdownDescription": "Denies the request_android_permission command without any pre-configured scope."
         },
         {
+          "description": "Enables the request_exact_alarm_access command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-request-exact-alarm-access",
+          "markdownDescription": "Enables the request_exact_alarm_access command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the request_exact_alarm_access command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-request-exact-alarm-access",
+          "markdownDescription": "Denies the request_exact_alarm_access command without any pre-configured scope."
+        },
+        {
           "description": "Enables the request_overlay_permission command without any pre-configured scope.",
           "type": "string",
           "const": "allow-request-overlay-permission",
@@ -565,6 +601,18 @@
           "markdownDescription": "Denies the save_image_to_gallery command without any pre-configured scope."
         },
         {
+          "description": "Enables the schedule_lifecycle_wakeup command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-schedule-lifecycle-wakeup",
+          "markdownDescription": "Enables the schedule_lifecycle_wakeup command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the schedule_lifecycle_wakeup command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-schedule-lifecycle-wakeup",
+          "markdownDescription": "Denies the schedule_lifecycle_wakeup command without any pre-configured scope."
+        },
+        {
           "description": "Enables the set_keep_screen_on command without any pre-configured scope.",
           "type": "string",
           "const": "allow-set-keep-screen-on",
@@ -575,6 +623,18 @@
           "type": "string",
           "const": "deny-set-keep-screen-on",
           "markdownDescription": "Denies the set_keep_screen_on command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_lifecycle_keepalive command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-lifecycle-keepalive",
+          "markdownDescription": "Enables the set_lifecycle_keepalive command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_lifecycle_keepalive command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-lifecycle-keepalive",
+          "markdownDescription": "Denies the set_lifecycle_keepalive command without any pre-configured scope."
         },
         {
           "description": "Enables the start_download_notification command without any pre-configured scope.",

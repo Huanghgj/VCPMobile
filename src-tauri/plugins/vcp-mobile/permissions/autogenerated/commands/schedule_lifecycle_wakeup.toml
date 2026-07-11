@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-schedule-lifecycle-wakeup"
+description = "Enables the schedule_lifecycle_wakeup command without any pre-configured scope."
+commands.allow = ["schedule_lifecycle_wakeup"]
+
+[[permission]]
+identifier = "deny-schedule-lifecycle-wakeup"
+description = "Denies the schedule_lifecycle_wakeup command without any pre-configured scope."
+commands.deny = ["schedule_lifecycle_wakeup"]

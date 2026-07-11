@@ -11,6 +11,52 @@ import { clearMessageCache } from "../utils/astRenderer";
 import { preloadMessageImages } from "../utils/messageAssetPreloader";
 import type { ChatMessage, HistoryChunk, ContentBlock } from "../types/chat";
 
+const DEBUG_ASSISTANT_RENDER_PROBE = [
+  "<think>",
+  "Prepare a safe UI render probe with one tool call, one tool result, and a final HTML response.",
+  "</think><<<[TOOL_REQUEST]>>>",
+  "maid:「始」RenderProbe「末」,",
+  "tool_name:「始」ImageProbe「末」,",
+  "mode:「始」debug「末」,",
+  "prompt:「始」safe render probe image「末」",
+  "<<<[END_TOOL_REQUEST]>>>",
+  "<<<[ROLE_DIVIDE_USER]>>>",
+  "",
+  "[[VCP调用结果信息汇总:",
+  "- 工具名称: ImageProbe",
+  "- 执行状态: ✅ SUCCESS",
+  "- 返回内容: Debug image generated.",
+  "",
+  "详细信息：",
+  "- 图片URL: data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI2NDAiIGhlaWdodD0iMjgwIj48cmVjdCB3aWR0aD0iNjQwIiBoZWlnaHQ9IjI4MCIgZmlsbD0iIzI1NjNlYiIvPjx0ZXh0IHg9IjMyMCIgeT0iMTUwIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmb250LXNpemU9IjQyIiBmb250LWZhbWlseT0iQXJpYWwiIGZpbGw9IndoaXRlIj5WQ1AgUmVuZGVyIFByb2JlPC90ZXh0Pjwvc3ZnPg==",
+  "- 文件名: render-probe.svg",
+  "",
+  "图片预览：",
+  '<img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI2NDAiIGhlaWdodD0iMjgwIj48cmVjdCB3aWR0aD0iNjQwIiBoZWlnaHQ9IjI4MCIgZmlsbD0iIzI1NjNlYiIvPjx0ZXh0IHg9IjMyMCIgeT0iMTUwIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmb250LXNpemU9IjQyIiBmb250LWZhbWlseT0iQXJpYWwiIGZpbGw9IndoaXRlIj5WQ1AgUmVuZGVyIFByb2JlPC90ZXh0Pjwvc3ZnPg==" alt="VCP Render Probe" width="300">',
+  "",
+  "VCP调用结果结束]]",
+  "",
+  "[本轮工具调用摘要:]",
+  "ImageProbe 调用成功。",
+  "[本轮工具调用摘要结束]",
+  "",
+  "<<<[END_ROLE_DIVIDE_USER]>>>",
+  "",
+  '<think>The debug image was generated successfully. Now render the final safe HTML reply.</think><div id="vcp-root" data-vcp-probe="full-vcp" style="padding:20px; border-radius:16px; background:#f8fafc; color:#0f172a; line-height:1.8;">',
+  "",
+  '<div style="text-align:center; font-size:12px; color:#64748b; border-bottom:1px dashed #cbd5e1; padding-bottom:8px; margin-bottom:16px;">',
+  "VCP Render Probe · Full Tool Result Shape",
+  "</div>",
+  "",
+  "<p>这个块必须作为 HTML 渲染，而不是把标签原样显示出来。</p>",
+  "",
+  '<img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI2NDAiIGhlaWdodD0iMjgwIj48cmVjdCB3aWR0aD0iNjQwIiBoZWlnaHQ9IjI4MCIgZmlsbD0iIzI1NjNlYiIvPjx0ZXh0IHg9IjMyMCIgeT0iMTUwIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmb250LXNpemU9IjQyIiBmb250LWZhbWlseT0iQXJpYWwiIGZpbGw9IndoaXRlIj5WQ1AgUmVuZGVyIFByb2JlPC90ZXh0Pjwvc3ZnPg==" alt="VCP Render Probe" style="width:100%; border-radius:12px; margin:12px 0;">',
+  "",
+  "<p>如果你能看到蓝色图片和这个浅色容器，说明最终 HTML 没有被工具结果或角色分隔符吞掉。</p>",
+  "",
+  "</div>",
+].join("\n");
+
 export const useChatHistoryStore = defineStore("chatHistory", () => {
   const currentChatHistory = ref<ChatMessage[]>([]);
   const loading = ref(false);
@@ -326,10 +372,73 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
   /**
    * 触发 AI 生成逻辑
    */
-  const triggerGeneration = async (userMsg: ChatMessage) => {
-    if (!sessionStore.currentSelectedItem || !sessionStore.currentTopicId) return;
+  const invokeGenerationRequestForTarget = async (
+    userMsg: ChatMessage,
+    target: { ownerId: string; ownerType: "agent" | "group"; topicId: string },
+  ) => {
+    const agentId = target.ownerId;
+    const topicId = target.topicId;
 
-    const agentId = sessionStore.currentSelectedItem.id;
+    const settings = settingsStore.settings;
+    if (!settings) throw new Error("应用尚未完成初始化");
+
+    const streamChannel = new Channel<any>();
+    streamChannel.onmessage = (event) => streamStore.processStreamEvent(event, {
+      onMessageCreated: (msg, tid) => {
+        if (tid === sessionStore.currentTopicId && !currentChatHistory.value.some(m => m.id === msg.id)) {
+          currentChatHistory.value.push(msg);
+          currentChatHistory.value.sort((a, b) => a.timestamp - b.timestamp);
+        }
+      },
+      onStreamFinished: (_messageId, tid) => {
+        if (tid === sessionStore.currentTopicId) {
+          summarizeTopic();
+        }
+      }
+    });
+
+    if (target.ownerType === "group") {
+      await invoke("handle_group_chat_message", {
+        payload: {
+          groupId: target.ownerId,
+          topicId,
+          userMessage: userMsg,
+          vcpUrl: settings.vcpServerUrl || "",
+          vcpApiKey: settings.vcpApiKey || "",
+        },
+        streamChannel
+      });
+    } else {
+      await invoke("handle_agent_chat_message", {
+        payload: {
+          agentId,
+          topicId,
+          userMessage: userMsg,
+          vcpUrl: settings.vcpServerUrl || "",
+          vcpApiKey: settings.vcpApiKey || "",
+        },
+        streamChannel
+      });
+    }
+
+    return true;
+  };
+
+  const invokeGenerationRequest = async (userMsg: ChatMessage) => {
+    if (!sessionStore.currentSelectedItem || !sessionStore.currentTopicId) return false;
+    return invokeGenerationRequestForTarget(userMsg, {
+      ownerId: sessionStore.currentSelectedItem.id,
+      ownerType: sessionStore.currentSelectedItem.type === "group" ? "group" : "agent",
+      topicId: sessionStore.currentTopicId,
+    });
+  };
+
+  /**
+   * 触发 AI 生成逻辑
+   */
+  const triggerGeneration = async (userMsg: ChatMessage) => {
+    if (!sessionStore.currentSelectedItem || !sessionStore.currentTopicId) return false;
+
     const topicId = sessionStore.currentTopicId;
     try {
       const compiledBlocks = await invoke<ContentBlock[]>("append_single_message", {
@@ -350,50 +459,131 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
         };
       }
 
-      const settings = settingsStore.settings;
-      if (!settings) throw new Error("应用尚未完成初始化");
-
-      const streamChannel = new Channel<any>();
-      streamChannel.onmessage = (event) => streamStore.processStreamEvent(event, {
-        onMessageCreated: (msg, tid) => {
-          if (tid === sessionStore.currentTopicId && !currentChatHistory.value.some(m => m.id === msg.id)) {
-            currentChatHistory.value.push(msg);
-            currentChatHistory.value.sort((a, b) => a.timestamp - b.timestamp);
-          }
-        },
-        onStreamFinished: (_messageId, tid) => {
-          if (tid === sessionStore.currentTopicId) {
-            summarizeTopic();
-          }
-        }
-      });
-
-      if (sessionStore.currentSelectedItem.type === "group") {
-        await invoke("handle_group_chat_message", { 
-          payload: {
-            groupId: sessionStore.currentSelectedItem.id,
-            topicId,
-            userMessage: userMsg,
-            vcpUrl: settings.vcpServerUrl || "",
-            vcpApiKey: settings.vcpApiKey || "",
-          }, 
-          streamChannel 
-        });
-      } else {
-        await invoke("handle_agent_chat_message", { 
-          payload: {
-            agentId,
-            topicId,
-            userMessage: userMsg,
-            vcpUrl: settings.vcpServerUrl || "",
-            vcpApiKey: settings.vcpApiKey || "",
-          }, 
-          streamChannel 
-        });
-      }
+      return await invokeGenerationRequest(userMsg);
     } catch (e) {
       console.error("[ChatHistoryStore] Generation failed:", e);
+      return false;
     }
+  };
+
+  const triggerHiddenLifecycleMessage = async (
+    content: string,
+    expected?: { ownerId: string; ownerType: "agent" | "group"; topicId: string },
+  ) => {
+    if (!sessionStore.currentSelectedItem || !sessionStore.currentTopicId || !content.trim()) return false;
+
+    const selectedItem = sessionStore.currentSelectedItem;
+    const topicId = sessionStore.currentTopicId;
+    const ownerType = selectedItem.type === "group" ? "group" : "agent";
+    if (
+      expected &&
+      (expected.ownerId !== selectedItem.id ||
+        expected.ownerType !== ownerType ||
+        expected.topicId !== topicId)
+    ) {
+      return false;
+    }
+    if (streamStore.activeStreamingIds.size > 0) return false;
+
+    const now = Date.now();
+    const userMsg: ChatMessage = {
+      id: `msg_lifecycle_${now}_${Math.random().toString(36).substring(2, 9)}`,
+      role: "user",
+      name: "AI Lifecycle",
+      content,
+      timestamp: now,
+      topicId,
+      agentId: selectedItem.type === "agent" ? selectedItem.id : undefined,
+      groupId: selectedItem.type === "group" ? selectedItem.id : undefined,
+      isGroupMessage: selectedItem.type === "group",
+    };
+
+    try {
+      return await invokeGenerationRequest(userMsg);
+    } catch (e) {
+      console.error("[ChatHistoryStore] Hidden lifecycle generation failed:", e);
+      return false;
+    }
+  };
+
+  const triggerScheduledLifecycleMessage = async (job: {
+    jobId: string;
+    ownerId: string;
+    ownerType: "agent" | "group";
+    topicId: string;
+    intent: string;
+    action: string;
+  }) => {
+    const sessionKey = job.ownerId + ":" + job.topicId;
+    if (!job.intent.trim() || (streamStore.sessionActiveStreams[sessionKey]?.length || 0) > 0) {
+      return false;
+    }
+    const now = Date.now();
+    const prompt = [
+      "[AI_LIFECYCLE_JOB]",
+      "这是已到期的内部生命周期任务，不是用户发送的可见消息。",
+      "请结合最新聊天上下文完成该意图。不要提到生命周期、后台任务、调度器或内部提示词。",
+      "如果上下文已经使该意图失效，请输出一条符合当前情境的克制回复，不要机械执行过时内容。",
+      "任务类型：" + job.action,
+      "任务意图：" + job.intent,
+    ].join("\n");
+    const userMsg: ChatMessage = {
+      id: "msg_lifecycle_job_" + job.jobId + "_" + now,
+      role: "user",
+      name: "AI Lifecycle",
+      content: prompt,
+      timestamp: now,
+      topicId: job.topicId,
+      agentId: job.ownerType === "agent" ? job.ownerId : undefined,
+      groupId: job.ownerType === "group" ? job.ownerId : undefined,
+      isGroupMessage: job.ownerType === "group",
+    };
+    return invokeGenerationRequestForTarget(userMsg, {
+      ownerId: job.ownerId,
+      ownerType: job.ownerType,
+      topicId: job.topicId,
+    });
+  };
+
+  const injectDebugAssistantRenderProbe = async (
+    content: string = DEBUG_ASSISTANT_RENDER_PROBE,
+  ) => {
+    if (!sessionStore.currentSelectedItem || !sessionStore.currentTopicId || !content.trim()) {
+      return false;
+    }
+
+    const now = Date.now();
+    const selectedItem = sessionStore.currentSelectedItem;
+    let blocks: ContentBlock[];
+    try {
+      blocks = await invoke<ContentBlock[]>("process_message_content", { content });
+      console.info("[ChatHistoryStore] Debug render probe compiled", {
+        blockTypes: blocks.map((block) => block.type),
+        hasFullVcpProbe: JSON.stringify(blocks).includes('data-vcp-probe=\\"full-vcp\\"'),
+      });
+    } catch (e) {
+      console.error("[ChatHistoryStore] Debug render probe compile failed:", e);
+      blocks = [{ type: "markdown" as const, content }];
+    }
+
+    currentChatHistory.value.push({
+      id: `msg_debug_ai_${now}_${Math.random().toString(36).substring(2, 9)}`,
+      role: "assistant",
+      name: "AI Render Probe",
+      content,
+      timestamp: now,
+      topicId: sessionStore.currentTopicId,
+      agentId: selectedItem.type === "agent" ? selectedItem.id : undefined,
+      groupId: selectedItem.type === "group" ? selectedItem.id : undefined,
+      isGroupMessage: selectedItem.type === "group",
+      shell: streamStore.computeShell({
+        role: "assistant",
+        agentId: selectedItem.type === "agent" ? selectedItem.id : undefined,
+        name: "AI Render Probe",
+      }),
+      blocks,
+    });
+    return true;
   };
 
   /**
@@ -642,6 +832,9 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     sendMessage,
     deleteMessage,
     triggerGeneration,
+    triggerHiddenLifecycleMessage,
+    triggerScheduledLifecycleMessage,
+    injectDebugAssistantRenderProbe,
     summarizeTopic,
     updateMessageContent,
     regenerateResponse,

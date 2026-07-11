@@ -9,7 +9,7 @@ use crate::vcp_modules::sync_hash::HashAggregator;
 use sqlx::Row;
 use std::path::Path;
 use tauri::ipc::Channel;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::fs;
 
 // =================================================================
@@ -1159,7 +1159,25 @@ pub async fn finalize_stream_message<R: tauri::Runtime>(
 ) -> Result<(), String> {
     let final_ts = crate::vcp_modules::infra::utils::now_millis() as u64;
 
-    let mut final_content = full_content;
+    let (mut final_content, scheduled_jobs) =
+        crate::vcp_modules::lifecycle_scheduler::extract_and_schedule_directives(
+            pool,
+            &full_content,
+            owner_id,
+            owner_type,
+            &topic_id,
+            responder_agent_id,
+            &message_id,
+        )
+        .await?;
+    if !scheduled_jobs.is_empty() {
+        log::info!(
+            "[StreamFinalizer] Scheduled {} lifecycle job(s) from message {}",
+            scheduled_jobs.len(),
+            message_id
+        );
+        let _ = app_handle.emit("vcp-lifecycle-jobs-changed", scheduled_jobs.len());
+    }
     if is_aborted {
         final_content.push_str("\n\n> VCP流式错误: 请求已中止");
     }

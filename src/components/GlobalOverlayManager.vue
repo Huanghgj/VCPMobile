@@ -39,6 +39,9 @@ const handleEditorSave = async (newContent: string) => {
     <!-- 全局 FullScreenEditor -->
     <FullScreenEditor v-if="overlayStore.editorConfig" class="pointer-events-auto"
       :is-open="!!overlayStore.editorConfig" :initial-value="overlayStore.editorConfig.initialValue"
+      :title="overlayStore.editorConfig.title" :placeholder="overlayStore.editorConfig.placeholder"
+      :read-only="overlayStore.editorConfig.readOnly" :show-save="overlayStore.editorConfig.showSave"
+      :monospace="overlayStore.editorConfig.monospace"
       @save="handleEditorSave" @cancel="overlayStore.closeEditor()"
       @update:isOpen="!$event && overlayStore.closeEditor()" />
 

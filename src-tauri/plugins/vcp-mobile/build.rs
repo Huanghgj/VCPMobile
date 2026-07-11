@@ -31,6 +31,11 @@ const COMMANDS: &[&str] = &[
     "acquire_wake_lock",
     "release_wake_lock",
     "start_network_monitoring",
+    "get_lifecycle_runtime_status",
+    "request_exact_alarm_access",
+    "schedule_lifecycle_wakeup",
+    "cancel_lifecycle_wakeup",
+    "set_lifecycle_keepalive",
 ];
 
 fn main() {

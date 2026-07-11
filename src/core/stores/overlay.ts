@@ -33,6 +33,7 @@ export const useOverlayStore = defineStore('overlay', () => {
   const isDistributedOpen = computed(() => pageStack.value.some(p => p.type === 'distributed'));
   const isRagObserverOpen = computed(() => pageStack.value.some(p => p.type === 'ragObserver'));
   const isDiaryOpen = computed(() => pageStack.value.some(p => p.type === 'diary'));
+  const isAiLifecycleDebugOpen = computed(() => pageStack.value.some(p => p.type === 'aiLifecycleDebug'));
 
 
   const agentSettingsId = computed(() => {
@@ -191,6 +192,14 @@ export const useOverlayStore = defineStore('overlay', () => {
     popPage();
   };
 
+  const openAiLifecycleDebug = () => {
+    pushPage('aiLifecycleDebug');
+  };
+
+  const closeAiLifecycleDebug = () => {
+    popPage();
+  };
+
   // --- Modal API (unchanged) ---
   const openPrompt = (config: PromptConfig) => {
     promptConfig.value = config;
@@ -251,6 +260,7 @@ export const useOverlayStore = defineStore('overlay', () => {
     isDistributedOpen,
     isRagObserverOpen,
     isDiaryOpen,
+    isAiLifecycleDebugOpen,
     // Legacy open/close (now backed by page stack)
     openSettings,
     closeSettings,
@@ -270,6 +280,8 @@ export const useOverlayStore = defineStore('overlay', () => {
     closeRagObserver,
     openDiary,
     closeDiary,
+    openAiLifecycleDebug,
+    closeAiLifecycleDebug,
     // Modals
     promptConfig,
     contextMenuConfig,

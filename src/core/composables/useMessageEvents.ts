@@ -19,9 +19,44 @@ function safeExternalHttpUrl(href: string | null): string {
 export function useMessageEvents(containerRef: Ref<HTMLElement | null>) {
   const historyStore = useChatHistoryStore();
 
+  const readCopyCode = (button: HTMLElement): string => {
+    const raw = button.getAttribute("data-vcp-copy-code") || "";
+    if (button.getAttribute("data-vcp-copy-encoded") === "uri") {
+      try {
+        return decodeURIComponent(raw);
+      } catch {
+        return raw;
+      }
+    }
+    return raw;
+  };
+
   const handleClick = (e: MouseEvent) => {
     if (!(e.target instanceof Element)) return;
     const target = e.target;
+
+    const copyButton = target.closest('[data-vcp-copy-code]') as HTMLButtonElement | null;
+    if (copyButton) {
+      e.preventDefault();
+      e.stopPropagation();
+
+      navigator.clipboard
+        .writeText(readCopyCode(copyButton))
+        .then(() => {
+          copyButton.classList.add("is-copied");
+          copyButton.setAttribute("aria-label", "已复制");
+          copyButton.title = "已复制";
+          window.setTimeout(() => {
+            copyButton.classList.remove("is-copied");
+            copyButton.setAttribute("aria-label", "复制代码");
+            copyButton.title = "复制代码";
+          }, 1200);
+        })
+        .catch((err) => {
+          console.error("[useMessageEvents] Failed to copy code block:", err);
+        });
+      return;
+    }
 
     // 消息渲染器自身的控件只处理 UI 状态，不能落入 AI 生成按钮的发送逻辑。
     if (target.closest('[data-vcp-ui-control]')) {
@@ -45,7 +80,11 @@ export function useMessageEvents(containerRef: Ref<HTMLElement | null>) {
 
     // 1.5 拦截 AI 回复中生成的内嵌 <button> 元素
     const aiButton = target.closest('button') as HTMLButtonElement | null;
-    if (aiButton) {
+    const explicitSendText =
+      aiButton?.getAttribute('data-vcp-send') ||
+      aiButton?.getAttribute('data-send') ||
+      "";
+    if (aiButton && explicitSendText.trim()) {
       e.preventDefault();
       e.stopPropagation();
 
@@ -55,7 +94,7 @@ export function useMessageEvents(containerRef: Ref<HTMLElement | null>) {
       }
 
       // 提取发送文本（优先级：data-send 属性 > 按钮 textContent）
-      const sendText = aiButton.getAttribute('data-send') || aiButton.textContent?.trim();
+      const sendText = explicitSendText.trim();
       if (sendText) {
         let finalSendText = `[[点击按钮:${sendText}]]`;
 

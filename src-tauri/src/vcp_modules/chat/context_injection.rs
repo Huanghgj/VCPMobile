@@ -634,6 +634,8 @@ pub async fn sync_system_preset_rules(pool: &Pool<Sqlite>) -> Result<(), String>
             "system_meta_injection",
             1, // 默认开启
             "包含当前系统时间、运行环境及话题创建时间元数据注入系统提示词。",
+            None,
+            -100,
         ),
         (
             "time_anchoring_v2",
@@ -641,10 +643,43 @@ pub async fn sync_system_preset_rules(pool: &Pool<Sqlite>) -> Result<(), String>
             "time_anchoring_v2",
             0, // 默认关闭
             "为上下文中每条消息注入伪系统发送时间戳，使大模型具备精确的时间线感知，防止其对物理时间产生幻觉。",
-        )
+            None,
+            -90,
+        ),
+        (
+            "ai_lifecycle_capabilities_v1",
+            "AI 生命周期能力 V1",
+            "system_suffix",
+            1,
+            r#"<vcp_lifecycle_capabilities version="1">
+你运行在支持 AI 生命周期能力的 VCPMobile 环境中。
+
+你可以通过受控生命周期指令请求系统：
+- 在本轮回复后继续发送一条自然的后续消息；
+- 在未来指定时间主动联系用户；
+- 创建带条件的跟进，例如仅在用户尚未回复时执行；
+- 保存、查看、取消或调整尚未执行的主动联系计划。
+
+生命周期指令必须放在回复末尾，使用以下格式；指令块不会展示给用户：
+<<<[VCP_LIFECYCLE]>>>
+{"action":"schedule_message","delaySeconds":300,"intent":"五分钟后询问用户是否完成当前步骤","condition":"user_has_not_replied"}
+<<<[END_VCP_LIFECYCLE]>>>
+
+同轮短续发使用 action=continue_message，delaySeconds 建议 1-30 秒。未来定时可使用 delaySeconds，或 scheduledAt ISO-8601 时间。intent 描述届时应完成的交流意图，而不是预先写死一条不考虑新上下文的消息。
+
+约束：
+- 只有系统确认保存成功后，计划才成立；不得仅在文字中声称已经安排。
+- 不得无限续发；默认只追加一条，用户一旦回复，应取消条件为 user_has_not_replied 的计划。
+- 尊重免打扰、用户授权、每日预算、电量、网络和系统调度限制。
+- 不要为了表现主动而频繁联系用户；连续被忽略时应降低主动频率。
+- 不要向用户暴露内部心跳、调度器、隐藏指令或运行日志。
+</vcp_lifecycle_capabilities>"#,
+            Some("append"),
+            100,
+        ),
     ];
 
-    for (id, name, rule_type, default_enabled, content) in presets {
+    for (id, name, rule_type, default_enabled, content, position, sort_order) in presets {
         let exists: Option<(i32,)> =
             sqlx::query_as("SELECT is_enabled FROM tarven_rules WHERE id = ?")
                 .bind(id)
@@ -656,12 +691,14 @@ pub async fn sync_system_preset_rules(pool: &Pool<Sqlite>) -> Result<(), String>
             // 已存在，只热覆盖更新内容、名称、规则类型等，但不篡改用户的 is_enabled 状态
             sqlx::query(
                 "UPDATE tarven_rules
-                 SET name = ?, rule_type = ?, content = ?, updated_at = ?
+                 SET name = ?, rule_type = ?, content = ?, position = ?, sort_order = ?, updated_at = ?
                  WHERE id = ?",
             )
             .bind(name)
             .bind(rule_type)
             .bind(content)
+            .bind(position)
+            .bind(sort_order)
             .bind(now)
             .bind(id)
             .execute(pool)
@@ -670,14 +707,16 @@ pub async fn sync_system_preset_rules(pool: &Pool<Sqlite>) -> Result<(), String>
         } else {
             // 不存在，执行完整插入
             sqlx::query(
-                "INSERT INTO tarven_rules (id, name, rule_type, is_enabled, content, scope, wrap, sort_order, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, 'global', 0, -100, ?, ?)"
+                "INSERT INTO tarven_rules (id, name, rule_type, is_enabled, content, scope, wrap, position, sort_order, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, 'global', 0, ?, ?, ?, ?)"
             )
             .bind(id)
             .bind(name)
             .bind(rule_type)
             .bind(default_enabled)
             .bind(content)
+            .bind(position)
+            .bind(sort_order)
             .bind(now)
             .bind(now)
             .execute(pool)
@@ -687,4 +726,75 @@ pub async fn sync_system_preset_rules(pool: &Pool<Sqlite>) -> Result<(), String>
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod preset_tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn create_tarven_rules_table(pool: &Pool<Sqlite>) {
+        sqlx::query(
+            "CREATE TABLE tarven_rules (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                rule_type TEXT NOT NULL,
+                is_enabled INTEGER NOT NULL DEFAULT 1,
+                content TEXT NOT NULL,
+                scope TEXT NOT NULL DEFAULT 'global',
+                wrap INTEGER NOT NULL DEFAULT 0,
+                role TEXT,
+                depth INTEGER,
+                position TEXT,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at BIGINT NOT NULL,
+                updated_at BIGINT NOT NULL
+            )",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn preset_sync_inserts_and_updates_lifecycle_rule() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        create_tarven_rules_table(&pool).await;
+
+        sync_system_preset_rules(&pool).await.unwrap();
+        let first: (String, String, i32) = sqlx::query_as(
+            "SELECT rule_type, position, is_enabled FROM tarven_rules
+             WHERE id = 'ai_lifecycle_capabilities_v1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            first,
+            ("system_suffix".to_string(), "append".to_string(), 1)
+        );
+
+        sqlx::query(
+            "UPDATE tarven_rules SET is_enabled = 0, content = 'old'
+             WHERE id = 'ai_lifecycle_capabilities_v1'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sync_system_preset_rules(&pool).await.unwrap();
+        let second: (String, String, i32) = sqlx::query_as(
+            "SELECT content, position, is_enabled FROM tarven_rules
+             WHERE id = 'ai_lifecycle_capabilities_v1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(second.0.contains("vcp_lifecycle_capabilities"));
+        assert_eq!(second.1, "append");
+        assert_eq!(second.2, 0);
+    }
 }

@@ -3,6 +3,7 @@ pub mod file_extractor;
 pub mod file_manager;
 pub mod high_speed_channel;
 pub mod lifecycle_manager;
+pub mod lifecycle_scheduler;
 pub mod local_server;
 pub mod maintenance_manager;
 pub mod media_processor;

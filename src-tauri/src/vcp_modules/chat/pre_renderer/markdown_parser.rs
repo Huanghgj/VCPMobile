@@ -28,7 +28,7 @@ lazy_static! {
     static ref COMMENT_RE: Regex = Regex::new(r"(?s)<!--[\s\S]*?(?:-->|$)").unwrap();
 
     static ref HTML_CONTAINER_CLOSE_BEFORE_FENCE_RE: Regex =
-        Regex::new(r"(?im)^[ \t]*</(?:div|section|article|header|footer|main|aside|figure|figcaption)>[ \t]*(?P<fence>```[a-zA-Z0-9-]*[ \t]*\r?$)").unwrap();
+        Regex::new(r"(?im)</(?P<tag>div|section|article|header|footer|main|aside|figure|figcaption)>[ \t]*(?:\r?\n[ \t]*)?(?P<fence>```[a-zA-Z0-9-]*[ \t]*\r?$)").unwrap();
 
     // 仅在 字母/数字 + ** + 标点 的模式下注入零宽空格，修复 CommonMark left-flanking 判定失效。
     // 前驱限定为 [\p{L}\p{N}] 确保不会误触发闭合符号（闭合 ** 前驱通常是标点或 \u{200B}）。
@@ -56,15 +56,23 @@ fn fix_flanking_delimiters(text: &str) -> String {
 /// ...
 /// ```
 ///
-/// 这类输出通常是为了从 HTML 容器临时切回 Markdown 围栏，但在本端 AST 渲染里
-/// HTML 容器本身支持 Markdown 子节点。保留这个提前闭合标签会把外层样式容器截断，
-/// 还会让后续围栏不再位于行首而无法按代码块解析。
+/// 这类输出通常是为了从 HTML 容器临时切回 Markdown 围栏。这里不能全局删除或改写闭合标签：
+/// 对正常 HTML 片段来说它可能是真实边界。实际修复发生在已经确认的容器内部，
+/// 由 `strip_stuck_container_close_before_fence` 只剥掉那一个假闭合。
 fn normalize_container_breaking_code_fences(text: &str) -> Cow<'_, str> {
     if !text.contains("```") || !text.contains("</") {
         return Cow::Borrowed(text);
     }
 
-    HTML_CONTAINER_CLOSE_BEFORE_FENCE_RE.replace_all(text, "$fence")
+    HTML_CONTAINER_CLOSE_BEFORE_FENCE_RE.replace_all(text, "</${tag}>\n${fence}")
+}
+
+pub(crate) fn strip_stuck_container_close_before_fence(text: &str) -> Cow<'_, str> {
+    if !text.contains("```") || !text.contains("</") {
+        return Cow::Borrowed(text);
+    }
+
+    HTML_CONTAINER_CLOSE_BEFORE_FENCE_RE.replace_all(text, "${fence}")
 }
 
 /// 剥除块级 $$ 公式行的多余前导缩进，防止 pulldown-cmark 将其误判为缩进代码块。
@@ -223,7 +231,8 @@ fn extract_html_containers(text: &str) -> (Cow<'_, str>, Vec<(String, Vec<Markdo
 
             // 递归解析内部内容
             let deindented_inner = trim_common_leading_indent(&inner_text);
-            let inner_nodes = parse_markdown_to_ast(&deindented_inner);
+            let markdown_inner = strip_stuck_container_close_before_fence(&deindented_inner);
+            let inner_nodes = parse_markdown_to_ast(markdown_inner.as_ref());
             containers.push((open_tag, inner_nodes, close_tag));
 
             last_pos = close_end;
@@ -393,7 +402,12 @@ pub(crate) fn find_matching_close_tag(
 
         if tag_name.eq_ignore_ascii_case(tag) {
             if is_close_tag {
-                if depth == 1 && close_tag_is_followed_by_code_fence(search_area, full_match.end())
+                if depth == 1
+                    && has_later_matching_close_after_stuck_fence(
+                        search_area,
+                        full_match.end(),
+                        tag,
+                    )
                 {
                     continue;
                 }
@@ -410,12 +424,88 @@ pub(crate) fn find_matching_close_tag(
     None
 }
 
-fn close_tag_is_followed_by_code_fence(search_area: &str, relative_end: usize) -> bool {
+fn stuck_code_fence_after_close(
+    search_area: &str,
+    relative_end: usize,
+) -> Option<std::ops::Range<usize>> {
     let Some(rest) = search_area.get(relative_end..) else {
+        return None;
+    };
+
+    let mut offset = 0;
+    let mut after_horizontal_ws = rest;
+    while after_horizontal_ws.starts_with([' ', '\t']) {
+        let ch = after_horizontal_ws.chars().next().unwrap();
+        offset += ch.len_utf8();
+        after_horizontal_ws = &after_horizontal_ws[ch.len_utf8()..];
+    }
+
+    if after_horizontal_ws.starts_with("\r\n") {
+        offset += 2;
+        after_horizontal_ws = &after_horizontal_ws[2..];
+    } else if after_horizontal_ws.starts_with('\n') {
+        offset += 1;
+        after_horizontal_ws = &after_horizontal_ws[1..];
+    }
+
+    while after_horizontal_ws.starts_with([' ', '\t']) {
+        let ch = after_horizontal_ws.chars().next().unwrap();
+        offset += ch.len_utf8();
+        after_horizontal_ws = &after_horizontal_ws[ch.len_utf8()..];
+    }
+
+    let line_tail = after_horizontal_ws
+        .split_once('\n')
+        .map_or(after_horizontal_ws, |(line, _)| line);
+    if FENCE_RE.is_match(line_tail) {
+        let candidate_start = relative_end + offset;
+        Some(candidate_start..candidate_start + line_tail.len())
+    } else {
+        None
+    }
+}
+
+fn has_later_matching_close_after_stuck_fence(
+    search_area: &str,
+    close_end: usize,
+    tag: &str,
+) -> bool {
+    let Some(fence_marker) = stuck_code_fence_after_close(search_area, close_end) else {
         return false;
     };
-    let line_tail = rest.split_once('\n').map_or(rest, |(line, _)| line);
-    FENCE_RE.is_match(line_tail.trim_start_matches([' ', '\t']))
+
+    let fence_ranges = collect_code_fence_ranges(search_area);
+    let after_fence = fence_ranges
+        .iter()
+        .find(|range| range.start == fence_marker.start)
+        .map(|range| range.end)
+        .unwrap_or(fence_marker.end)
+        .min(search_area.len());
+
+    let after = &search_area[after_fence..];
+    let later_fence_ranges = collect_code_fence_ranges(after);
+    let comment_ranges: Vec<std::ops::Range<usize>> = COMMENT_RE
+        .find_iter(after)
+        .map(|m| m.start()..m.end())
+        .collect();
+
+    TAG_SCANNER.captures_iter(after).any(|cap| {
+        let full_match = cap.get(0).unwrap();
+        let cap_start = full_match.start();
+        if later_fence_ranges
+            .iter()
+            .any(|range| range.contains(&cap_start))
+            || comment_ranges
+                .iter()
+                .any(|range| range.contains(&cap_start))
+        {
+            return false;
+        }
+
+        let is_close_tag = cap.get(1).unwrap().as_str() == "</";
+        let tag_name = cap.get(2).unwrap().as_str();
+        is_close_tag && tag_name.eq_ignore_ascii_case(tag)
+    })
 }
 
 /// 后处理：将 AST 中的占位符替换为开标签 + 子节点 + 闭标签
@@ -1039,13 +1129,59 @@ mod tests {
         })
     }
 
+    fn collect_yaml_code_blocks(nodes: &[MarkdownNode], codes: &mut Vec<String>) {
+        for node in nodes {
+            match node {
+                MarkdownNode::CodeBlock { lang, code, .. } if lang.as_deref() == Some("yaml") => {
+                    codes.push(code.clone());
+                }
+                MarkdownNode::Blockquote { children, .. } => {
+                    collect_yaml_code_blocks(children, codes)
+                }
+                MarkdownNode::List { items, .. } => {
+                    for item_nodes in items {
+                        collect_yaml_code_blocks(item_nodes, codes);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn contains_raw_html(nodes: &[MarkdownNode], needle: &str) -> bool {
         nodes.iter().any(|node| match node {
             MarkdownNode::RawHtml { content, .. } => content.contains(needle),
+            MarkdownNode::Paragraph { children, .. } | MarkdownNode::Heading { children, .. } => {
+                contains_inline_raw_html(children, needle)
+            }
             MarkdownNode::Blockquote { children, .. } => contains_raw_html(children, needle),
             MarkdownNode::List { items, .. } => items
                 .iter()
                 .any(|item_nodes| contains_raw_html(item_nodes, needle)),
+            MarkdownNode::Table { header, rows, .. } => {
+                header
+                    .iter()
+                    .any(|cell| contains_inline_raw_html(cell, needle))
+                    || rows.iter().any(|row| {
+                        row.iter()
+                            .any(|cell| contains_inline_raw_html(cell, needle))
+                    })
+            }
+            _ => false,
+        })
+    }
+
+    fn contains_inline_raw_html(nodes: &[InlineNode], needle: &str) -> bool {
+        nodes.iter().any(|node| match node {
+            InlineNode::RawHtmlInline { content, .. } => content.contains(needle),
+            InlineNode::Strong { children, .. }
+            | InlineNode::Emphasis { children, .. }
+            | InlineNode::Strikethrough { children, .. }
+            | InlineNode::Link { children, .. } => contains_inline_raw_html(children, needle),
+            InlineNode::VcpCustom {
+                children: Some(children),
+                ..
+            } => contains_inline_raw_html(children, needle),
             _ => false,
         })
     }
@@ -1083,6 +1219,52 @@ mod tests {
         assert!(
             contains_raw_html(&nodes, "</div>"),
             "expected outer HTML container to retain a closing tag, got {nodes:#?}"
+        );
+    }
+
+    #[test]
+    fn parses_inline_html_container_stuck_to_code_fence_without_swallowing_tail() {
+        let input = r#"AI render probe:
+
+The next boundary is intentionally stuck together:
+<div class="vcp-debug-probe"><strong>HTML container</strong></div>```yaml
+name: render-probe
+copy_button: should_not_send
+```
+
+<button data-vcp-ui-control="true" data-vcp-copy-code="render-probe">Copy code</button>
+
+[[点击按钮:继续]]
+
+- The YAML block above should render as a code block.
+- The copy button should not be sent as an AI button click."#;
+
+        let nodes = parse_markdown_to_ast(input);
+        let mut yaml_codes = Vec::new();
+        collect_yaml_code_blocks(&nodes, &mut yaml_codes);
+
+        assert_eq!(
+            yaml_codes.len(),
+            1,
+            "expected exactly one yaml code block, got {nodes:#?}"
+        );
+        assert!(yaml_codes[0].contains("name: render-probe"));
+        assert!(yaml_codes[0].contains("copy_button: should_not_send"));
+        assert!(
+            !yaml_codes[0].contains("<button"),
+            "copy button HTML was swallowed by yaml code block: {nodes:#?}"
+        );
+        assert!(
+            !yaml_codes[0].contains("[[点击按钮:继续]]"),
+            "AI button marker was swallowed by yaml code block: {nodes:#?}"
+        );
+        assert!(
+            contains_raw_html(&nodes, "vcp-debug-probe"),
+            "expected inline HTML container to render as raw HTML, got {nodes:#?}"
+        );
+        assert!(
+            contains_raw_html(&nodes, "data-vcp-copy-code"),
+            "expected copy button HTML to remain renderable after the yaml block, got {nodes:#?}"
         );
     }
 }

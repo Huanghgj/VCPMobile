@@ -58,6 +58,7 @@ pub use infra::diary_manager;
 pub use infra::file_manager;
 pub use infra::high_speed_channel;
 pub use infra::lifecycle_manager;
+pub use infra::lifecycle_scheduler;
 pub use infra::maintenance_manager;
 pub use infra::media_processor;
 pub use infra::model_manager;

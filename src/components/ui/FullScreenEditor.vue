@@ -9,6 +9,11 @@ import { useKeyboardInsets } from '../../core/composables/useKeyboardInsets';
 const props = defineProps<{
   isOpen: boolean;
   initialValue: string;
+  title?: string;
+  placeholder?: string;
+  readOnly?: boolean;
+  showSave?: boolean;
+  monospace?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -25,6 +30,7 @@ watch(() => props.isOpen, (newVal) => {
   if (newVal) {
     editorContent.value = props.initialValue || '';
     nextTick(() => {
+      if (props.readOnly) return;
       textareaRef.value?.focus();
       textareaRef.value?.setSelectionRange(editorContent.value.length, editorContent.value.length);
     });
@@ -42,6 +48,10 @@ watch(keyboardHeight, () => {
 });
 
 const handleSave = () => {
+  if (props.readOnly || props.showSave === false) {
+    handleCancel();
+    return;
+  }
   emit('save', editorContent.value);
 };
 
@@ -105,19 +115,21 @@ const handleTouchMove = (e: TouchEvent) => {
             <X :size="24" />
           </button>
 
-          <h2 class="text-sm font-bold text-gray-800 dark:text-gray-200 tracking-wider">编辑消息</h2>
+          <h2 class="text-sm font-bold text-gray-800 dark:text-gray-200 tracking-wider">{{ title || '编辑消息' }}</h2>
 
-          <button @click="handleSave"
+          <button v-if="showSave !== false && !readOnly" @click="handleSave"
             class="p-2 -mr-2 rounded-full active:bg-black/5 dark:active:bg-white/5 text-blue-500 hover:text-blue-600 dark:text-blue-400 dark:hover:text-blue-300 transition-colors">
             <Check :size="24" />
           </button>
+          <div v-else class="w-10 h-10"></div>
         </div>
 
         <!-- 编辑器主体 -->
         <div class="flex-1 relative flex flex-col p-4 overflow-hidden">
           <textarea ref="textareaRef" v-model="editorContent" @touchstart="handleTouchStart" @touchmove="handleTouchMove"
             class="vcp-fullscreen-textarea flex-1 w-full bg-transparent resize-none outline-none text-[15px] leading-relaxed text-gray-800 dark:text-gray-200 placeholder-gray-400 font-sans"
-            placeholder="输入消息内容..." spellcheck="false"></textarea>
+            :class="{ 'font-mono text-[12px] leading-5': monospace }"
+            :placeholder="placeholder || '输入消息内容...'" :readonly="readOnly" spellcheck="false"></textarea>
         </div>
 
       </div>

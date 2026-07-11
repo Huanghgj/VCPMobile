@@ -2,6 +2,7 @@
 import { computed, ref, watch } from "vue";
 import { Brain, ChevronDown, ChevronUp, Loader2 } from "lucide-vue-next";
 import { renderMarkdownNodes } from "../../../core/utils/astRenderer";
+import { renderSafeMarkdown } from "../../../core/utils/safeMarkdown";
 import type { ContentBlock } from "../../../core/types/chat";
 
 const props = withDefaults(
@@ -39,14 +40,14 @@ const summary = computed(() => {
   return compact.length > 36 ? `${compact.slice(0, 36)}...` : compact;
 });
 
-function escapeHtml(text: string): string {
-  return text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
-}
+const renderedBody = computed(() =>
+  props.block.nodes && props.block.nodes.length > 0
+    ? renderMarkdownNodes(props.block.nodes, props.messageId, props.block.hash)
+    : renderSafeMarkdown(props.block.content || "", {
+        allowRichHtml: true,
+        allowStyleAttr: true,
+      }),
+);
 </script>
 
 <template>
@@ -79,11 +80,7 @@ function escapeHtml(text: string): string {
     <div v-show="isExpanded" class="vcp-thought-content animate-slide-down">
       <div
         class="thought-body"
-        v-html="
-          block.nodes && block.nodes.length > 0
-            ? renderMarkdownNodes(block.nodes, messageId, block.hash)
-            : escapeHtml(block.content || '')
-        "
+        v-html="renderedBody"
       />
     </div>
   </div>

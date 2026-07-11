@@ -45,6 +45,10 @@ use vcp_modules::lifecycle_manager::{
     bootstrap, get_core_status, get_last_error, get_system_snapshot,
     reconcile_distributed_node_cmd, reconcile_local_server_cmd, LifecycleState,
 };
+use vcp_modules::lifecycle_scheduler::{
+    cancel_lifecycle_job, claim_due_lifecycle_jobs, complete_lifecycle_job, create_lifecycle_job,
+    fail_lifecycle_job, list_lifecycle_jobs,
+};
 use vcp_modules::maintenance_manager::{
     cleanup_orphaned_attachments, cleanup_single_orphaned_attachment, clear_webview_cache,
     init_automatic_maintenance, reconstruct_system_cache,
@@ -225,6 +229,12 @@ pub fn run() {
         .plugin(tauri_plugin_vcp_mobile::init())
         .invoke_handler(tauri::generate_handler![
             sendToVCP,
+            create_lifecycle_job,
+            list_lifecycle_jobs,
+            claim_due_lifecycle_jobs,
+            complete_lifecycle_job,
+            fail_lifecycle_job,
+            cancel_lifecycle_job,
             get_tarven_rules,
             save_tarven_rule,
             delete_tarven_rule,

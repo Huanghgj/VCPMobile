@@ -15,6 +15,7 @@ interface AppSettings {
   vcpServerUrl?: string;
   vcpApiKey?: string;
   assistantAgentId?: string;
+  vcpConfigured?: boolean;
   [key: string]: any;
 }
 
@@ -157,7 +158,7 @@ export const useFloatingAssistantStore = defineStore(
           wsConfigured.value = true;
           console.log("[FloatingAssistantStore] Config loaded:", {
             agentId: data.settings.assistantAgentId,
-            vcpUrl: data.settings.vcpServerUrl,
+            vcpConfigured: data.settings.vcpConfigured,
           });
         } else {
           console.warn(
@@ -343,7 +344,10 @@ export const useFloatingAssistantStore = defineStore(
 
       const vcpUrl = settings.vcpServerUrl || "";
       const vcpApiKey = settings.vcpApiKey || "";
-      if (!vcpUrl || !vcpApiKey) {
+      if (
+        (isFloatingMode.value && settings.vcpConfigured === false) ||
+        (!isFloatingMode.value && (!vcpUrl || !vcpApiKey))
+      ) {
         addToast(
           "error",
           "VCP 连接未配置",
@@ -398,13 +402,14 @@ export const useFloatingAssistantStore = defineStore(
           timestamp: m.timestamp,
         }));
 
-      const payload = { agentId, tempMessages, vcpUrl, vcpApiKey };
+      const payload = isFloatingMode.value
+        ? { agentId, tempMessages }
+        : { agentId, tempMessages, vcpUrl, vcpApiKey };
 
       if (isFloatingMode.value) {
         try {
           console.log("[FloatingAssistantStore] Sending via WS:", {
             agentId,
-            vcpUrl,
             msgCount: tempMessages.length,
           });
           floatingSocket!.send(

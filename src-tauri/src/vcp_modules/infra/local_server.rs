@@ -3,22 +3,29 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
+    http::{HeaderMap, HeaderValue},
     response::{IntoResponse, Response},
     routing::get,
     Router,
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use futures_util::{sink::SinkExt, stream::StreamExt};
+use rand::{rngs::OsRng, RngCore};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tauri::{
     http::{header, Request, StatusCode},
     AppHandle, Manager,
 };
 use tokio::sync::watch;
 
+const LOCAL_AUTH_COOKIE: &str = "vcp_local_auth";
+
 #[derive(Clone)]
 struct AppState {
     app_handle: AppHandle,
+    auth_token: Arc<str>,
 }
 
 /// 服务器句柄：持有此句柄可触发优雅关闭
@@ -37,7 +44,10 @@ impl ServerHandle {
 
 /// 启动本地 HTTP + WebSocket 服务器，返回可用于关闭的句柄
 pub fn start_server(app_handle: AppHandle) -> ServerHandle {
-    let state = AppState { app_handle };
+    let state = AppState {
+        app_handle,
+        auth_token: generate_auth_token(),
+    };
     let addr = SocketAddr::from(([127, 0, 0, 1], 14202));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -87,8 +97,54 @@ pub fn start_server(app_handle: AppHandle) -> ServerHandle {
     }
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+fn generate_auth_token() -> Arc<str> {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    Arc::<str>::from(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn has_local_server_origin(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|origin| {
+            matches!(
+                origin,
+                "http://127.0.0.1:14202" | "http://localhost:14202" | "http://[::1]:14202"
+            )
+        })
+}
+
+fn has_auth_cookie(headers: &HeaderMap, token: &str) -> bool {
+    headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|cookies| {
+            cookies.split(';').any(|cookie| {
+                cookie
+                    .trim()
+                    .split_once('=')
+                    .is_some_and(|(name, value)| name == LOCAL_AUTH_COOKIE && value == token)
+            })
+        })
+}
+
+fn is_authorized_ws(headers: &HeaderMap, state: &AppState) -> bool {
+    has_local_server_origin(headers) && has_auth_cookie(headers, &state.auth_token)
+}
+
+async fn ws_handler(
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> Response {
+    if !is_authorized_ws(&headers, &state) {
+        log::warn!("[LocalServer/WS] Rejected unauthorized WebSocket connection.");
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
     ws.on_upgrade(|socket| handle_socket(socket, state))
+        .into_response()
 }
 
 async fn handle_socket(socket: WebSocket, state: AppState) {
@@ -118,6 +174,45 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 continue;
                             }
                         };
+
+                    let app_c = app_handle.clone();
+                    match crate::vcp_modules::settings_manager::read_settings(
+                        app_c.clone(),
+                        app_c.state(),
+                    )
+                    .await
+                    {
+                        Ok(settings) => {
+                            if settings.vcp_server_url.trim().is_empty()
+                                || settings.vcp_api_key.trim().is_empty()
+                            {
+                                let _ = sender
+                                    .send(Message::Text(
+                                        json!({
+                                            "type": "error",
+                                            "error": "VCP server URL or API key is not configured",
+                                        })
+                                        .to_string(),
+                                    ))
+                                    .await;
+                                continue;
+                            }
+                            payload.vcp_url = settings.vcp_server_url;
+                            payload.vcp_api_key = settings.vcp_api_key;
+                        }
+                        Err(e) => {
+                            let _ = sender
+                                .send(Message::Text(
+                                    json!({
+                                        "type": "error",
+                                        "error": format!("Failed to read settings: {}", e),
+                                    })
+                                    .to_string(),
+                                ))
+                                .await;
+                            continue;
+                        }
+                    }
 
                     let fallback_message_id = format!(
                         "msg_{}_{}",
@@ -265,14 +360,19 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     {
                         Ok(settings) => {
                             log::info!(
-                                "[LocalServer/WS] Sending initial_config, assistantAgentId={}",
+                                "[LocalServer/WS] Sending safe initial_config, assistantAgentId={}",
                                 settings.assistant_agent_id
                             );
                             let _ = sender
                                 .send(Message::Text(
                                     json!({
                                         "type": "initial_config",
-                                        "settings": settings,
+                                        "settings": {
+                                            "userName": settings.user_name,
+                                            "assistantAgentId": settings.assistant_agent_id,
+                                            "vcpConfigured": !settings.vcp_server_url.trim().is_empty()
+                                                && !settings.vcp_api_key.trim().is_empty(),
+                                        },
                                     })
                                     .to_string(),
                                 ))
@@ -298,12 +398,29 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     }
 }
 
+fn escape_html_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
 async fn index_handler(State(state): State<AppState>) -> impl IntoResponse {
     serve_asset(state, "index.html".to_string(), "".to_string()).await
 }
 
 async fn floating_handler(State(state): State<AppState>) -> impl IntoResponse {
-    serve_asset(state, "floating.html".to_string(), "".to_string()).await
+    let cookie = format!(
+        "{}={}; HttpOnly; SameSite=Strict; Path=/",
+        LOCAL_AUTH_COOKIE, state.auth_token
+    );
+    let mut response = serve_asset(state, "floating.html".to_string(), "".to_string()).await;
+    if let Ok(value) = HeaderValue::from_str(&cookie) {
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
+    response
 }
 
 async fn any_handler(
@@ -394,6 +511,8 @@ async fn serve_asset(state: AppState, path: String, query: String) -> Response<a
         }
     }
 
+    let escaped_path = escape_html_text(&clean_path);
+    let escaped_query = escape_html_text(&query);
     Response::builder()
         .status(StatusCode::NOT_FOUND)
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
@@ -408,7 +527,20 @@ async fn serve_asset(state: AppState, path: String, query: String) -> Response<a
                 </ul>
                 <button onclick="window.AndroidBridge.closeWindow()" style="padding: 8px 16px;">关闭悬浮窗</button>
             </div>"#,
-            clean_path, query
+            escaped_path, escaped_query
         )))
         .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::escape_html_text;
+
+    #[test]
+    fn escapes_untrusted_text_for_error_page() {
+        assert_eq!(
+            escape_html_text("<script>alert('x') & \"y\"</script>"),
+            "&lt;script&gt;alert(&#39;x&#39;) &amp; &quot;y&quot;&lt;/script&gt;"
+        );
+    }
 }

@@ -19,10 +19,10 @@
       }
     ],
     "security": {
-      "csp": null,
+      "csp": "default-src 'self'; script-src 'self' http://localhost:1420 http://127.0.0.1:1420 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost data: blob: http: https:; media-src 'self' asset: http://asset.localhost data: blob: http: https:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost http: https: ws: wss:; frame-src 'self' about: data: blob:; child-src 'self' about: data: blob:; object-src 'none'; base-uri 'self'",
       "assetProtocol": {
         "enable": true,
-        "scope": ["**"]
+        "scope": ["$APPDATA/**", "$APPCACHE/**", "$APPCONFIG/**"]
       }
     }
   },

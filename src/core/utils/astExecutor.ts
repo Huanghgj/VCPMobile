@@ -127,6 +127,110 @@ function sanitizeHighlightedCodeHtml(html: string): string {
   });
 }
 
+function normalizeHighlightedCodeHtml(html: string): string {
+  let normalized = html;
+  const nestedPreMatch = normalized.match(
+    /<pre[^>]*>\s*<code>([\s\S]*?)<\/code>\s*<\/pre>/i,
+  );
+  if (nestedPreMatch && nestedPreMatch[1].trim().startsWith("<pre")) {
+    const innerMatch = nestedPreMatch[1].match(
+      /<pre[^>]*>([\s\S]*?)<\/pre>/i,
+    );
+    if (innerMatch) {
+      normalized = innerMatch[1];
+    }
+  }
+  return normalized;
+}
+
+function createCodeCopyButton(code: string): HTMLButtonElement {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "vcp-code-copy-btn";
+  button.title = "复制代码";
+  button.setAttribute("aria-label", "复制代码");
+  button.setAttribute("data-vcp-ui-control", "code-copy");
+  button.dataset.vcpCopyCode = code;
+
+  const icon = document.createElement("span");
+  icon.className = "i-ph:copy-bold vcp-code-copy-icon";
+  icon.setAttribute("aria-hidden", "true");
+  button.appendChild(icon);
+
+  return button;
+}
+
+function createCodeShell(pre: HTMLPreElement, code: string, lang: string): HTMLDivElement {
+  const shell = document.createElement("div");
+  shell.className = "vcp-code-shell";
+
+  const toolbar = document.createElement("div");
+  toolbar.className = "vcp-code-toolbar";
+  toolbar.setAttribute("data-vcp-ui-control", "code-toolbar");
+
+  if (lang) {
+    const label = document.createElement("span");
+    label.className = "vcp-code-lang";
+    label.textContent = lang;
+    toolbar.appendChild(label);
+  }
+
+  toolbar.appendChild(createCodeCopyButton(code));
+  shell.appendChild(toolbar);
+  shell.appendChild(pre);
+  return shell;
+}
+
+function getCodePreFromShell(node: Node): HTMLPreElement | null {
+  if (!(node instanceof HTMLElement)) return null;
+  if (node.tagName === "PRE") return node as HTMLPreElement;
+  for (const child of Array.from(node.children)) {
+    if (
+      child instanceof HTMLPreElement &&
+      child.classList.contains("vcp-code-block")
+    ) {
+      return child;
+    }
+  }
+  return null;
+}
+
+function syncCodeShellMetadata(shellOrPre: Node, code: string, lang: string): void {
+  if (!(shellOrPre instanceof HTMLElement)) return;
+  const shell = shellOrPre.classList.contains("vcp-code-shell")
+    ? shellOrPre
+    : shellOrPre.parentElement?.classList.contains("vcp-code-shell")
+      ? shellOrPre.parentElement
+      : null;
+  if (!shell) return;
+
+  const toolbar = Array.from(shell.children).find(
+    (child): child is HTMLElement =>
+      child instanceof HTMLElement && child.classList.contains("vcp-code-toolbar"),
+  );
+  if (!toolbar) return;
+
+  const copyButton = toolbar.querySelector<HTMLButtonElement>("[data-vcp-copy-code]");
+  if (copyButton) {
+    copyButton.dataset.vcpCopyCode = code;
+  }
+
+  let label = Array.from(toolbar.children).find(
+    (child): child is HTMLElement =>
+      child instanceof HTMLElement && child.classList.contains("vcp-code-lang"),
+  );
+  if (lang) {
+    if (!label) {
+      label = document.createElement("span");
+      label.className = "vcp-code-lang";
+      toolbar.insertBefore(label, toolbar.firstChild);
+    }
+    label.textContent = lang;
+  } else if (label) {
+    label.remove();
+  }
+}
+
 function sanitizeClassList(value: string | undefined, fallback: string): string {
   const classList = (value || fallback)
     .split(/\s+/)
@@ -371,24 +475,17 @@ function createDomFromNode(
         el.className = "mermaid-placeholder";
         el.textContent = node.code || "";
       } else {
-        el = document.createElement("pre");
-        el.className = "vcp-code-block vcp-scrollable";
+        const pre = document.createElement("pre");
+        pre.className = "vcp-code-block vcp-scrollable";
         if (node.highlighted_html) {
-          let html = node.highlighted_html;
-          // 剥离多余的 <pre><code> 嵌套包裹以满足前端样式
-          const nestedPreMatch = html.match(/<pre[^>]*>\s*<code>([\s\S]*?)<\/code>\s*<\/pre>/i);
-          if (nestedPreMatch && nestedPreMatch[1].trim().startsWith("<pre")) {
-            const innerMatch = nestedPreMatch[1].match(/<pre[^>]*>([\s\S]*?)<\/pre>/i);
-            if (innerMatch) {
-              html = innerMatch[1];
-            }
-          }
-          el.innerHTML = sanitizeHighlightedCodeHtml(html);
+          const html = normalizeHighlightedCodeHtml(node.highlighted_html);
+          pre.innerHTML = sanitizeHighlightedCodeHtml(html);
         } else {
           const code = document.createElement("code");
           code.textContent = node.code || "";
-          el.appendChild(code);
+          pre.appendChild(code);
         }
+        el = createCodeShell(pre, node.code || "", node.lang || "");
       }
       break;
     }
@@ -771,26 +868,21 @@ function executeMutation(
           if (
             nodeType === "code_block" &&
             oldNode instanceof HTMLElement &&
-            oldNode.tagName === "PRE" &&
+            getCodePreFromShell(oldNode) &&
             mutation.node.highlighted_html
           ) {
             cleanupSubtreeRefs(mutation.id, registry, false); // 保留外层 pre 的 ref
 
-            let html = mutation.node.highlighted_html;
-            // 剥离多余包裹的 pre/code...
-            const nestedPreMatch = html.match(
-              /<pre[^>]*>\s*<code>([\s\S]*?)<\/code>\s*<\/pre>/i,
-            );
-            if (nestedPreMatch && nestedPreMatch[1].trim().startsWith("<pre")) {
-              const innerMatch = nestedPreMatch[1].match(
-                /<pre[^>]*>([\s\S]*?)<\/pre>/i,
-              );
-              if (innerMatch) {
-                html = innerMatch[1];
-              }
-            }
+            const html = normalizeHighlightedCodeHtml(mutation.node.highlighted_html);
 
-            oldNode.innerHTML = sanitizeHighlightedCodeHtml(html); // 原地覆盖
+            const pre = getCodePreFromShell(oldNode);
+            if (!pre) {
+              status = "failed";
+              detail = "Code block pre not found";
+              break;
+            }
+            pre.innerHTML = sanitizeHighlightedCodeHtml(html); // 原地覆盖
+            syncCodeShellMetadata(oldNode, mutation.node.code || "", mutation.node.lang || "");
             astDebugLog(`[AST replace code_block optimized] id=${mutation.id}`);
             break;
           }

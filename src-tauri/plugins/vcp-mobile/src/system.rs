@@ -16,6 +16,118 @@ pub struct PermissionStatus {
     pub location: bool,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LifecycleRuntimeStatus {
+    pub exact_alarm_allowed: bool,
+    pub battery_optimization_ignored: bool,
+    pub lifecycle_keepalive_active: bool,
+    pub manufacturer: String,
+}
+
+#[tauri::command]
+pub fn get_lifecycle_runtime_status<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<LifecycleRuntimeStatus, String> {
+    #[cfg(target_os = "android")]
+    {
+        let state = app.state::<VcpMobileState<R>>();
+        let handle = state.plugin_handle.lock().map_err(|e| e.to_string())?;
+        let plugin_handle = handle.as_ref().ok_or("Plugin handle not initialized")?;
+        plugin_handle
+            .run_mobile_plugin::<LifecycleRuntimeStatus>(
+                "getLifecycleRuntimeStatus",
+                serde_json::json!({}),
+            )
+            .map_err(|e| format!("run_mobile_plugin failed: {}", e))
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        Ok(LifecycleRuntimeStatus {
+            exact_alarm_allowed: true,
+            battery_optimization_ignored: true,
+            lifecycle_keepalive_active: false,
+            manufacturer: "desktop".to_string(),
+        })
+    }
+}
+
+#[tauri::command]
+pub fn request_exact_alarm_access<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    run_android_unit_command(app, "requestExactAlarmAccess")
+}
+
+#[tauri::command]
+pub fn schedule_lifecycle_wakeup<R: Runtime>(
+    app: AppHandle<R>,
+    trigger_at_ms: i64,
+) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let state = app.state::<VcpMobileState<R>>();
+        let handle = state.plugin_handle.lock().map_err(|e| e.to_string())?;
+        let plugin_handle = handle.as_ref().ok_or("Plugin handle not initialized")?;
+        plugin_handle
+            .run_mobile_plugin::<serde_json::Value>(
+                "scheduleLifecycleWakeup",
+                serde_json::json!({ "triggerAtMs": trigger_at_ms }),
+            )
+            .map_err(|e| format!("run_mobile_plugin failed: {}", e))?;
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        let _ = trigger_at_ms;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn cancel_lifecycle_wakeup<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    run_android_unit_command(app, "cancelLifecycleWakeup")
+}
+
+#[tauri::command]
+pub fn set_lifecycle_keepalive<R: Runtime>(app: AppHandle<R>, enabled: bool) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let state = app.state::<VcpMobileState<R>>();
+        let handle = state.plugin_handle.lock().map_err(|e| e.to_string())?;
+        let plugin_handle = handle.as_ref().ok_or("Plugin handle not initialized")?;
+        plugin_handle
+            .run_mobile_plugin::<serde_json::Value>(
+                "setLifecycleKeepalive",
+                serde_json::json!({ "enabled": enabled }),
+            )
+            .map_err(|e| format!("run_mobile_plugin failed: {}", e))?;
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        let _ = enabled;
+    }
+    Ok(())
+}
+
+fn run_android_unit_command<R: Runtime>(app: AppHandle<R>, command: &str) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let state = app.state::<VcpMobileState<R>>();
+        let handle = state.plugin_handle.lock().map_err(|e| e.to_string())?;
+        let plugin_handle = handle.as_ref().ok_or("Plugin handle not initialized")?;
+        plugin_handle
+            .run_mobile_plugin::<serde_json::Value>(command, serde_json::json!({}))
+            .map_err(|e| format!("run_mobile_plugin failed: {}", e))?;
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        let _ = command;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn check_all_permissions<R: Runtime>(app: AppHandle<R>) -> Result<PermissionStatus, String> {
     #[cfg(target_os = "android")]
