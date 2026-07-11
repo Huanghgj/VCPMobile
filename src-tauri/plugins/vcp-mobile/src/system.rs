@@ -22,6 +22,8 @@ pub struct LifecycleRuntimeStatus {
     pub exact_alarm_allowed: bool,
     pub battery_optimization_ignored: bool,
     pub lifecycle_keepalive_active: bool,
+    pub lifecycle_keepalive_requested: bool,
+    pub scheduled_wakeup_at: Option<i64>,
     pub manufacturer: String,
 }
 
@@ -48,6 +50,8 @@ pub fn get_lifecycle_runtime_status<R: Runtime>(
             exact_alarm_allowed: true,
             battery_optimization_ignored: true,
             lifecycle_keepalive_active: false,
+            lifecycle_keepalive_requested: false,
+            scheduled_wakeup_at: None,
             manufacturer: "desktop".to_string(),
         })
     }
@@ -68,12 +72,15 @@ pub fn schedule_lifecycle_wakeup<R: Runtime>(
         let state = app.state::<VcpMobileState<R>>();
         let handle = state.plugin_handle.lock().map_err(|e| e.to_string())?;
         let plugin_handle = handle.as_ref().ok_or("Plugin handle not initialized")?;
-        plugin_handle
+        let result = plugin_handle
             .run_mobile_plugin::<serde_json::Value>(
                 "scheduleLifecycleWakeup",
                 serde_json::json!({ "triggerAtMs": trigger_at_ms }),
             )
             .map_err(|e| format!("run_mobile_plugin failed: {}", e))?;
+        if result.get("scheduled").and_then(serde_json::Value::as_bool) != Some(true) {
+            return Err("Android lifecycle alarm could not be scheduled".to_string());
+        }
     }
     #[cfg(not(target_os = "android"))]
     {

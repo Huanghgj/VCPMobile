@@ -32,11 +32,17 @@ const historyStore = useChatHistoryStore();
 const sessionStore = useChatSessionStore();
 const scheduler = useLifecycleSchedulerStore();
 const isBusy = ref(false);
-const lifecycleKeepaliveEnabled = ref(localStorage.getItem("vcp-lifecycle-keepalive") === "true");
+const initialKeepalivePreference = localStorage.getItem("vcp-lifecycle-keepalive");
+const lifecycleKeepaliveEnabled = ref(
+  initialKeepalivePreference === "true"
+    || (initialKeepalivePreference === null && lifecycle.config.enabled),
+);
 const runtimeStatus = ref<{
   exactAlarmAllowed: boolean;
   batteryOptimizationIgnored: boolean;
   lifecycleKeepaliveActive: boolean;
+  lifecycleKeepaliveRequested: boolean;
+  scheduledWakeupAt?: number | null;
   manufacturer: string;
 } | null>(null);
 const showAdvanced = ref(false);
@@ -139,11 +145,19 @@ const requestExactAlarmAccess = async () => {
 };
 
 const setLifecycleKeepalive = async (enabled: boolean) => {
-  lifecycleKeepaliveEnabled.value = enabled;
-  localStorage.setItem("vcp-lifecycle-keepalive", String(enabled));
-  if (isTauriRuntime()) {
-    await invoke("plugin:vcp-mobile|set_lifecycle_keepalive", { enabled });
-    await refreshRuntimeStatus();
+  const previous = lifecycleKeepaliveEnabled.value;
+  try {
+    if (isTauriRuntime()) {
+      await invoke("plugin:vcp-mobile|set_lifecycle_keepalive", { enabled });
+    }
+    lifecycleKeepaliveEnabled.value = enabled;
+    localStorage.setItem("vcp-lifecycle-keepalive", String(enabled));
+    if (isTauriRuntime()) {
+      await refreshRuntimeStatus();
+    }
+  } catch (error) {
+    lifecycleKeepaliveEnabled.value = previous;
+    throw error;
   }
 };
 
@@ -174,6 +188,21 @@ const forceTrigger = async () => {
   }
 };
 
+const scheduleBackgroundWakeupTest = async () => {
+  isBusy.value = true;
+  try {
+    if (!lifecycleKeepaliveEnabled.value) {
+      await setLifecycleKeepalive(true);
+    }
+    const triggerAt = lifecycle.scheduleDebugHeartbeat(60);
+    scheduler.setCompanionWakeupAt(triggerAt);
+    await scheduler.syncNativeWakeup();
+    await refreshRuntimeStatus();
+  } finally {
+    isBusy.value = false;
+  }
+};
+
 const injectRenderProbe = async () => {
   isBusy.value = true;
   try {
@@ -195,9 +224,14 @@ const resumeLifecycle = () => {
   lifecycle.resume();
 };
 
-const onEnabledChange = (enabled: boolean) => {
+const onEnabledChange = async (enabled: boolean) => {
   lifecycle.updateConfig({ enabled });
-  if (enabled) lifecycle.startTimer();
+  if (enabled) {
+    lifecycle.startTimer();
+    if (localStorage.getItem("vcp-lifecycle-keepalive") === null) {
+      await setLifecycleKeepalive(true);
+    }
+  }
 };
 
 watch(
@@ -299,6 +333,11 @@ onUnmounted(() => {
               title="待执行计划"
               :description="scheduler.nextJob ? '下次：' + formatTime(scheduler.nextJob.scheduledAt) : '当前没有已计划任务'"
             />
+            <div class="life-divider" />
+            <SettingsRow
+              title="原生唤醒"
+              :description="scheduler.nativeWakeupError || (runtimeStatus?.scheduledWakeupAt ? '下次：' + formatTime(runtimeStatus.scheduledWakeupAt) : '尚未设置系统闹钟')"
+            />
           </div>
         </section>
 
@@ -396,6 +435,10 @@ onUnmounted(() => {
         <button class="life-action probe" :disabled="isBusy" @click="injectRenderProbe">
           <Bot :size="15" />
           <span>注入模拟 AI 回复渲染样例</span>
+        </button>
+        <button class="life-action probe" :disabled="isBusy" @click="scheduleBackgroundWakeupTest">
+          <Clock3 :size="15" />
+          <span>1 分钟后台唤醒测试</span>
         </button>
             </div>
           </Transition>

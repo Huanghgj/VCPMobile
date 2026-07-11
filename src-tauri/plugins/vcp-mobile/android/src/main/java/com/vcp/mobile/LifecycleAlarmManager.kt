@@ -21,10 +21,6 @@ object LifecycleAlarmManager {
         val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
         val pendingIntent = createPendingIntent(context)
         val effectiveAt = triggerAtMs.coerceAtLeast(System.currentTimeMillis() + 1_000L)
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .edit()
-            .putLong(KEY_TRIGGER_AT, effectiveAt)
-            .apply()
         return try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 if (canScheduleExact(context)) {
@@ -43,6 +39,10 @@ object LifecycleAlarmManager {
             } else {
                 alarmManager.setExact(AlarmManager.RTC_WAKEUP, effectiveAt, pendingIntent)
             }
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .putLong(KEY_TRIGGER_AT, effectiveAt)
+                .apply()
             true
         } catch (_: Exception) {
             false
@@ -59,12 +59,15 @@ object LifecycleAlarmManager {
     }
 
     fun reschedulePersisted(context: Context) {
-        val triggerAt = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .getLong(KEY_TRIGGER_AT, 0L)
+        val triggerAt = persistedTriggerAt(context)
         if (triggerAt > 0L) {
             schedule(context, triggerAt.coerceAtLeast(System.currentTimeMillis() + 5_000L))
         }
     }
+
+    fun persistedTriggerAt(context: Context): Long =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getLong(KEY_TRIGGER_AT, 0L)
 
     fun clearPersisted(context: Context) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)

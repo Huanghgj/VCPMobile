@@ -28,7 +28,6 @@ class LifecycleAlarmReceiver : BroadcastReceiver() {
             return
         }
         if (intent?.action != ACTION_WAKEUP) return
-        LifecycleAlarmManager.clearPersisted(context)
         val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
         val wakeLock = powerManager.newWakeLock(
             PowerManager.PARTIAL_WAKE_LOCK,
@@ -40,9 +39,7 @@ class LifecycleAlarmReceiver : BroadcastReceiver() {
             if (wakeLock.isHeld) wakeLock.release()
         }, 60_000L)
         val plugin = VcpMobilePlugin.getInstance()
-        if (plugin != null) {
-            plugin.emitLifecycleWakeup()
-        } else {
+        if (plugin?.emitLifecycleWakeup() != true) {
             showWakeupNotification(context)
             if (wakeLock.isHeld) wakeLock.release()
         }

@@ -180,6 +180,9 @@ export const useAiLifecycleStore = defineStore(
     const sendLedger = ref<number[]>([]);
     const pausedUntil = ref<number | null>(null);
     const consecutiveFailures = ref(0);
+    const isHeartbeatRunning = ref(false);
+    const isTimerSuspended = ref(false);
+    const forceNextHeartbeat = ref(false);
 
     const isRunning = computed(() => timerId.value !== null);
     const latestDecision = computed(() => decisions.value[0] || null);
@@ -255,11 +258,16 @@ export const useAiLifecycleStore = defineStore(
     };
 
     const updateConfig = (updates: Partial<AiLifecycleConfig>) => {
+      const hadScheduledHeartbeat = timerId.value !== null || nextHeartbeatAt.value !== null;
+      const timingChanged = updates.minTriggerMinutes !== undefined
+        || updates.maxTriggerMinutes !== undefined
+        || updates.intervalMinutes !== undefined;
       config.value = { ...config.value, ...updates };
       normalizeConfig();
       if (!config.value.enabled) {
         stopTimer();
-      } else if (isRunning.value) {
+      } else if (hadScheduledHeartbeat && timingChanged) {
+        stopTimer();
         startTimer();
       }
     };
@@ -278,6 +286,7 @@ export const useAiLifecycleStore = defineStore(
 
     const resume = () => {
       pausedUntil.value = null;
+      stopTimer();
       if (config.value.enabled) startTimer();
     };
 
@@ -522,9 +531,12 @@ export const useAiLifecycleStore = defineStore(
       if (decisions.value.length > MAX_LOGS) decisions.value.length = MAX_LOGS;
     };
 
-    const runHeartbeat = async (source: "manual" | "timer" = "manual") => {
+    const runHeartbeat = async (
+      source: "manual" | "timer" = "manual",
+      options: { force?: boolean } = {},
+    ) => {
       lastHeartbeatAt.value = Date.now();
-      const decision = buildDecision(source);
+      const decision = buildDecision(source, options);
       pushDecision(decision);
       if (decision.shouldSend && config.value.allowAutoSend && source === "timer") {
         await sendSuggestedMessage(decision.id);
@@ -608,16 +620,63 @@ export const useAiLifecycleStore = defineStore(
       return true;
     };
 
-    function stopTimer() {
+    function clearTimerHandle() {
       if (timerId.value !== null) {
         window.clearTimeout(timerId.value);
         timerId.value = null;
       }
+    }
+
+    function suspendTimer() {
+      isTimerSuspended.value = true;
+      clearTimerHandle();
+    }
+
+    function stopTimer() {
+      isTimerSuspended.value = false;
+      clearTimerHandle();
       nextHeartbeatAt.value = null;
     }
 
+    function armTimerAt(triggerAt: number) {
+      clearTimerHandle();
+      nextHeartbeatAt.value = triggerAt;
+      if (isTimerSuspended.value) return;
+      timerId.value = window.setTimeout(() => {
+        timerId.value = null;
+        runDueHeartbeat().catch((err) => {
+          console.error("[AiLifecycle] timer heartbeat failed:", err);
+          if (config.value.enabled && nextHeartbeatAt.value === null) {
+            scheduleNextTimer();
+          }
+        });
+      }, Math.max(0, triggerAt - Date.now()));
+    }
+
+    const runDueHeartbeat = async () => {
+      normalizeConfig();
+      if (!config.value.enabled || isHeartbeatRunning.value) return false;
+      const triggerAt = nextHeartbeatAt.value;
+      if (triggerAt === null || triggerAt > Date.now() + 1_000) return false;
+
+      isHeartbeatRunning.value = true;
+      clearTimerHandle();
+      nextHeartbeatAt.value = null;
+      const force = forceNextHeartbeat.value;
+      forceNextHeartbeat.value = false;
+      try {
+        await runHeartbeat("timer", { force });
+        return true;
+      } finally {
+        isHeartbeatRunning.value = false;
+        if (config.value.enabled && nextHeartbeatAt.value === null) {
+          scheduleNextTimer();
+        }
+      }
+    };
+
     function scheduleNextTimer(delayOverrideMinutes?: number): number {
-      stopTimer();
+      clearTimerHandle();
       normalizeConfig();
       if (!config.value.enabled) return 0;
       const delayMinutes = delayOverrideMinutes
@@ -630,32 +689,49 @@ export const useAiLifecycleStore = defineStore(
           )
         : 0;
       const effectiveDelayMinutes = Math.max(delayMinutes, failureBackoff);
-      nextHeartbeatAt.value = Date.now() + effectiveDelayMinutes * 60_000;
-      timerId.value = window.setTimeout(() => {
-        timerId.value = null;
-        if (pausedUntil.value && Date.now() >= pausedUntil.value) {
-          pausedUntil.value = null;
-        }
-        runHeartbeat("timer").catch((err) => {
-          console.error("[AiLifecycle] timer heartbeat failed:", err);
-          if (config.value.enabled) {
-            scheduleNextTimer();
-          }
-        });
-      }, effectiveDelayMinutes * 60_000);
+      armTimerAt(Date.now() + effectiveDelayMinutes * 60_000);
       return effectiveDelayMinutes;
     }
 
     function startTimer() {
-      stopTimer();
+      isTimerSuspended.value = false;
+      clearTimerHandle();
       normalizeConfig();
-      if (!config.value.enabled) return;
+      if (!config.value.enabled) {
+        nextHeartbeatAt.value = null;
+        return;
+      }
       if (isPaused.value) {
-        scheduleNextTimer(Math.max(1, Math.ceil(((pausedUntil.value || Date.now()) - Date.now()) / 60_000)));
+        if (pausedUntil.value && Date.now() >= pausedUntil.value) {
+          pausedUntil.value = null;
+        } else {
+          scheduleNextTimer(Math.max(1, Math.ceil(((pausedUntil.value || Date.now()) - Date.now()) / 60_000)));
+          return;
+        }
+      }
+      if (nextHeartbeatAt.value !== null) {
+        if (nextHeartbeatAt.value <= Date.now() + 1_000) {
+          runDueHeartbeat().catch((err) => {
+            console.error("[AiLifecycle] overdue heartbeat failed:", err);
+          });
+        } else {
+          armTimerAt(nextHeartbeatAt.value);
+        }
         return;
       }
       scheduleNextTimer();
     }
+
+    const scheduleDebugHeartbeat = (delaySeconds = 60) => {
+      if (!config.value.enabled) {
+        config.value.enabled = true;
+      }
+      forceNextHeartbeat.value = true;
+      clearTimerHandle();
+      const triggerAt = Date.now() + Math.max(5, Math.min(300, delaySeconds)) * 1_000;
+      armTimerAt(triggerAt);
+      return triggerAt;
+    };
 
     const clearLogs = () => {
       decisions.value = [];
@@ -677,6 +753,7 @@ export const useAiLifecycleStore = defineStore(
       healthScore,
       sendLedger,
       isSending,
+      isHeartbeatRunning,
       updateConfig,
       applyPreset,
       pauseFor,
@@ -685,13 +762,16 @@ export const useAiLifecycleStore = defineStore(
       forceTriggerNow,
       sendSuggestedMessage,
       startTimer,
+      suspendTimer,
       stopTimer,
+      runDueHeartbeat,
+      scheduleDebugHeartbeat,
       clearLogs,
     };
   },
   {
     persist: {
-      pick: ["config", "decisions", "lastHeartbeatAt", "lastSentAt", "sendLedger", "pausedUntil", "consecutiveFailures"],
+      pick: ["config", "decisions", "lastHeartbeatAt", "lastSentAt", "nextHeartbeatAt", "sendLedger", "pausedUntil", "consecutiveFailures", "forceNextHeartbeat"],
     },
   },
 );

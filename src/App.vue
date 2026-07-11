@@ -280,6 +280,7 @@ let unlistenLog: (() => void) | null = null;
 let unlistenLifecycleJobs: (() => void) | null = null;
 let removeRouteGuard: (() => void) | null = null;
 let stopPendingShareReadyWatch: (() => void) | null = null;
+let stopLifecycleDeadlineWatch: (() => void) | null = null;
 
 // --- Root Exit Handler (Double-Tap to Exit with Toast) ---
 let exitTimer: number | null = null;
@@ -379,7 +380,13 @@ const handleVcpLifecycle = (e: Event) => {
       "[Lifecycle] App moved to background, tuning heartbeat to 120s..."
     );
     suspendPhysicalScreenKeep(); // 休眠物理亮屏，达到省电效果
-    aiLifecycleStore.stopTimer();
+    aiLifecycleStore.suspendTimer();
+    lifecycleSchedulerStore.setCompanionWakeupAt(
+      aiLifecycleStore.config.enabled ? aiLifecycleStore.nextHeartbeatAt : null,
+    );
+    lifecycleSchedulerStore.syncNativeWakeup().catch((err) => {
+      console.error("[Lifecycle] Failed to sync background wakeup:", err);
+    });
     invoke("set_vcp_log_heartbeat", { intervalMs: 120000 }).catch((err) => {
       console.error("[Lifecycle] Failed to set background heartbeat:", err);
     });
@@ -396,17 +403,50 @@ const handleVcpLifecycle = (e: Event) => {
     lifecycleStore.hydrateSystemStatus().catch((err) => {
       console.error("[Lifecycle] Failed to hydrate system status:", err);
     });
-    if (aiLifecycleStore.config.enabled) {
-      aiLifecycleStore.startTimer();
-    }
-    lifecycleSchedulerStore.wake().catch((err) => {
-      console.error("[Lifecycle] Failed to run due lifecycle jobs:", err);
+    processLifecycleWakeup().catch((err) => {
+      console.error("[Lifecycle] Failed to resume lifecycle work:", err);
     });
   }
 };
 
+const processLifecycleWakeup = async () => {
+  const companionWasDue = aiLifecycleStore.config.enabled
+    && aiLifecycleStore.nextHeartbeatAt !== null
+    && aiLifecycleStore.nextHeartbeatAt <= Date.now() + 1_000;
+  if (companionWasDue) {
+    try {
+      await aiLifecycleStore.runDueHeartbeat();
+    } catch (err) {
+      console.error("[Lifecycle] Companion heartbeat wakeup failed:", err);
+    }
+  }
+  try {
+    await lifecycleSchedulerStore.wake();
+  } catch (err) {
+    console.error("[Lifecycle] Scheduled job wakeup failed:", err);
+  }
+  if (aiLifecycleStore.config.enabled) {
+    if (!companionWasDue && !aiLifecycleStore.isHeartbeatRunning) {
+      try {
+        await aiLifecycleStore.runDueHeartbeat();
+      } catch (err) {
+        console.error("[Lifecycle] Companion heartbeat wakeup failed:", err);
+      }
+    }
+    if (isAppBackground) {
+      aiLifecycleStore.suspendTimer();
+    } else if (!aiLifecycleStore.isHeartbeatRunning) {
+      aiLifecycleStore.startTimer();
+    }
+  }
+  lifecycleSchedulerStore.setCompanionWakeupAt(
+    aiLifecycleStore.config.enabled ? aiLifecycleStore.nextHeartbeatAt : null,
+  );
+  await lifecycleSchedulerStore.syncNativeWakeup();
+};
+
 const handleLifecycleWakeup = () => {
-  lifecycleSchedulerStore.wake().catch((err) => {
+  processLifecycleWakeup().catch((err) => {
     console.error("[Lifecycle] Native wakeup execution failed:", err);
   });
 };
@@ -500,15 +540,30 @@ onMounted(async () => {
   // 2. 异步执行重度核心资源加载 (启动引导)
   await bootstrapApp();
 
-  if (!isAssistant.value && aiLifecycleStore.config.enabled) {
-    aiLifecycleStore.startTimer();
-  }
   if (!isAssistant.value) {
+    stopLifecycleDeadlineWatch = watch(
+      () => aiLifecycleStore.config.enabled ? aiLifecycleStore.nextHeartbeatAt : null,
+      (triggerAt) => lifecycleSchedulerStore.setCompanionWakeupAt(triggerAt),
+      { immediate: true },
+    );
     await lifecycleSchedulerStore.start();
-    if (isTauriRuntime() && localStorage.getItem("vcp-lifecycle-keepalive") === "true") {
-      invoke("plugin:vcp-mobile|set_lifecycle_keepalive", { enabled: true }).catch((err) => {
-        console.error("[Lifecycle] Failed to restore lifecycle keepalive:", err);
-      });
+    if (aiLifecycleStore.config.enabled) {
+      await aiLifecycleStore.runDueHeartbeat();
+      aiLifecycleStore.startTimer();
+    }
+    const keepalivePreference = localStorage.getItem("vcp-lifecycle-keepalive");
+    const shouldRestoreKeepalive = keepalivePreference === "true"
+      || (keepalivePreference === null && aiLifecycleStore.config.enabled);
+    if (isTauriRuntime() && shouldRestoreKeepalive) {
+      invoke("plugin:vcp-mobile|set_lifecycle_keepalive", { enabled: true })
+        .then(() => {
+          if (keepalivePreference === null) {
+            localStorage.setItem("vcp-lifecycle-keepalive", "true");
+          }
+        })
+        .catch((err) => {
+          console.error("[Lifecycle] Failed to restore lifecycle keepalive:", err);
+        });
     }
   }
 
@@ -532,6 +587,8 @@ onUnmounted(() => {
   removeRouteGuard = null;
   if (stopPendingShareReadyWatch) stopPendingShareReadyWatch();
   stopPendingShareReadyWatch = null;
+  if (stopLifecycleDeadlineWatch) stopLifecycleDeadlineWatch();
+  stopLifecycleDeadlineWatch = null;
   if (exitTimer) {
     clearTimeout(exitTimer);
     exitTimer = null;

@@ -30,16 +30,24 @@ const MAX_TIMER_DELAY_MS = 60_000;
 export const useLifecycleSchedulerStore = defineStore("lifecycleScheduler", () => {
   const jobs = ref<LifecycleJob[]>([]);
   const historyJobs = ref<LifecycleJob[]>([]);
+  const companionWakeupAt = ref<number | null>(null);
   const isRunning = ref(false);
   const isExecuting = ref(false);
   const lastCheckedAt = ref<number | null>(null);
+  const nativeWakeupError = ref<string | null>(null);
   const timerId = ref<number | null>(null);
+  let nativeSyncChain: Promise<void> = Promise.resolve();
 
   const nextJob = computed(() =>
     jobs.value
       .filter((job) => job.status === "scheduled")
       .sort((a, b) => a.scheduledAt - b.scheduledAt)[0] || null,
   );
+  const nextNativeWakeupAt = computed(() => {
+    const deadlines = [nextJob.value?.scheduledAt, companionWakeupAt.value]
+      .filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+    return deadlines.length > 0 ? Math.min(...deadlines) : null;
+  });
 
   const stopTimer = () => {
     if (timerId.value !== null) {
@@ -77,18 +85,35 @@ export const useLifecycleSchedulerStore = defineStore("lifecycleScheduler", () =
     }, delay);
   };
 
-  const syncNativeWakeup = async () => {
-    if (!isTauriRuntime()) return;
-    try {
-      if (nextJob.value) {
-        await invoke("plugin:vcp-mobile|schedule_lifecycle_wakeup", {
-          triggerAtMs: nextJob.value.scheduledAt,
-        });
-      } else {
-        await invoke("plugin:vcp-mobile|cancel_lifecycle_wakeup");
-      }
-    } catch (error) {
-      console.warn("[LifecycleScheduler] Native wakeup sync failed:", error);
+  const syncNativeWakeup = () => {
+    if (!isTauriRuntime()) return Promise.resolve();
+    const targetWakeupAt = nextNativeWakeupAt.value;
+    const operation = nativeSyncChain
+      .catch(() => undefined)
+      .then(async () => {
+        if (targetWakeupAt !== null) {
+          await invoke("plugin:vcp-mobile|schedule_lifecycle_wakeup", {
+            triggerAtMs: targetWakeupAt,
+          });
+        } else {
+          await invoke("plugin:vcp-mobile|cancel_lifecycle_wakeup");
+        }
+        nativeWakeupError.value = null;
+      })
+      .catch((error) => {
+        nativeWakeupError.value = error instanceof Error ? error.message : String(error);
+        throw error;
+      });
+    nativeSyncChain = operation;
+    return operation;
+  };
+
+  const setCompanionWakeupAt = (triggerAt: number | null) => {
+    companionWakeupAt.value = triggerAt;
+    if (isRunning.value) {
+      syncNativeWakeup().catch((error) => {
+        console.warn("[LifecycleScheduler] Companion wakeup sync failed:", error);
+      });
     }
   };
 
@@ -128,8 +153,13 @@ export const useLifecycleSchedulerStore = defineStore("lifecycleScheduler", () =
       await Promise.all([refreshJobs(), refreshJobHistory()]);
     } finally {
       isExecuting.value = false;
-      await syncNativeWakeup();
-      scheduleNextCheck();
+      try {
+        await syncNativeWakeup();
+      } catch (error) {
+        console.warn("[LifecycleScheduler] Native wakeup sync failed:", error);
+      } finally {
+        scheduleNextCheck();
+      }
     }
   };
 
@@ -153,19 +183,26 @@ export const useLifecycleSchedulerStore = defineStore("lifecycleScheduler", () =
   const cancelJob = async (jobId: string) => {
     await invoke("cancel_lifecycle_job", { jobId });
     await Promise.all([refreshJobs(), refreshJobHistory()]);
-    await syncNativeWakeup();
-    scheduleNextCheck();
+    try {
+      await syncNativeWakeup();
+    } finally {
+      scheduleNextCheck();
+    }
   };
 
   return {
     jobs,
     historyJobs,
+    companionWakeupAt,
     nextJob,
+    nextNativeWakeupAt,
     isRunning,
     isExecuting,
     lastCheckedAt,
+    nativeWakeupError,
     refreshJobs,
     refreshJobHistory,
+    setCompanionWakeupAt,
     syncNativeWakeup,
     runDueJobs,
     start,

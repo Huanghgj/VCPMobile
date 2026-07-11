@@ -76,13 +76,18 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
-    fun emitLifecycleWakeup() {
+    fun emitLifecycleWakeup(): Boolean {
+        val webView = webViewRef ?: return false
+        if (!LifecycleAlarmManager.schedule(activity, System.currentTimeMillis() + 5 * 60_000L)) {
+            return false
+        }
         activity.runOnUiThread {
-            webViewRef?.evaluateJavascript(
+            webView.evaluateJavascript(
                 "window.dispatchEvent(new CustomEvent('vcp-lifecycle-wakeup'))",
                 null,
             )
         }
+        return true
     }
 
     val pluginActivity: Activity get() = activity
@@ -263,6 +268,8 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
             put("exactAlarmAllowed", LifecycleAlarmManager.canScheduleExact(activity))
             put("batteryOptimizationIgnored", powerManager.isIgnoringBatteryOptimizations(activity.packageName))
             put("lifecycleKeepaliveActive", StreamKeepaliveService.isKeepaliveModeActive)
+            put("lifecycleKeepaliveRequested", StreamKeepaliveService.isKeepaliveRequested(activity))
+            put("scheduledWakeupAt", LifecycleAlarmManager.persistedTriggerAt(activity).takeIf { it > 0L })
             put("manufacturer", Build.MANUFACTURER ?: "unknown")
         }
         invoke.resolve(result)
@@ -305,23 +312,31 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
     @Command
     fun setLifecycleKeepalive(invoke: Invoke) {
         val args = invoke.parseArgs(SetLifecycleKeepaliveArgs::class.java)
-        StreamKeepaliveService.persistKeepaliveRequested(activity, args.enabled)
         val serviceIntent = StreamKeepaliveService.createIntent(activity, "", args.enabled)
-        if (args.enabled) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                ContextCompat.startForegroundService(activity, serviceIntent)
+        try {
+            if (args.enabled) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    ContextCompat.startForegroundService(activity, serviceIntent)
+                } else {
+                    activity.startService(serviceIntent)
+                }
+                StreamKeepaliveService.persistKeepaliveRequested(activity, true)
             } else {
-                activity.startService(serviceIntent)
+                StreamKeepaliveService.isKeepaliveModeActive = false
+                if (StreamKeepaliveService.currentStreamName.isEmpty()) {
+                    activity.stopService(serviceIntent)
+                } else {
+                    activity.startService(serviceIntent)
+                }
+                StreamKeepaliveService.persistKeepaliveRequested(activity, false)
             }
-        } else {
-            StreamKeepaliveService.isKeepaliveModeActive = false
-            if (StreamKeepaliveService.currentStreamName.isEmpty()) {
-                activity.stopService(serviceIntent)
-            } else {
-                activity.startService(serviceIntent)
+            invoke.resolve()
+        } catch (error: Exception) {
+            if (args.enabled) {
+                StreamKeepaliveService.persistKeepaliveRequested(activity, false)
             }
+            invoke.reject(error.message ?: "Failed to update lifecycle keepalive")
         }
-        invoke.resolve()
     }
 
     @Command
