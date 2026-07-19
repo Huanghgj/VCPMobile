@@ -9,10 +9,19 @@ use tokio::sync::mpsc;
 
 type CachedMessageContent = (String, String, String, Vec<u8>);
 type CachedMessageBatch = Vec<CachedMessageContent>;
+const RENDER_CACHE_VERSION: &str = "render-v2";
 
 pub struct MessageRenderCompiler;
 
 impl MessageRenderCompiler {
+    pub fn cache_key(content_hash: &str) -> String {
+        format!("{RENDER_CACHE_VERSION}:{content_hash}")
+    }
+
+    pub fn cache_matches(cache_hash: &str, content_hash: &str) -> bool {
+        cache_hash == Self::cache_key(content_hash)
+    }
+
     /// Compiles raw message content into AST blocks (the "astbin" format base)
     pub fn compile(content: &str) -> Vec<ContentBlock> {
         // Core parse (now robust enough to handle HTML natively via content_parser)
@@ -257,7 +266,12 @@ pub async fn rebuild_all_pre_renders(app_handle: AppHandle) -> Result<(), String
                     Some((topic_id, msg_id, content_hash, content)) => {
                         let blocks = MessageRenderCompiler::compile(&content);
                         if let Ok(bytes) = MessageRenderCompiler::serialize(&blocks) {
-                            batch.push((topic_id, msg_id, content_hash, bytes));
+                            batch.push((
+                                topic_id,
+                                msg_id,
+                                MessageRenderCompiler::cache_key(&content_hash),
+                                bytes,
+                            ));
                         }
 
                         if batch.len() >= 50
@@ -404,7 +418,7 @@ impl MessageRepository {
         )
         .bind(topic_id)
         .bind(&message.id)
-        .bind(&content_hash)
+        .bind(MessageRenderCompiler::cache_key(&content_hash))
         .bind(render_content)
         .bind(message.timestamp as i64)
         .execute(&mut **tx)
@@ -508,5 +522,26 @@ impl MessageRepository {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MessageRenderCompiler;
+
+    #[test]
+    fn render_cache_key_requires_current_compiler_version() {
+        let content_hash = "message-fingerprint";
+        let current = MessageRenderCompiler::cache_key(content_hash);
+
+        assert!(MessageRenderCompiler::cache_matches(&current, content_hash));
+        assert!(!MessageRenderCompiler::cache_matches(
+            content_hash,
+            content_hash
+        ));
+        assert!(!MessageRenderCompiler::cache_matches(
+            "render-v1:message-fingerprint",
+            content_hash
+        ));
     }
 }

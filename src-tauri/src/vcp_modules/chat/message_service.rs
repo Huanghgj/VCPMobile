@@ -181,7 +181,8 @@ pub async fn load_multi_topic_messages(
         };
         let blocks = match (&render_content, &render_content_hash, &content_hash) {
             (Some(bytes), Some(render_hash), Some(message_hash))
-                if !render_hash.is_empty() && render_hash == message_hash =>
+                if !render_hash.is_empty()
+                    && MessageRenderCompiler::cache_matches(render_hash, message_hash) =>
             {
                 parse_render_bytes(Some(bytes.clone()))
             }
@@ -509,7 +510,7 @@ pub async fn load_chat_history_internal(
         let content_hash = Some(effective_content_hash.clone());
         let cache_matches_content = match (&render_content, &render_content_hash, &content_hash) {
             (Some(_), Some(render_hash), Some(message_hash)) if !render_hash.is_empty() => {
-                render_hash == message_hash
+                MessageRenderCompiler::cache_matches(render_hash, message_hash)
             }
             _ => false,
         };
@@ -547,7 +548,8 @@ pub async fn load_chat_history_internal(
                     let pool_c = pool.clone();
                     let tid = topic_id.to_string();
                     let mid = msg_id.clone();
-                    let content_hash_for_cache = effective_content_hash.clone();
+                    let content_hash_for_cache =
+                        MessageRenderCompiler::cache_key(&effective_content_hash);
                     let content_hash_backfill_for_message = content_hash_backfill.clone();
                     tokio::spawn(async move {
                         let now = chrono::Utc::now().timestamp_millis();
@@ -958,7 +960,7 @@ pub async fn re_render_message(
             )
             .bind(&topic_id)
             .bind(&message_id)
-            .bind(&content_hash)
+            .bind(MessageRenderCompiler::cache_key(&content_hash))
             .bind(&serialized)
             .bind(now)
             .execute(pool)
