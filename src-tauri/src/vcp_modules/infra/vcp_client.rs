@@ -11,7 +11,7 @@ use std::io::Error as IoError;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
-use tauri::{ipc::Channel, AppHandle, Manager, Runtime};
+use tauri::{ipc::Channel, AppHandle, Emitter, Manager, Runtime};
 use tokio::sync::oneshot;
 use tokio_util::codec::{FramedRead, LinesCodec};
 use tokio_util::io::StreamReader;
@@ -85,6 +85,7 @@ fn split_audio_data_url(audio_url: &str) -> (String, &'static str) {
 struct ImageHostConfig {
     base_url: String,
     image_key: String,
+    upload_key: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -133,6 +134,9 @@ impl ImageHostConfig {
         Some(Self {
             base_url,
             image_key: image_key.to_string(),
+            upload_key: setting_string(settings, "imageUploadKey")
+                .unwrap_or(image_key)
+                .to_string(),
         })
     }
 
@@ -140,7 +144,7 @@ impl ImageHostConfig {
         format!(
             "{}/pw={}/images/upload",
             self.base_url,
-            urlencoding::encode(&self.image_key)
+            urlencoding::encode(&self.upload_key)
         )
     }
 
@@ -162,6 +166,29 @@ impl ImageHostConfig {
     fn cache_scope(&self) -> String {
         format!("{}|{}", self.base_url, self.image_key)
     }
+}
+
+fn normalize_image_upload_location(config: &ImageHostConfig, value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    if let Ok(parsed) = Url::parse(value) {
+        if matches!(parsed.scheme(), "http" | "https") {
+            return Some(value.to_string());
+        }
+    }
+
+    if value.starts_with('/') {
+        return Some(format!(
+            "{}{}",
+            config.base_url.trim_end_matches('/'),
+            value
+        ));
+    }
+
+    Some(config.public_url_for_key(value))
 }
 
 fn image_extension_for_mime(mime: &str) -> &'static str {
@@ -304,8 +331,14 @@ async fn post_image_to_host(
 
     upload
         .url
-        .filter(|url| !url.trim().is_empty())
-        .or_else(|| upload.key.map(|key| config.public_url_for_key(&key)))
+        .as_deref()
+        .and_then(|url| normalize_image_upload_location(config, url))
+        .or_else(|| {
+            upload
+                .key
+                .as_deref()
+                .and_then(|key| normalize_image_upload_location(config, key))
+        })
         .ok_or_else(|| "image host upload response did not include url/key".to_string())
 }
 
@@ -340,35 +373,6 @@ async fn upload_image_path_to_host(
     let url = post_image_to_host(client, config, bytes, &mime, file_name, trace_id).await?;
     IMAGE_HOST_UPLOAD_CACHE.insert(cache_key, url.clone());
     Ok(url)
-}
-
-fn append_hosted_image_lines(parts: &mut Vec<Value>, lines: Vec<String>) {
-    if lines.is_empty() {
-        return;
-    }
-
-    let hosted_text = format!(
-        "\n\n[多模态图床URL]\n{}\n[/多模态图床URL]",
-        lines.join("\n")
-    );
-
-    if let Some(text_part) = parts
-        .iter_mut()
-        .find(|part| part.get("type").and_then(|t| t.as_str()) == Some("text"))
-    {
-        if let Some(Value::String(text)) = text_part.get_mut("text") {
-            text.push_str(&hosted_text);
-            return;
-        }
-    }
-
-    parts.insert(
-        0,
-        json!({
-            "type": "text",
-            "text": hosted_text.trim_start()
-        }),
-    );
 }
 
 impl StreamEvent {
@@ -768,6 +772,21 @@ pub async fn perform_vcp_request<R: Runtime>(
         None
     };
     let request_message_id = payload.message_id.clone();
+    let latest_image_user_message_index = payload.messages.iter().rposition(|message| {
+        message.get("role").and_then(|role| role.as_str()) == Some("user")
+            && message
+                .get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|parts| {
+                    parts.iter().any(|part| {
+                        part.get("type").and_then(Value::as_str) == Some("local_file")
+                            && part
+                                .get("mime")
+                                .and_then(Value::as_str)
+                                .is_some_and(|mime| mime.starts_with("image/"))
+                    })
+                })
+    });
 
     // === 0. 数据验证和规范化 ===
     let mut messages: Vec<Value> = Vec::new();
@@ -779,11 +798,11 @@ pub async fn perform_vcp_request<R: Runtime>(
 
         let mut msg = msg_val.clone();
         let content = msg.get("content").cloned().unwrap_or(Value::Null);
+        let is_latest_user_message = latest_image_user_message_index == Some(msg_index);
 
         // 处理多模态或复杂内容数组
         if let Some(content_array) = content.as_array() {
             let mut new_parts = Vec::new();
-            let mut hosted_image_text_lines: Vec<String> = Vec::new();
             for part in content_array {
                 if let Some(obj) = part.as_object() {
                     // 识别自定义的 local_file 类型并进行路径还原与编码
@@ -802,6 +821,19 @@ pub async fn perform_vcp_request<R: Runtime>(
                                 })
                                 .unwrap_or("附件文件");
                             let path_buf = std::path::PathBuf::from(&clean_path);
+                            let declared_is_image = obj
+                                .get("mime")
+                                .and_then(|mime| mime.as_str())
+                                .is_some_and(|mime| mime.starts_with("image/"));
+
+                            // 历史图片不在每一轮重复转码和重传。否则旧附件读取失败时会
+                            // 降级成文件名文本，干扰当前轮多模态判断，并显著放大请求体。
+                            if declared_is_image && !is_latest_user_message {
+                                log::info!(
+                                    "[VCPClient] Skipping historical image attachment in request replay"
+                                );
+                                continue;
+                            }
 
                             let mut converted = false;
                             let mut fallback_text = format!("[附件文件: {}]", display_name);
@@ -864,10 +896,8 @@ pub async fn perform_vcp_request<R: Runtime>(
                                                     "[VCPClient] Image uploaded to ImageServer for multimodal payload: {}",
                                                     mask_image_url_for_log(&url)
                                                 );
-                                                hosted_image_text_lines.push(format!(
-                                                    "[图床URL: {}] (文件名: {})",
-                                                    url, display_name
-                                                ));
+                                                // 图床结果不写入模型文本，避免旧版服务端丢弃
+                                                // image_url 后只剩文件名/URL 占位，让模型误判已收到图片。
                                             }
                                             Err(e) => {
                                                 log::warn!(
@@ -893,9 +923,22 @@ pub async fn perform_vcp_request<R: Runtime>(
                                         .await
                                         {
                                             Ok(Ok(data_url)) => {
+                                                let payload_chars = data_url.len();
+                                                log::info!(
+                                                    "[VCPClient] Base64 multimodal image ready: name={}, payload_chars={}",
+                                                    display_name,
+                                                    payload_chars
+                                                );
+                                                let _ = app.emit(
+                                                    "vcp-multimodal-status",
+                                                    json!({
+                                                        "status": "base64_ready",
+                                                        "payloadChars": payload_chars
+                                                    }),
+                                                );
                                                 new_parts.push(json!({
                                                     "type": "image_url",
-                                                    "image_url": { "url": data_url }
+                                                    "image_url": { "url": data_url, "detail": "high" }
                                                 }));
                                                 converted = true;
                                             }
@@ -905,12 +948,24 @@ pub async fn perform_vcp_request<R: Runtime>(
                                                     path_buf,
                                                     e
                                                 );
+                                                if is_latest_user_message {
+                                                    return Err(format!(
+                                                        "图片附件“{}”转换为 Base64 失败，消息未发送：{}",
+                                                        display_name, e
+                                                    ));
+                                                }
                                             }
                                             Err(e) => {
                                                 log::warn!(
                                                     "[VCPClient] Image conversion task panicked: {}",
                                                     e
                                                 );
+                                                if is_latest_user_message {
+                                                    return Err(format!(
+                                                        "图片附件“{}”转换任务失败，消息未发送：{}",
+                                                        display_name, e
+                                                    ));
+                                                }
                                             }
                                         }
                                     }
@@ -977,6 +1032,12 @@ pub async fn perform_vcp_request<R: Runtime>(
 
                             // 修复：若文件不存在或读取失败，至少保留文本描述，避免内容静默丢失
                             if !converted {
+                                if declared_is_image && is_latest_user_message {
+                                    return Err(format!(
+                                        "图片附件“{}”未能转换为 Base64，消息未发送；请重新选择图片后重试",
+                                        display_name
+                                    ));
+                                }
                                 new_parts.push(json!({
                                     "type": "text",
                                     "text": fallback_text
@@ -990,7 +1051,6 @@ pub async fn perform_vcp_request<R: Runtime>(
                     new_parts.push(part.clone());
                 }
             }
-            append_hosted_image_lines(&mut new_parts, hosted_image_text_lines);
             msg["content"] = json!(new_parts);
         } else if content.is_object() {
             if let Some(text) = content.get("text") {
@@ -1015,13 +1075,41 @@ pub async fn perform_vcp_request<R: Runtime>(
             .unwrap_or(false);
     }
 
+    let inline_image_stats = messages
+        .iter()
+        .filter_map(|message| message.get("content").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|part| {
+            let url = part
+                .get("image_url")
+                .and_then(|image| image.get("url"))
+                .and_then(Value::as_str)?;
+            url.starts_with("data:image/").then_some(url.len())
+        })
+        .fold((0usize, 0usize), |(count, chars), len| {
+            (count + 1, chars + len)
+        });
+    let has_inline_images = inline_image_stats.0 > 0;
+    if has_inline_images {
+        log::info!(
+            "[VCPClient] Final request contains {} inline Base64 image(s), total_chars={}",
+            inline_image_stats.0,
+            inline_image_stats.1
+        );
+    }
+
     let mut final_url = payload.vcp_url.clone();
-    if enable_vcp_tool_injection {
+    if enable_vcp_tool_injection && !has_inline_images {
         if let Ok(mut url) = Url::parse(&final_url) {
             url.set_path("/v1/chatvcp/completions");
             final_url = url.to_string();
         }
     } else {
+        if enable_vcp_tool_injection && has_inline_images {
+            log::info!(
+                "[VCPClient] Inline image detected; using standard chat completions route to preserve multimodal parts"
+            );
+        }
         final_url = normalize_vcp_url(&final_url);
     }
 
@@ -1574,6 +1662,14 @@ pub async fn test_vcp_connection(vcp_url: String, vcp_api_key: String) -> Result
 /// Handles URLs with or without trailing slashes in the existing path.
 pub fn normalize_vcp_url(url_str: &str) -> String {
     if let Ok(url) = Url::parse(url_str) {
+        if url.path().ends_with("/chatvcp/completions") {
+            let mut url = url;
+            let new_path = url
+                .path()
+                .replace("/chatvcp/completions", "/chat/completions");
+            url.set_path(&new_path);
+            return url.to_string();
+        }
         if !url.path().ends_with("/chat/completions") {
             let mut url = url;
             let new_path = if url.path().ends_with('/') {
@@ -1586,4 +1682,60 @@ pub fn normalize_vcp_url(url_str: &str) -> String {
         }
     }
     url_str.to_string()
+}
+
+#[cfg(test)]
+mod image_host_tests {
+    use super::*;
+
+    fn image_host_config() -> ImageHostConfig {
+        ImageHostConfig {
+            base_url: "https://images.example.com".to_string(),
+            image_key: "read key".to_string(),
+            upload_key: "upload key".to_string(),
+        }
+    }
+
+    #[test]
+    fn image_host_uses_dedicated_upload_key() {
+        assert_eq!(
+            image_host_config().upload_url(),
+            "https://images.example.com/pw=upload%20key/images/upload"
+        );
+    }
+
+    #[test]
+    fn keeps_absolute_image_upload_url() {
+        assert_eq!(
+            normalize_image_upload_location(
+                &image_host_config(),
+                "https://cdn.example.com/folder/a.jpg"
+            ),
+            Some("https://cdn.example.com/folder/a.jpg".to_string())
+        );
+    }
+
+    #[test]
+    fn expands_relative_image_upload_file_name() {
+        assert_eq!(
+            normalize_image_upload_location(&image_host_config(), "8923.jpg"),
+            Some("https://images.example.com/pw=read%20key/images/8923.jpg".to_string())
+        );
+    }
+
+    #[test]
+    fn expands_root_relative_image_upload_url() {
+        assert_eq!(
+            normalize_image_upload_location(&image_host_config(), "/pw=read%20key/images/8923.jpg"),
+            Some("https://images.example.com/pw=read%20key/images/8923.jpg".to_string())
+        );
+    }
+
+    #[test]
+    fn encodes_nested_image_upload_key() {
+        assert_eq!(
+            normalize_image_upload_location(&image_host_config(), "folder/a b.jpg"),
+            Some("https://images.example.com/pw=read%20key/images/folder/a%20b.jpg".to_string())
+        );
+    }
 }

@@ -348,6 +348,9 @@ const isGenerating = computed(() => streamStore.activeStreamingIds.size > 0);
 
 // 是否有内容可发送
 const hasContent = computed(() => input.value.trim() !== '' || attachmentStore.stagedAttachments.length > 0);
+const hasLoadingAttachments = computed(() =>
+  attachmentStore.stagedAttachments.some((attachment) => attachment.status === "loading"),
+);
 
 // 监听并接收外部注入的”编辑消息”内容
 watch(() => historyStore.editMessageContent, async (newContent) => {
@@ -378,6 +381,16 @@ watch(() => sessionStore.sharePrefillText, async (newText) => {
 });
 
 const handleSend = () => {
+  if (hasLoadingAttachments.value) {
+    notificationStore.addNotification({
+      type: "warning",
+      title: "附件仍在处理中",
+      message: "请等待附件完成注册后再发送。",
+      toastOnly: true,
+      duration: 2400,
+    });
+    return;
+  }
   if (hasContent.value && !props.disabled) {
     emit('send', input.value);
     input.value = '';

@@ -1,0 +1,32 @@
+VCP Mobile Chinese affect classifier
+
+Model ID: vcp/rbt3-zh-dialogue-affect
+Model version: 1.0.0-int8
+SHA-256: d203ee44af1023a837ff8a69d50d9e8bb4062e77b0db3e95537815836a20125a
+
+Backbone
+--------
+hfl/rbt3
+Revision: 0aa0527ff4170f29e1dfd3eb6ef60dc67e1bf75c
+License: Apache License 2.0
+Source: https://huggingface.co/hfl/rbt3
+
+Fine-tuning dataset
+-------------------
+Johnson8187/Chinese_Multi-Emotion_Dialogue_Dataset
+Revision: 119d246a1595b44fd2cdccff0d9b288eafee25d1
+License: MIT
+Source: https://huggingface.co/datasets/Johnson8187/Chinese_Multi-Emotion_Dialogue_Dataset
+
+Evaluation
+----------
+The frozen stratified test split contains 624 examples and was not used for
+training or hard-example augmentation. Test accuracy is 0.8862 and macro-F1 is
+0.8873. These figures measure the source dataset only and are not a claim of
+open-domain conversation accuracy.
+
+The model recognizes eight user-expression categories: neutral, joy, sadness,
+anger, confusion, disgust, surprise, and affection. Relationship-directed
+signals such as jealousy, rejection, promises, and abandonment remain under
+the separate heuristic engine. The application falls back to that engine when
+the model is unavailable, invalid, or times out.

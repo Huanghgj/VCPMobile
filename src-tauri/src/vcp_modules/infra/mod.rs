@@ -1,3 +1,5 @@
+pub mod affect_engine;
+pub mod affect_recognizer;
 pub mod diary_manager;
 pub mod file_extractor;
 pub mod file_manager;

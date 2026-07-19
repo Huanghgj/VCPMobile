@@ -72,7 +72,20 @@ const rebuildEmoticonLibrary = async () => {
         v-model="settings.fileKey"
         is-secure
         label="VCP 图床密钥 (Image_Key)"
-        placeholder="用于表情包和多模态图片上传"
+        placeholder="用于表情包和图片访问"
+        mono
+      />
+      <SettingsTextField
+        v-model="settings.imageUploadKey"
+        is-secure
+        label="VCP 图床上传密钥 (Image_Upload_Key)"
+        placeholder="留空时兼容使用 Image_Key"
+        mono
+      />
+      <SettingsTextField
+        v-model="settings.imageServerUrl"
+        label="VCP 图床 URL"
+        placeholder="留空时使用 VCP Server 的域名"
         mono
       />
 

@@ -1,4 +1,5 @@
 use crate::vcp_modules::db_manager::DbState;
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -40,6 +41,44 @@ pub fn get_thumbnails_root_dir<R: tauri::Runtime>(
     let mut path = get_data_root_dir(app_handle)?;
     path.push("thumbnails");
     Ok(path)
+}
+
+#[tauri::command]
+pub async fn read_image_preview_data_url<R: tauri::Runtime>(
+    app_handle: AppHandle<R>,
+    path: String,
+    max_bytes: Option<u64>,
+) -> Result<String, String> {
+    let clean_path = path.trim_start_matches("file://");
+    let image_path = std::path::PathBuf::from(clean_path);
+    ensure_safe_path(&app_handle, &image_path)?;
+
+    let metadata = tokio::fs::metadata(&image_path)
+        .await
+        .map_err(|e| format!("无法读取图片预览元数据: {}", e))?;
+    const DEFAULT_PREVIEW_BYTES: u64 = 3 * 1024 * 1024;
+    const MAX_ALLOWED_BYTES: u64 = 12 * 1024 * 1024;
+    let byte_limit = max_bytes
+        .unwrap_or(DEFAULT_PREVIEW_BYTES)
+        .clamp(64 * 1024, MAX_ALLOWED_BYTES);
+    if metadata.len() > byte_limit {
+        return Err(format!("图片预览文件过大: {} bytes", metadata.len()));
+    }
+
+    let bytes = tokio::fs::read(&image_path)
+        .await
+        .map_err(|e| format!("无法读取图片预览: {}", e))?;
+    let mime = infer::get(&bytes)
+        .map(|kind| kind.mime_type().to_string())
+        .or_else(|| {
+            mime_guess::from_path(&image_path)
+                .first()
+                .map(|m| m.to_string())
+        })
+        .filter(|mime| mime.starts_with("image/"))
+        .ok_or_else(|| "预览资源不是受支持的图片".to_string())?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Ok(format!("data:{};base64,{}", mime, encoded))
 }
 
 /// 物理安全的文件移动工具，能够跨越物理挂载分区 (EXDEV) 降级进行物理拷贝+删除。
@@ -302,7 +341,10 @@ pub async fn generate_thumbnail<R: tauri::Runtime>(
 }
 
 /// 内部辅助函数：校验路径安全性，防止路径遍历攻击
-fn ensure_safe_path(app_handle: &AppHandle, path: &std::path::Path) -> Result<(), String> {
+fn ensure_safe_path<R: tauri::Runtime>(
+    app_handle: &AppHandle<R>,
+    path: &std::path::Path,
+) -> Result<(), String> {
     // 物理展开目标路径的所有相对路径分量 (..)，杜绝字符级前缀欺骗的沙盒逃逸
     let canonical_path = if path.exists() {
         std::fs::canonicalize(path).map_err(|e| format!("路径规范化失败: {}", e))?

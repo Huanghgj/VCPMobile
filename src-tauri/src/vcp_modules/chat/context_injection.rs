@@ -216,11 +216,6 @@ pub async fn apply_tarven_pipeline(
             .iter()
             .rposition(|m| m["role"].as_str() == Some("user"))
         {
-            let mut user_content = messages[user_idx]["content"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-
             let mut user_prepend_parts = Vec::new();
             let mut user_append_parts = Vec::new();
 
@@ -233,25 +228,11 @@ pub async fn apply_tarven_pipeline(
                 }
             }
 
-            if !user_prepend_parts.is_empty() {
-                let prepend_str = user_prepend_parts.join("\n\n");
-                if !user_content.is_empty() {
-                    user_content = format!("{}\n\n{}", prepend_str, user_content);
-                } else {
-                    user_content = prepend_str;
-                }
-            }
-
-            if !user_append_parts.is_empty() {
-                let append_str = user_append_parts.join("\n\n");
-                if !user_content.is_empty() {
-                    user_content = format!("{}\n\n{}", user_content, append_str);
-                } else {
-                    user_content = append_str;
-                }
-            }
-
-            messages[user_idx]["content"] = serde_json::Value::String(user_content);
+            apply_user_suffix_to_content(
+                &mut messages[user_idx]["content"],
+                &user_prepend_parts,
+                &user_append_parts,
+            );
         }
     }
 
@@ -536,11 +517,6 @@ pub async fn preview_tarven_injection(
             .iter()
             .rposition(|m| m["role"].as_str() == Some("user"))
         {
-            let mut user_content = messages[user_idx]["content"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-
             let mut user_prepend_parts = Vec::new();
             let mut user_append_parts = Vec::new();
 
@@ -553,25 +529,11 @@ pub async fn preview_tarven_injection(
                 }
             }
 
-            if !user_prepend_parts.is_empty() {
-                let prepend_str = user_prepend_parts.join("\n\n");
-                if !user_content.is_empty() {
-                    user_content = format!("{}\n\n{}", prepend_str, user_content);
-                } else {
-                    user_content = prepend_str;
-                }
-            }
-
-            if !user_append_parts.is_empty() {
-                let append_str = user_append_parts.join("\n\n");
-                if !user_content.is_empty() {
-                    user_content = format!("{}\n\n{}", user_content, append_str);
-                } else {
-                    user_content = append_str;
-                }
-            }
-
-            messages[user_idx]["content"] = serde_json::Value::String(user_content);
+            apply_user_suffix_to_content(
+                &mut messages[user_idx]["content"],
+                &user_prepend_parts,
+                &user_append_parts,
+            );
         }
     }
 
@@ -797,4 +759,184 @@ mod preset_tests {
         assert_eq!(second.1, "append");
         assert_eq!(second.2, 0);
     }
+
+    async fn insert_user_suffix_rule(
+        pool: &Pool<Sqlite>,
+        id: &str,
+        content: &str,
+        position: &str,
+        sort_order: i32,
+    ) {
+        sqlx::query(
+            "INSERT INTO tarven_rules (
+                id, name, rule_type, is_enabled, content, scope, wrap, position,
+                sort_order, created_at, updated_at
+             ) VALUES (?, ?, 'user_suffix', 1, ?, 'global', 0, ?, ?, 1, 1)",
+        )
+        .bind(id)
+        .bind(id)
+        .bind(content)
+        .bind(position)
+        .bind(sort_order)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn user_suffix_preserves_all_multimodal_parts_and_updates_text_part() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        create_tarven_rules_table(&pool).await;
+        insert_user_suffix_rule(&pool, "prepend", "PRE", "prepend", 1).await;
+        insert_user_suffix_rule(&pool, "append", "POST", "append", 2).await;
+
+        let local_file = serde_json::json!({
+            "type": "local_file",
+            "path": "/tmp/photo.jpg",
+            "mime": "image/jpeg"
+        });
+        let image_url = serde_json::json!({
+            "type": "image_url",
+            "image_url": { "url": "data:image/jpeg;base64,abc" }
+        });
+        let input_audio = serde_json::json!({
+            "type": "input_audio",
+            "input_audio": { "data": "abc", "format": "aac" }
+        });
+        let mut messages = vec![serde_json::json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "hello" },
+                local_file.clone(),
+                image_url.clone(),
+                input_audio.clone()
+            ]
+        })];
+
+        apply_tarven_pipeline(&pool, "topic", "Agent", "agent", &mut messages)
+            .await
+            .unwrap();
+
+        let parts = messages[0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 4);
+        assert_eq!(parts[0]["text"], "PRE\n\nhello\n\nPOST");
+        assert_eq!(parts[1], local_file);
+        assert_eq!(parts[2], image_url);
+        assert_eq!(parts[3], input_audio);
+    }
+
+    #[tokio::test]
+    async fn user_suffix_adds_text_parts_without_replacing_attachment_only_content() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        create_tarven_rules_table(&pool).await;
+        insert_user_suffix_rule(&pool, "prepend", "PRE", "prepend", 1).await;
+        insert_user_suffix_rule(&pool, "append", "POST", "append", 2).await;
+
+        let local_file = serde_json::json!({
+            "type": "local_file",
+            "path": "/tmp/video.mp4",
+            "mime": "video/mp4"
+        });
+        let mut messages = vec![serde_json::json!({
+            "role": "user",
+            "content": [local_file.clone()]
+        })];
+
+        apply_tarven_pipeline(&pool, "topic", "Agent", "agent", &mut messages)
+            .await
+            .unwrap();
+
+        let parts = messages[0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(
+            parts[0],
+            serde_json::json!({ "type": "text", "text": "PRE" })
+        );
+        assert_eq!(parts[1], local_file);
+        assert_eq!(
+            parts[2],
+            serde_json::json!({ "type": "text", "text": "POST" })
+        );
+    }
+}
+
+fn apply_user_suffix_to_content(
+    content: &mut serde_json::Value,
+    prepend_parts: &[String],
+    append_parts: &[String],
+) {
+    let prepend = prepend_parts.join("\n\n");
+    let append = append_parts.join("\n\n");
+
+    if let Some(parts) = content.as_array_mut() {
+        if let Some(text_part) = parts.iter_mut().find(|part| {
+            part.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                && part
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some()
+        }) {
+            let original = text_part["text"].as_str().unwrap_or("");
+            let mut updated = original.to_string();
+            if !prepend.is_empty() {
+                updated = if updated.is_empty() {
+                    prepend.clone()
+                } else {
+                    format!("{}\n\n{}", prepend, updated)
+                };
+            }
+            if !append.is_empty() {
+                updated = if updated.is_empty() {
+                    append.clone()
+                } else {
+                    format!("{}\n\n{}", updated, append)
+                };
+            }
+            text_part["text"] = serde_json::Value::String(updated);
+            return;
+        }
+
+        if !prepend.is_empty() {
+            parts.insert(
+                0,
+                serde_json::json!({
+                    "type": "text",
+                    "text": prepend
+                }),
+            );
+        }
+        if !append.is_empty() {
+            parts.push(serde_json::json!({
+                "type": "text",
+                "text": append
+            }));
+        }
+        return;
+    }
+
+    let original = content.as_str().unwrap_or("");
+    let mut updated = original.to_string();
+    if !prepend.is_empty() {
+        updated = if updated.is_empty() {
+            prepend
+        } else {
+            format!("{}\n\n{}", prepend, updated)
+        };
+    }
+    if !append.is_empty() {
+        updated = if updated.is_empty() {
+            append
+        } else {
+            format!("{}\n\n{}", updated, append)
+        };
+    }
+    *content = serde_json::Value::String(updated);
 }

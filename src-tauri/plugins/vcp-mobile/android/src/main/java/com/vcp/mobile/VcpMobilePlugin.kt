@@ -36,6 +36,7 @@ import androidx.core.content.ContextCompat
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.JSArray
 import app.tauri.plugin.Invoke
+import com.vcp.mobile.affect.AffectClassifier
 import com.vcp.mobile.service.StreamKeepaliveService
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
@@ -101,6 +102,8 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
     private val floatingWindowManager by lazy { FloatingWindowManager(activity) }
     private val sensorStatusManager = SensorStatusManager(activity)
     private val shareIntentHandler = ShareIntentHandler(this)
+    private val affectClassifierGuard = Any()
+    @Volatile private var affectClassifier: AffectClassifier? = null
     private val fileIoExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
     private var cameraTempFile: java.io.File? = null
     private var wakeLock: PowerManager.WakeLock? = null
@@ -696,6 +699,71 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
+    @Command
+    fun classifyAffect(invoke: Invoke) {
+        val args = try {
+            invoke.parseArgs(ClassifyAffectArgs::class.java)
+        } catch (error: Throwable) {
+            invoke.reject("Invalid affect classification arguments: ${error.message}")
+            return
+        }
+
+        val classifier = synchronized(affectClassifierGuard) {
+            affectClassifier ?: AffectClassifier(activity).also { affectClassifier = it }
+        }
+        classifier.classifyAsync(
+            text = args.text,
+            timeoutMs = args.timeoutMs.toLong(),
+            onSuccess = { classification ->
+                val scoreObject = JSObject().apply {
+                    classification.scores.forEach { (label, score) -> put(label, score.toDouble()) }
+                }
+                val result = JSObject().apply {
+                    put("scores", scoreObject)
+                    put("modelId", classification.modelId)
+                    put("modelVersion", classification.modelVersion)
+                    put("inferenceMs", classification.inferenceMs)
+                    put("truncated", classification.truncated)
+                }
+                invoke.resolve(result)
+            },
+            onFailure = { error ->
+                Log.w(TAG, "classifyAffect failed; caller may use heuristic fallback", error)
+                invoke.reject(error.message ?: "Affect classification failed")
+            },
+        )
+    }
+
+    /**
+     * Releases the ONNX session and its worker threads. The Rust/frontend setting
+     * bridge should call this after local affect recognition is disabled. A later
+     * classifyAffect call lazily creates a fresh classifier.
+     */
+    @Command
+    fun unloadAffectModel(invoke: Invoke) {
+        val classifier = synchronized(affectClassifierGuard) {
+            affectClassifier.also { affectClassifier = null }
+        }
+        if (classifier == null) {
+            invoke.resolve()
+            return
+        }
+        try {
+            fileIoExecutor.execute {
+                try {
+                    classifier.close()
+                    invoke.resolve()
+                } catch (error: Throwable) {
+                    Log.w(TAG, "unloadAffectModel failed", error)
+                    invoke.reject(error.message ?: "Failed to unload affect model")
+                }
+            }
+        } catch (error: Throwable) {
+            classifier.close()
+            invoke.reject(error.message ?: "Failed to schedule affect model unload")
+        }
+    }
+
     // ==================================================================
     // Plugin Lifecycle
     // ==================================================================
@@ -781,6 +849,12 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
             notificationManager.cancel(DOWNLOAD_NOTIF_ID)
             downloadNotificationBuilder = null
             activity.stopService(StreamKeepaliveService.createIntent(activity, "", false))
+        } catch (_: Exception) {}
+        try {
+            synchronized(affectClassifierGuard) {
+                affectClassifier?.close()
+                affectClassifier = null
+            }
         } catch (_: Exception) {}
         try {
             fileIoExecutor.shutdown()
@@ -2016,4 +2090,12 @@ class ScheduleLifecycleWakeupArgs {
 @InvokeArg
 class SetLifecycleKeepaliveArgs {
     var enabled: Boolean = false
+}
+
+@InvokeArg
+class ClassifyAffectArgs {
+    lateinit var text: String
+    // First use may need to copy and verify the 38 MB model on slower devices.
+    // Warm inference remains much faster, while this still provides a hard cap.
+    var timeoutMs: Int = 2500
 }

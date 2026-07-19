@@ -171,12 +171,8 @@ pub fn assemble_history_for_vcp(
                         att.src.clone()
                     };
 
-                    if is_image {
-                        combined_text
-                            .push_str(&format!("\n\n[附加图片: {}] (文件名: {})", path, att.name));
-                    } else {
-                        combined_text
-                            .push_str(&format!("\n\n[附加文件: {}] (文件名: {})", path, att.name));
+                    if !is_image {
+                        combined_text.push_str(&format!("\n\n[附加媒体: {}]", att.name));
                     }
 
                     content_parts.push(json!({
@@ -186,13 +182,7 @@ pub fn assemble_history_for_vcp(
                         "name": att.name
                     }));
                 } else if att.extracted_text.is_none() {
-                    let path = if !att.internal_path.is_empty() {
-                        att.internal_path.clone()
-                    } else {
-                        att.src.clone()
-                    };
-                    combined_text
-                        .push_str(&format!("\n\n[附加文件: {}] (文件名: {})", path, att.name));
+                    combined_text.push_str(&format!("\n\n[附加文件: {}]", att.name));
                 }
             }
         }
@@ -268,6 +258,7 @@ pub fn assemble_history_for_vcp(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vcp_modules::chat_manager::Attachment;
 
     fn message(role: &str, content: &str) -> ChatMessage {
         ChatMessage {
@@ -323,6 +314,66 @@ mod tests {
         let content = messages[0]["content"].as_str().unwrap();
 
         assert!(content.contains("<think>demo</think>"));
+    }
+
+    #[test]
+    fn multimodal_attachments_are_preserved_as_local_file_content_parts() {
+        let mut user_message = message("user", "请分析这些附件");
+        user_message.attachments = Some(vec![
+            Attachment {
+                r#type: "image/png".to_string(),
+                src: "fallback/image.png".to_string(),
+                name: "photo.png".to_string(),
+                internal_path:
+                    "/storage/emulated/0/Android/data/com.vcp.avatar/files/attachments/98245.jpg"
+                        .to_string(),
+                ..Default::default()
+            },
+            Attachment {
+                r#type: "audio/mpeg".to_string(),
+                src: "fallback/audio.mp3".to_string(),
+                name: "voice.mp3".to_string(),
+                internal_path: "attachments/audio.mp3".to_string(),
+                ..Default::default()
+            },
+            Attachment {
+                r#type: "video/mp4".to_string(),
+                src: "fallback/video.mp4".to_string(),
+                name: "clip.mp4".to_string(),
+                internal_path: "attachments/video.mp4".to_string(),
+                ..Default::default()
+            },
+        ]);
+
+        let messages = assemble_history_for_vcp(&[user_message], false, false);
+        let parts = messages[0]["content"].as_array().unwrap();
+
+        assert_eq!(parts[0]["type"], "text");
+        assert!(parts[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("请分析这些附件"));
+        let text = parts[0]["text"].as_str().unwrap();
+        assert!(!text.contains("photo.png"));
+        assert!(!text.contains("/storage/emulated/"));
+        assert!(!text.contains("Android/data"));
+        assert!(!text.contains("fallback/image.png"));
+
+        let expected = [
+            (
+                "/storage/emulated/0/Android/data/com.vcp.avatar/files/attachments/98245.jpg",
+                "image/png",
+                "photo.png",
+            ),
+            ("attachments/audio.mp3", "audio/mpeg", "voice.mp3"),
+            ("attachments/video.mp4", "video/mp4", "clip.mp4"),
+        ];
+        for (part, (path, mime, name)) in parts[1..].iter().zip(expected) {
+            assert_eq!(part["type"], "local_file");
+            assert_eq!(part["path"], path);
+            assert_eq!(part["mime"], mime);
+            assert_eq!(part["name"], name);
+        }
     }
 
     #[tokio::test]

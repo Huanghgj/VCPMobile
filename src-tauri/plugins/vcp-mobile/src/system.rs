@@ -5,6 +5,57 @@ use serde::{Deserialize, Serialize};
 use tauri::Manager;
 use tauri::{AppHandle, Runtime};
 
+#[cfg(target_os = "android")]
+const AFFECT_MODEL_TIMEOUT_MS: u64 = 2_500;
+
+/// Calls the Android-only on-device affect classifier. Desktop builds deliberately
+/// return `None` so the application can keep using its heuristic recognizer.
+pub fn classify_affect_model<R: Runtime>(
+    app: &AppHandle<R>,
+    text: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    #[cfg(target_os = "android")]
+    {
+        let state = app.state::<VcpMobileState<R>>();
+        let handle = state.plugin_handle.lock().map_err(|e| e.to_string())?;
+        let plugin_handle = handle.as_ref().ok_or("Plugin handle not initialized")?;
+        let value = plugin_handle
+            .run_mobile_plugin::<serde_json::Value>(
+                "classifyAffect",
+                serde_json::json!({ "text": text, "timeoutMs": AFFECT_MODEL_TIMEOUT_MS }),
+            )
+            .map_err(|e| format!("run_mobile_plugin failed: {e}"))?;
+        if value.is_null() {
+            Ok(None)
+        } else {
+            Ok(Some(value))
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (app, text);
+        Ok(None)
+    }
+}
+
+/// Releases the lazily loaded Android affect model. Desktop builds are a no-op.
+pub fn unload_affect_model<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let state = app.state::<VcpMobileState<R>>();
+        let handle = state.plugin_handle.lock().map_err(|e| e.to_string())?;
+        let plugin_handle = handle.as_ref().ok_or("Plugin handle not initialized")?;
+        plugin_handle
+            .run_mobile_plugin::<serde_json::Value>("unloadAffectModel", serde_json::json!({}))
+            .map_err(|e| format!("run_mobile_plugin failed: {e}"))?;
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+    }
+    Ok(())
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct PermissionStatus {
     pub notification: bool,

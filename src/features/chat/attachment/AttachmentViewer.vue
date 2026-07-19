@@ -1,19 +1,11 @@
 <script setup lang="ts">
 import { computed, watch, ref } from "vue";
 import { useModalHistory } from "../../../core/composables/useModalHistory";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { X, ExternalLink, Download } from "lucide-vue-next";
 import { saveImageToGallery } from "tauri-plugin-vcp-mobile";
 import { useNotificationStore } from "../../../core/stores/notification";
-
-interface Attachment {
-  type: string;
-  src: string;
-  name: string;
-  size: number;
-  extractedText?: string;
-  internalPath?: string;
-}
+import type { Attachment } from "../../../core/types/chat";
 
 const props = defineProps<{
   file: Attachment | null;
@@ -29,6 +21,8 @@ const notificationStore = useNotificationStore();
 const previewText = ref("");
 const isTextTruncated = ref(false);
 const isLoading = ref(false);
+const fullResolutionSrc = ref("");
+const isFullImageLoading = ref(false);
 
 const IMAGE_WHITELIST = ["jpg", "jpeg", "png", "gif", "webp", "svg", "bmp", "heic", "heif", "avif"];
 const TEXT_WHITELIST = [
@@ -70,6 +64,33 @@ watch(() => props.isOpen, async (newVal) => {
     registerModal(modalId, close);
     previewText.value = "";
     isTextTruncated.value = false;
+    fullResolutionSrc.value = "";
+
+    if (isImage.value && props.file) {
+      const sourcePath = props.file.internalPath || props.file.src;
+      if (sourcePath) {
+        if (
+          sourcePath.startsWith("data:image/") ||
+          sourcePath.startsWith("http:") ||
+          sourcePath.startsWith("https:") ||
+          sourcePath.startsWith("blob:")
+        ) {
+          fullResolutionSrc.value = sourcePath;
+        } else {
+          isFullImageLoading.value = true;
+          try {
+            fullResolutionSrc.value = await invoke<string>("read_image_preview_data_url", {
+              path: sourcePath,
+              maxBytes: 12 * 1024 * 1024,
+            });
+          } catch (e) {
+            console.warn("[AttachmentViewer] Failed to load full-resolution image:", e);
+          } finally {
+            isFullImageLoading.value = false;
+          }
+        }
+      }
+    }
 
     // 如果是可预览的文本，开始流式读取物理文件的前 128KB 进行预览
     if (isText.value && props.file) {
@@ -125,23 +146,35 @@ watch(() => props.isOpen, async (newVal) => {
     unregisterModal(modalId);
     previewText.value = "";
     isTextTruncated.value = false;
+    fullResolutionSrc.value = "";
+    isFullImageLoading.value = false;
   }
 });
 
 const renderSrc = computed(() => {
-  if (!props.file?.src) return "";
+  const source = fullResolutionSrc.value || props.file?.resolvedSrc || props.file?.internalPath || props.file?.src;
+  if (!source) return "";
   if (
-    props.file.src.startsWith("http") ||
-    props.file.src.startsWith("data:") ||
-    props.file.src.startsWith("blob:")
+    source.startsWith("http:") ||
+    source.startsWith("https:") ||
+    source.startsWith("data:") ||
+    source.startsWith("blob:") ||
+    source.startsWith("asset:") ||
+    source.startsWith("tauri:")
   )
-    return props.file.src;
+    return source;
   try {
-    return convertFileSrc(props.file.src.replace("file://", "").replace("file://", ""));
-  } catch (e) {
+    return convertFileSrc(source.replace("file://", ""));
+  } catch {
     return "";
   }
 });
+
+const handleImageError = () => {
+  if (fullResolutionSrc.value) {
+    fullResolutionSrc.value = "";
+  }
+};
 
 const close = () => emit("close");
 
@@ -259,13 +292,20 @@ const saveToAlbum = async () => {
         <!-- Image Viewer -->
         <div
           v-else-if="isImage"
-          class="h-full w-full flex items-center justify-center p-4"
+          class="relative h-full w-full flex items-center justify-center p-4"
         >
           <img
             :src="renderSrc"
             class="max-w-full max-h-full object-contain rounded-lg shadow-2xl animate-zoom-in"
             @click.stop
+            @error="handleImageError"
           />
+          <div
+            v-if="isFullImageLoading"
+            class="absolute bottom-[calc(var(--vcp-safe-bottom,0px)+24px)] px-3 py-1.5 rounded-full bg-black/55 text-white text-xs"
+          >
+            正在加载原图…
+          </div>
         </div>
 
 

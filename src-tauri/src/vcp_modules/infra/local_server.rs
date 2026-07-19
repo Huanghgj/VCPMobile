@@ -237,11 +237,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     tauri::async_runtime::spawn(async move {
                         let agent_state =
                             app_c.state::<crate::vcp_modules::agent_service::AgentConfigState>();
+                        let db_state = app_c.state::<crate::vcp_modules::db_manager::DbState>();
                         let active_requests =
                             app_c.state::<crate::vcp_modules::vcp_client::ActiveRequests>();
                         let _ = crate::vcp_modules::agent_chat_application_service::handle_assistant_chat_stream(
                             app_c.clone(),
                             agent_state,
+                            db_state,
                             active_requests,
                             payload,
                             channel

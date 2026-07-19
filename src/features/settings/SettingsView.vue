@@ -56,6 +56,8 @@ const settings = ref<AppSettings>({
   adminUsername: "",
   adminPassword: "",
   fileKey: "",
+  imageUploadKey: "",
+  imageServerUrl: "",
   agentOrder: [],
   groupOrder: [],
   topicSummaryModel: "gemini-2.5-flash",

@@ -25,10 +25,25 @@ if (sdkDir) {
   env.ANDROID_SDK_ROOT = sdkDir;
 }
 
-const result = spawnSync(
-  gradlew,
-  ["--project-dir", androidProjectDir, ":tauri-plugin-vcp-mobile:compileReleaseKotlin"],
-  { cwd: repoRoot, env, stdio: "inherit" },
-);
+const gradleArgs = [
+  "--project-dir",
+  androidProjectDir,
+  ":tauri-plugin-vcp-mobile:compileReleaseKotlin",
+];
+const command =
+  process.platform === "win32" ? process.env.ComSpec || "cmd.exe" : gradlew;
+const commandArgs =
+  process.platform === "win32"
+    ? ["/d", "/s", "/c", gradlew, ...gradleArgs]
+    : gradleArgs;
+const result = spawnSync(command, commandArgs, {
+  cwd: repoRoot,
+  env,
+  stdio: "inherit",
+});
+
+if (result.error) {
+  console.error(result.error.message);
+}
 
 process.exit(result.status ?? 1);

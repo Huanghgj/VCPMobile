@@ -7,6 +7,8 @@ import SlidePage from "../../components/ui/SlidePage.vue";
 import ModelSelector from "../../components/ModelSelector.vue";
 import AvatarCropper from "../../components/ui/AvatarCropper.vue";
 import VcpAvatar from "../../components/ui/VcpAvatar.vue";
+import { BrainCircuit, ChevronRight } from "lucide-vue-next";
+import { useOverlayStore } from "../../core/stores/overlay";
 
 interface AgentConfig {
   id: string;
@@ -37,6 +39,7 @@ const emit = defineEmits(["close", "delete"]);
 
 const assistantStore = useAssistantStore();
 const sessionStore = useChatSessionStore();
+const overlayStore = useOverlayStore();
 
 const agentConfig = ref<AgentConfig>({
   id: props.id || "",
@@ -283,7 +286,27 @@ onMounted(async () => {
           </div>
         </section>
 
-        <!-- 3. Model Parameters (Collapsible) -->
+        <!-- 3. Affect Center -->
+        <section class="space-y-3">
+          <div class="flex items-center gap-2 px-2 py-1">
+            <div class="w-1 h-4 bg-pink-500 rounded-full"></div>
+            <h3 class="text-xs font-black uppercase tracking-[0.2em] opacity-50">情感与人格</h3>
+          </div>
+          <button
+            class="affect-entry card-modern w-full text-left"
+            :disabled="!agentConfig.id"
+            @click="overlayStore.openAffectCenter(agentConfig.id)"
+          >
+            <span class="affect-entry-icon"><BrainCircuit :size="21" /></span>
+            <span class="min-w-0 flex-1">
+              <strong>情感中枢</strong>
+              <small>查看 PAD 心境、关系状态、戏剧行为与事件记录</small>
+            </span>
+            <ChevronRight :size="18" class="opacity-25" />
+          </button>
+        </section>
+
+        <!-- 4. Model Parameters (Collapsible) -->
         <section class="space-y-3">
           <button @click="toggleSection('params')" class="w-full flex items-center justify-between px-2 py-1">
             <div class="flex items-center gap-2">
@@ -392,5 +415,47 @@ input[type="number"]::-webkit-outer-spin-button {
 
 .flex-center {
   @apply flex items-center justify-center;
+}
+
+.affect-entry {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  transition: transform 0.15s ease, background-color 0.15s ease;
+}
+
+.affect-entry:active:not(:disabled) {
+  transform: scale(0.985);
+}
+
+.affect-entry:disabled {
+  opacity: 0.4;
+}
+
+.affect-entry-icon {
+  width: 42px;
+  height: 42px;
+  display: grid;
+  place-items: center;
+  flex: none;
+  border-radius: 8px;
+  color: #ec4899;
+  background: rgba(236, 72, 153, 0.12);
+}
+
+.affect-entry strong,
+.affect-entry small {
+  display: block;
+}
+
+.affect-entry strong {
+  font-size: 14px;
+}
+
+.affect-entry small {
+  margin-top: 3px;
+  font-size: 10px;
+  line-height: 1.35;
+  opacity: 0.4;
 }
 </style>

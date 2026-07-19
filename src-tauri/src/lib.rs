@@ -3,6 +3,10 @@ mod vcp_modules;
 
 use tauri::{Listener, Manager};
 use tauri_plugin_log::{Target, TargetKind};
+use vcp_modules::affect_engine::{
+    get_affect_state, list_affect_events, reset_affect_state, update_affect_config,
+    update_affect_persona,
+};
 use vcp_modules::agent_chat_application_service::{
     handle_agent_chat_message, handle_assistant_chat_stream,
 };
@@ -29,7 +33,8 @@ use vcp_modules::emoticon_manager::{
     fix_emoticon_url, get_emoticon_library, regenerate_emoticon_library,
 };
 use vcp_modules::file_manager::{
-    get_attachment_real_path, open_file, register_local_file, store_file,
+    get_attachment_real_path, open_file, read_image_preview_data_url, register_local_file,
+    store_file,
 };
 use vcp_modules::frontend_update_manager::{
     apply_frontend_update, check_for_frontend_update, clear_frontend_updates,
@@ -229,6 +234,11 @@ pub fn run() {
         .plugin(tauri_plugin_vcp_mobile::init())
         .invoke_handler(tauri::generate_handler![
             sendToVCP,
+            get_affect_state,
+            list_affect_events,
+            update_affect_config,
+            update_affect_persona,
+            reset_affect_state,
             create_lifecycle_job,
             list_lifecycle_jobs,
             claim_due_lifecycle_jobs,
@@ -287,6 +297,7 @@ pub fn run() {
             set_theme,
             store_file,
             register_local_file,
+            read_image_preview_data_url,
             prepare_vcp_upload,
             fetch_raw_message_content,
             re_render_message,

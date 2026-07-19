@@ -31,6 +31,7 @@ const SettingsView = defineAsyncComponent(() => import('../features/settings/Set
 const RagObserverView = defineAsyncComponent(() => import('../features/rag/RagObserver.vue'));
 const DiaryManagerView = defineAsyncComponent(() => import('../features/diary/DiaryManagerView.vue'));
 const AiLifecycleDebugView = defineAsyncComponent(() => import('../features/lifecycle/AiLifecycleDebugView.vue'));
+const AffectCenterView = defineAsyncComponent(() => import('../features/affect/AffectCenterView.vue'));
 
 
 const overlayStore = useOverlayStore();
@@ -101,6 +102,13 @@ onMounted(() => {
       :is-open="overlayStore.isAiLifecycleDebugOpen"
       :z-index="overlayStore.getPageZIndex('aiLifecycleDebug')"
       @close="overlayStore.closeAiLifecycleDebug()"
+    />
+
+    <AffectCenterView
+      :is-open="overlayStore.isAffectCenterOpen"
+      :agent-id="overlayStore.affectCenterAgentId"
+      :z-index="overlayStore.getPageZIndex('affectCenter')"
+      @close="overlayStore.closeAffectCenter()"
     />
 
     <!-- 仅当用户已启用分布式计算时才挂载事件监听器，避免常驻不必要的后台监听 -->

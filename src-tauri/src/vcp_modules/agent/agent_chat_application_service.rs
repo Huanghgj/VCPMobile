@@ -11,12 +11,35 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tauri::{ipc::Channel, AppHandle, State};
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatTurnSource {
+    #[default]
+    User,
+    LifecycleHeartbeat,
+    LifecycleScheduled,
+    Regeneration,
+}
+
+impl ChatTurnSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::LifecycleHeartbeat => "lifecycle_heartbeat",
+            Self::LifecycleScheduled => "lifecycle_scheduled",
+            Self::Regeneration => "regeneration",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentChatPayload {
     pub agent_id: String,
     pub topic_id: String,
     pub user_message: ChatMessage,
+    #[serde(default)]
+    pub turn_source: ChatTurnSource,
     pub vcp_url: String,
     pub vcp_api_key: String,
 }
@@ -85,9 +108,29 @@ pub async fn internal_process_agent_chat_message(
     let agent_id = payload.agent_id;
     let topic_id = payload.topic_id;
     let user_message = payload.user_message;
+    let turn_source = payload.turn_source;
 
     let timestamp = crate::vcp_modules::infra::utils::now_millis();
-    let thinking_id = format!("msg_{}_{}", agent_id, timestamp);
+    let thinking_id = response_message_id(&agent_id, &user_message.id, turn_source, timestamp);
+
+    if turn_source == ChatTurnSource::LifecycleScheduled {
+        let already_exists = sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM messages WHERE topic_id = ? AND msg_id = ? AND deleted_at IS NULL LIMIT 1",
+        )
+        .bind(&topic_id)
+        .bind(&thinking_id)
+        .fetch_optional(&db_state.pool)
+        .await
+        .map_err(|error| error.to_string())?
+        .is_some();
+        if already_exists {
+            log::info!(
+                "[AgentChatAppService] Lifecycle response {} already exists; skipping retry",
+                thinking_id
+            );
+            return Ok(json!({ "status": "already_completed", "messageId": thinking_id }));
+        }
+    }
 
     // 1. 读取 Agent 配置
     let agent_config =
@@ -136,11 +179,104 @@ pub async fn internal_process_agent_chat_message(
     }
 
     // 4. 委派上下文级联装配外观中枢，完成微观编织与宏观 Tavern 规则流水线拦截
-    let effective_prompt = if !agent_config.mobile_system_prompt.is_empty() {
+    let mut effective_prompt = if !agent_config.mobile_system_prompt.is_empty() {
         agent_config.mobile_system_prompt.clone()
     } else {
         agent_config.system_prompt.clone()
     };
+
+    if turn_source == ChatTurnSource::User {
+        let affect_input = crate::vcp_modules::affect_engine::RecordAffectEventInput {
+            agent_id: agent_id.clone(),
+            source_message_id: user_message.id.clone(),
+            source: "user_message".to_string(),
+            text: user_message.content.clone(),
+            topic_id: Some(topic_id.clone()),
+        };
+        let reserved = match crate::vcp_modules::affect_engine::reserve_affect_event(
+            &db_state.pool,
+            &affect_input,
+        )
+        .await
+        {
+            Ok(reserved) => reserved,
+            Err(error) => {
+                log::warn!(
+                    "[AgentChatAppService] Affect reservation failed for agent {}: {}",
+                    agent_id,
+                    error
+                );
+                false
+            }
+        };
+        if reserved {
+            let use_local_model = crate::vcp_modules::affect_engine::should_use_local_model(
+                &db_state.pool,
+                &agent_id,
+            )
+            .await
+            .unwrap_or(false);
+            let observation = if use_local_model {
+                match crate::vcp_modules::affect_recognizer::observe_model_affect(
+                    &app_handle,
+                    &user_message.content,
+                )
+                .await
+                {
+                    Ok(observation) => observation,
+                    Err(error) => {
+                        log::warn!(
+                            "[AgentChatAppService] Local affect model unavailable; using heuristic fallback for agent {}: {}",
+                            agent_id,
+                            error
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let record_result = if let Some(observation) = observation.as_ref() {
+                crate::vcp_modules::affect_engine::record_affect_event_with_observation(
+                    &db_state.pool,
+                    affect_input,
+                    Some(observation),
+                )
+                .await
+            } else {
+                crate::vcp_modules::affect_engine::record_affect_event(&db_state.pool, affect_input)
+                    .await
+            };
+            if let Err(error) = record_result {
+                log::warn!(
+                    "[AgentChatAppService] Affect event update failed for agent {}: {}",
+                    agent_id,
+                    error
+                );
+            }
+        }
+    }
+
+    match crate::vcp_modules::affect_engine::build_affect_context_snapshot_for_turn(
+        &db_state.pool,
+        &agent_id,
+        &user_message.id,
+        turn_source.as_str(),
+    )
+    .await
+    {
+        Ok(snapshot) if !snapshot.is_empty() => {
+            effective_prompt = format!("{}\n\n{}", effective_prompt, snapshot);
+        }
+        Ok(_) => {}
+        Err(error) => {
+            log::warn!(
+                "[AgentChatAppService] Affect snapshot unavailable for agent {}: {}",
+                agent_id,
+                error
+            );
+        }
+    }
 
     let messages = crate::vcp_modules::context_assembler::orchestrate_chat_context(
         &db_state.pool,
@@ -244,16 +380,143 @@ pub struct AssistantChatPayload {
     pub message_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AssistantAffectTurn {
+    turn_id: String,
+    text: String,
+}
+
+fn assistant_affect_turn(
+    agent_id: &str,
+    temp_messages: &[crate::vcp_modules::chat::topic_service::TempMessage],
+) -> Option<AssistantAffectTurn> {
+    let message = temp_messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user" && !message.content.trim().is_empty())?;
+    let identity = format!("{agent_id}\n{}\n{}", message.timestamp, message.content);
+    let digest = crate::vcp_modules::infra::utils::calculate_sha256(identity.as_bytes());
+    Some(AssistantAffectTurn {
+        turn_id: format!("assistant_chat_{}_{}", message.timestamp, digest),
+        text: message.content.clone(),
+    })
+}
+
+async fn build_assistant_affect_snapshot(
+    app_handle: &AppHandle,
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    agent_id: &str,
+    turn: &AssistantAffectTurn,
+) -> Option<String> {
+    let affect_input = crate::vcp_modules::affect_engine::RecordAffectEventInput {
+        agent_id: agent_id.to_string(),
+        source_message_id: turn.turn_id.clone(),
+        source: "user_message".to_string(),
+        text: turn.text.clone(),
+        topic_id: Some("assistant_chat".to_string()),
+    };
+    let reserved =
+        match crate::vcp_modules::affect_engine::reserve_affect_event(pool, &affect_input).await {
+            Ok(reserved) => reserved,
+            Err(error) => {
+                log::warn!(
+                    "[AssistantChatAppService] Affect reservation failed for agent {}: {}",
+                    agent_id,
+                    error
+                );
+                false
+            }
+        };
+
+    if reserved {
+        let use_local_model =
+            crate::vcp_modules::affect_engine::should_use_local_model(pool, agent_id)
+                .await
+                .unwrap_or(false);
+        let observation = if use_local_model {
+            match crate::vcp_modules::affect_recognizer::observe_model_affect(
+                app_handle, &turn.text,
+            )
+            .await
+            {
+                Ok(observation) => observation,
+                Err(error) => {
+                    log::warn!(
+                        "[AssistantChatAppService] Local affect model unavailable; using heuristic fallback for agent {}: {}",
+                        agent_id,
+                        error
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let record_result = if let Some(observation) = observation.as_ref() {
+            crate::vcp_modules::affect_engine::record_affect_event_with_observation(
+                pool,
+                affect_input,
+                Some(observation),
+            )
+            .await
+        } else {
+            crate::vcp_modules::affect_engine::record_affect_event(pool, affect_input).await
+        };
+        if let Err(error) = record_result {
+            log::warn!(
+                "[AssistantChatAppService] Affect event update failed for agent {}: {}",
+                agent_id,
+                error
+            );
+        }
+    }
+
+    match crate::vcp_modules::affect_engine::build_affect_context_snapshot_for_turn(
+        pool,
+        agent_id,
+        &turn.turn_id,
+        ChatTurnSource::User.as_str(),
+    )
+    .await
+    {
+        Ok(snapshot) if !snapshot.is_empty() => Some(snapshot),
+        Ok(_) => None,
+        Err(error) => {
+            log::warn!(
+                "[AssistantChatAppService] Affect snapshot unavailable for agent {}: {}",
+                agent_id,
+                error
+            );
+            None
+        }
+    }
+}
+
+fn response_message_id(
+    agent_id: &str,
+    source_message_id: &str,
+    turn_source: ChatTurnSource,
+    timestamp: i64,
+) -> String {
+    if turn_source == ChatTurnSource::LifecycleScheduled {
+        format!("msg_lifecycle_response_{agent_id}_{source_message_id}")
+    } else {
+        format!("msg_{agent_id}_{timestamp}")
+    }
+}
+
 #[tauri::command]
 pub async fn handle_assistant_chat_stream(
     app_handle: AppHandle,
     agent_state: State<'_, AgentConfigState>,
+    db_state: State<'_, DbState>,
     active_requests: State<'_, ActiveRequests>,
     payload: AssistantChatPayload,
     stream_channel: Channel<crate::vcp_modules::vcp_client::StreamEvent>,
 ) -> Result<Value, String> {
     let agent_id = payload.agent_id;
     let temp_messages = payload.temp_messages;
+    let affect_turn = assistant_affect_turn(&agent_id, &temp_messages);
 
     let timestamp = crate::vcp_modules::infra::utils::now_millis();
     let thinking_id = payload
@@ -274,11 +537,19 @@ pub async fn handle_assistant_chat_stream(
     // 3. 构造请求消息数组 (注入 System Prompt)
     let mut messages: Vec<Value> = Vec::new();
 
-    let effective_prompt = if !agent_config.mobile_system_prompt.is_empty() {
+    let mut effective_prompt = if !agent_config.mobile_system_prompt.is_empty() {
         agent_config.mobile_system_prompt.clone()
     } else {
         agent_config.system_prompt.clone()
     };
+
+    if let Some(turn) = affect_turn.as_ref() {
+        if let Some(snapshot) =
+            build_assistant_affect_snapshot(&app_handle, &db_state.pool, &agent_id, turn).await
+        {
+            effective_prompt = format!("{}\n\n{}", effective_prompt, snapshot);
+        }
+    }
 
     messages.push(json!({
         "role": "system",
@@ -385,5 +656,86 @@ mod tests {
         let content = sanitize_outbound_context_content("user", "请保留 <think>demo</think>");
 
         assert_eq!(content, "请保留 <think>demo</think>");
+    }
+
+    #[test]
+    fn assistant_affect_turn_uses_latest_non_empty_user_message_and_is_stable() {
+        use crate::vcp_modules::chat::topic_service::TempMessage;
+
+        let messages = vec![
+            TempMessage {
+                role: "user".to_string(),
+                name: None,
+                content: "第一条".to_string(),
+                timestamp: 100,
+            },
+            TempMessage {
+                role: "assistant".to_string(),
+                name: None,
+                content: "回复".to_string(),
+                timestamp: 101,
+            },
+            TempMessage {
+                role: "user".to_string(),
+                name: None,
+                content: "妈妈我爱你".to_string(),
+                timestamp: 102,
+            },
+            TempMessage {
+                role: "user".to_string(),
+                name: None,
+                content: "   ".to_string(),
+                timestamp: 103,
+            },
+        ];
+
+        let first = assistant_affect_turn("agent-1", &messages).unwrap();
+        let retry = assistant_affect_turn("agent-1", &messages).unwrap();
+        assert_eq!(first, retry);
+        assert_eq!(first.text, "妈妈我爱你");
+        assert!(first.turn_id.starts_with("assistant_chat_102_"));
+        assert_ne!(
+            first.turn_id,
+            assistant_affect_turn("agent-2", &messages).unwrap().turn_id
+        );
+    }
+
+    #[test]
+    fn assistant_affect_turn_is_absent_without_user_content() {
+        use crate::vcp_modules::chat::topic_service::TempMessage;
+
+        let messages = vec![TempMessage {
+            role: "assistant".to_string(),
+            name: None,
+            content: "只有助手消息".to_string(),
+            timestamp: 100,
+        }];
+
+        assert!(assistant_affect_turn("agent-1", &messages).is_none());
+    }
+
+    #[test]
+    fn scheduled_lifecycle_response_id_is_retry_stable() {
+        let first = response_message_id(
+            "agent-1",
+            "msg_lifecycle_job_job-1",
+            ChatTurnSource::LifecycleScheduled,
+            100,
+        );
+        let retry = response_message_id(
+            "agent-1",
+            "msg_lifecycle_job_job-1",
+            ChatTurnSource::LifecycleScheduled,
+            999,
+        );
+        assert_eq!(first, retry);
+    }
+
+    #[test]
+    fn ordinary_response_ids_remain_unique_per_turn() {
+        assert_ne!(
+            response_message_id("agent-1", "message-1", ChatTurnSource::User, 100),
+            response_message_id("agent-1", "message-1", ChatTurnSource::User, 101)
+        );
     }
 }

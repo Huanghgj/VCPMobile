@@ -1,5 +1,6 @@
 import { defineStore } from "pinia";
 import { computed, ref } from "vue";
+import { invoke } from "@tauri-apps/api/core";
 import { useChatHistoryStore } from "./chatHistoryStore";
 import { useChatSessionStore } from "./chatSessionStore";
 import { useChatStreamStore } from "./chatStreamStore";
@@ -45,6 +46,16 @@ export interface AiLifecycleConfig {
   minMinutesBetweenSends: number;
   maxSendsPerDay: number;
   adaptiveScheduling: boolean;
+}
+
+interface LifecycleAffectCue {
+  enabled: boolean;
+  primaryEmotion: string;
+  attachment: number;
+  security: number;
+  resentment: number;
+  jealousy: number;
+  distanceNeed: number;
 }
 
 const DEFAULT_CONFIG: AiLifecycleConfig = {
@@ -147,7 +158,7 @@ function pickRecentTopicHint(content: string): string {
 }
 
 function buildLifecycleTriggerPrompt(decision: AiLifecycleDecision): string {
-  const targetName = decision.target?.displayName || "????";
+  const targetName = decision.target?.displayName || "当前对象";
   const signals = decision.signals.length
     ? decision.signals.map((signal) => `- ${signal}`).join("\n")
     : "- 无额外信号";
@@ -293,6 +304,7 @@ export const useAiLifecycleStore = defineStore(
     const buildDecision = (
       source: "manual" | "timer",
       options: { force?: boolean } = {},
+      affectCue?: LifecycleAffectCue,
     ): AiLifecycleDecision => {
       normalizeConfig();
 
@@ -316,7 +328,7 @@ export const useAiLifecycleStore = defineStore(
       const aiSpokeLast =
         !!lastAssistantMessage &&
         (!lastUserMessage || lastAssistantMessage.timestamp > lastUserMessage.timestamp);
-      const nextCheckMinutes = pickRandomTriggerMinutes(config.value);
+      let nextCheckMinutes = pickRandomTriggerMinutes(config.value);
       const selectedItem = sessionStore.currentSelectedItem;
       const target: AiLifecycleTarget | undefined =
         selectedItem && sessionStore.currentTopicId
@@ -345,12 +357,12 @@ export const useAiLifecycleStore = defineStore(
 
       if (isPaused.value && !force) {
         const remainingMinutes = Math.max(1, Math.ceil(((pausedUntil.value || now) - now) / 60_000));
-        signals.push(`????????? ${remainingMinutes} ?????`);
+        signals.push(`生命周期已暂停，剩余约 ${remainingMinutes} 分钟`);
         return {
           id: `life_${now}_${Math.random().toString(36).slice(2, 8)}`,
           timestamp: now,
           shouldSend: false,
-          reason: "??????????",
+          reason: "生命周期处于暂停状态",
           priority: "none",
           message: "",
           nextCheckMinutes: remainingMinutes,
@@ -497,6 +509,34 @@ export const useAiLifecycleStore = defineStore(
         signals.push("手动调试强制触发，已绕过免打扰/冷却/最近活跃门禁");
       }
 
+      if (affectCue?.enabled) {
+        const attachmentDrive = affectCue.attachment * (1 - affectCue.security);
+        signals.push(`情感中枢：${affectCue.primaryEmotion}`);
+        if (!force && (affectCue.distanceNeed >= 0.45 || affectCue.resentment >= 0.58)) {
+          signals.push("角色当前更想保持距离，选择暂不主动联系");
+          return {
+            id: `life_${now}_${Math.random().toString(36).slice(2, 8)}`,
+            timestamp: now,
+            shouldSend: false,
+            reason: "情感状态倾向冷却与保持距离",
+            priority: "none",
+            message: "",
+            nextCheckMinutes: Math.max(45, Math.round(nextCheckMinutes * 0.85)),
+            signals,
+            source,
+            target,
+            status: "deferred",
+          };
+        }
+        if (attachmentDrive >= 0.16) {
+          nextCheckMinutes = Math.max(20, Math.round(nextCheckMinutes * (0.82 - attachmentDrive * 0.45)));
+          signals.push("依恋与不安全感提高了主动联系倾向");
+        }
+        if (affectCue.jealousy >= 0.18) {
+          signals.push("未消退的嫉妒会影响主动消息的关注点与语气");
+        }
+      }
+
       let reason = "用户静默足够久，且没有命中免打扰/冷却/上限";
       let message =
         `${idleText}里我没有继续打扰你。可以围绕「${topicHint}」轻轻补充一个观察，或帮用户把下一步推进一下。`;
@@ -507,6 +547,18 @@ export const useAiLifecycleStore = defineStore(
       } else if (aiSpokeLast) {
         reason = "距离上次 AI 发言已超过一小时，允许主动补充分享";
         message = `用户暂时没有接话。可以围绕「${topicHint}」补充一个简短观察，或自然分享你想到的下一步。`;
+      }
+
+
+      if (affectCue?.enabled) {
+        const attachmentDrive = affectCue.attachment * (1 - affectCue.security);
+        if (attachmentDrive >= 0.16) {
+          reason = "依恋与不安全感推动角色主动联系";
+          message += " 这次主动联系要体现角色自己的需要、在意或不满，不要写成通用提醒。";
+        } else if (affectCue.jealousy >= 0.18) {
+          reason = "未消退的嫉妒推动角色确认关系";
+          message += " 可以含蓄确认用户的注意力去向，但不要报告情感数值。";
+        }
       }
 
       return {
@@ -526,6 +578,28 @@ export const useAiLifecycleStore = defineStore(
       };
     };
 
+    const loadLifecycleAffectCue = async (): Promise<LifecycleAffectCue | undefined> => {
+      const sessionStore = useChatSessionStore();
+      const selected = sessionStore.currentSelectedItem;
+      if (!selected || selected.type === "group") return undefined;
+      try {
+        const raw = await invoke<any>("get_affect_state", { agentId: selected.id });
+        const relationship = raw?.relationship || {};
+        return {
+          enabled: raw?.config?.enabled !== false,
+          primaryEmotion: String(raw?.primaryEmotion || "平静"),
+          attachment: clampNumber(Number(relationship.attachment) || 0, 0, 1),
+          security: clampNumber(Number(relationship.security) || 0, 0, 1),
+          resentment: clampNumber(Number(relationship.resentment) || 0, 0, 1),
+          jealousy: clampNumber(Number(relationship.jealousy) || 0, 0, 1),
+          distanceNeed: clampNumber(Number(relationship.distanceNeed) || 0, 0, 1),
+        };
+      } catch (error) {
+        console.warn("[AiLifecycle] Affect cue unavailable; using schedule fallback:", error);
+        return undefined;
+      }
+    };
+
     const pushDecision = (decision: AiLifecycleDecision) => {
       decisions.value.unshift(decision);
       if (decisions.value.length > MAX_LOGS) decisions.value.length = MAX_LOGS;
@@ -536,7 +610,7 @@ export const useAiLifecycleStore = defineStore(
       options: { force?: boolean } = {},
     ) => {
       lastHeartbeatAt.value = Date.now();
-      const decision = buildDecision(source, options);
+      const decision = buildDecision(source, options, await loadLifecycleAffectCue());
       pushDecision(decision);
       if (decision.shouldSend && config.value.allowAutoSend && source === "timer") {
         await sendSuggestedMessage(decision.id);
@@ -549,7 +623,7 @@ export const useAiLifecycleStore = defineStore(
 
     const forceTriggerNow = async () => {
       lastHeartbeatAt.value = Date.now();
-      const decision = buildDecision("manual", { force: true });
+      const decision = buildDecision("manual", { force: true }, await loadLifecycleAffectCue());
       pushDecision(decision);
       await sendSuggestedMessage(decision.id);
       return decision;

@@ -1044,6 +1044,10 @@ VCP Render Probe · Full Tool Result Shape
 </div>"##
     }
 
+    fn nova_rich_html_response() -> &'static str {
+        include_str!("fixtures/nova_rich_html_response.txt")
+    }
+
     fn nodes_contain_raw_html(nodes: &[MarkdownNode], needle: &str) -> bool {
         nodes.iter().any(|node| match node {
             MarkdownNode::RawHtml { content, .. } => content.contains(needle),
@@ -1304,6 +1308,51 @@ copy_button: should_not_send
                 .iter()
                 .any(|block| block_contains_raw_html(block, "data:image/svg+xml;base64")),
             "expected final image tag to remain renderable raw HTML, got {blocks:#?}"
+        );
+        assert!(
+            !blocks
+                .iter()
+                .any(|block| block_contains_plain_text(block, "<div id=\"vcp-root\"")),
+            "final HTML container was downgraded to visible text, got {blocks:#?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_content_nova_rich_html_response_preserves_final_container() {
+        let blocks = parse_content(nova_rich_html_response());
+
+        assert!(
+            blocks.iter().any(|block| matches!(
+                block,
+                ContentBlock::ToolUse { tool_name, .. } if tool_name == "ComfyUIGen"
+            )),
+            "expected ComfyUIGen tool call, got {blocks:#?}"
+        );
+        assert!(
+            blocks
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolResult { tool_name, .. } if tool_name == "ComfyUIGen")),
+            "expected ComfyUIGen tool result, got {blocks:#?}"
+        );
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block_contains_raw_html(block, "id=\"vcp-root\"")),
+            "expected final vcp-root HTML container to remain raw HTML, got {blocks:#?}"
+        );
+        assert!(
+            blocks.iter().any(|block| block_contains_raw_html(
+                block,
+                "linear-gradient(170deg, #1a1a2e 0%, #16213e 40%, #0f3460 100%)"
+            )),
+            "expected root inline style to survive parsing, got {blocks:#?}"
+        );
+        assert!(
+            blocks.iter().any(|block| block_contains_raw_html(
+                block,
+                "7958c0eb-3252-4819-8e89-3088133de1ad.png"
+            )),
+            "expected generated image URL to survive parsing, got {blocks:#?}"
         );
         assert!(
             !blocks

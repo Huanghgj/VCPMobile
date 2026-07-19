@@ -38,6 +38,56 @@ export const useAttachmentStore = defineStore("attachment", () => {
     });
   };
 
+  const resolveAttachmentImage = async (att: Attachment) => {
+    if (!att.type.startsWith("image/")) return;
+
+    if (
+      att.resolvedSrc?.startsWith("data:image/") ||
+      att.resolvedSrc?.startsWith("http:") ||
+      att.resolvedSrc?.startsWith("https:")
+    ) {
+      preloadAttachmentImage(att.resolvedSrc);
+      return;
+    }
+
+    const sourcePath = att.thumbnailPath || att.internalPath || att.src;
+    if (!sourcePath) return;
+
+    if (
+      sourcePath.startsWith("data:image/") ||
+      sourcePath.startsWith("http:") ||
+      sourcePath.startsWith("https:") ||
+      sourcePath.startsWith("blob:")
+    ) {
+      att.resolvedSrc = sourcePath;
+      preloadAttachmentImage(sourcePath);
+      return;
+    }
+
+    try {
+      att.resolvedSrc = await invoke<string>("read_image_preview_data_url", {
+        path: sourcePath,
+      });
+      preloadAttachmentImage(att.resolvedSrc);
+      return;
+    } catch (err) {
+      console.warn(
+        `[AttachmentStore] Failed to read image preview data for ${att.name}:`,
+        err,
+      );
+    }
+
+    try {
+      att.resolvedSrc = convertFileSrc(sourcePath.replace("file://", ""));
+      preloadAttachmentImage(att.resolvedSrc);
+    } catch (err) {
+      console.warn(
+        `[AttachmentStore] Failed to convert attachment image path ${att.name}:`,
+        err,
+      );
+    }
+  };
+
   // 全局监听 Rust 端发出的注册进度，用于大文件哈希/移动等Phase 2流程
   listen<any>("vcp-file-register-progress", (event) => {
     const { progress, stableId } = event.payload;
@@ -53,32 +103,27 @@ export const useAttachmentStore = defineStore("attachment", () => {
     }
   });
 
+  listen<any>("vcp-multimodal-status", (event) => {
+    if (event.payload?.status !== "base64_ready") return;
+    const payloadChars = Number(event.payload?.payloadChars) || 0;
+    useNotificationStore().addNotification({
+      type: "success",
+      title: "图片已转换",
+      message: `Base64 多模态载荷已生成（${Math.round(payloadChars / 1024)} KB）`,
+      toastOnly: true,
+      duration: 2400,
+    });
+  });
+
   /**
    * 处理消息中的本地资源路径 (仅附件)，使用 Tauri 原生 asset:// 协议绕过 WebView 限制
    */
-  const resolveMessageAssets = (msg: any) => {
+  const resolveMessageAssets = async (msg: any) => {
     // 处理附件 (仅处理图片类型)
     if (msg.attachments && msg.attachments.length > 0) {
-      msg.attachments.forEach((att: Attachment) => {
-        // Rust 后端返回的路径现在主要在 internalPath，如果不在，回退到 src
-        const sourcePath = att.internalPath || att.src;
-        if (
-          att.type.startsWith("image/") &&
-          sourcePath &&
-          !sourcePath.startsWith("http") &&
-          !sourcePath.startsWith("data:")
-        ) {
-          try {
-            att.resolvedSrc = convertFileSrc(sourcePath);
-            preloadAttachmentImage(att.resolvedSrc);
-          } catch (err) {
-            console.warn(
-              `[AttachmentStore] Failed to convert attachment image path ${att.name}:`,
-              err,
-            );
-          }
-        }
-      });
+      await Promise.all(
+        msg.attachments.map((att: Attachment) => resolveAttachmentImage(att)),
+      );
     }
   };
 
@@ -221,7 +266,7 @@ export const useAttachmentStore = defineStore("attachment", () => {
         if (displaySrc) {
           const finalIdx = stagedAttachments.value.findIndex(a => a.id === stableId);
           if (finalIdx !== -1) {
-            stagedAttachments.value[finalIdx].src = displaySrc;
+            stagedAttachments.value[finalIdx].resolvedSrc = displaySrc;
           }
           preloadAttachmentImage(displaySrc);
         }
@@ -254,6 +299,7 @@ export const useAttachmentStore = defineStore("attachment", () => {
               status: "done",
               progress: undefined,
             };
+            await resolveAttachmentImage(stagedAttachments.value[index]);
           }
         }
       } catch (err: any) {
@@ -460,6 +506,7 @@ export const useAttachmentStore = defineStore("attachment", () => {
                   hash: finalData.hash,
                   status: "done",
                 };
+                await resolveAttachmentImage(stagedAttachments.value[index]);
               }
             }
             resolve();

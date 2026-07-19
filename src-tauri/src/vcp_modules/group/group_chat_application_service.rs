@@ -1,6 +1,7 @@
 // group_chat_application_service.rs: 编排群聊工作流
 // 职责: 1. 读取配置 2. 保存消息 3. 决策发言者 4. 组装上下文 5. 执行 AI 调用 6. 发射事件
 
+use crate::vcp_modules::agent_chat_application_service::ChatTurnSource;
 use crate::vcp_modules::agent_service::{read_agent_config_internal, AgentConfigState};
 use crate::vcp_modules::chat_manager::ChatMessage;
 use crate::vcp_modules::db_manager::DbState;
@@ -23,6 +24,8 @@ pub struct GroupChatPayload {
     pub group_id: String,
     pub topic_id: String,
     pub user_message: ChatMessage,
+    #[serde(default)]
+    pub turn_source: ChatTurnSource,
     pub vcp_url: String,
     pub vcp_api_key: String,
 }
@@ -31,6 +34,7 @@ pub struct GroupChatParams {
     pub group_id: String,
     pub topic_id: String,
     pub user_message: ChatMessage,
+    pub turn_source: ChatTurnSource,
     pub vcp_url: String,
     pub vcp_api_key: String,
     pub stream_channel: Option<Channel<crate::vcp_modules::vcp_client::StreamEvent>>,
@@ -74,6 +78,7 @@ pub async fn internal_process_group_chat_message(
     let group_id = params.group_id;
     let topic_id = params.topic_id;
     let user_message = params.user_message;
+    let turn_source = params.turn_source;
     let vcp_url = params.vcp_url;
     let vcp_api_key = params.vcp_api_key;
 
@@ -128,6 +133,77 @@ pub async fn internal_process_group_chat_message(
         recent_history_for_decision.push(user_message.clone());
     }
 
+    if turn_source == ChatTurnSource::User {
+        let mut pending_affect_inputs = Vec::new();
+        let mut use_local_model = false;
+        for member in &active_member_configs {
+            let input = crate::vcp_modules::affect_engine::RecordAffectEventInput {
+                agent_id: member.id.clone(),
+                source_message_id: user_message.id.clone(),
+                source: "group".to_string(),
+                text: user_message.content.clone(),
+                topic_id: Some(topic_id.clone()),
+            };
+            let reserved =
+                crate::vcp_modules::affect_engine::reserve_affect_event(&db_state.pool, &input)
+                    .await
+                    .unwrap_or(false);
+            if reserved {
+                if !use_local_model {
+                    use_local_model = crate::vcp_modules::affect_engine::should_use_local_model(
+                        &db_state.pool,
+                        &member.id,
+                    )
+                    .await
+                    .unwrap_or(false);
+                }
+                pending_affect_inputs.push(input);
+            }
+        }
+
+        let observation = if use_local_model && !pending_affect_inputs.is_empty() {
+            match crate::vcp_modules::affect_recognizer::observe_model_affect(
+                &app_handle,
+                &user_message.content,
+            )
+            .await
+            {
+                Ok(observation) => observation,
+                Err(error) => {
+                    log::warn!(
+                        "[GroupChatAppService] Local affect model unavailable; using heuristic fallback: {}",
+                        error
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        for affect_input in pending_affect_inputs {
+            let member_id = affect_input.agent_id.clone();
+            let record_result = if let Some(observation) = observation.as_ref() {
+                crate::vcp_modules::affect_engine::record_affect_event_with_observation(
+                    &db_state.pool,
+                    affect_input,
+                    Some(observation),
+                )
+                .await
+            } else {
+                crate::vcp_modules::affect_engine::record_affect_event(&db_state.pool, affect_input)
+                    .await
+            };
+            if let Err(error) = record_result {
+                log::warn!(
+                    "[GroupChatAppService] Affect event update failed for agent {}: {}",
+                    member_id,
+                    error
+                );
+            }
+        }
+    }
+
     // 4. 决策引擎：谁该说话？
     let speakers = if group_config.mode == "sequential" {
         active_member_configs.clone()
@@ -179,6 +255,7 @@ pub async fn internal_process_group_chat_message(
 
     // 5. 串行异步调度 (约束：群聊内部必须串行)
     let mut final_new_msgs = Vec::new();
+    let mut response_message_ids = Vec::new();
 
     for speaker in speakers {
         // 检查全局中断令牌：如果话题已被标记为取消，立即停止接力赛
@@ -203,12 +280,32 @@ pub async fn internal_process_group_chat_message(
 
         let agent_id = speaker.id.clone();
         let agent_name = speaker.name.clone();
-        let message_id = format!(
-            "msg_group_{}_{}_{}",
-            user_message.id,
-            agent_id,
-            crate::vcp_modules::infra::utils::now_millis()
-        );
+        let message_id = if turn_source == ChatTurnSource::LifecycleScheduled {
+            format!("msg_group_lifecycle_{}_{}", user_message.id, agent_id)
+        } else {
+            format!(
+                "msg_group_{}_{}_{}",
+                user_message.id,
+                agent_id,
+                crate::vcp_modules::infra::utils::now_millis()
+            )
+        };
+        if turn_source == ChatTurnSource::LifecycleScheduled {
+            let already_exists = sqlx::query_scalar::<_, i64>(
+                "SELECT 1 FROM messages WHERE topic_id = ? AND msg_id = ? AND deleted_at IS NULL LIMIT 1",
+            )
+            .bind(&topic_id)
+            .bind(&message_id)
+            .fetch_optional(&db_pool)
+            .await
+            .map_err(|error| error.to_string())?
+            .is_some();
+            if already_exists {
+                response_message_ids.push(message_id);
+                continue;
+            }
+        }
+        response_message_ids.push(message_id.clone());
 
         // 【优化点】：此时已识别出当前轮次的发言者 agent_name，立即提前启动前台服务保活，
         // 从而与接下来耗时的群组上下文组装、SQLite Tavern 级联编织等逻辑并行重叠。
@@ -219,9 +316,30 @@ pub async fn internal_process_group_chat_message(
         );
 
         // 组装上下文
-        let base_system_prompt =
+        let mut base_system_prompt =
             assemble_group_context(&speaker, &group_config_inner, &active_member_configs_inner)
                 .await;
+
+        match crate::vcp_modules::affect_engine::build_affect_context_snapshot_for_turn(
+            &db_pool,
+            &agent_id,
+            &user_message.id,
+            turn_source.as_str(),
+        )
+        .await
+        {
+            Ok(snapshot) if !snapshot.is_empty() => {
+                base_system_prompt = format!("{}\n\n{}", base_system_prompt, snapshot);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                log::warn!(
+                    "[GroupChatAppService] Affect snapshot unavailable for agent {}: {}",
+                    agent_id,
+                    error
+                );
+            }
+        }
 
         // 动态路由决策：是否使用群组统一模型
         let model_to_use = if group_config_inner.use_unified_model {
@@ -377,7 +495,10 @@ pub async fn internal_process_group_chat_message(
     // 回合结束，清理中断标记
     cancelled_turns.0.remove(&topic_id);
 
-    Ok(json!({"status": "completed"}))
+    Ok(json!({
+        "status": "completed",
+        "messageId": response_message_ids.first()
+    }))
 }
 
 #[tauri::command]
@@ -408,6 +529,7 @@ pub async fn handle_group_chat_message(
             group_id: payload.group_id,
             topic_id: payload.topic_id,
             user_message: payload.user_message,
+            turn_source: payload.turn_source,
             vcp_url: payload.vcp_url,
             vcp_api_key: payload.vcp_api_key,
             stream_channel: Some(stream_channel),

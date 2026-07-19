@@ -34,6 +34,7 @@ export const useOverlayStore = defineStore('overlay', () => {
   const isRagObserverOpen = computed(() => pageStack.value.some(p => p.type === 'ragObserver'));
   const isDiaryOpen = computed(() => pageStack.value.some(p => p.type === 'diary'));
   const isAiLifecycleDebugOpen = computed(() => pageStack.value.some(p => p.type === 'aiLifecycleDebug'));
+  const isAffectCenterOpen = computed(() => pageStack.value.some(p => p.type === 'affectCenter'));
 
 
   const agentSettingsId = computed(() => {
@@ -43,6 +44,11 @@ export const useOverlayStore = defineStore('overlay', () => {
 
   const groupSettingsId = computed(() => {
     const page = pageStack.value.find(p => p.type === 'groupSettings');
+    return page?.id || '';
+  });
+
+  const affectCenterAgentId = computed(() => {
+    const page = pageStack.value.find(p => p.type === 'affectCenter');
     return page?.id || '';
   });
 
@@ -200,6 +206,14 @@ export const useOverlayStore = defineStore('overlay', () => {
     popPage();
   };
 
+  const openAffectCenter = (agentId: string) => {
+    pushPage('affectCenter', agentId);
+  };
+
+  const closeAffectCenter = () => {
+    popPage();
+  };
+
   // --- Modal API (unchanged) ---
   const openPrompt = (config: PromptConfig) => {
     promptConfig.value = config;
@@ -261,6 +275,8 @@ export const useOverlayStore = defineStore('overlay', () => {
     isRagObserverOpen,
     isDiaryOpen,
     isAiLifecycleDebugOpen,
+    isAffectCenterOpen,
+    affectCenterAgentId,
     // Legacy open/close (now backed by page stack)
     openSettings,
     closeSettings,
@@ -282,6 +298,8 @@ export const useOverlayStore = defineStore('overlay', () => {
     closeDiary,
     openAiLifecycleDebug,
     closeAiLifecycleDebug,
+    openAffectCenter,
+    closeAffectCenter,
     // Modals
     promptConfig,
     contextMenuConfig,

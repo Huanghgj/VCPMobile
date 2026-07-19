@@ -1140,5 +1140,9 @@ async fn setup_tables(pool: &Pool<Sqlite>) -> Result<(), String> {
         .await
         .map_err(|e| format!("[DBManager] Failed to setup lifecycle tables: {}", e))?;
 
+    crate::vcp_modules::affect_engine::setup_affect_tables(pool)
+        .await
+        .map_err(|e| format!("[DBManager] Failed to setup affect tables: {}", e))?;
+
     Ok(())
 }

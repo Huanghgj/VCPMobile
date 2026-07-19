@@ -15,6 +15,8 @@ export interface AppSettings {
   adminUsername?: string;
   adminPassword?: string;
   fileKey?: string;
+  imageUploadKey?: string;
+  imageServerUrl?: string;
   topicSummaryModel: string;
   syncLogLevel: string;
   agentOrder: string[];

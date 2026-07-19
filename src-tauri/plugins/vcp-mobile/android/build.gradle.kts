@@ -32,5 +32,7 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.6.1")
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.lifecycle:lifecycle-common:2.7.0")
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.22.0")
     implementation("com.github.topjohnwu.libsu:core:5.0.3")
+    testImplementation("junit:junit:4.13.2")
 }

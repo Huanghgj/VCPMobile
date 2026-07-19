@@ -54,6 +54,8 @@ pub use persistence::db_write_queue;
 pub use persistence::message_repository;
 
 // --- Infra 领域 ---
+pub use infra::affect_engine;
+pub use infra::affect_recognizer;
 pub use infra::diary_manager;
 pub use infra::file_manager;
 pub use infra::high_speed_channel;

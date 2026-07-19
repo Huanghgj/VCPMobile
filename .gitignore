@@ -51,6 +51,7 @@ plans/Archive_Assets/
 # Local Release Artifacts
 releases/
 vector/
+/*.apk
 
 # Cargo registry cache
 .cargo

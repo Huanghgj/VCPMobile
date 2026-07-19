@@ -1,0 +1,25 @@
+{
+  "modelId": "vcp/rbt3-zh-dialogue-affect",
+  "modelVersion": "1.0.0-int8",
+  "labels": [
+    "neutral",
+    "joy",
+    "sadness",
+    "anger",
+    "confusion",
+    "disgust",
+    "surprise",
+    "affection"
+  ],
+  "inputIdsName": "input_ids",
+  "attentionMaskName": "attention_mask",
+  "tokenTypeIdsName": "token_type_ids",
+  "outputName": "logits",
+  "lowerCase": true,
+  "maxLength": 128,
+  "sha256": "d203ee44af1023a837ff8a69d50d9e8bb4062e77b0db3e95537815836a20125a",
+  "backbone": "hfl/rbt3",
+  "backboneRevision": "0aa0527ff4170f29e1dfd3eb6ef60dc67e1bf75c",
+  "dataset": "Johnson8187/Chinese_Multi-Emotion_Dialogue_Dataset",
+  "datasetRevision": "119d246a1595b44fd2cdccff0d9b288eafee25d1"
+}

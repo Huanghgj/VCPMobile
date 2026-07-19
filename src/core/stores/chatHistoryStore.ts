@@ -7,6 +7,7 @@ import { useAttachmentStore } from "./attachmentStore";
 import { useAssistantStore } from "./assistant";
 import { useSettingsStore } from "./settings";
 import { useTopicStore } from "./topicListManager";
+import { useNotificationStore } from "./notification";
 import { clearMessageCache } from "../utils/astRenderer";
 import { preloadMessageImages } from "../utils/messageAssetPreloader";
 import type { ChatMessage, HistoryChunk, ContentBlock } from "../types/chat";
@@ -81,6 +82,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
   const assistantStore = useAssistantStore();
   const settingsStore = useSettingsStore();
   const topicStore = useTopicStore();
+  const notificationStore = useNotificationStore();
 
   const summarizeTopic = async () => {
     if (!sessionStore.currentTopicId || !sessionStore.currentSelectedItem?.id) return;
@@ -320,7 +322,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
       const messagesToResolve = offset === 0 ? currentChatHistory.value : buffer;
       await Promise.all(
         messagesToResolve.map(async (msg) => {
-          attachmentStore.resolveMessageAssets(msg);
+          await attachmentStore.resolveMessageAssets(msg);
         }),
       );
       await preloadMessageImages(messagesToResolve);
@@ -372,9 +374,16 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
   /**
    * 触发 AI 生成逻辑
    */
+  type AffectTurnSource =
+    | "user"
+    | "lifecycle_heartbeat"
+    | "lifecycle_scheduled"
+    | "regeneration";
+
   const invokeGenerationRequestForTarget = async (
     userMsg: ChatMessage,
     target: { ownerId: string; ownerType: "agent" | "group"; topicId: string },
+    turnSource: AffectTurnSource = "user",
   ): Promise<{ started: true; messageId?: string }> => {
     const agentId = target.ownerId;
     const topicId = target.topicId;
@@ -403,6 +412,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
           groupId: target.ownerId,
           topicId,
           userMessage: userMsg,
+          turnSource,
           vcpUrl: settings.vcpServerUrl || "",
           vcpApiKey: settings.vcpApiKey || "",
         },
@@ -415,6 +425,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
           agentId,
           topicId,
           userMessage: userMsg,
+          turnSource,
           vcpUrl: settings.vcpServerUrl || "",
           vcpApiKey: settings.vcpApiKey || "",
         },
@@ -424,13 +435,16 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     }
   };
 
-  const invokeGenerationRequest = async (userMsg: ChatMessage) => {
+  const invokeGenerationRequest = async (
+    userMsg: ChatMessage,
+    turnSource: AffectTurnSource = "user",
+  ) => {
     if (!sessionStore.currentSelectedItem || !sessionStore.currentTopicId) return false;
     const result = await invokeGenerationRequestForTarget(userMsg, {
       ownerId: sessionStore.currentSelectedItem.id,
       ownerType: sessionStore.currentSelectedItem.type === "group" ? "group" : "agent",
       topicId: sessionStore.currentTopicId,
-    });
+    }, turnSource);
     return result.started;
   };
 
@@ -460,9 +474,16 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
         };
       }
 
-      return await invokeGenerationRequest(userMsg);
+      return await invokeGenerationRequest(userMsg, "user");
     } catch (e) {
       console.error("[ChatHistoryStore] Generation failed:", e);
+      notificationStore.addNotification({
+        type: "error",
+        title: "消息发送失败",
+        message: e instanceof Error ? e.message : String(e),
+        toastOnly: true,
+        duration: 5000,
+      });
       return false;
     }
   };
@@ -489,7 +510,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     const now = Date.now();
     const userMsg: ChatMessage = {
       id: `msg_lifecycle_${now}_${Math.random().toString(36).substring(2, 9)}`,
-      role: "user",
+      role: "system",
       name: "AI Lifecycle",
       content,
       timestamp: now,
@@ -500,7 +521,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     };
 
     try {
-      return await invokeGenerationRequest(userMsg);
+      return await invokeGenerationRequest(userMsg, "lifecycle_heartbeat");
     } catch (e) {
       console.error("[ChatHistoryStore] Hidden lifecycle generation failed:", e);
       return false;
@@ -529,8 +550,8 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
       "任务意图：" + job.intent,
     ].join("\n");
     const userMsg: ChatMessage = {
-      id: "msg_lifecycle_job_" + job.jobId + "_" + now,
-      role: "user",
+      id: "msg_lifecycle_job_" + job.jobId,
+      role: "system",
       name: "AI Lifecycle",
       content: prompt,
       timestamp: now,
@@ -543,7 +564,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
       ownerId: job.ownerId,
       ownerType: job.ownerType,
       topicId: job.topicId,
-    });
+    }, "lifecycle_scheduled");
     return result.messageId || null;
   };
 
@@ -594,6 +615,17 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
   const sendMessage = async (content: string) => {
     if (!sessionStore.currentSelectedItem || !sessionStore.currentTopicId || (!content.trim() && attachmentStore.stagedAttachments.length === 0)) return;
 
+    if (attachmentStore.stagedAttachments.some((attachment) => attachment.status === "loading")) {
+      notificationStore.addNotification({
+        type: "warning",
+        title: "附件仍在处理中",
+        message: "请等待附件完成注册后再发送。",
+        toastOnly: true,
+        duration: 2400,
+      });
+      return;
+    }
+
     if (editingOriginalMessageId.value) {
       const originalId = editingOriginalMessageId.value;
       editingOriginalMessageId.value = null;
@@ -615,7 +647,6 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     }
 
     const currentStaged = [...attachmentStore.stagedAttachments];
-    attachmentStore.clearStaged();
     if (currentStaged.length > 0) {
       await attachmentStore.preProcessDocuments(currentStaged);
     }
@@ -633,6 +664,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
       blocks: [{ type: "markdown" as const, content }],
     };
 
+    attachmentStore.clearStaged();
     currentChatHistory.value.push(userMsg);
     if (sessionStore.currentTopicId) {
       topicStore.incrementTopicMsgCount(sessionStore.currentTopicId);
