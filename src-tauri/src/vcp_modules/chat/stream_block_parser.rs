@@ -193,6 +193,14 @@ impl StreamBlockParser {
     /// 处理累积的全文，返回 (已完成的块列表, 尾部纯文本)
     /// 已闭合的块从 tail 中移除加入 stable blocks，未闭合部分保留为 tail
     pub fn process(&mut self, full_text: &str) -> (Vec<StreamBlock>, String) {
+        self.process_internal(full_text, false)
+    }
+
+    fn process_internal(
+        &mut self,
+        full_text: &str,
+        allow_vcp_root_completion: bool,
+    ) -> (Vec<StreamBlock>, String) {
         let mut blocks = Vec::new();
         let mut pos = self.processed_len.min(full_text.len());
 
@@ -220,9 +228,13 @@ impl StreamBlockParser {
                 let content_start = end;
                 let search_area = &remaining[content_start..];
 
-                if let Some((end_start, end_end)) =
-                    find_end_marker(remaining, start, end, &block_type)
-                {
+                if let Some((end_start, end_end)) = find_end_marker(
+                    remaining,
+                    start,
+                    end,
+                    &block_type,
+                    allow_vcp_root_completion,
+                ) {
                     let inner_content = &search_area[..end_start];
                     let block = build_stream_block(
                         &block_type,
@@ -261,7 +273,11 @@ impl StreamBlockParser {
     /// 流结束：强制处理剩余 tail 为最后一个 Markdown 块
     pub fn finalize(&mut self, full_text: &str) -> Vec<StreamBlock> {
         let (mut blocks, tail) = self.process(full_text);
-        if let Some(block) = Self::build_incomplete_tail_block(&tail) {
+        let repaired_tail = crate::vcp_modules::render_repair::repair_html_fragment(&tail);
+        let mut final_parser = StreamBlockParser::new();
+        let (mut final_blocks, final_tail) = final_parser.process_internal(&repaired_tail, true);
+        blocks.append(&mut final_blocks);
+        if let Some(block) = Self::build_incomplete_tail_block(&final_tail) {
             blocks.push(block);
         }
         blocks
@@ -387,12 +403,18 @@ fn find_end_marker(
     start: usize,
     end: usize,
     block_type: &BlockType,
+    allow_vcp_root_completion: bool,
 ) -> Option<(usize, usize)> {
     let content_start = end;
     let search_area = &remaining[content_start..];
 
     if let BlockType::HtmlContainer = block_type {
         let marker_text = &remaining[start..end];
+        if !allow_vcp_root_completion
+            && crate::vcp_modules::render_repair::is_vcp_root_open_tag(marker_text)
+        {
+            return None;
+        }
         if let Some(caps) =
             crate::vcp_modules::content_parser::HTML_CONTAINER_OPEN_RE.captures(marker_text)
         {
@@ -1255,5 +1277,35 @@ copy_button: should_not_send
             contains_button_click(&blocks),
             "explicit VCP button marker should still become a button-click block: {blocks:#?}"
         );
+    }
+
+    #[test]
+    fn vcp_root_stays_in_tail_and_repairs_on_finalize() {
+        let raw = concat!(
+            "<div id=\"vcp-root\"><style>@keyframes fade { from { opacity:0 } to { opacity:1 } }</style>",
+            "<div data-probe=\"first\">first</div></div>",
+            "<div data-probe=\"second\">second</div>",
+            "</div>"
+        );
+        let mut parser = StreamBlockParser::new();
+
+        let (stable, tail) = parser.process(raw);
+        assert!(
+            stable.is_empty(),
+            "vcp-root must not stabilize before stream end"
+        );
+        assert_eq!(tail, raw);
+
+        let blocks = parser.finalize(raw);
+        assert_eq!(blocks.len(), 1, "{blocks:#?}");
+        match &blocks[0] {
+            StreamBlock::Markdown { content, .. } => {
+                assert!(content.contains("data-probe=\"first\""), "{content}");
+                assert!(content.contains("data-probe=\"second\""), "{content}");
+                assert!(!content.contains("</div></div><div data-probe=\"second\""));
+                assert!(content.ends_with("</div>"), "{content}");
+            }
+            other => panic!("expected repaired markdown block, got {other:?}"),
+        }
     }
 }

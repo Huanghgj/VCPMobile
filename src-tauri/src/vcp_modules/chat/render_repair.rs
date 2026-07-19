@@ -1,4 +1,5 @@
 use regex::Regex;
+use std::borrow::Cow;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProtectedBlock {
@@ -133,6 +134,9 @@ pub fn repair_html_fragment(fragment: &str) -> String {
         return fragment.to_string();
     }
 
+    let normalized_fragment = repair_premature_vcp_root_closes(fragment);
+    let fragment = normalized_fragment.as_ref();
+
     let mut output = String::with_capacity(fragment.len() + 32);
     let mut stack: Vec<String> = Vec::new();
     let mut cursor = 0;
@@ -205,6 +209,157 @@ pub fn repair_html_fragment(fragment: &str) -> String {
     }
 
     output
+}
+
+pub(crate) fn is_vcp_root_open_tag(tag_text: &str) -> bool {
+    lazy_static::lazy_static! {
+        static ref VCP_ROOT_ID: Regex = Regex::new(
+            r#"(?i)\bid\s*=\s*(?:\"vcp-root\"|'vcp-root'|vcp-root(?:[\s/>]|$))"#,
+        )
+        .unwrap();
+    }
+
+    parse_html_tag(tag_text)
+        .is_some_and(|tag| !tag.closing && tag.name == "div" && VCP_ROOT_ID.is_match(tag_text))
+}
+
+/// Keeps the designated rich-message root open across later rich blocks when
+/// an early `</div>` would otherwise split the rendered response.
+pub(crate) fn repair_premature_vcp_root_closes(fragment: &str) -> Cow<'_, str> {
+    if !fragment.contains("vcp-root") {
+        return Cow::Borrowed(fragment);
+    }
+
+    let mut output = String::with_capacity(fragment.len());
+    let mut cursor = 0;
+    let mut active_root: Option<(String, usize)> = None;
+    let mut changed = false;
+
+    while cursor < fragment.len() {
+        let Some(relative_lt) = fragment[cursor..].find('<') else {
+            output.push_str(&fragment[cursor..]);
+            break;
+        };
+        let lt = cursor + relative_lt;
+        output.push_str(&fragment[cursor..lt]);
+
+        if fragment[lt..].starts_with("<!--") {
+            if let Some(relative_end) = fragment[lt + 4..].find("-->") {
+                let end = lt + 4 + relative_end + 3;
+                output.push_str(&fragment[lt..end]);
+                cursor = end;
+                continue;
+            }
+            output.push_str(&fragment[lt..]);
+            break;
+        }
+
+        let Some(gt) = find_tag_end(fragment, lt) else {
+            output.push_str(&fragment[lt..]);
+            break;
+        };
+        let tag_text = &fragment[lt..=gt];
+        let Some(tag) = parse_html_tag(tag_text) else {
+            output.push_str(tag_text);
+            cursor = gt + 1;
+            continue;
+        };
+
+        if active_root.is_none() && is_vcp_root_open_tag(tag_text) {
+            active_root = Some((tag.name.clone(), 1));
+            output.push_str(tag_text);
+            cursor = gt + 1;
+            continue;
+        }
+
+        if let Some((root_tag, depth)) = active_root.as_mut() {
+            if tag.name == *root_tag && !tag.self_closing && !is_void_tag(&tag.name) {
+                if tag.closing {
+                    if *depth == 1
+                        && (has_later_orphan_close(fragment, gt + 1, root_tag.as_str())
+                            || has_renderable_vcp_root_continuation(fragment, gt + 1))
+                    {
+                        changed = true;
+                        cursor = gt + 1;
+                        continue;
+                    }
+
+                    *depth = depth.saturating_sub(1);
+                    if *depth == 0 {
+                        active_root = None;
+                    }
+                } else {
+                    *depth += 1;
+                }
+            }
+        }
+
+        output.push_str(tag_text);
+        cursor = gt + 1;
+    }
+
+    if changed {
+        Cow::Owned(output)
+    } else {
+        Cow::Borrowed(fragment)
+    }
+}
+
+fn has_renderable_vcp_root_continuation(fragment: &str, start: usize) -> bool {
+    lazy_static::lazy_static! {
+        static ref RICH_HTML_CONTINUATION: Regex = Regex::new(
+            r"(?is)^<(?:div|section|article|header|footer|main|aside|figure|figcaption|img|p|span|table|ul|ol)\b",
+        )
+        .unwrap();
+    }
+
+    fragment
+        .get(start..)
+        .is_some_and(|rest| RICH_HTML_CONTINUATION.is_match(rest.trim_start()))
+}
+
+fn has_later_orphan_close(fragment: &str, start: usize, tag_name: &str) -> bool {
+    let mut depth = 0usize;
+    let mut cursor = start;
+
+    while cursor < fragment.len() {
+        let Some(relative_lt) = fragment[cursor..].find('<') else {
+            break;
+        };
+        let lt = cursor + relative_lt;
+
+        if fragment[lt..].starts_with("<!--") {
+            if let Some(relative_end) = fragment[lt + 4..].find("-->") {
+                cursor = lt + 4 + relative_end + 3;
+                continue;
+            }
+            break;
+        }
+
+        let Some(gt) = find_tag_end(fragment, lt) else {
+            break;
+        };
+        let tag_text = &fragment[lt..=gt];
+        cursor = gt + 1;
+
+        let Some(tag) = parse_html_tag(tag_text) else {
+            continue;
+        };
+        if tag.name != tag_name || tag.self_closing || is_void_tag(&tag.name) {
+            continue;
+        }
+
+        if tag.closing {
+            if depth == 0 {
+                return true;
+            }
+            depth -= 1;
+        } else {
+            depth += 1;
+        }
+    }
+
+    false
 }
 
 fn find_earliest_protected_block(text: &str) -> Option<(usize, usize, ProtectedBlock)> {
@@ -508,5 +663,45 @@ mod tests {
             )
         });
         assert!(!has_code, "{blocks:#?}");
+    }
+
+    #[test]
+    fn keeps_vcp_root_open_until_later_orphan_close() {
+        let input = concat!(
+            "<div id=\"vcp-root\"><style>@keyframes fade { from { opacity: 0 } to { opacity: 1 } }</style>",
+            "<div data-probe=\"first\">first</div></div>",
+            "<div data-probe=\"second\">second</div>",
+            "</div>"
+        );
+
+        let repaired = repair_html_fragment(input);
+
+        assert_eq!(
+            repaired,
+            concat!(
+                "<div id=\"vcp-root\"><style>@keyframes fade { from { opacity: 0 } to { opacity: 1 } }</style>",
+                "<div data-probe=\"first\">first</div>",
+                "<div data-probe=\"second\">second</div>",
+                "</div>"
+            )
+        );
+    }
+
+    #[test]
+    fn keeps_streaming_vcp_root_open_across_later_rich_blocks() {
+        let partial = concat!(
+            "<div id=\"vcp-root\"><div data-probe=\"first\">first</div></div>",
+            "<div data-probe=\"second\">second</div>"
+        );
+
+        let repaired = repair_html_fragment(partial);
+
+        assert_eq!(
+            repaired,
+            concat!(
+                "<div id=\"vcp-root\"><div data-probe=\"first\">first</div>",
+                "<div data-probe=\"second\">second</div></div>"
+            )
+        );
     }
 }

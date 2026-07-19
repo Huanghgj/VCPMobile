@@ -1194,9 +1194,10 @@ watch(
     removeScopedCss(props.message.id);
     injectedStyleSignature = styleSignature;
 
-    for (const block of styleBlocks) {
-      injectScopedCss(block.content || "", props.message.id);
-    }
+    injectScopedCss(
+      styleBlocks.map((block) => block.content || "").join("\n"),
+      props.message.id,
+    );
   },
   { immediate: true },
 );

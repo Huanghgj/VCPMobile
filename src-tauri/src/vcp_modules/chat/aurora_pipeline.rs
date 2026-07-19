@@ -166,7 +166,7 @@ impl AuroraBuffer {
                 // 如果是以 HTML 容器/样式标签开头，直接将其作为 RawHtml 块，防止 pulldown_cmark 将内部 CSS 规则或内联样式解析为缩进代码块
                 Some(vec![
                     crate::vcp_modules::pre_renderer::MarkdownNode::raw_html(
-                        self.tail_content.clone(),
+                        crate::vcp_modules::render_repair::repair_html_fragment(&self.tail_content),
                     ),
                 ])
             } else if self.tail_content.len() <= MAX_SPECULATIVE_TAIL_AST_BYTES {
@@ -335,5 +335,31 @@ mod tests {
         } else {
             panic!("expected markdown tail block");
         }
+    }
+
+    #[test]
+    fn streaming_vcp_root_snapshot_keeps_later_rich_blocks_inside() {
+        let mut buffer = AuroraBuffer::new();
+        buffer.append_chunk(concat!(
+            "<div id=\"vcp-root\"><div data-probe=\"first\">first</div></div>",
+            "<div data-probe=\"second\">second</div>"
+        ));
+        buffer.process_queue();
+
+        let nodes = match buffer.tail_block.as_ref() {
+            Some(StreamBlock::Markdown {
+                nodes: Some(nodes), ..
+            }) => nodes,
+            other => panic!("expected rich HTML tail nodes, got {other:?}"),
+        };
+        let rendered_tail = nodes.iter().find_map(|node| match node {
+            MarkdownNode::RawHtml { content, .. } => Some(content.as_str()),
+            _ => None,
+        });
+        let rendered_tail = rendered_tail.expect("expected repaired raw HTML tail");
+
+        assert!(rendered_tail.contains("data-probe=\"second\""));
+        assert!(!rendered_tail.contains("</div></div><div data-probe=\"second\""));
+        assert!(rendered_tail.ends_with("</div>"), "{rendered_tail}");
     }
 }

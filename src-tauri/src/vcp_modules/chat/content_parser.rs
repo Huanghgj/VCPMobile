@@ -400,7 +400,9 @@ pub fn de_indent_misinterpreted_code_blocks(text: &str) -> String {
 
 /// 核心解析函数：将原始 Markdown 文本解析为 AST 块数组
 pub fn parse_content(raw_text: &str) -> Vec<ContentBlock> {
-    let deindented_text = de_indent_misinterpreted_code_blocks(raw_text);
+    let root_repaired =
+        crate::vcp_modules::render_repair::repair_premature_vcp_root_closes(raw_text);
+    let deindented_text = de_indent_misinterpreted_code_blocks(root_repaired.as_ref());
     let text = deindented_text.as_str();
 
     let mut blocks = Vec::new();
@@ -1386,5 +1388,39 @@ copy_button: should_not_send
             contains_button_click(&blocks),
             "explicit VCP button marker should still become a button-click block: {blocks:#?}"
         );
+    }
+
+    #[test]
+    fn test_parse_content_repairs_premature_vcp_root_close() {
+        let raw = concat!(
+            "<div id=\"vcp-root\" style=\"padding:20px\">",
+            "<style>@keyframes fadeIn { from { opacity:0 } to { opacity:1 } }</style>",
+            "<div data-probe=\"first\">first</div></div>",
+            "<div data-probe=\"second\">second</div>",
+            "</div>"
+        );
+
+        let blocks = parse_content(raw);
+        let root_html = blocks.iter().find_map(|block| match block {
+            ContentBlock::Markdown {
+                nodes: Some(nodes), ..
+            } => Some(
+                nodes
+                    .iter()
+                    .filter_map(|node| match node {
+                        MarkdownNode::RawHtml { content, .. } => Some(content.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+            ),
+            _ => None,
+        });
+
+        let root_html = root_html.expect("expected repaired vcp-root raw HTML nodes");
+        assert!(root_html.starts_with("<div id=\"vcp-root\""), "{blocks:#?}");
+        assert!(root_html.contains("data-probe=\"first\""), "{blocks:#?}");
+        assert!(root_html.contains("data-probe=\"second\""), "{blocks:#?}");
+        assert!(root_html.contains("@keyframes fadeIn"), "{blocks:#?}");
+        assert!(root_html.ends_with("</div>"), "{blocks:#?}");
     }
 }
