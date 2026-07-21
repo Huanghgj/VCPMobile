@@ -33,6 +33,16 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     >
   >({});
   const activeStreamTotal = ref(0);
+  const pendingGenerations = reactive<
+    Record<
+      string,
+      {
+        token: string;
+        ownerType: "agent" | "group";
+        requestId?: string;
+      }
+    >
+  >({});
   const auroraActiveMessageIds = new Set<string>();
   const sealedStreamMessageIds = new Set<string>();
   const terminalStreamMessageIds = new Set<string>();
@@ -218,6 +228,21 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     return new Set(sessionActiveStreams.value[key] || []);
   });
 
+  const currentSessionKey = computed(() => {
+    const ownerId = sessionStore.currentSelectedItem?.id;
+    const topicId = sessionStore.currentTopicId;
+    return ownerId && topicId ? `${ownerId}:${topicId}` : null;
+  });
+
+  const isCurrentSessionGenerating = computed(() => {
+    const key = currentSessionKey.value;
+    if (!key) return false;
+    return Boolean(
+      (sessionActiveStreams.value[key]?.length || 0) > 0 ||
+        pendingGenerations[key],
+    );
+  });
+
   const allActiveStreamingIds = computed(() => {
     return new Set(Object.keys(activeStreamRefCounts));
   });
@@ -247,8 +272,30 @@ export const useChatStreamStore = defineStore("chatStream", () => {
       return false;
     const key = `${sessionStore.currentSelectedItem.id}:${sessionStore.currentTopicId}`;
     const streams = sessionActiveStreams.value[key];
-    return streams ? streams.length > 0 : false;
+    return Boolean((streams?.length || 0) > 0 || pendingGenerations[key]);
   });
+
+  const beginGeneration = (
+    ownerId: string,
+    ownerType: "agent" | "group",
+    topicId: string,
+    requestId?: string,
+  ) => {
+    const token = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    pendingGenerations[`${ownerId}:${topicId}`] = {
+      token,
+      ownerType,
+      requestId,
+    };
+    return token;
+  };
+
+  const endGeneration = (ownerId: string, topicId: string, token: string) => {
+    const key = `${ownerId}:${topicId}`;
+    if (pendingGenerations[key]?.token === token) {
+      delete pendingGenerations[key];
+    }
+  };
 
   // 全局流消息池上限，防止极端场景下 OOM
   const MAX_STREAM_MESSAGES = 100;
@@ -939,7 +986,12 @@ export const useChatStreamStore = defineStore("chatStream", () => {
       `[ChatStreamStore] Global Group Interruption for topic: ${topicId}`
     );
     try {
-      await invoke("interruptGroupTurn", { topicId: topicId });
+      const ownerId = sessionStore.currentSelectedItem?.id;
+      const key = ownerId ? `${ownerId}:${topicId}` : "";
+      const turnId = key ? pendingGenerations[key]?.requestId : undefined;
+      await invoke("interruptGroupTurn", { topicId, turnId });
+
+      if (ownerId) delete pendingGenerations[`${ownerId}:${topicId}`];
 
       const activeIds = Array.from(activeStreamingIds.value);
       if (activeIds.length > 0) {
@@ -948,6 +1000,24 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     } catch (e) {
       console.error("[ChatStreamStore] Failed to stop group turn:", e);
     }
+  };
+
+  const stopCurrentGeneration = async () => {
+    const item = sessionStore.currentSelectedItem;
+    const topicId = sessionStore.currentTopicId;
+    if (!item || !topicId) return;
+
+    if (item.type === "group") {
+      await stopGroupTurn(topicId);
+      return;
+    }
+
+    const key = `${item.id}:${topicId}`;
+    const pendingRequestId = pendingGenerations[key]?.requestId;
+    delete pendingGenerations[key];
+    const requestIds = new Set(activeStreamingIds.value);
+    if (pendingRequestId) requestIds.add(pendingRequestId);
+    await Promise.all(Array.from(requestIds, (id) => stopMessage(id)));
   };
 
   onScopeDispose(() => {
@@ -973,22 +1043,30 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     for (const id of Object.keys(activeStreamContexts)) {
       delete activeStreamContexts[id];
     }
+    for (const key of Object.keys(pendingGenerations)) {
+      delete pendingGenerations[key];
+    }
   });
 
   return {
     streamingMessageId,
     sessionActiveStreams,
     activeStreamMessages,
+    pendingGenerations,
     allActiveStreamingIds,
     activeStreamingIds,
+    isCurrentSessionGenerating,
     isGroupGenerating,
     isMessageInActiveStream,
     isMessageStreamingInSession,
     computeShell,
     addSessionStream,
     removeSessionStream,
+    beginGeneration,
+    endGeneration,
     processStreamEvent,
     stopMessage,
     stopGroupTurn,
+    stopCurrentGeneration,
   };
 });

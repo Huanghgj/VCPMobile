@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch, nextTick, onUnmounted } from "vue";
+import { computed, ref, watch, nextTick } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import type { ChatMessage, ContentBlock } from "../../core/types/chat";
 import { useOverlayStore } from "../../core/stores/overlay";
@@ -9,20 +9,25 @@ import { useChatStreamStore } from "../../core/stores/chatStreamStore";
 import { useNotificationStore } from "../../core/stores/notification";
 import { useMessageEvents } from "../../core/composables/useMessageEvents";
 import { useEmoticonFixer } from "../../core/composables/useEmoticonFixer";
-import { renderMarkdownNodes } from "../../core/utils/astRenderer";
-import { renderSafeMarkdown } from "../../core/utils/safeMarkdown";
 import {
   getKatexRenderer,
   getMermaidRenderer,
 } from "../../core/utils/renderLibraryPreloader";
 import {
-  applyFrame,
-  cleanupRegistry,
-  rebuildSnapshot,
-} from "../../core/utils/astExecutor";
-import { useMessageStyleInjector } from "../../core/composables/useMessageStyleInjector";
-import { Copy, Edit2, RotateCcw, Trash2, StopCircle, Bug } from "lucide-vue-next";
-import morphdom from "morphdom";
+  blockContainsRichHtml,
+  compileRenderFragment,
+  createRenderDocument,
+  isRenderDocumentBlock,
+  RENDER_DOCUMENT_VERSION,
+} from "../../core/utils/renderDocument";
+import {
+  Copy,
+  Edit2,
+  RotateCcw,
+  Trash2,
+  StopCircle,
+  Bug,
+} from "lucide-vue-next";
 
 const { processEmoticonsInContainer } = useEmoticonFixer();
 const mermaidCache = new Map<string, string>();
@@ -48,6 +53,7 @@ import MessageHeader from "./components/MessageHeader.vue";
 import ThinkingIndicator from "./components/ThinkingIndicator.vue";
 import StreamingTag from "./components/StreamingTag.vue";
 import AttachmentPreview from "./attachment/AttachmentPreview.vue";
+import RenderDocumentBlock from "./components/RenderDocumentBlock.vue";
 
 // Interactive Block Components
 import ToolBlock from "./blocks/ToolBlock.vue";
@@ -67,183 +73,6 @@ const notificationStore = useNotificationStore();
 const historyStore = useChatHistoryStore();
 const sessionStore = useChatSessionStore();
 const streamStore = useChatStreamStore();
-
-function isAstDebugEnabled(): boolean {
-  return Boolean(import.meta.env.DEV && (window as any).__VCP_AST_DEBUG__);
-}
-
-function astDebugLog(...args: unknown[]): void {
-  if (isAstDebugEnabled()) {
-    console.warn(...args);
-  }
-}
-
-// === AST Diff Feature Flags & Refs ===
-const tailSandboxRef = ref<HTMLElement | null>(null);
-const enableAstDiff = ref(true); // Feature Flag, 默认开启
-
-function inlineNodesContainRawHtml(nodes?: any[]): boolean {
-  if (!nodes || nodes.length === 0) return false;
-  return nodes.some((node) => {
-    if (!node) return false;
-    if (node.type === "raw_html_inline") return true;
-    return inlineNodesContainRawHtml(node.children);
-  });
-}
-
-function markdownNodesContainRawHtml(nodes?: any[]): boolean {
-  if (!nodes || nodes.length === 0) return false;
-  return nodes.some((node) => {
-    if (!node) return false;
-    switch (node.type) {
-      case "raw_html":
-        return true;
-      case "paragraph":
-      case "heading":
-        return inlineNodesContainRawHtml(node.children);
-      case "blockquote":
-        return markdownNodesContainRawHtml(node.children);
-      case "list":
-        return (node.items || []).some((itemNodes: any[]) =>
-          markdownNodesContainRawHtml(itemNodes),
-        );
-      case "table":
-        return (
-          (node.header || []).some((cell: any[]) =>
-            inlineNodesContainRawHtml(cell),
-          ) ||
-          (node.rows || []).some((row: any[]) =>
-            row.some((cell: any[]) => inlineNodesContainRawHtml(cell)),
-          )
-        );
-      default:
-        return false;
-    }
-  });
-}
-
-function rawHtmlLooksLikeRichRoot(content?: string): boolean {
-  if (!content) return false;
-  return (
-    /id\s*=\s*["']vcp-root["']/i.test(content) ||
-    /data-vcp-probe\s*=/i.test(content) ||
-    /style\s*=/i.test(content) ||
-    /<(?:div|section|article|main|table|img|svg|canvas)\b/i.test(content)
-  );
-}
-
-function inlineNodesContainRichHtml(nodes?: any[]): boolean {
-  if (!nodes || nodes.length === 0) return false;
-  return nodes.some((node) => {
-    if (!node) return false;
-    if (node.type === "raw_html_inline") {
-      return rawHtmlLooksLikeRichRoot(node.content);
-    }
-    return inlineNodesContainRichHtml(node.children);
-  });
-}
-
-function markdownNodesContainRichHtml(nodes?: any[]): boolean {
-  if (!nodes || nodes.length === 0) return false;
-  return nodes.some((node) => {
-    if (!node) return false;
-    if (node.type === "raw_html") {
-      return rawHtmlLooksLikeRichRoot(node.content);
-    }
-    if (inlineNodesContainRichHtml(node.children)) return true;
-    if (markdownNodesContainRichHtml(node.children)) return true;
-    if ((node.items || []).some((itemNodes: any[]) => markdownNodesContainRichHtml(itemNodes))) {
-      return true;
-    }
-    if ((node.header || []).some((cell: any[]) => inlineNodesContainRichHtml(cell))) {
-      return true;
-    }
-    return (node.rows || []).some((row: any[]) =>
-      row.some((cell: any[]) => inlineNodesContainRichHtml(cell)),
-    );
-  });
-}
-
-function blockContainsRichHtml(block: ContentBlock): boolean {
-  if (block.type !== "markdown" && block.type !== "diary") return false;
-  if (markdownNodesContainRichHtml(block.nodes)) return true;
-  return rawHtmlLooksLikeRichRoot(block.content);
-}
-
-function tailFrameContainsRawHtml(): boolean {
-  const frame = props.message.tailFrame;
-  if (!frame) return false;
-  if (markdownNodesContainRawHtml(frame.snapshot)) return true;
-  return (frame.mutations || []).some((mutation: any) => {
-    if (markdownNodesContainRawHtml([mutation.node])) return true;
-    if (inlineNodesContainRawHtml([mutation.node])) return true;
-    if (mutation.children && markdownNodesContainRawHtml(mutation.children)) {
-      return true;
-    }
-    return false;
-  });
-}
-
-const useAstForCurrentTail = computed(() => {
-  if (!enableAstDiff.value) return false;
-  // 超长 tail 降级保护：当后端因 tail 超过推测渲染上限（64KB）而停止产出 AST 节点时，
-  // tailBlock 会是一个 plain 类型但 nodes 为空的纯文本块。此时必须走原始 tailContent 路径，
-  // 否则 AST 沙箱会因无快照/无指令而留白。判定依据：有 plain tailBlock 却无 nodes。
-  const tb = props.message.tailBlock;
-  if (tb && isPlainBlock(tb.type) && (!tb.nodes || tb.nodes.length === 0)) {
-    return false;
-  }
-  const snapshotNodes =
-    tb?.nodes || props.message.tailSnapshot || props.message.tailFrame?.snapshot;
-  if (markdownNodesContainRawHtml(snapshotNodes)) {
-    return false;
-  }
-  if (tailFrameContainsRawHtml()) {
-    return false;
-  }
-  return (
-    !!props.message.tailFrame ||
-    !!props.message.tailBlock?.nodes ||
-    !!props.message.tailSnapshot
-  );
-});
-let lastAppliedFrameSeq = 0;
-let localTailEpoch = -1;
-let localTailRevision = -1;
-let astFailureCount = 0;
-let lastSandbox: HTMLElement | null = null;
-
-function getTailSnapshotNodes() {
-  // 恢复/重建优先用 tailBlock.nodes（当前帧的完整 tail AST，与后端 prev_tail_ast 的 diff 基线
-  // 完全一致），而非 tailSnapshot（仅在 epoch reset 时刷新，增量增长期间已过期）。
-  // 用过期快照重建会导致 registry 与后端基线错位，后续增量 mutation 接连失败甚至成环。
-  return props.message.tailBlock?.nodes || props.message.tailSnapshot || [];
-}
-
-function rebuildTailSnapshot(sandbox: HTMLElement): void {
-  rebuildSnapshot(getTailSnapshotNodes(), props.message.id, sandbox);
-  localTailEpoch = props.message.tailFrame?.epoch ?? localTailEpoch;
-  localTailRevision = props.message.tailFrame?.revision ?? localTailRevision;
-}
-
-function handleAstFrameFailure(sandbox: HTMLElement, reason: string): void {
-  astFailureCount += 1;
-  astDebugLog(
-    `[AST Diff Recovery] ${props.message.id}: ${reason}. failureCount=${astFailureCount}`,
-  );
-  if (getTailSnapshotNodes().length > 0) {
-    rebuildTailSnapshot(sandbox);
-    // 【意图性设计说明】：此处直接 return 退出，不执行下方的关闭降级逻辑，是有意为之的保活设计。
-    // 在流式输出过程中，哪怕某些中间帧的 AST 增量解析/渲染出现临时局部错乱报错，我们也优先依赖
-    // rebuildTailSnapshot() 在微任务/渲染帧内进行全量快照重刷，而不是彻底降级退回到普通 HTML
-    // 渲染（那会导致流式组件切换、DOM 物理销毁重建以及严重的布局物理抖动和输入框焦点丢失）。
-    return;
-  }
-  if (astFailureCount >= 2) {
-    enableAstDiff.value = false;
-    cleanupRegistry(props.message.id);
-  }
-}
 
 // === Mermaid FullScreen States ===
 const isMermaidFullScreen = ref(false);
@@ -279,18 +108,17 @@ const isStreaming = computed(() => {
   );
 });
 
-const shouldRenderRawContentFallback = computed(() => {
-  if (!props.message.content) return false;
-  if (!isStreaming.value) return true;
-  return !props.message.tailBlock && !props.message.tailContent;
+const renderDocument = computed(() => {
+  const allowFallback =
+    !!props.message.content &&
+    (!isStreaming.value ||
+      (!props.message.tailBlock && !props.message.tailContent));
+  return createRenderDocument(
+    props.message.blocks,
+    props.message.tailBlock,
+    allowFallback ? props.message.content : "",
+  );
 });
-
-const renderedContentFallback = computed(() =>
-  renderSafeMarkdown(props.message.content || "", {
-    allowRichHtml: true,
-    allowStyleAttr: true,
-  }),
-);
 
 function isBrkNode(node: any): boolean {
   if (node.type === "raw_html" && node.content) {
@@ -321,11 +149,15 @@ function splitMarkdownNodes(nodes: any[]): any[][] {
   let currentGroup: any[] = [];
   let hasBrk = false;
   let htmlDepth = 0;
-  
+
   for (const node of nodes) {
     if (node.type === "raw_html" && node.content) {
       const content = node.content.trim().toLowerCase();
-      if (content.startsWith("<div") && !content.endsWith("/>") && !content.includes("</div>")) {
+      if (
+        content.startsWith("<div") &&
+        !content.endsWith("/>") &&
+        !content.includes("</div>")
+      ) {
         htmlDepth++;
       }
       if (content.startsWith("</div")) {
@@ -341,7 +173,7 @@ function splitMarkdownNodes(nodes: any[]): any[][] {
       currentGroup.push(node);
     }
   }
-  
+
   if (hasBrk && currentGroup.length === 0) {
     result.push([]);
   } else if (currentGroup.length > 0) {
@@ -392,8 +224,8 @@ const messageBubbles = computed(() => {
 
   const isUserMsg = shell.value?.isUser;
 
-  if (props.message.blocks && props.message.blocks.length > 0) {
-    for (const block of props.message.blocks) {
+  if (renderDocument.value.blocks.length > 0) {
+    for (const block of renderDocument.value.blocks) {
       if (!isPlainBlock(block.type) || isUserMsg) {
         currentBlocks.push(block);
         continue;
@@ -438,10 +270,10 @@ const messageBubbles = computed(() => {
 
   // 🆕 流式状态下，如果最后一个稳定块是个 brk 块，我们需要额外追加一个空的气泡组以供 tailBlock 打字渲染
   const lastBlockIsBrk =
-    props.message.blocks &&
-    props.message.blocks.length > 0 &&
+    renderDocument.value.blocks.length > 0 &&
     (() => {
-      const last = props.message.blocks[props.message.blocks.length - 1];
+      const last =
+        renderDocument.value.blocks[renderDocument.value.blocks.length - 1];
       return last ? isBrkBlock(last) : false;
     })();
 
@@ -471,7 +303,7 @@ useMessageEvents(messageContentRef);
 
 // === Block Rendering Helper ===
 function isPlainBlock(type: string): boolean {
-  return ["markdown", "diary", "role-divider", "button-click"].includes(type);
+  return isRenderDocumentBlock(type);
 }
 
 function isRenderableTailBlock(type?: string): boolean {
@@ -498,114 +330,21 @@ function getBubbleStyle(bubble: BubbleGroup): Record<string, string> {
     style["border-color"] = "transparent";
     style["box-shadow"] = "none";
     style["padding"] = "0";
+    style["width"] = "100%";
+    style["min-width"] = "0";
+    style["max-width"] = "100%";
   }
   return style;
 }
 
-function getMarkdownBlockShell(block: ContentBlock): { className: string; attrs: string } {
-  if (!blockContainsRichHtml(block)) {
-    return {
-      className: "vcp-markdown-block",
-      attrs: "",
-    };
-  }
-  return {
-    className: "vcp-markdown-block vcp-rich-html-block",
-    attrs: ' data-vcp-rich-html="true"',
-  };
-}
-
 function renderBlockHtml(block: ContentBlock): string {
-  switch (block.type) {
-    case "markdown":
-      if (block.nodes && block.nodes.length > 0) {
-        if (
-          block.nodes.length === 1 &&
-          block.nodes[0].type === "raw_html" &&
-          block.nodes[0].content?.trimStart().toLowerCase().startsWith("<style")
-        ) {
-          const content = block.nodes[0].content;
-          let cssContent = "";
-          content.replace(
-            /<style\b[^>]*>([\s\S]*?)(?:<\/style>|$)/gi,
-            (_, css) => {
-              cssContent += css.trim() + "\n";
-              return "";
-            },
-          );
-          if (cssContent.trim().length > 0) {
-            injectScopedCss(cssContent, props.message.id);
-          }
-          return ""; // Keep unclosed style invisible in chat body
-        }
-        const shell = getMarkdownBlockShell(block);
-        return `<div class="${shell.className}"${shell.attrs}>${renderMarkdownNodes(block.nodes, props.message.id, block.hash)}</div>`;
-      }
-      const shell = getMarkdownBlockShell(block);
-      return `<div class="${shell.className}"${shell.attrs}>${renderSafeMarkdown(block.content || "", { allowRichHtml: true, allowStyleAttr: true })}</div>`;
-
-    case "diary": {
-      const diaryContent =
-        block.nodes && block.nodes.length > 0
-          ? renderMarkdownNodes(block.nodes, props.message.id, block.hash)
-          : renderSafeMarkdown(block.content || "", {
-              allowRichHtml: true,
-              allowStyleAttr: true,
-            });
-      return `
-        <div class="vcp-diary-block">
-          <div class="vcp-diary-header">
-            <span class="vcp-diary-title">Maid's Diary</span>
-            ${block.date ? `<span class="vcp-diary-date">${escapeHtml(block.date)}</span>` : ""}
-          </div>
-          ${
-            block.maid
-              ? `
-            <div class="vcp-diary-maid-info">
-              <span class="diary-maid-label">Maid:</span>
-              <span class="vcp-diary-maid-name">${escapeHtml(block.maid)}</span>
-            </div>
-          `
-              : ""
-          }
-          <div class="vcp-diary-content vcp-markdown-block">${diaryContent}</div>
-        </div>
-      `;
-    }
-
-    case "role-divider":
-      const role = block.role || "unknown";
-      const roleDisplay = role.charAt(0).toUpperCase() + role.slice(1);
-      const actionText = block.is_end ? "[结束]" : "[起始]";
-      const roleClass = `role-${role.toLowerCase()}`;
-      const typeClass = block.is_end ? "type-end" : "type-start";
-
-      return `
-        <div class="vcp-role-divider ${roleClass} ${typeClass}">
-          <span class="divider-text">角色分界: ${roleDisplay} ${actionText}</span>
-        </div>
-      `;
-
-    case "button-click": {
-      const escapedContent = escapeHtml(block.content || "");
-      const finalText = `[[点击按钮:${block.content || ""}]]`;
-      return `
-        <div class="inline-block px-3 py-1 bg-black/10 dark:bg-white/10 rounded-full text-[10px] font-bold opacity-70 my-1 cursor-pointer active:opacity-40 transition-opacity select-none border border-black/5 dark:border-white/5 active:scale-95 duration-75 transform"
-             data-vcp-button="${escapeHtml(finalText)}">
-          ${escapedContent}
-        </div>
-      `;
-    }
-
-    case "style":
-      return "";
-
-    default:
-      return "";
-  }
+  return compileRenderFragment(block, props.message.id).html;
 }
 
-function walkInlineDebug(nodes: any[] | undefined, stats: Record<string, number>) {
+function walkInlineDebug(
+  nodes: any[] | undefined,
+  stats: Record<string, number>,
+) {
   for (const node of nodes || []) {
     if (!node?.type) continue;
     stats[`inline:${node.type}`] = (stats[`inline:${node.type}`] || 0) + 1;
@@ -619,7 +358,10 @@ function walkInlineDebug(nodes: any[] | undefined, stats: Record<string, number>
   }
 }
 
-function walkMarkdownDebug(nodes: any[] | undefined, stats: Record<string, number>) {
+function walkMarkdownDebug(
+  nodes: any[] | undefined,
+  stats: Record<string, number>,
+) {
   for (const node of nodes || []) {
     if (!node?.type) continue;
     stats[`node:${node.type}`] = (stats[`node:${node.type}`] || 0) + 1;
@@ -647,9 +389,12 @@ function summarizeBlocksForDebug(blocks: ContentBlock[] | undefined) {
   }, {});
   const stats: Record<string, number> = {};
   for (const block of list) {
-    if (block.type === "html-preview") stats.htmlPreview = (stats.htmlPreview || 0) + 1;
-    if (block.type === "button-click") stats.buttonClick = (stats.buttonClick || 0) + 1;
-    if (block.type === "style") stats.styleBlocks = (stats.styleBlocks || 0) + 1;
+    if (block.type === "html-preview")
+      stats.htmlPreview = (stats.htmlPreview || 0) + 1;
+    if (block.type === "button-click")
+      stats.buttonClick = (stats.buttonClick || 0) + 1;
+    if (block.type === "style")
+      stats.styleBlocks = (stats.styleBlocks || 0) + 1;
     walkMarkdownDebug(block.nodes, stats);
   }
   return {
@@ -662,8 +407,9 @@ function summarizeBlocksForDebug(blocks: ContentBlock[] | undefined) {
       hash: block.hash,
       contentLength: block.content?.length || block.raw_content?.length || 0,
       nodeCount: block.nodes?.length || 0,
-      hasRawHtml: markdownNodesContainRawHtml(block.nodes),
-      htmlPreviewLength: block.type === "html-preview" ? block.content?.length || 0 : undefined,
+      hasRawHtml: blockContainsRichHtml(block),
+      htmlPreviewLength:
+        block.type === "html-preview" ? block.content?.length || 0 : undefined,
       toolName: block.tool_name,
       status: block.status,
       role: block.role,
@@ -672,7 +418,9 @@ function summarizeBlocksForDebug(blocks: ContentBlock[] | undefined) {
   };
 }
 
-function renderBlocksForDebug(blocks: ContentBlock[]): Array<Record<string, unknown>> {
+function renderBlocksForDebug(
+  blocks: ContentBlock[],
+): Array<Record<string, unknown>> {
   return blocks.map((block, index) => {
     let html = "";
     let error = "";
@@ -698,7 +446,9 @@ function renderBlocksForDebug(blocks: ContentBlock[]): Array<Record<string, unkn
   });
 }
 
-function readElementStyleForDebug(element: Element | null): Record<string, unknown> | null {
+function readElementStyleForDebug(
+  element: Element | null,
+): Record<string, unknown> | null {
   if (!(element instanceof HTMLElement)) return null;
   const style = window.getComputedStyle(element);
   const rect = element.getBoundingClientRect();
@@ -787,6 +537,7 @@ function buildRenderDebugReport(
   return JSON.stringify(
     {
       message: {
+        renderDocumentVersion: RENDER_DOCUMENT_VERSION,
         id: props.message.id,
         role: props.message.role,
         name: props.message.name,
@@ -831,9 +582,12 @@ function buildRenderDebugReport(
 async function openRenderDebugReport(getFullText: () => Promise<string>) {
   try {
     const rawContent = await getFullText();
-    const reparsedBlocks = await invoke<ContentBlock[]>("process_message_content", {
-      content: rawContent,
-    });
+    const reparsedBlocks = await invoke<ContentBlock[]>(
+      "process_message_content",
+      {
+        content: rawContent,
+      },
+    );
     overlayStore.openEditor({
       title: "渲染解析诊断",
       initialValue: buildRenderDebugReport(rawContent, reparsedBlocks),
@@ -894,6 +648,7 @@ function enhanceMermaid(el: HTMLElement, sourceCode: string) {
     "absolute top-3 right-3 z-10 flex items-center justify-center w-8 h-8 rounded-lg border border-black/5 dark:border-white/10 bg-white/80 dark:bg-black/80 text-gray-500 dark:text-gray-400 opacity-0 group-hover:opacity-100 active:scale-90 transition-all duration-200 cursor-pointer shadow-sm";
   fullscreenBtn.innerHTML = '<div class="i-ph:arrows-out-bold w-4 h-4"></div>';
   fullscreenBtn.title = "全屏查看图表";
+  fullscreenBtn.dataset.vcpUiControl = "mermaid-fullscreen";
 
   wrapper.addEventListener("click", (e) => {
     e.stopPropagation();
@@ -915,7 +670,7 @@ const renderHeavyContent = async () => {
   await nextTick();
   if (!messageContentRef.value) return;
 
-  // 1. KaTeX math (inline + display mode, rendered inside markdown blocks via v-html)
+  // 1. KaTeX math (inline + display mode, rendered inside Renderer V2 blocks)
   const mathElements = Array.from(
     messageContentRef.value.querySelectorAll(
       ".vcp-math-inline[data-latex], .vcp-math-block[data-latex]",
@@ -1162,241 +917,6 @@ function formatTime(ts: number) {
   const minutes = String(date.getMinutes()).padStart(2, "0");
   return `${year}-${month}-${day} ${hours}:${minutes}`;
 }
-
-// === Style Block CSS Injection ===
-const { injectScopedCss, removeScopedCss } = useMessageStyleInjector();
-let injectedStyleSignature = "";
-
-watch(
-  () => props.message.blocks,
-  (blocks) => {
-    if (!blocks) {
-      if (injectedStyleSignature) {
-        removeScopedCss(props.message.id);
-        injectedStyleSignature = "";
-      }
-      return;
-    }
-    const styleBlocks = blocks.filter(
-      (block) => block.type === "style" && block.content,
-    );
-    const styleSignature = styleBlocks
-      .map((block) => block.hash || block.content)
-      .join("|");
-    if (!styleSignature) {
-      if (injectedStyleSignature) {
-        removeScopedCss(props.message.id);
-        injectedStyleSignature = "";
-      }
-      return;
-    }
-    if (styleSignature === injectedStyleSignature) return;
-    removeScopedCss(props.message.id);
-    injectedStyleSignature = styleSignature;
-
-    injectScopedCss(
-      styleBlocks.map((block) => block.content || "").join("\n"),
-      props.message.id,
-    );
-  },
-  { immediate: true },
-);
-
-// === Stream Tail Morphdom Smooth Rendering ===
-const tailRootRef = ref<HTMLElement | null>(null);
-const fallbackTailSignature = computed(() => {
-  const block = props.message.tailBlock;
-  if (!block) return "";
-
-  const contentSignal =
-    block.hash !== undefined && block.hash !== null
-      ? String(block.hash)
-      : block.content || "";
-
-  return [block.type, contentSignal, block.nodes?.length ?? 0].join("|");
-});
-
-watch(
-  fallbackTailSignature,
-  () => {
-    const newTailBlock = props.message.tailBlock;
-    if (useAstForCurrentTail.value) return; // 🆕 启用 AST Diff 且有节点时跳过 Morphdom
-    if (!newTailBlock || !isPlainBlock(newTailBlock.type)) return;
-    nextTick(() => {
-      if (!tailRootRef.value) return;
-      const html = renderBlockHtml(newTailBlock);
-
-      // 实时提取未闭合/已闭合的 <style> 并物理抹除以防 morphdom 崩溃
-      let cssContent = "";
-      const processedHtml = html.replace(
-        /<style\b[^>]*>([\s\S]*?)(?:<\/style>|$)/gi,
-        (_, css) => {
-          cssContent += css.trim() + "\n";
-          return ""; // 从正文 HTML 中抹除 style 标签
-        },
-      );
-
-      if (cssContent.trim().length > 0) {
-        injectScopedCss(cssContent, props.message.id);
-      }
-
-      try {
-        morphdom(tailRootRef.value, `<div>${processedHtml}</div>`, {
-          childrenOnly: true,
-          getNodeKey: (node: Node) => {
-            if (!node || node.nodeType !== 1) return undefined;
-            const el = node as Element;
-            return el.id || el.getAttribute("data-vcp-key") || undefined;
-          },
-          onBeforeElUpdated: (fromEl: HTMLElement, toEl: HTMLElement) => {
-            if (fromEl.isEqualNode(toEl)) return false;
-
-            // 1. 保留可能存在的过渡/动画 class，防止 morphdom 移除它们
-            const animClasses = [
-              "vcp-stream-element-fade-in",
-              "animate-fade-in",
-              "vcp-stream-content-pulse",
-            ];
-            for (const cls of animClasses) {
-              if (fromEl.classList.contains(cls)) {
-                toEl.classList.add(cls);
-              }
-            }
-
-            // 2. 保留媒体播放状态
-            if (fromEl.tagName === "VIDEO" || fromEl.tagName === "AUDIO") {
-              const mediaEl = fromEl as HTMLMediaElement;
-              if (!mediaEl.paused) return false;
-            }
-
-            // 3. 保留输入焦点
-            if (fromEl === document.activeElement) {
-              requestAnimationFrame(() => {
-                if (toEl && typeof toEl.focus === "function") toEl.focus();
-              });
-            }
-
-            // 4. 保留已加载图片的可见性和状态，防止重新加载闪烁
-            if (fromEl.tagName === "IMG") {
-              const fromImg = fromEl as HTMLImageElement;
-              const toImg = toEl as HTMLImageElement;
-              if (fromImg.onerror && !toImg.onerror)
-                toImg.onerror = fromImg.onerror;
-              if (fromImg.onload && !toImg.onload)
-                toImg.onload = fromImg.onload;
-              if (fromImg.style.visibility)
-                toImg.style.visibility = fromImg.style.visibility;
-              if (fromImg.complete && fromImg.naturalWidth > 0) return false;
-            }
-
-            return true;
-          },
-        });
-      } catch (e) {
-        console.debug("[TailMorphdom] Skipped frame:", e);
-      }
-    });
-  },
-  { immediate: true, flush: "post" },
-);
-
-// === AST Diff Executor ===
-
-watch(
-  [
-    () => props.message.tailFrame,
-    () => props.message.tailSnapshot,
-    tailSandboxRef,
-  ],
-  ([frame, _snapshot, sandbox]) => {
-    astDebugLog(
-      `[AST Diff Watch] Msg ${props.message.id} frame=${frame ? frame.frameSeq : "none"}, mutations=${frame?.mutations?.length || 0}, sandbox=${sandbox ? "Ready" : "Null"}, epoch=${frame?.epoch}, revision=${frame?.revision}`,
-    );
-
-    if (!useAstForCurrentTail.value || !sandbox) {
-      if (lastSandbox) {
-        cleanupRegistry(props.message.id);
-        lastSandbox.innerHTML = "";
-        lastSandbox = null;
-      }
-      return;
-    }
-
-    if (lastSandbox !== sandbox) {
-      cleanupRegistry(props.message.id);
-      sandbox.innerHTML = "";
-      lastAppliedFrameSeq = 0;
-      localTailEpoch = -1;
-      localTailRevision = -1;
-      lastSandbox = sandbox;
-      if (getTailSnapshotNodes().length > 0) {
-        rebuildTailSnapshot(sandbox); // 内部已将 localTailEpoch/Revision 同步到当前 frame
-        astFailureCount = 0;
-        // 认领当前帧，避免下方 reset 分支对同一帧重复重建（新 sandbox 时 localTailEpoch 刚被重置，
-        // epochChanged 必为真，会触发第二次全量重建）。重建已用当前完整 tail AST，无需再来一次。
-        if (frame) {
-          lastAppliedFrameSeq = frame.frameSeq;
-        }
-      }
-    }
-
-    if (!frame) {
-      return;
-    }
-
-    if (frame.frameSeq <= lastAppliedFrameSeq) {
-      return;
-    }
-
-    const incomingEpoch = frame.epoch ?? 0;
-    const incomingRevision = frame.revision ?? -1;
-    const epochChanged = incomingEpoch !== localTailEpoch;
-    const explicitReset = frame.reset === true || epochChanged;
-
-    if (explicitReset) {
-      sandbox.innerHTML = "";
-      cleanupRegistry(props.message.id);
-      localTailEpoch = incomingEpoch;
-      localTailRevision = incomingRevision;
-      lastAppliedFrameSeq = frame.frameSeq;
-      astFailureCount = 0;
-
-      const snapshot = frame.snapshot || getTailSnapshotNodes();
-      if (snapshot.length > 0) {
-        rebuildSnapshot(snapshot, props.message.id, sandbox);
-        return;
-      }
-    }
-
-    const mutations = frame.mutations || [];
-    if (mutations.length === 0) {
-      lastAppliedFrameSeq = frame.frameSeq;
-      localTailRevision = incomingRevision;
-      return;
-    }
-
-    astDebugLog(
-      `[AST Diff Apply] Executing frame ${frame.frameSeq} (${mutations.length} mutations) for ${props.message.id}`,
-    );
-    const result = applyFrame(mutations, props.message.id, sandbox);
-    if (result.ok) {
-      lastAppliedFrameSeq = frame.frameSeq;
-      localTailRevision = incomingRevision;
-      astFailureCount = 0;
-    } else {
-      handleAstFrameFailure(
-        sandbox,
-        result.failed?.reason || "applyFrame failed",
-      );
-    }
-  },
-  { flush: "post", immediate: true },
-);
-
-onUnmounted(() => {
-  removeScopedCss(props.message.id);
-  cleanupRegistry(props.message.id);
-});
 </script>
 
 <template>
@@ -1442,14 +962,14 @@ onUnmounted(() => {
             class="vcp-content-blocks space-y-2 min-w-0 w-full overflow-hidden"
           >
             <template v-if="bubble.blocks && bubble.blocks.length > 0">
-              <template
-                v-for="block in bubble.blocks"
-                :key="block.__renderKey"
-              >
+              <template v-for="block in bubble.blocks" :key="block.__renderKey">
                 <div>
-                  <div
+                  <RenderDocumentBlock
                     v-if="isPlainBlock(block.type)"
-                    v-html="renderBlockHtml(block)"
+                    :block="block"
+                    :message-id="message.id"
+                    :source-id="block.__renderKey"
+                    @rendered="renderHeavyContent"
                   />
 
                   <ToolBlock
@@ -1466,7 +986,9 @@ onUnmounted(() => {
                     v-else-if="block.type === 'thought'"
                     :block="block"
                     :message-id="message.id"
+                    :source-id="block.__renderKey"
                     :default-expanded="isMessageInActiveStream"
+                    @rendered="renderHeavyContent"
                   />
 
                   <HtmlPreviewBlock
@@ -1485,15 +1007,6 @@ onUnmounted(() => {
                 </div>
               </template>
             </template>
-            <template
-              v-else-if="bubbleIndex === 0 && shouldRenderRawContentFallback"
-            >
-              <div
-                class="vcp-markdown-block select-text"
-                v-html="renderedContentFallback"
-              />
-            </template>
-
             <!-- 尾部流式推测渲染（只对最后一个活跃气泡生效，且正在流式、有 tailBlock 时渲染，完美拼合在气泡正文末尾） -->
             <div
               v-if="
@@ -1503,30 +1016,13 @@ onUnmounted(() => {
               "
               class="streaming-tail opacity-90"
             >
-              <div
-                v-if="
-                  useAstForCurrentTail && isPlainBlock(message.tailBlock.type)
-                "
-              >
-                <div
-                  :ref="
-                    (el) => {
-                      tailSandboxRef = el as HTMLElement | null;
-                    }
-                  "
-                  class="vcp-markdown-block vcp-ast-sandbox"
-                />
-              </div>
-              <div
-                v-else-if="
-                  !useAstForCurrentTail && isPlainBlock(message.tailBlock.type)
-                "
-                :ref="
-                  (el) => {
-                    tailRootRef = el as HTMLElement | null;
-                  }
-                "
-                class="vcp-markdown-block"
+              <RenderDocumentBlock
+                v-if="isPlainBlock(message.tailBlock.type)"
+                :block="message.tailBlock"
+                :message-id="message.id"
+                source-id="stream-tail"
+                streaming
+                @rendered="renderHeavyContent"
               />
               <ToolBlock
                 v-else-if="
@@ -1542,7 +1038,9 @@ onUnmounted(() => {
                 v-else-if="message.tailBlock.type === 'thought'"
                 :block="message.tailBlock"
                 :message-id="message.id"
+                source-id="stream-tail-thought"
                 :default-expanded="isMessageInActiveStream"
+                @rendered="renderHeavyContent"
               />
               <HtmlPreviewBlock
                 v-else-if="message.tailBlock.type === 'html-preview'"

@@ -88,6 +88,8 @@ const { initGlobalFixer } = useEmoticonFixer();
 const { isPromptOpen, updateInfo, handleConfirm, handleDismiss } =
   useAutoUpdate();
 const router = useRouter();
+const isRendererProbe =
+  import.meta.env.DEV && window.location.hash.startsWith("#/renderer-v2-probe");
 
 const { initRootHistory } = useModalHistory();
 
@@ -485,6 +487,11 @@ const handleFloatingBallClick = async () => {
 };
 
 onMounted(async () => {
+  if (isRendererProbe) {
+    await router.isReady();
+    return;
+  }
+
   // 环境探测：若是原生悬浮窗模式，Tauri API 可能不可用，优先通过 URL 判断
   isAssistant.value = window.location.search.includes("mode=floating");
 
@@ -496,9 +503,6 @@ onMounted(async () => {
       // 忽略非 Tauri 环境下的错误
     }
   }
-
-  // Android WebView 省电默认档：装饰性无限动画不自动跑，点击/加载态再动。
-  document.documentElement.classList.add("vcp-battery-static");
 
   // 1. 同步挂载基础物理按键与系统事件监听 (混合应用黄金铁律：物理拦截最优先挂载，杜绝初始化阻塞失效)
   window.addEventListener("vcp-exit-requested", handleExitRequest);
@@ -578,7 +582,6 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
-  document.documentElement.classList.remove("vcp-battery-static");
   if (unlistenLog) unlistenLog();
   unlistenLog = null;
   if (unlistenLifecycleJobs) unlistenLifecycleJobs();
@@ -619,7 +622,7 @@ onUnmounted(() => {
     <PermissionGate v-if="lifecycleStore.state === 'PERMISSIONS'" />
 
     <!-- 0.5. 全局初始化加载层 & 错误看板 -->
-    <BootScreen v-else />
+    <BootScreen v-else-if="!isRendererProbe" />
 
     <!-- 1. 背景底层 -->
     <Transition name="bg-fade">
@@ -783,31 +786,6 @@ body,
 .vcp-paused-animations *::before,
 .vcp-paused-animations *::after {
   animation-play-state: paused !important;
-}
-
-/* Android WebView 省电护栏：默认停掉装饰性无限动画，流式状态也只保留静态反馈。 */
-.vcp-battery-static .vcp-decorative-motion,
-.vcp-battery-static .vcp-decorative-motion::before,
-.vcp-battery-static .vcp-decorative-motion::after {
-  animation: none !important;
-  transition-duration: 0.01ms !important;
-  will-change: auto !important;
-}
-
-.vcp-battery-static .streaming .vcp-bubble-container::before,
-.vcp-battery-static .thinking-dots span,
-.vcp-battery-static .custom-ping,
-.vcp-battery-static .vcp-tool-block.is-tool-use,
-.vcp-battery-static .vcp-tool-block.is-tool-use::after,
-.vcp-battery-static .streaming-tail,
-.vcp-battery-static .streaming-tail * {
-  animation: none !important;
-  transition-duration: 0.01ms !important;
-  will-change: auto !important;
-}
-
-.vcp-battery-static .streaming .vcp-bubble-container::before {
-  opacity: 0.35 !important;
 }
 
 @media (prefers-reduced-motion: reduce) {

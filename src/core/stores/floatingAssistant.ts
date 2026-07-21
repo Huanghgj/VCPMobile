@@ -215,7 +215,12 @@ export const useFloatingAssistantStore = defineStore(
         if (!target) {
           target = messages.value.find((m) => m.isThinking);
         }
-        if (target) target.isThinking = false;
+        if (target) {
+          target.isThinking = false;
+          if (typeof data.content === "string") {
+            target.content = data.content;
+          }
+        }
         currentStreamingMessageId.value = null;
       } else if (data.type === "error") {
         isGenerating.value = false;

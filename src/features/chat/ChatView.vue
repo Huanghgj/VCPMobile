@@ -45,7 +45,7 @@ const chatViewContainerRef = ref<HTMLElement | null>(null);
 // const bottomSentinelRef = ref<HTMLElement | null>(null);
 
 // 流式状态
-const isStreamingActive = computed(() => streamStore.activeStreamingIds.size > 0);
+const isStreamingActive = computed(() => streamStore.isCurrentSessionGenerating);
 const currentTopicTitle = computed(() => {
   const topicId = sessionStore.currentTopicId;
   if (topicId) {

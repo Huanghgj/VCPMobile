@@ -344,7 +344,7 @@ watch(input, () => {
 });
 
 // 是否正在生成中
-const isGenerating = computed(() => streamStore.activeStreamingIds.size > 0);
+const isGenerating = computed(() => streamStore.isCurrentSessionGenerating);
 
 // 是否有内容可发送
 const hasContent = computed(() => input.value.trim() !== '' || attachmentStore.stagedAttachments.length > 0);
@@ -400,8 +400,7 @@ const handleSend = () => {
 
 const handleAction = () => {
   if (isGenerating.value) {
-    const activeIds = Array.from(streamStore.activeStreamingIds);
-    activeIds.forEach(id => streamStore.stopMessage(id as string));
+    void streamStore.stopCurrentGeneration();
   } else {
     handleSend();
   }

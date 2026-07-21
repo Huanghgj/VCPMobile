@@ -21,6 +21,10 @@ const DEBUG_ASSISTANT_RENDER_PROBE = [
   "mode:「始」debug「末」,",
   "prompt:「始」safe render probe image「末」",
   "<<<[END_TOOL_REQUEST]>>>",
+  "<<<[TOOL_REQUEST]>>>",
+  "maid:「始」RenderProbe「末」,",
+  "tool_name:「始」BoundaryRecoveryProbe「末」,",
+  "prompt:「始」this request intentionally omits its closing marker",
   "<<<[ROLE_DIVIDE_USER]>>>",
   "",
   "[[VCP调用结果信息汇总:",
@@ -55,7 +59,18 @@ const DEBUG_ASSISTANT_RENDER_PROBE = [
   "",
   "<p>如果你能看到蓝色图片和这个浅色容器，说明最终 HTML 没有被工具结果或角色分隔符吞掉。</p>",
   "",
-  "</div>",
+  "</div><<<[TOOL_REQUEST]>>>",
+  "maid:「始」RenderProbe「末」,",
+  "tool_name:「始」DailyNote「末」,",
+  "command:「始」create「末」,",
+  "Date:「始」2026-07-20「末」,",
+  "Content:「始ESCAPE」Boundary recovery diary body.「末ESCAPE」,",
+  "archery:「始」no_reply「末」",
+  "<<<[END_TOOL_REQUEST]>>><details data-probe=\"details-body\">",
+  "<summary><b>Boundary recovery details</b></summary>",
+  "",
+  "Boundary recovery final details body remains visible.",
+  "</details>",
 ].join("\n");
 
 export const useChatHistoryStore = defineStore("chatHistory", () => {
@@ -391,6 +406,18 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     const settings = settingsStore.settings;
     if (!settings) throw new Error("应用尚未完成初始化");
 
+    const responseMessageId = turnSource === "lifecycle_scheduled"
+      ? undefined
+      : target.ownerType === "agent"
+        ? `msg_${agentId}_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`
+        : `group-turn-${topicId}-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    const generationToken = streamStore.beginGeneration(
+      target.ownerId,
+      target.ownerType,
+      topicId,
+      responseMessageId,
+    );
+
     const streamChannel = new Channel<any>();
     streamChannel.onmessage = (event) => streamStore.processStreamEvent(event, {
       onMessageCreated: (msg, tid) => {
@@ -406,32 +433,38 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
       }
     });
 
-    if (target.ownerType === "group") {
-      const result = await invoke<{ messageId?: string }>("handle_group_chat_message", {
-        payload: {
-          groupId: target.ownerId,
-          topicId,
-          userMessage: userMsg,
-          turnSource,
-          vcpUrl: settings.vcpServerUrl || "",
-          vcpApiKey: settings.vcpApiKey || "",
-        },
-        streamChannel
-      });
-      return { started: true, messageId: result?.messageId };
-    } else {
+    try {
+      if (target.ownerType === "group") {
+        const result = await invoke<{ messageId?: string }>("handle_group_chat_message", {
+          payload: {
+            groupId: target.ownerId,
+            topicId,
+            userMessage: userMsg,
+            turnSource,
+            turnId: responseMessageId,
+            vcpUrl: settings.vcpServerUrl || "",
+            vcpApiKey: settings.vcpApiKey || "",
+          },
+          streamChannel
+        });
+        return { started: true, messageId: result?.messageId };
+      }
+
       const result = await invoke<{ messageId?: string }>("handle_agent_chat_message", {
         payload: {
           agentId,
           topicId,
           userMessage: userMsg,
           turnSource,
+          responseMessageId,
           vcpUrl: settings.vcpServerUrl || "",
           vcpApiKey: settings.vcpApiKey || "",
         },
         streamChannel
       });
       return { started: true, messageId: result?.messageId };
+    } finally {
+      streamStore.endGeneration(target.ownerId, topicId, generationToken);
     }
   };
 
@@ -505,7 +538,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     ) {
       return false;
     }
-    if (streamStore.activeStreamingIds.size > 0) return false;
+    if (streamStore.isCurrentSessionGenerating) return false;
 
     const now = Date.now();
     const userMsg: ChatMessage = {
@@ -537,7 +570,11 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     action: string;
   }) => {
     const sessionKey = job.ownerId + ":" + job.topicId;
-    if (!job.intent.trim() || (streamStore.sessionActiveStreams[sessionKey]?.length || 0) > 0) {
+    if (
+      !job.intent.trim() ||
+      (streamStore.sessionActiveStreams[sessionKey]?.length || 0) > 0 ||
+      Boolean(streamStore.pendingGenerations[sessionKey])
+    ) {
       return null;
     }
     const now = Date.now();
@@ -613,7 +650,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
    * 发送消息
    */
   const sendMessage = async (content: string) => {
-    if (!sessionStore.currentSelectedItem || !sessionStore.currentTopicId || (!content.trim() && attachmentStore.stagedAttachments.length === 0)) return;
+    if (!sessionStore.currentSelectedItem || !sessionStore.currentTopicId || (!content.trim() && attachmentStore.stagedAttachments.length === 0)) return false;
 
     if (attachmentStore.stagedAttachments.some((attachment) => attachment.status === "loading")) {
       notificationStore.addNotification({
@@ -623,7 +660,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
         toastOnly: true,
         duration: 2400,
       });
-      return;
+      return false;
     }
 
     if (editingOriginalMessageId.value) {
@@ -641,8 +678,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
           timestamp: targetMsg.timestamp,
         });
         currentChatHistory.value = currentChatHistory.value.slice(0, targetIndex + 1);
-        await triggerGeneration(targetMsg);
-        return;
+        return await triggerGeneration(targetMsg);
       }
     }
 
@@ -669,7 +705,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     if (sessionStore.currentTopicId) {
       topicStore.incrementTopicMsgCount(sessionStore.currentTopicId);
     }
-    await triggerGeneration(userMsg);
+    return await triggerGeneration(userMsg);
   };
 
   /**

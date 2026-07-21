@@ -20,8 +20,8 @@ lazy_static! {
     static ref CONVENTIONAL_THOUGHT_REGEX: Regex = Regex::new(r"(?is)<think(?:ing)?>.*?</think(?:ing)?>").unwrap();
     /// 清理未闭合 <think>/<thinking> 标签的正则表达式
     static ref INCOMPLETE_CONVENTIONAL_THOUGHT_REGEX: Regex = Regex::new(r"(?is)<think(?:ing)?>.*\z").unwrap();
-    /// 简单检查是否包含 HTML 标签的正则表达式
-    static ref HTML_CHECK_REGEX: Regex = Regex::new(r"<[^>]+>").unwrap();
+    /// 仅匹配实际会参与富文本渲染的 HTML 标签，避免把 `a < b > c` 误判为 HTML。
+    static ref HTML_CHECK_REGEX: Regex = Regex::new(r"(?is)</?(?:html|head|body|title|meta|link|style|script|div|span|p|br|strong|b|em|i|u|s|h[1-6]|ul|ol|li|a|img|audio|video|source|pre|code|blockquote|table|thead|tbody|tfoot|tr|th|td|details|summary|section|article|header|footer|main|nav|aside|form|input|button|label|select|option|textarea|svg|canvas|iframe|template|noscript|hr)\b[^>]*>").unwrap();
     /// 清理多余空行（保留最多2个连续空行）的正则表达式
     static ref MULTI_NEWLINE_REGEX: regex::Regex = regex::Regex::new(r"\n{3,}").unwrap();
 }
@@ -97,13 +97,18 @@ impl ContextSanitizer {
     /// @param keep_thoughts 是否保留思考链
     #[allow(dead_code)]
     pub fn sanitize_content(&self, content: &str, keep_thoughts: bool) -> String {
-        if content.trim().is_empty() {
-            return content.to_string();
+        let normalized = if keep_thoughts {
+            content.to_string()
+        } else {
+            strip_thought_chains(content)
+        };
+        if normalized.trim().is_empty() {
+            return normalized;
         }
 
         // 如果不包含 HTML，直接返回
-        if !contains_html(content) {
-            return content.to_string();
+        if !contains_html(&normalized) {
+            return normalized;
         }
 
         // 尝试从缓存获取
@@ -113,7 +118,7 @@ impl ContextSanitizer {
         }
 
         // 核心执行：HTML 转换为 Markdown
-        let result = html_to_vcp_markdown(content, keep_thoughts);
+        let result = html_to_vcp_markdown(&normalized, keep_thoughts);
 
         // 存入缓存
         self.set_cached(cache_key, result.clone());
@@ -141,6 +146,19 @@ pub fn strip_thought_chains(content: &str) -> String {
     INCOMPLETE_CONVENTIONAL_THOUGHT_REGEX
         .replace_all(&s, "")
         .to_string()
+}
+
+pub fn assistant_context_contains_html(content: &str) -> bool {
+    contains_html(&strip_thought_chains(content))
+}
+
+pub fn sanitize_assistant_context_content(content: &str, preserve_render: bool) -> String {
+    let without_thoughts = strip_thought_chains(content);
+    if preserve_render || !contains_html(&without_thoughts) {
+        without_thoughts
+    } else {
+        html_to_vcp_markdown(&without_thoughts, false)
+    }
 }
 
 /// 核心算法：将 HTML 树转换为 VCP 风格的 Markdown
@@ -172,43 +190,43 @@ fn process_node(node: NodeRef<Node>, out: &mut String, keep_thoughts: bool) {
         Node::Element(el) => {
             let tag = el.name();
 
-            // 算法 A：特殊块的“零损提取”
-            // 检查是否有 data-raw-content 属性，如果有则直接返回原始内容
+            // 算法 A：VCP 协议块的“零损提取”
             if let Some(raw) = el.attr("data-raw-content") {
-                out.push_str(raw);
-                return;
+                if raw.contains("<<<[TOOL_REQUEST]>>>")
+                    || raw.contains("<<<DailyNoteStart>>>")
+                    || raw.contains("[[VCP调用结果信息汇总:")
+                {
+                    out.push_str(raw);
+                    return;
+                }
             }
 
             // 算法 B：多媒体与特殊结构处理
             match tag {
                 // 保留图片标签
                 "img" => {
-                    let src = el.attr("src").unwrap_or("");
-                    let alt = el.attr("alt").unwrap_or("");
-                    if !src.is_empty() {
-                        out.push_str(&format!(r#"<img src="{}" alt="{}">"#, src, alt));
+                    let alt = el.attr("alt").unwrap_or("").trim();
+                    if alt.is_empty() {
+                        out.push_str("[图片]");
+                    } else {
+                        out.push_str(&format!("[图片: {alt}]"));
                     }
                 }
-                // 保留音频/视频标签
+                // 媒体的物理载荷由附件通道负责，历史上下文只保留语义占位。
                 "audio" | "video" => {
-                    let src = el.attr("src").unwrap_or("");
-                    if !src.is_empty() {
-                        out.push_str(&format!(r#"<{0} src="{1}"></{0}>"#, tag, src));
+                    if tag == "audio" {
+                        out.push_str("[音频]");
                     } else {
-                        // 尝试从子节点 <source> 中提取
-                        let mut first_src = "";
+                        out.push_str("[视频]");
+                    }
+                }
+                // 纯渲染、资源或执行节点不进入历史上下文。
+                "style" | "script" | "svg" | "canvas" | "iframe" | "template" | "noscript"
+                | "link" | "meta" | "source" => {}
+                "think" | "thinking" => {
+                    if keep_thoughts {
                         for child in node.children() {
-                            if let Node::Element(cel) = child.value() {
-                                if cel.name() == "source" {
-                                    if let Some(csrc) = cel.attr("src") {
-                                        first_src = csrc;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        if !first_src.is_empty() {
-                            out.push_str(&format!(r#"<{0} src="{1}"></{0}>"#, tag, first_src));
+                            process_node(child, out, keep_thoughts);
                         }
                     }
                 }
@@ -285,6 +303,13 @@ fn process_node(node: NodeRef<Node>, out: &mut String, keep_thoughts: bool) {
                     }
                     out.push('\n');
                 }
+                "title" => {
+                    out.push_str("\n# ");
+                    for child in node.children() {
+                        process_node(child, out, keep_thoughts);
+                    }
+                    out.push('\n');
+                }
                 "code" => {
                     out.push('`');
                     for child in node.children() {
@@ -306,13 +331,54 @@ fn process_node(node: NodeRef<Node>, out: &mut String, keep_thoughts: bool) {
                     }
                     out.push('\n');
                 }
-                "a" => {
-                    let href = el.attr("href").unwrap_or("");
-                    out.push('[');
+                "blockquote" => {
+                    let mut text = String::new();
+                    for child in node.children() {
+                        process_node(child, &mut text, keep_thoughts);
+                    }
+                    for line in text.lines() {
+                        out.push_str("> ");
+                        out.push_str(line);
+                        out.push('\n');
+                    }
+                }
+                "table" => {
+                    out.push('\n');
                     for child in node.children() {
                         process_node(child, out, keep_thoughts);
                     }
-                    out.push_str(&format!("]({})", href));
+                    out.push('\n');
+                }
+                "tr" => {
+                    for child in node.children() {
+                        process_node(child, out, keep_thoughts);
+                    }
+                    out.push_str("|\n");
+                }
+                "th" | "td" => {
+                    out.push_str("| ");
+                    for child in node.children() {
+                        process_node(child, out, keep_thoughts);
+                    }
+                    out.push(' ');
+                }
+                "hr" => out.push_str("\n---\n"),
+                "a" => {
+                    let href = el.attr("href").unwrap_or("");
+                    let unsafe_or_oversized = href.starts_with("data:")
+                        || href.starts_with("javascript:")
+                        || href.len() > 2048;
+                    if href.is_empty() || unsafe_or_oversized {
+                        for child in node.children() {
+                            process_node(child, out, keep_thoughts);
+                        }
+                    } else {
+                        out.push('[');
+                        for child in node.children() {
+                            process_node(child, out, keep_thoughts);
+                        }
+                        out.push_str(&format!("]({})", href));
+                    }
                 }
                 _ => {
                     // 默认透传：递归处理子节点
@@ -394,7 +460,8 @@ mod tests {
     fn test_html_to_md_img() {
         let html = r#"<p>Hello <img src="test.png" alt="alt text"> World</p>"#;
         let md = html_to_vcp_markdown(html, false);
-        assert!(md.contains(r#"<img src="test.png" alt="alt text">"#));
+        assert!(md.contains("[图片: alt text]"));
+        assert!(!md.contains("test.png"));
     }
 
     #[test]
@@ -402,5 +469,49 @@ mod tests {
         let html = "<pre data-raw-content=\"<<<[TOOL_REQUEST]>>>\ncall()\"></pre>";
         let md = html_to_vcp_markdown(html, false);
         assert_eq!(md, "<<<[TOOL_REQUEST]>>>\ncall()");
+    }
+
+    #[test]
+    fn assistant_context_compacts_old_render_markup() {
+        let html = r#"
+            <style>.card { color: red; }</style>
+            <script>window.secret = true;</script>
+            <div class="card"><h2>Report</h2><p>Hello <strong>world</strong>.</p></div>
+            <img src="data:image/png;base64,AAAA" alt="chart">
+            <iframe src="https://example.com/embed"></iframe>
+        "#;
+
+        let compacted = sanitize_assistant_context_content(html, false);
+
+        assert!(compacted.contains("## Report"));
+        assert!(compacted.contains("Hello **world**."));
+        assert!(compacted.contains("[图片: chart]"));
+        assert!(!compacted.contains("color: red"));
+        assert!(!compacted.contains("window.secret"));
+        assert!(!compacted.contains("base64"));
+        assert!(!compacted.contains("example.com/embed"));
+        assert!(compacted.len() < html.len());
+    }
+
+    #[test]
+    fn assistant_context_preserves_latest_render_but_removes_thoughts() {
+        let html =
+            "<style>.card{color:red}</style><div class=\"card\">Visible</div><think>hidden</think>";
+
+        let preserved = sanitize_assistant_context_content(html, true);
+
+        assert!(preserved.contains("<style>"));
+        assert!(preserved.contains("class=\"card\""));
+        assert!(preserved.contains("Visible"));
+        assert!(!preserved.contains("hidden"));
+        assert!(!preserved.contains("<think>"));
+    }
+
+    #[test]
+    fn comparison_text_is_not_treated_as_html() {
+        let content = "Keep the relation a < b > c unchanged.";
+
+        assert!(!assistant_context_contains_html(content));
+        assert_eq!(sanitize_assistant_context_content(content, false), content);
     }
 }

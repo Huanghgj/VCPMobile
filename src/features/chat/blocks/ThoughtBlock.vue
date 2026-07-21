@@ -1,20 +1,22 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { Brain, ChevronDown, ChevronUp, Loader2 } from "lucide-vue-next";
-import { renderMarkdownNodes } from "../../../core/utils/astRenderer";
-import { renderSafeMarkdown } from "../../../core/utils/safeMarkdown";
 import type { ContentBlock } from "../../../core/types/chat";
+import RenderDocumentBlock from "../components/RenderDocumentBlock.vue";
 
 const props = withDefaults(
   defineProps<{
     block: ContentBlock;
     messageId: string;
+    sourceId?: string;
     defaultExpanded?: boolean;
   }>(),
   {
     defaultExpanded: undefined,
   },
 );
+
+const emit = defineEmits<{ rendered: [] }>();
 
 const isExpanded = ref(props.defaultExpanded ?? !props.block.is_complete);
 
@@ -39,15 +41,6 @@ const summary = computed(() => {
   if (!compact) return props.block.is_complete ? "已折叠" : "正在整理思路";
   return compact.length > 36 ? `${compact.slice(0, 36)}...` : compact;
 });
-
-const renderedBody = computed(() =>
-  props.block.nodes && props.block.nodes.length > 0
-    ? renderMarkdownNodes(props.block.nodes, props.messageId, props.block.hash)
-    : renderSafeMarkdown(props.block.content || "", {
-        allowRichHtml: true,
-        allowStyleAttr: true,
-      }),
-);
 </script>
 
 <template>
@@ -78,9 +71,13 @@ const renderedBody = computed(() =>
     </button>
 
     <div v-show="isExpanded" class="vcp-thought-content animate-slide-down">
-      <div
+      <RenderDocumentBlock
         class="thought-body"
-        v-html="renderedBody"
+        :block="block"
+        :message-id="messageId"
+        :source-id="sourceId || `thought-${String(block.hash || 'body')}`"
+        :streaming="!block.is_complete"
+        @rendered="emit('rendered')"
       />
     </div>
   </div>

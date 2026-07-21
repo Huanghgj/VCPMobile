@@ -1,11 +1,14 @@
 use crate::vcp_modules::agent_service::{read_agent_config_internal, AgentConfigState};
+use crate::vcp_modules::agent_types::AgentConfig;
 use crate::vcp_modules::chat_manager::ChatMessage;
-use crate::vcp_modules::context_sanitizer::strip_thought_chains;
+use crate::vcp_modules::context_sanitizer::{
+    assistant_context_contains_html, sanitize_assistant_context_content,
+};
 use crate::vcp_modules::db_manager::DbState;
 use crate::vcp_modules::message_service;
 use crate::vcp_modules::stream_service_guard::StreamServiceGuard;
 use crate::vcp_modules::vcp_client::{
-    perform_vcp_request, ActiveRequests, StreamEvent, VcpRequestPayload,
+    perform_vcp_request, ActiveRequestGuard, ActiveRequests, StreamEvent, VcpRequestPayload,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -40,6 +43,8 @@ pub struct AgentChatPayload {
     pub user_message: ChatMessage,
     #[serde(default)]
     pub turn_source: ChatTurnSource,
+    #[serde(default)]
+    pub response_message_id: Option<String>,
     pub vcp_url: String,
     pub vcp_api_key: String,
 }
@@ -67,12 +72,43 @@ fn context_history_message_limit(context_token_limit: i32) -> usize {
         .clamp(MIN_HISTORY_MESSAGES, MAX_HISTORY_MESSAGES)
 }
 
-fn sanitize_outbound_context_content(role: &str, content: &str) -> String {
+fn sanitize_outbound_context_content(
+    role: &str,
+    content: &str,
+    preserve_assistant_render: bool,
+) -> String {
     if role == "assistant" {
-        strip_thought_chains(content)
+        sanitize_assistant_context_content(content, preserve_assistant_render)
     } else {
         content.to_string()
     }
+}
+
+fn latest_temp_assistant_render_index(
+    messages: &[crate::vcp_modules::chat::topic_service::TempMessage],
+) -> Option<usize> {
+    // Floating sessions bypass context_assembler, so apply the same one-render policy here.
+    messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, message)| {
+            (message.role == "assistant" && assistant_context_contains_html(&message.content))
+                .then_some(index)
+        })
+}
+
+fn build_agent_model_config(agent_config: &AgentConfig) -> Value {
+    let mut model_config = json!({
+        "model": agent_config.model,
+        "max_tokens": agent_config.max_output_tokens,
+        "contextTokenLimit": agent_config.context_token_limit,
+        "stream": agent_config.stream_output
+    });
+    if agent_config.use_temperature {
+        model_config["temperature"] = json!(agent_config.temperature);
+    }
+    model_config
 }
 
 #[tauri::command]
@@ -111,7 +147,9 @@ pub async fn internal_process_agent_chat_message(
     let turn_source = payload.turn_source;
 
     let timestamp = crate::vcp_modules::infra::utils::now_millis();
-    let thinking_id = response_message_id(&agent_id, &user_message.id, turn_source, timestamp);
+    let thinking_id = payload.response_message_id.clone().unwrap_or_else(|| {
+        response_message_id(&agent_id, &user_message.id, turn_source, timestamp)
+    });
 
     if turn_source == ChatTurnSource::LifecycleScheduled {
         let already_exists = sqlx::query_scalar::<_, i64>(
@@ -132,9 +170,24 @@ pub async fn internal_process_agent_chat_message(
         }
     }
 
+    let request_control = active_requests.register(&thinking_id);
+    let _request_guard = ActiveRequestGuard::new(
+        active_requests.0.clone(),
+        thinking_id.clone(),
+        request_control.clone(),
+    );
     // 1. 读取 Agent 配置
     let agent_config =
         read_agent_config_internal(&app_handle, &agent_state, &agent_id, Some(true)).await?;
+    let preparing_context = Some(json!({
+        "agentId": agent_id,
+        "topicId": topic_id,
+        "agentName": agent_config.name
+    }));
+    let _ = stream_channel.send(StreamEvent::thinking(
+        thinking_id.clone(),
+        preparing_context,
+    ));
 
     // 【优化点】：此时已拿到智能体配置，立即启动前台服务保活以抢先渲染通知卡片，
     // 从而与接下来的追加消息 SQLite IO、长历史读取、Tavern上下文编织等重度异步准备并行重叠
@@ -290,15 +343,7 @@ pub async fn internal_process_agent_chat_message(
     .await?;
 
     // 6. 构造 VCP 请求载荷
-    let mut model_config = json!({
-        "model": agent_config.model,
-        "max_tokens": agent_config.max_output_tokens,
-        "contextTokenLimit": agent_config.context_token_limit,
-        "stream": true
-    });
-    if agent_config.use_temperature {
-        model_config["temperature"] = json!(agent_config.temperature);
-    }
+    let model_config = build_agent_model_config(&agent_config);
 
     let context = Some(json!({
         "agentId": agent_id,
@@ -315,13 +360,10 @@ pub async fn internal_process_agent_chat_message(
         context: context.clone(),
     };
 
-    // 在发起 VCP 请求前，向前端发射 thinking 事件以初始化气泡
-    let _ = stream_channel.send(StreamEvent::thinking(thinking_id.clone(), context.clone()));
-
     // 8. 发起请求
     let result = perform_vcp_request(
         &app_handle,
-        active_requests.0.clone(),
+        request_control,
         request_payload,
         Some(stream_channel.clone()),
     )
@@ -522,10 +564,24 @@ pub async fn handle_assistant_chat_stream(
     let thinking_id = payload
         .message_id
         .unwrap_or_else(|| format!("msg_{}_{}", agent_id, timestamp));
-
+    let request_control = active_requests.register(&thinking_id);
+    let _request_guard = ActiveRequestGuard::new(
+        active_requests.0.clone(),
+        thinking_id.clone(),
+        request_control.clone(),
+    );
     // 1. 读取 Agent 配置
     let agent_config =
         read_agent_config_internal(&app_handle, &agent_state, &agent_id, Some(true)).await?;
+    let preparing_context = Some(json!({
+        "agentId": agent_id,
+        "topicId": "assistant_chat",
+        "agentName": agent_config.name
+    }));
+    let _ = stream_channel.send(StreamEvent::thinking(
+        thinking_id.clone(),
+        preparing_context,
+    ));
 
     // 2. 启动前台服务保活；RAII 守卫兜住异常/断连路径，避免保活服务残留。
     let mut stream_service_guard = StreamServiceGuard::start(
@@ -556,8 +612,13 @@ pub async fn handle_assistant_chat_stream(
         "content": effective_prompt
     }));
 
-    for temp_msg in temp_messages {
-        let content = sanitize_outbound_context_content(&temp_msg.role, &temp_msg.content);
+    let preserved_render_index = latest_temp_assistant_render_index(&temp_messages);
+    for (message_index, temp_msg) in temp_messages.into_iter().enumerate() {
+        let content = sanitize_outbound_context_content(
+            &temp_msg.role,
+            &temp_msg.content,
+            preserved_render_index == Some(message_index),
+        );
         messages.push(json!({
             "role": temp_msg.role,
             "content": content
@@ -565,15 +626,7 @@ pub async fn handle_assistant_chat_stream(
     }
 
     // 4. 构造 VCP 请求载荷
-    let mut model_config = json!({
-        "model": agent_config.model,
-        "max_tokens": agent_config.max_output_tokens,
-        "contextTokenLimit": agent_config.context_token_limit,
-        "stream": true
-    });
-    if agent_config.use_temperature {
-        model_config["temperature"] = json!(agent_config.temperature);
-    }
+    let model_config = build_agent_model_config(&agent_config);
 
     let context = Some(json!({
         "agentId": agent_id,
@@ -590,13 +643,10 @@ pub async fn handle_assistant_chat_stream(
         context: context.clone(),
     };
 
-    // 发送 thinking 事件通知前端初始化气泡
-    let _ = stream_channel.send(StreamEvent::thinking(thinking_id.clone(), context.clone()));
-
     // 5. 发起流式请求 (直接调用 perform_vcp_request，不存入 DB)
     let result = perform_vcp_request(
         &app_handle,
-        active_requests.0.clone(),
+        request_control,
         request_payload,
         Some(stream_channel.clone()),
     )
@@ -609,21 +659,23 @@ pub async fn handle_assistant_chat_stream(
     let final_ts = crate::vcp_modules::infra::utils::now_millis() as u64;
     match result {
         Ok((res, is_aborted)) => {
-            if res["fullContent"].is_string() {
+            if let Some(full_content) = res["fullContent"].as_str() {
                 let finish_reason = if is_aborted {
                     Some("cancelled_by_user".to_string())
                 } else {
                     res["finishReason"].as_str().map(|s| s.to_string())
                 };
 
-                // 发送 end 事件让前端知道传输完毕
-                let _ = stream_channel.send(StreamEvent::end(
+                // Carry the final text so the floating assistant can render one-shot responses too.
+                let mut end_event = StreamEvent::end(
                     thinking_id.clone(),
                     context,
                     finish_reason,
                     None,
                     Some(final_ts),
-                ));
+                );
+                end_event.content = Some(full_content.to_string());
+                let _ = stream_channel.send(end_event);
             }
         }
         Err(e) => {
@@ -644,18 +696,91 @@ mod tests {
     use super::*;
 
     #[test]
+    fn agent_model_config_honors_stream_output() {
+        let mut config = crate::vcp_modules::agent_service::create_default_config("agent-1");
+
+        config.stream_output = false;
+        assert_eq!(build_agent_model_config(&config)["stream"], false);
+
+        config.stream_output = true;
+        assert_eq!(build_agent_model_config(&config)["stream"], true);
+    }
+
+    #[test]
+    fn agent_model_config_only_sends_enabled_temperature() {
+        let mut config = crate::vcp_modules::agent_service::create_default_config("agent-1");
+        config.temperature = 0.35;
+        config.use_temperature = true;
+
+        let enabled = build_agent_model_config(&config);
+        assert_eq!(enabled["temperature"], json!(0.35));
+
+        config.use_temperature = false;
+        let disabled = build_agent_model_config(&config);
+        assert!(disabled.get("temperature").is_none());
+    }
+
+    #[test]
     fn assistant_temp_message_thoughts_are_removed_from_context() {
-        let content =
-            sanitize_outbound_context_content("assistant", "正文<think>内部推理</think>结论");
+        let content = sanitize_outbound_context_content(
+            "assistant",
+            "正文<think>内部推理</think>结论",
+            false,
+        );
 
         assert_eq!(content, "正文结论");
     }
 
     #[test]
     fn user_temp_message_think_examples_are_preserved() {
-        let content = sanitize_outbound_context_content("user", "请保留 <think>demo</think>");
+        let content =
+            sanitize_outbound_context_content("user", "请保留 <think>demo</think>", false);
 
         assert_eq!(content, "请保留 <think>demo</think>");
+    }
+
+    #[test]
+    fn floating_context_preserves_only_latest_assistant_render() {
+        use crate::vcp_modules::chat::topic_service::TempMessage;
+
+        let messages = vec![
+            TempMessage {
+                role: "assistant".to_string(),
+                name: None,
+                content: "<style>.old{color:red}</style><div>Old</div>".to_string(),
+                timestamp: 100,
+            },
+            TempMessage {
+                role: "user".to_string(),
+                name: None,
+                content: "continue".to_string(),
+                timestamp: 101,
+            },
+            TempMessage {
+                role: "assistant".to_string(),
+                name: None,
+                content: "<style>.new{color:blue}</style><div>New</div>".to_string(),
+                timestamp: 102,
+            },
+        ];
+
+        let preserved_index = latest_temp_assistant_render_index(&messages);
+        assert_eq!(preserved_index, Some(2));
+
+        let old = sanitize_outbound_context_content(
+            &messages[0].role,
+            &messages[0].content,
+            preserved_index == Some(0),
+        );
+        let latest = sanitize_outbound_context_content(
+            &messages[2].role,
+            &messages[2].content,
+            preserved_index == Some(2),
+        );
+        assert!(!old.contains("<style>"));
+        assert!(old.contains("Old"));
+        assert!(latest.contains("<style>"));
+        assert!(latest.contains("New"));
     }
 
     #[test]

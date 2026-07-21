@@ -1,5 +1,7 @@
 use crate::vcp_modules::chat_manager::ChatMessage;
-use crate::vcp_modules::context_sanitizer::strip_thought_chains;
+use crate::vcp_modules::context_sanitizer::{
+    assistant_context_contains_html, sanitize_assistant_context_content,
+};
 use serde_json::{json, Value};
 use sqlx::{Pool, Sqlite};
 
@@ -102,10 +104,18 @@ pub fn assemble_history_for_vcp(
     enable_time_anchoring: bool,
 ) -> Vec<Value> {
     let mut result = Vec::new();
+    // Keep one recent raw render as a style/layout reference; compact older assistant HTML.
+    let preserved_render_index = history.iter().enumerate().rev().find_map(|(index, msg)| {
+        (!msg.is_thinking.unwrap_or(false)
+            && msg.role == "assistant"
+            && assistant_context_contains_html(&msg.content))
+        .then_some(index)
+    });
 
-    for msg in history
+    for (message_index, msg) in history
         .iter()
-        .filter(|msg| !msg.is_thinking.unwrap_or(false))
+        .enumerate()
+        .filter(|(_, msg)| !msg.is_thinking.unwrap_or(false))
     {
         use chrono::TimeZone;
         let formatted_time = if let Some(dt) = chrono::Local
@@ -138,7 +148,10 @@ pub fn assemble_history_for_vcp(
 
         // 3. 核心消息正文
         let message_content = if msg.role == "assistant" {
-            strip_thought_chains(&msg.content)
+            sanitize_assistant_context_content(
+                &msg.content,
+                preserved_render_index == Some(message_index),
+            )
         } else {
             msg.content.clone()
         };
@@ -314,6 +327,40 @@ mod tests {
         let content = messages[0]["content"].as_str().unwrap();
 
         assert!(content.contains("<think>demo</think>"));
+    }
+
+    #[test]
+    fn only_latest_assistant_render_is_preserved_in_request_context() {
+        let history = vec![
+            message(
+                "assistant",
+                "<style>.old{color:red}</style><div class=\"old\">Old visible</div>",
+            ),
+            message("user", "<div class=\"sample\">User HTML sample</div>"),
+            message(
+                "assistant",
+                "<style>.new{color:blue}</style><div class=\"new\">New visible</div><think>hidden</think>",
+            ),
+            message("user", "continue"),
+        ];
+
+        let messages = assemble_history_for_vcp(&history, false, false);
+        let old_render = messages[0]["content"].as_str().unwrap();
+        let user_html = messages[1]["content"].as_str().unwrap();
+        let latest_render = messages[2]["content"].as_str().unwrap();
+
+        assert!(old_render.contains("Old visible"));
+        assert!(!old_render.contains("<style>"));
+        assert!(!old_render.contains("class=\"old\""));
+        assert!(!old_render.contains("color:red"));
+
+        assert!(user_html.contains("class=\"sample\""));
+
+        assert!(latest_render.contains("<style>"));
+        assert!(latest_render.contains("class=\"new\""));
+        assert!(latest_render.contains("New visible"));
+        assert!(!latest_render.contains("hidden"));
+        assert!(!latest_render.contains("<think>"));
     }
 
     #[test]

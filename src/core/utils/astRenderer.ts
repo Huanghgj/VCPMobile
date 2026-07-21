@@ -6,7 +6,10 @@ import type { MarkdownNode, InlineNode } from "../types/chat";
 const htmlCache = new Map<string, string>();
 const MAX_CACHE_SIZE = 500;
 
-function getCacheKey(messageId: string, blockHash?: string | number): string | null {
+function getCacheKey(
+  messageId: string,
+  blockHash?: string | number,
+): string | null {
   if (blockHash !== undefined && blockHash !== null) {
     return `${messageId}:${String(blockHash)}`;
   }
@@ -30,11 +33,11 @@ export function clearMessageCache(messageId: string): void {
  * 将 Rust 预渲染的 AST 节点树转换为 HTML 字符串
  */
 export function renderMarkdownNodes(
-  nodes: MarkdownNode[], 
+  nodes: MarkdownNode[],
   messageId: string,
-  blockHash?: string | number
+  blockHash?: string | number,
 ): string {
-  if (!nodes || nodes.length === 0) return '';
+  if (!nodes || nodes.length === 0) return "";
   const key = getCacheKey(messageId, blockHash);
 
   if (key) {
@@ -42,7 +45,9 @@ export function renderMarkdownNodes(
     if (cached !== undefined) return cached;
   }
 
-  const html = sanitizeMarkdownHtml(nodes.map(node => renderNode(node, messageId)).join(''));
+  const html = sanitizeMarkdownHtml(
+    nodes.map((node) => renderNode(node, messageId)).join(""),
+  );
 
   // 无 hash 时不缓存，避免不同内容但节点数量相同的 legacy AST 串用 HTML
   if (!key) return html;
@@ -57,25 +62,29 @@ export function renderMarkdownNodes(
 
 function renderNode(node: MarkdownNode, messageId: string): string {
   switch (node.type) {
-    case 'paragraph':
-      return `<p>${(node.children || []).map(renderInline).join('')}</p>`;
-    
-    case 'heading':
+    case "paragraph":
+      return `<p>${(node.children || []).map(renderInline).join("")}</p>`;
+
+    case "heading":
       const level = node.level || 1;
-      return `<h${level}>${(node.children || []).map(renderInline).join('')}</h${level}>`;
-    
-    case 'code_block': {
-      if (node.lang === 'mermaid') {
-        return `<div class="mermaid-placeholder">${escapeHtml(node.code || '')}</div>`;
+      return `<h${level}>${(node.children || []).map(renderInline).join("")}</h${level}>`;
+
+    case "code_block": {
+      if (node.lang === "mermaid") {
+        return `<div class="mermaid-placeholder">${escapeHtml(node.code || "")}</div>`;
       }
-      const code = node.code || '';
-      const lang = node.lang || '';
+      const code = node.code || "";
+      const lang = node.lang || "";
       let html = node.highlighted_html;
       if (html) {
         // 兼容旧 AST：如果 highlighted_html 是 <pre><code> 包裹内层 <pre> 的嵌套结构，提取单层
-        const nestedPreMatch = html.match(/<pre[^>]*>\s*<code>([\s\S]*?)<\/code>\s*<\/pre>/i);
-        if (nestedPreMatch && nestedPreMatch[1].trim().startsWith('<pre')) {
-          const innerMatch = nestedPreMatch[1].match(/<pre[^>]*>([\s\S]*?)<\/pre>/i);
+        const nestedPreMatch = html.match(
+          /<pre[^>]*>\s*<code>([\s\S]*?)<\/code>\s*<\/pre>/i,
+        );
+        if (nestedPreMatch && nestedPreMatch[1].trim().startsWith("<pre")) {
+          const innerMatch = nestedPreMatch[1].match(
+            /<pre[^>]*>([\s\S]*?)<\/pre>/i,
+          );
           if (innerMatch) {
             html = `<pre class="vcp-code-block vcp-scrollable">${innerMatch[1]}</pre>`;
           }
@@ -88,112 +97,140 @@ function renderNode(node: MarkdownNode, messageId: string): string {
         lang,
       );
     }
-    
-    case 'blockquote':
-      return `<blockquote>${(node.children || []).map((n: any) => renderNode(n, messageId)).join('')}</blockquote>`;
-    
-    case 'list':
-      const tag = node.ordered ? 'ol' : 'ul';
-      const itemsHtml = (node.items || []).map(itemNodes => 
-        `<li>${itemNodes.map(n => renderNode(n, messageId)).join('')}</li>`
-      ).join('');
+
+    case "blockquote":
+      return `<blockquote>${(node.children || []).map((n: any) => renderNode(n, messageId)).join("")}</blockquote>`;
+
+    case "list":
+      const tag = node.ordered ? "ol" : "ul";
+      const itemsHtml = (node.items || [])
+        .map(
+          (itemNodes) =>
+            `<li>${itemNodes.map((n) => renderNode(n, messageId)).join("")}</li>`,
+        )
+        .join("");
       return `<${tag}>${itemsHtml}</${tag}>`;
-    
-    case 'table': {
-      const headerHtml = `<tr>${(node.header || []).map(cell => `<th>${(cell as any).map(renderInline).join('')}</th>`).join('')}</tr>`;
-      const bodyHtml = (node.rows || []).map(row =>
-        `<tr>${row.map(cell => `<td>${(cell as any).map(renderInline).join('')}</td>`).join('')}</tr>`
-      ).join('');
-      const wrapper = sanitizeClassList(node.wrapper_class, 'vcp-table-wrapper');
+
+    case "table": {
+      const headerHtml = `<tr>${(node.header || []).map((cell) => `<th>${(cell as any).map(renderInline).join("")}</th>`).join("")}</tr>`;
+      const bodyHtml = (node.rows || [])
+        .map(
+          (row) =>
+            `<tr>${row.map((cell) => `<td>${(cell as any).map(renderInline).join("")}</td>`).join("")}</tr>`,
+        )
+        .join("");
+      const wrapper = sanitizeClassList(
+        node.wrapper_class,
+        "vcp-table-wrapper",
+      );
       return `<div class="${wrapper}"><table><thead>${headerHtml}</thead><tbody>${bodyHtml}</tbody></table></div>`;
     }
-    
-    case 'thematic_break':
-      return '<hr/>';
-    
 
-    
-    case 'raw_html':
+    case "thematic_break":
+      return "<hr/>";
+
+    case "raw_html":
       // Raw HTML nodes can be partial tags produced from a larger HTML container.
       // Sanitizing fragments one by one makes browsers auto-close tags early; the
       // complete HTML string is sanitized once in renderMarkdownNodes().
-      return node.content || '';
-    
+      return node.content || "";
+
     default:
-      return '';
+      return "";
   }
 }
 
 function renderInline(node: InlineNode): string {
   switch (node.type) {
-    case 'text':
-      return escapeHtml(node.value || '');
-    
-    case 'strong':
-      return `<strong>${(node.children || []).map(renderInline).join('')}</strong>`;
-    
-    case 'emphasis':
-      return `<em>${(node.children || []).map(renderInline).join('')}</em>`;
-    
-    case 'strikethrough':
-      return `<del>${(node.children || []).map(renderInline).join('')}</del>`;
-    
-    case 'code':
-      return `<code>${escapeHtml(node.value || '')}</code>`;
-    
-    case 'link': {
-      const href = sanitizeLinkUrl(node.needs_asset_conversion && node.href
-        ? convertFileSrc(node.href)
-        : node.href || '');
-      return `<a href="${href}" title="${escapeHtml(node.title || '')}" target="_blank" rel="noopener noreferrer">${(node.children || []).map(renderInline).join('')}</a>`;
+    case "text":
+      return escapeHtml(node.value || "");
+
+    case "strong":
+      return `<strong>${(node.children || []).map(renderInline).join("")}</strong>`;
+
+    case "emphasis":
+      return `<em>${(node.children || []).map(renderInline).join("")}</em>`;
+
+    case "strikethrough":
+      return `<del>${(node.children || []).map(renderInline).join("")}</del>`;
+
+    case "code":
+      return `<code>${escapeHtml(node.value || "")}</code>`;
+
+    case "link": {
+      const href = sanitizeLinkUrl(
+        node.needs_asset_conversion && node.href
+          ? convertFileSrc(node.href)
+          : node.href || "",
+      );
+      return `<a href="${href}" title="${escapeHtml(node.title || "")}" target="_blank" rel="noopener noreferrer">${(node.children || []).map(renderInline).join("")}</a>`;
     }
-    
-    case 'image': {
-      const src = sanitizeImageUrl(node.needs_asset_conversion && node.src
-        ? convertFileSrc(node.src)
-        : node.src || '');
-      if (!src) return '';
-      const originalSrc = node.src ? sanitizeImageUrl(node.src) : '';
-      const originalAttr = originalSrc ? ` data-vcp-image-src="${originalSrc}"` : '';
-      return `<img src="${src}"${originalAttr} alt="${escapeHtml(node.alt || '')}" title="${escapeHtml(node.title || '')}" loading="lazy" decoding="async" class="vcp-markdown-image" />`;
+
+    case "image": {
+      const src = sanitizeImageUrl(
+        node.needs_asset_conversion && node.src
+          ? convertFileSrc(node.src)
+          : node.src || "",
+      );
+      if (!src) return "";
+      const originalSrc = node.src ? sanitizeImageUrl(node.src) : "";
+      const originalAttr = originalSrc
+        ? ` data-vcp-image-src="${originalSrc}"`
+        : "";
+      return `<img src="${src}"${originalAttr} alt="${escapeHtml(node.alt || "")}" title="${escapeHtml(node.title || "")}" loading="lazy" decoding="async" class="vcp-markdown-image" />`;
     }
-    
-    case 'break':
-      return '<br/>';
-    
-    case 'inline_math': {
+
+    case "break":
+      return "<br/>";
+
+    case "inline_math": {
       const isDisplay = node.display_mode || false;
-      const cls = isDisplay ? 'vcp-math-block no-swipe' : 'vcp-math-inline no-swipe';
-      const tag = 'span';
-      return `<${tag} class="${cls}" data-latex="${escapeHtml(node.content || '')}">${escapeHtml(node.content || '')}</${tag}>`;
+      const cls = isDisplay
+        ? "vcp-math-block no-swipe"
+        : "vcp-math-inline no-swipe";
+      const tag = "span";
+      return `<${tag} class="${cls}" data-latex="${escapeHtml(node.content || "")}">${escapeHtml(node.content || "")}</${tag}>`;
     }
-    
-    case 'vcp_custom': {
+
+    case "vcp_custom": {
       const cls = `vcp-custom-${node.kind}`;
       if (node.children && node.children.length > 0) {
-        const innerContent = (node.children || []).map(renderInline).join('');
+        const innerContent = (node.children || []).map(renderInline).join("");
         return `<span class="${cls}">${innerContent}</span>`;
       }
-      return `<span class="${cls}">${escapeHtml(node.value || '')}</span>`;
+      return `<span class="${cls}">${escapeHtml(node.value || "")}</span>`;
     }
-    
-    case 'raw_html_inline':
+
+    case "raw_html_inline":
       // Keep inline open/close tag fragments intact until the final full-HTML
       // sanitization pass in renderMarkdownNodes().
-      return node.content || '';
-    
+      return node.content || "";
+
     default:
-      return '';
+      return "";
   }
 }
 
 function escapeHtml(text: string): string {
   return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#039;');
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+/**
+ * Serializes the complete Markdown AST before sanitization. Raw HTML nodes may
+ * be split across the AST, so Renderer V2 must join them before the browser's
+ * HTML5 parser and DOMPurify see the fragment.
+ */
+export function renderMarkdownNodesToHtml(
+  nodes: MarkdownNode[],
+  messageId: string,
+): string {
+  if (!nodes || nodes.length === 0) return "";
+  return nodes.map((node) => renderNode(node, messageId)).join("");
 }
 
 function renderCodeShell(preHtml: string, code: string, lang: string): string {
@@ -206,49 +243,61 @@ function renderCodeShell(preHtml: string, code: string, lang: string): string {
 function sanitizeMarkdownHtml(html: string): string {
   return DOMPurify.sanitize(html, {
     USE_PROFILES: { html: true, svg: true, mathMl: true },
-    FORBID_TAGS: ['script', 'iframe', 'object', 'embed', 'applet', 'link', 'meta'],
-    FORBID_ATTR: ['srcdoc'],
+    FORBID_TAGS: [
+      "script",
+      "iframe",
+      "object",
+      "embed",
+      "applet",
+      "link",
+      "meta",
+    ],
+    FORBID_ATTR: ["srcdoc"],
     ALLOW_UNKNOWN_PROTOCOLS: false,
-    ALLOWED_URI_REGEXP: /^(?:(?:https?|mailto|tel|blob|asset):|data:image\/|\/|\.\/|\.\.\/|#)/i,
+    ALLOWED_URI_REGEXP:
+      /^(?:(?:https?|mailto|tel|blob|asset):|data:image\/|\/|\.\/|\.\.\/|#)/i,
   });
 }
 
 function sanitizeHighlightedCodeHtml(html: string): string {
   return DOMPurify.sanitize(html, {
     USE_PROFILES: { html: true },
-    ALLOWED_TAGS: ['pre', 'code', 'span'],
-    ALLOWED_ATTR: ['class', 'style'],
+    ALLOWED_TAGS: ["pre", "code", "span"],
+    ALLOWED_ATTR: ["class", "style"],
   });
 }
 
-function sanitizeClassList(value: string | undefined, fallback: string): string {
+function sanitizeClassList(
+  value: string | undefined,
+  fallback: string,
+): string {
   const classList = (value || fallback)
     .split(/\s+/)
     .map((item) => item.trim())
     .filter((item) => /^[A-Za-z0-9_-]+$/.test(item));
-  return escapeHtml(classList.length ? classList.join(' ') : fallback);
+  return escapeHtml(classList.length ? classList.join(" ") : fallback);
 }
 
 function sanitizeLinkUrl(value: string): string {
   const trimmed = value.trim();
-  if (!trimmed) return '';
+  if (!trimmed) return "";
   if (/^(https?:|mailto:|tel:|blob:|asset:)/i.test(trimmed)) {
     return escapeHtml(trimmed);
   }
   if (/^[./#]/.test(trimmed)) {
     return escapeHtml(trimmed);
   }
-  return '';
+  return "";
 }
 
 function sanitizeImageUrl(value: string): string {
   const trimmed = value.trim();
-  if (!trimmed) return '';
+  if (!trimmed) return "";
   if (/^(https?:|data:image\/|blob:|asset:)/i.test(trimmed)) {
     return escapeHtml(trimmed);
   }
   if (/^[./#]/.test(trimmed)) {
     return escapeHtml(trimmed);
   }
-  return '';
+  return "";
 }

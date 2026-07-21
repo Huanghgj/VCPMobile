@@ -426,10 +426,20 @@ fn find_end_marker(
     }
 
     let m = match block_type {
-        BlockType::Tool => TOOL_END.find(search_area),
+        BlockType::Tool => {
+            return crate::vcp_modules::content_parser::find_protocol_bounded_end(
+                search_area,
+                &TOOL_END,
+            );
+        }
         BlockType::Thought => THOUGHT_END.find(search_area),
         BlockType::Think => THINK_END.find(search_area),
-        BlockType::ToolResult => TOOL_RESULT_END.find(search_area),
+        BlockType::ToolResult => {
+            return crate::vcp_modules::content_parser::find_protocol_bounded_end(
+                search_area,
+                &TOOL_RESULT_END,
+            );
+        }
         BlockType::Diary => DIARY_END.find(search_area),
         BlockType::ToolCallSummary => {
             crate::vcp_modules::content_parser::TOOL_CALL_SUMMARY_END.find(search_area)
@@ -528,6 +538,27 @@ fn build_stream_block(
         }
         BlockType::HtmlContainer => {
             let open_tag = &remaining[start_idx..end_idx];
+            let mut full_html = format!("{}{}", open_tag, inner_content);
+            let close_tag = if end_end > 0 {
+                let search_area = &remaining[end_idx..];
+                let end_start = inner_content.len();
+                if end_start < end_end && end_end <= search_area.len() {
+                    Some(&search_area[end_start..end_end])
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(close_tag) = close_tag {
+                full_html.push_str(close_tag);
+            }
+            let hash = HashAggregator::compute_content_hash(&full_html);
+
+            if crate::vcp_modules::content_parser::requires_active_html_preview(&full_html) {
+                return StreamBlock::html_preview(full_html, hash);
+            }
+
             let deindented_inner =
                 crate::vcp_modules::chat::pre_renderer::markdown_parser::trim_common_leading_indent(
                     inner_content,
@@ -545,20 +576,12 @@ fn build_stream_block(
                 ),
             );
 
-            let mut full_html = format!("{}{}", open_tag, inner_content);
-            if end_end > 0 {
-                let search_area = &remaining[end_idx..];
-                let end_start = inner_content.len();
-                if end_start < end_end && end_end <= search_area.len() {
-                    let close_tag = &search_area[end_start..end_end];
-                    nodes.push(crate::vcp_modules::pre_renderer::MarkdownNode::raw_html(
-                        close_tag.to_string(),
-                    ));
-                    full_html.push_str(close_tag);
-                }
+            if let Some(close_tag) = close_tag {
+                nodes.push(crate::vcp_modules::pre_renderer::MarkdownNode::raw_html(
+                    close_tag.to_string(),
+                ));
             }
 
-            let hash = HashAggregator::compute_content_hash(&full_html);
             StreamBlock::markdown(full_html, Some(nodes), hash)
         }
         BlockType::CodeFence => {
@@ -1252,6 +1275,112 @@ copy_button: should_not_send
     }
 
     #[test]
+    fn test_finalize_recovers_after_unclosed_tool_request() {
+        let raw = r#"<<<[TOOL_REQUEST]>>>
+tool_name:「始」ComfyUIGen「末」,
+prompt:「始」first image「末」
+<<<[END_TOOL_REQUEST]>>>
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」ComfyUIGen「末」,
+negative_prompt:「始」truncated request
+<<<[ROLE_DIVIDE_USER]>>>
+
+[[VCP调用结果信息汇总:
+- 工具名称: ComfyUIGen
+- 执行状态: SUCCESS
+- 返回内容: image generated
+VCP调用结果结束]]
+
+[本轮工具调用摘要:]
+ComfyUIGen 调用成功。
+[本轮工具调用摘要结束]
+
+<<<[END_ROLE_DIVIDE_USER]>>>
+
+<style>.scene { color: red; }</style>
+<div id="vcp-root"><p data-probe="recovered-body">rich body recovered</p></div><<<[TOOL_REQUEST]>>>
+maid:「始」Mama「末」,
+tool_name:「始」DailyNote「末」,
+command:「始」create「末」,
+Date:「始」2026-07-20「末」,
+Content:「始ESCAPE」diary body only「末ESCAPE」,
+archery:「始」no_reply「末」
+<<<[END_TOOL_REQUEST]>>><details data-probe="details-body">
+<summary>Daily challenge</summary>
+
+details body remains visible
+</details>"#;
+
+        let mut parser = StreamBlockParser::new();
+        let blocks = parser.finalize(raw);
+        let comfy_tool_count = blocks
+            .iter()
+            .filter(|block| {
+                matches!(
+                    block,
+                    StreamBlock::Tool { tool_name, .. } if tool_name == "ComfyUIGen"
+                )
+            })
+            .count();
+
+        assert_eq!(
+            comfy_tool_count, 2,
+            "both the closed and recovered tool requests must remain visible: {blocks:#?}"
+        );
+        assert!(
+            blocks.iter().any(|block| matches!(
+                block,
+                StreamBlock::ToolResult { tool_name, status, .. }
+                    if tool_name == "ComfyUIGen" && status.contains("SUCCESS")
+            )),
+            "tool result after the malformed request must remain visible: {blocks:#?}"
+        );
+        assert!(
+            blocks.iter().any(|block| {
+                stream_block_contains_raw_html(block, "data-probe=\"recovered-body\"")
+            }),
+            "rich response after the malformed request must remain visible: {blocks:#?}"
+        );
+        assert!(
+            blocks.iter().any(|block| matches!(
+                block,
+                StreamBlock::Diary { content, .. } if content == "diary body only"
+            )),
+            "ESCAPE-wrapped DailyNote content must exclude wrapper and archery fields: {blocks:#?}"
+        );
+        assert!(
+            blocks.iter().any(|block| {
+                stream_block_contains_raw_html(block, "data-probe=\"details-body\"")
+            }),
+            "details body stuck to DailyNote must remain renderable: {blocks:#?}"
+        );
+    }
+
+    #[test]
+    fn test_finalize_active_html_container_becomes_executable_preview() {
+        let raw = r#"<div id="web-app">
+<canvas id="scene"></canvas>
+<iframe src="https://example.com"></iframe>
+<script>window.__activeHtmlRan = true</script>
+</div>"#;
+        let mut parser = StreamBlockParser::new();
+        let blocks = parser.finalize(raw);
+
+        assert_eq!(blocks.len(), 1, "{blocks:#?}");
+        match &blocks[0] {
+            StreamBlock::HtmlPreview { content, .. } => {
+                assert!(content.contains("<canvas"), "{content}");
+                assert!(content.contains("https://example.com"), "{content}");
+                assert!(
+                    content.contains("window.__activeHtmlRan = true"),
+                    "{content}"
+                );
+            }
+            other => panic!("expected active html preview, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_finalize_plain_html_button_is_not_button_click() {
         let raw = r#"<div class="actions">
 <button type="button" data-vcp-copy-code="hello">复制代码</button>
@@ -1307,5 +1436,53 @@ copy_button: should_not_send
             }
             other => panic!("expected repaired markdown block, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn every_stream_chunk_boundary_matches_one_shot_render_document() {
+        let raw = concat!(
+            "前言段落。\n\n",
+            "<div id=\"vcp-root\" style=\"padding:20px\">",
+            "<style>@keyframes blurIn { from { opacity:0 } to { opacity:1 } }",
+            ".scene { animation:blurIn .4s ease }</style>",
+            "<section class=\"scene\" data-probe=\"first\">first</section>",
+            "</div></div>",
+            "<section class=\"scene\" data-probe=\"second\">second</section>",
+            "</div>"
+        );
+
+        let mut one_shot = StreamBlockParser::new();
+        let expected = serde_json::to_value(one_shot.finalize(raw)).unwrap();
+        let boundaries: Vec<usize> = raw
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain(std::iter::once(raw.len()))
+            .collect();
+
+        for split in boundaries.iter().copied() {
+            let mut parser = StreamBlockParser::new();
+            let (mut actual, _) = parser.process(&raw[..split]);
+            let (mut after_split, _) = parser.process(raw);
+            actual.append(&mut after_split);
+            actual.extend(parser.finalize(raw));
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                expected,
+                "two-chunk rendering diverged at UTF-8 boundary {split}"
+            );
+        }
+
+        let mut parser = StreamBlockParser::new();
+        let mut actual = Vec::new();
+        for end in boundaries.iter().copied().skip(1) {
+            let (mut emitted, _) = parser.process(&raw[..end]);
+            actual.append(&mut emitted);
+        }
+        actual.extend(parser.finalize(raw));
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            expected,
+            "single-character chunking must match one-shot rendering"
+        );
     }
 }

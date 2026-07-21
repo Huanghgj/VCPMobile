@@ -8,10 +8,10 @@ const sessionStore = useChatSessionStore();
 const streamStore = useChatStreamStore();
 
 const isVisible = computed(() => {
-  return streamStore.isGroupGenerating && streamStore.activeStreamingIds.size > 0;
+  return streamStore.isGroupGenerating;
 });
 
-const activeCount = computed(() => streamStore.activeStreamingIds.size);
+const activeCount = computed(() => Math.max(1, streamStore.activeStreamingIds.size));
 
 const handleStopAll = () => {
   if (sessionStore.currentTopicId) {

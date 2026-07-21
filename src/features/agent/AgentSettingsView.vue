@@ -116,6 +116,7 @@ const isSaving = ref(false);
 const saveSuccess = ref(false);
 let saveTimeout: ReturnType<typeof setTimeout> | null = null;
 let saveSuccessTimer: ReturnType<typeof setTimeout> | null = null;
+let saveLoop: Promise<void> | null = null;
 
 // 原始配置快照，用于判断用户是否真正修改了内容
 const originalConfig = ref<AgentConfig | null>(null);
@@ -146,27 +147,59 @@ const loadConfig = async () => {
   }
 };
 
-const autoSave = async () => {
-  if (!agentConfig.value.id || !props.isOpen) return;
+const cloneConfig = (config: AgentConfig): AgentConfig =>
+  JSON.parse(JSON.stringify(config)) as AgentConfig;
 
-  isSaving.value = true;
-  saveSuccess.value = false;
+const configsMatch = (left: AgentConfig | null, right: AgentConfig) =>
+  Boolean(left && JSON.stringify(left) === JSON.stringify(right));
 
-  try {
-    // Use assistantStore to save config and get notification
-    await assistantStore.saveAgent(agentConfig.value);
-    saveSuccess.value = true;
-    // 保存成功后更新快照，避免重复保存相同内容
-    originalConfig.value = JSON.parse(JSON.stringify(agentConfig.value));
-    if (saveSuccessTimer) clearTimeout(saveSuccessTimer);
-    saveSuccessTimer = setTimeout(() => {
-      saveSuccess.value = false;
-    }, 2000);
-  } catch (err) {
-    console.error("Auto save failed:", err);
-  } finally {
-    isSaving.value = false;
+const autoSave = async (force = false) => {
+  if (!agentConfig.value.id || (!props.isOpen && !force)) return;
+  if (saveLoop) return saveLoop;
+
+  saveLoop = (async () => {
+    isSaving.value = true;
+    saveSuccess.value = false;
+    try {
+      // 串行保存不可变快照。若保存期间又有修改，继续保存最新快照，
+      // 避免较旧请求晚返回后覆盖 temperature/useTemperature 等新值。
+      while (!configsMatch(originalConfig.value, agentConfig.value)) {
+        const snapshot = cloneConfig(agentConfig.value);
+        await assistantStore.saveAgent(snapshot);
+        originalConfig.value = snapshot;
+      }
+      saveSuccess.value = true;
+      if (saveSuccessTimer) clearTimeout(saveSuccessTimer);
+      saveSuccessTimer = setTimeout(() => {
+        saveSuccess.value = false;
+      }, 2000);
+    } catch (err) {
+      console.error("Auto save failed:", err);
+    } finally {
+      isSaving.value = false;
+      saveLoop = null;
+    }
+  })();
+
+  return saveLoop;
+};
+
+const flushPendingSave = async () => {
+  if (saveTimeout) {
+    clearTimeout(saveTimeout);
+    saveTimeout = null;
   }
+  if (
+    originalConfig.value &&
+    JSON.stringify(agentConfig.value) !== JSON.stringify(originalConfig.value)
+  ) {
+    await autoSave(true);
+  }
+};
+
+const handleClose = async () => {
+  await flushPendingSave();
+  emit("close");
 };
 
 watch(
@@ -188,7 +221,11 @@ watch(
 );
 
 watch(() => props.isOpen, (val) => {
-  if (val) loadConfig();
+  if (val) {
+    loadConfig();
+  } else {
+    void flushPendingSave();
+  }
 });
 
 const handleDelete = async () => {
@@ -217,7 +254,7 @@ onMounted(async () => {
       <header
         class="p-3 flex items-center justify-between border-b border-black/10 dark:border-white/10 pt-[calc(var(--vcp-safe-top,24px)+10px)] pb-3 shrink-0 bg-black/5 dark:bg-white/5">
         <div class="flex items-center gap-2">
-          <button @click="emit('close')"
+          <button @click="handleClose"
             class="p-2 hover:bg-black/5 dark:hover:bg-white/10 rounded-lg active:scale-95 transition-all">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
               stroke-linecap="round" stroke-linejoin="round">

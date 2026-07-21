@@ -3,6 +3,11 @@ import { openUrl as openExternal } from "@tauri-apps/plugin-opener";
 import { useChatHistoryStore } from "../stores/chatHistoryStore";
 import { openRenderedImageViewer } from "./useRenderedImageViewer";
 import { findRenderedImagePayload } from "../utils/renderedImage";
+import {
+  buildHtmlButtonAction,
+  isLocalHtmlButton,
+  wrapVcpButtonAction,
+} from "../utils/htmlActions";
 
 function safeExternalHttpUrl(href: string | null): string {
   if (!href) return "";
@@ -29,6 +34,29 @@ export function useMessageEvents(containerRef: Ref<HTMLElement | null>) {
       }
     }
     return raw;
+  };
+
+  const sendButtonAction = async (
+    button: HTMLButtonElement,
+    action: string,
+  ) => {
+    const payload = wrapVcpButtonAction(action);
+    if (!payload || button.dataset.vcpActionPending === "true") return;
+
+    button.dataset.vcpActionPending = "true";
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+    try {
+      const sent = await historyStore.sendMessage(payload);
+      if (!sent) throw new Error("AI action did not start a generation request");
+      button.dataset.vcpActionSent = "true";
+    } catch (error) {
+      button.disabled = false;
+      delete button.dataset.vcpActionPending;
+      console.error("[useMessageEvents] Failed to send AI action:", error);
+    } finally {
+      button.removeAttribute("aria-busy");
+    }
   };
 
   const handleClick = (e: MouseEvent) => {
@@ -74,47 +102,25 @@ export function useMessageEvents(containerRef: Ref<HTMLElement | null>) {
     const vcpButton = target.closest('[data-vcp-button]');
     if (vcpButton) {
       const text = vcpButton.getAttribute('data-vcp-button');
-      if (text) historyStore.sendMessage(text);
+      if (text && vcpButton instanceof HTMLButtonElement) {
+        e.preventDefault();
+        e.stopPropagation();
+        void sendButtonAction(
+          vcpButton,
+          text.replace(/^\[\[点击按钮:|\]\]$/g, ""),
+        );
+      }
       return;
     }
 
-    // 1.5 拦截 AI 回复中生成的内嵌 <button> 元素
+    // 1.5 AI-generated command buttons send their local card context to AI.
     const aiButton = target.closest('button') as HTMLButtonElement | null;
-    const explicitSendText =
-      aiButton?.getAttribute('data-vcp-send') ||
-      aiButton?.getAttribute('data-send') ||
-      "";
-    if (aiButton && explicitSendText.trim()) {
+    if (aiButton && !isLocalHtmlButton(aiButton)) {
+      const action = buildHtmlButtonAction(aiButton);
+      if (!action) return;
       e.preventDefault();
       e.stopPropagation();
-
-      // 如果按钮已被禁用，直接拦截，防止重复点击
-      if (aiButton.disabled) {
-        return;
-      }
-
-      // 提取发送文本（优先级：data-send 属性 > 按钮 textContent）
-      const sendText = explicitSendText.trim();
-      if (sendText) {
-        let finalSendText = `[[点击按钮:${sendText}]]`;
-
-        // 超长文本截断（防超限）
-        if (finalSendText.length > 500) {
-          const maxTextLength = 500 - '[[点击按钮:]]'.length;
-          const truncatedText = sendText.substring(0, maxTextLength);
-          finalSendText = `[[点击按钮:${truncatedText}]]`;
-        }
-
-        // 按钮物理禁用与状态置灰反馈（与桌面端一致）
-        aiButton.disabled = true;
-        aiButton.style.opacity = '0.6';
-        aiButton.style.cursor = 'not-allowed';
-        const originalText = aiButton.textContent || '';
-        aiButton.textContent = originalText + ' ✓';
-
-        // 发送消息
-        historyStore.sendMessage(finalSendText);
-      }
+      void sendButtonAction(aiButton, action);
       return;
     }
 

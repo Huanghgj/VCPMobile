@@ -9,10 +9,10 @@ use serde_json::{json, Value};
 use std::io::Error as IoError;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tauri::{ipc::Channel, AppHandle, Emitter, Manager, Runtime};
-use tokio::sync::oneshot;
+use tokio::sync::watch;
 use tokio_util::codec::{FramedRead, LinesCodec};
 use tokio_util::io::StreamReader;
 use url::Url;
@@ -442,34 +442,12 @@ struct RemoteInterruptContext {
     request_id: String,
 }
 
-static REMOTE_INTERRUPT_CONTEXTS: LazyLock<DashMap<String, RemoteInterruptContext>> =
-    LazyLock::new(DashMap::new);
-
 fn interrupt_url_for_request(url_str: &str) -> Option<String> {
     let mut url = Url::parse(url_str).ok()?;
     url.set_path("/v1/interrupt");
     url.set_query(None);
     url.set_fragment(None);
     Some(url.to_string())
-}
-
-fn register_remote_interrupt_context(message_id: &str, vcp_url: &str, api_key: &str) {
-    let Some(interrupt_url) = interrupt_url_for_request(vcp_url) else {
-        log::warn!(
-            "[VCPClient] Failed to build remote interrupt URL for messageId: {}",
-            message_id
-        );
-        return;
-    };
-
-    REMOTE_INTERRUPT_CONTEXTS.insert(
-        message_id.to_string(),
-        RemoteInterruptContext {
-            interrupt_url,
-            api_key: api_key.to_string(),
-            request_id: message_id.to_string(),
-        },
-    );
 }
 
 async fn post_remote_interrupt(ctx: RemoteInterruptContext) {
@@ -526,38 +504,106 @@ async fn post_remote_interrupt(ctx: RemoteInterruptContext) {
     }
 }
 
-fn spawn_remote_interrupt(message_id: &str) {
-    let Some(ctx) = REMOTE_INTERRUPT_CONTEXTS
-        .get(message_id)
-        .map(|entry| entry.clone())
-    else {
-        log::warn!(
-            "[VCPClient] No remote interrupt context found for messageId: {}",
-            message_id
-        );
-        return;
-    };
+/// 单个请求的取消状态。句柄可以在上下文和附件准备前登记，随后由网络层绑定远端中止信息。
+pub struct ActiveRequestControl {
+    cancelled: AtomicBool,
+    remote_interrupt_sent: AtomicBool,
+    cancel_tx: watch::Sender<bool>,
+    remote_context: Mutex<Option<RemoteInterruptContext>>,
+}
 
-    tauri::async_runtime::spawn(post_remote_interrupt(ctx));
+impl ActiveRequestControl {
+    fn new() -> Self {
+        let (cancel_tx, _) = watch::channel(false);
+        Self {
+            cancelled: AtomicBool::new(false),
+            remote_interrupt_sent: AtomicBool::new(false),
+            cancel_tx,
+            remote_context: Mutex::new(None),
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub fn subscribe(&self) -> watch::Receiver<bool> {
+        self.cancel_tx.subscribe()
+    }
+
+    /// 返回 true 表示本次调用首次把请求切换为已取消。
+    pub fn cancel(&self) -> bool {
+        let first = !self.cancelled.swap(true, Ordering::AcqRel);
+        self.cancel_tx.send_replace(true);
+        self.try_spawn_remote_interrupt();
+        first
+    }
+
+    pub fn bind_remote_interrupt(&self, message_id: &str, vcp_url: &str, api_key: &str) {
+        let Some(interrupt_url) = interrupt_url_for_request(vcp_url) else {
+            log::warn!(
+                "[VCPClient] Failed to build remote interrupt URL for messageId: {}",
+                message_id
+            );
+            return;
+        };
+        if let Ok(mut remote_context) = self.remote_context.lock() {
+            *remote_context = Some(RemoteInterruptContext {
+                interrupt_url,
+                api_key: api_key.to_string(),
+                request_id: message_id.to_string(),
+            });
+        }
+        if self.is_cancelled() {
+            self.try_spawn_remote_interrupt();
+        }
+    }
+
+    fn try_spawn_remote_interrupt(&self) {
+        let context = self
+            .remote_context
+            .lock()
+            .ok()
+            .and_then(|context| context.clone());
+        let Some(context) = context else {
+            return;
+        };
+        if self
+            .remote_interrupt_sent
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            tauri::async_runtime::spawn(post_remote_interrupt(context));
+        }
+    }
+}
+
+async fn wait_for_cancellation(receiver: &mut watch::Receiver<bool>) {
+    if *receiver.borrow() {
+        return;
+    }
+    while receiver.changed().await.is_ok() {
+        if *receiver.borrow() {
+            return;
+        }
+    }
 }
 
 pub fn schedule_interrupt_request_with_retry(
-    active_requests: Arc<DashMap<String, oneshot::Sender<()>>>,
+    active_requests: Arc<DashMap<String, Arc<ActiveRequestControl>>>,
     message_id: String,
     reason: &'static str,
 ) {
     tauri::async_runtime::spawn(async move {
         for attempt in 0..20 {
-            if let Some((_, sender)) = active_requests.remove(&message_id) {
+            if let Some(control) = active_requests.get(&message_id).map(|entry| entry.clone()) {
                 log::info!(
                     "[VCPClient] Interrupting request {} after {} attempt(s), reason={}",
                     message_id,
                     attempt + 1,
                     reason
                 );
-                spawn_remote_interrupt(&message_id);
-                let _ = sender.send(());
-                REMOTE_INTERRUPT_CONTEXTS.remove(&message_id);
+                control.cancel();
                 return;
             }
 
@@ -565,19 +611,24 @@ pub fn schedule_interrupt_request_with_retry(
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
         }
-
         log::warn!(
             "[VCPClient] Request {} was not found after retrying interrupt, reason={}",
             message_id,
             reason
         );
-        REMOTE_INTERRUPT_CONTEXTS.remove(&message_id);
     });
 }
 
-/// 全局活跃请求管理器，使用 DashMap 存储中止信号发送端
-/// messageId -> oneshot::Sender
-pub struct ActiveRequests(pub Arc<DashMap<String, oneshot::Sender<()>>>);
+/// 全局活跃请求管理器。请求准备阶段和网络阶段共享同一个幂等取消句柄。
+pub struct ActiveRequests(pub Arc<DashMap<String, Arc<ActiveRequestControl>>>);
+
+impl ActiveRequests {
+    pub fn register(&self, message_id: &str) -> Arc<ActiveRequestControl> {
+        let control = Arc::new(ActiveRequestControl::new());
+        self.0.insert(message_id.to_string(), control.clone());
+        control
+    }
+}
 
 impl Default for ActiveRequests {
     fn default() -> Self {
@@ -588,23 +639,34 @@ impl Default for ActiveRequests {
 
 /// RAII guard：在 Drop 时自动从 ActiveRequests 中移除对应条目，防止 panic 导致泄漏
 pub struct ActiveRequestGuard {
-    requests: Arc<DashMap<String, oneshot::Sender<()>>>,
+    requests: Arc<DashMap<String, Arc<ActiveRequestControl>>>,
     message_id: String,
+    control: Arc<ActiveRequestControl>,
 }
 
 impl ActiveRequestGuard {
-    pub fn new(requests: Arc<DashMap<String, oneshot::Sender<()>>>, message_id: String) -> Self {
+    pub fn new(
+        requests: Arc<DashMap<String, Arc<ActiveRequestControl>>>,
+        message_id: String,
+        control: Arc<ActiveRequestControl>,
+    ) -> Self {
         Self {
             requests,
             message_id,
+            control,
         }
     }
 }
 
 impl Drop for ActiveRequestGuard {
     fn drop(&mut self) {
-        self.requests.remove(&self.message_id);
-        REMOTE_INTERRUPT_CONTEXTS.remove(&self.message_id);
+        let should_remove = self
+            .requests
+            .get(&self.message_id)
+            .is_some_and(|current| Arc::ptr_eq(current.value(), &self.control));
+        if should_remove {
+            self.requests.remove(&self.message_id);
+        }
     }
 }
 
@@ -625,13 +687,15 @@ impl Default for CancelledGroupTurns {
 pub fn interruptGroupTurn(
     state: tauri::State<'_, CancelledGroupTurns>,
     topic_id: String,
+    turn_id: Option<String>,
 ) -> Result<Value, String> {
+    let cancellation_key = turn_id.unwrap_or(topic_id);
     log::info!(
-        "[VCPClient] interruptGroupTurn called for topicId: {}",
-        topic_id
+        "[VCPClient] interruptGroupTurn called for key: {}",
+        cancellation_key
     );
-    state.0.insert(topic_id);
-    Ok(json!({"status": "cancelled"}))
+    state.0.insert(cancellation_key.clone());
+    Ok(json!({"status": "cancelled", "turnId": cancellation_key}))
 }
 
 /// 核心请求函数：sendToVCP
@@ -651,12 +715,14 @@ pub async fn sendToVCP<R: Runtime>(
 ) -> Result<Value, String> {
     let message_id = payload.message_id.clone();
     let context = payload.context.clone();
-    let is_stream = payload.model_config["stream"].as_bool().unwrap_or(false);
+    let request_control = state.register(&message_id);
+    let _request_guard =
+        ActiveRequestGuard::new(state.0.clone(), message_id.clone(), request_control.clone());
 
     let (res, is_aborted) =
-        perform_vcp_request(&app, state.0.clone(), payload, Some(stream_channel.clone())).await?;
+        perform_vcp_request(&app, request_control, payload, Some(stream_channel.clone())).await?;
 
-    if is_stream {
+    if let Some(full_content) = res["fullContent"].as_str() {
         let finish_reason = if is_aborted {
             Some("cancelled_by_user".to_string())
         } else {
@@ -693,7 +759,7 @@ pub async fn sendToVCP<R: Runtime>(
             owner_type,
             topic_id,
             message_id,
-            res["fullContent"].as_str().unwrap_or("").to_string(),
+            full_content.to_string(),
             is_aborted,
             finish_reason,
             agent_id,
@@ -714,7 +780,7 @@ fn extract_text_for_hash(content: &Value) -> String {
     if let Some(arr) = content.as_array() {
         let text_parts: Vec<String> = arr
             .iter()
-            .filter(|part| part["type"].as_str() == Some("text"))
+            .filter(|part| matches!(part["type"].as_str(), Some("text") | Some("output_text")))
             .filter_map(|part| part["text"].as_str())
             .map(|s| s.to_string())
             .collect();
@@ -726,6 +792,59 @@ fn extract_text_for_hash(content: &Value) -> String {
         }
     }
     String::new()
+}
+
+fn normalize_non_stream_completion(response: Value) -> Result<Value, String> {
+    let (full_content, finish_reason) = {
+        let choice = response
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+            .ok_or_else(|| {
+                "VCP non-stream response did not contain a completion choice".to_string()
+            })?;
+        let message = choice.get("message");
+        let content = message
+            .and_then(|value| value.get("content"))
+            .or_else(|| choice.get("text"))
+            .map(extract_text_for_hash)
+            .unwrap_or_default();
+        let reasoning = message
+            .and_then(|value| {
+                value
+                    .get("reasoning_content")
+                    .or_else(|| value.get("reasoningContent"))
+                    .or_else(|| value.get("reasoning"))
+            })
+            .and_then(Value::as_str)
+            .unwrap_or("");
+
+        let full_content = if reasoning.is_empty() {
+            content
+        } else if content.is_empty() {
+            format!("<think>{reasoning}</think>")
+        } else {
+            format!("<think>{reasoning}</think>{content}")
+        };
+        let finish_reason = choice
+            .get("finish_reason")
+            .and_then(Value::as_str)
+            .map(|reason| {
+                if reason == "stop" {
+                    "completed".to_string()
+                } else {
+                    reason.to_string()
+                }
+            });
+        (full_content, finish_reason)
+    };
+
+    Ok(json!({
+        "response": response,
+        "fullContent": full_content,
+        "streamingStarted": false,
+        "finishReason": finish_reason
+    }))
 }
 
 fn get_or_calculate_message_hash(content: &Value) -> String {
@@ -740,7 +859,7 @@ fn get_or_calculate_message_hash(content: &Value) -> String {
 /// 返回 Result<(全量内容/响应体, 是否被中止), 错误信息>
 pub async fn perform_vcp_request<R: Runtime>(
     app: &AppHandle<R>,
-    active_requests: Arc<DashMap<String, oneshot::Sender<()>>>,
+    request_control: Arc<ActiveRequestControl>,
     payload: VcpRequestPayload,
     stream_channel: Option<Channel<StreamEvent>>,
 ) -> Result<(Value, bool), String> {
@@ -749,6 +868,21 @@ pub async fn perform_vcp_request<R: Runtime>(
         payload.message_id,
         payload.context
     );
+
+    let mut abort_rx = request_control.subscribe();
+    let cancelled_result = || {
+        (
+            json!({
+                "fullContent": "",
+                "streamingStarted": false,
+                "finishReason": "cancelled_by_user"
+            }),
+            true,
+        )
+    };
+    if request_control.is_cancelled() {
+        return Ok(cancelled_result());
+    }
 
     let send_stream_event = |event: StreamEvent| {
         if let Some(ref ch) = stream_channel {
@@ -791,6 +925,9 @@ pub async fn perform_vcp_request<R: Runtime>(
     // === 0. 数据验证和规范化 ===
     let mut messages: Vec<Value> = Vec::new();
     for (msg_index, msg_val) in payload.messages.into_iter().enumerate() {
+        if request_control.is_cancelled() {
+            return Ok(cancelled_result());
+        }
         if !msg_val.is_object() {
             messages.push(json!({"role": "system", "content": "[Invalid message]"}));
             continue;
@@ -804,6 +941,9 @@ pub async fn perform_vcp_request<R: Runtime>(
         if let Some(content_array) = content.as_array() {
             let mut new_parts = Vec::new();
             for part in content_array {
+                if request_control.is_cancelled() {
+                    return Ok(cancelled_result());
+                }
                 if let Some(obj) = part.as_object() {
                     // 识别自定义的 local_file 类型并进行路径还原与编码
                     if obj.get("type").and_then(|t| t.as_str()) == Some("local_file") {
@@ -914,14 +1054,20 @@ pub async fn perform_vcp_request<R: Runtime>(
                                     if !converted {
                                         let path_buf_clone = path_buf.clone();
                                         let app_clone = app.clone();
-                                        match tokio::task::spawn_blocking(move || {
-                                            convert_local_image_for_multimodal(
-                                                &app_clone,
-                                                &path_buf_clone,
-                                            )
-                                        })
-                                        .await
-                                        {
+                                        let conversion_task =
+                                            tokio::task::spawn_blocking(move || {
+                                                convert_local_image_for_multimodal(
+                                                    &app_clone,
+                                                    &path_buf_clone,
+                                                )
+                                            });
+                                        let conversion_result = tokio::select! {
+                                            _ = wait_for_cancellation(&mut abort_rx) => {
+                                                return Ok(cancelled_result());
+                                            }
+                                            result = conversion_task => result
+                                        };
+                                        match conversion_result {
                                             Ok(Ok(data_url)) => {
                                                 let payload_chars = data_url.len();
                                                 log::info!(
@@ -1184,11 +1330,14 @@ pub async fn perform_vcp_request<R: Runtime>(
         .build()
         .map_err(|e| e.to_string())?;
 
-    // 创建并注册中止信号
-    let (abort_tx, abort_rx) = oneshot::channel();
-    register_remote_interrupt_context(&payload.message_id, &payload.vcp_url, &payload.vcp_api_key);
-    active_requests.insert(payload.message_id.clone(), abort_tx);
-    let _guard = ActiveRequestGuard::new(active_requests.clone(), payload.message_id.clone());
+    if request_control.is_cancelled() {
+        return Ok(cancelled_result());
+    }
+    request_control.bind_remote_interrupt(
+        &payload.message_id,
+        &payload.vcp_url,
+        &payload.vcp_api_key,
+    );
 
     let message_id = payload.message_id.clone();
     let context = payload.context.clone();
@@ -1199,12 +1348,9 @@ pub async fn perform_vcp_request<R: Runtime>(
         let _app_handle = app.clone();
         let message_id_inner = message_id.clone();
         let context_inner = context.clone();
-        let active_requests_inner = active_requests.clone();
-
         let mut full_content = String::new();
         let mut last_finish_reason: Option<String> = None;
         let mut is_aborted = false;
-        let mut abort_rx = abort_rx; // 取得所有权进入循环
         let mut aurora_buffer = AuroraBuffer::new();
         let mut pending_aurora_chunk = String::new();
         let mut last_aurora_parse = std::time::Instant::now() - Duration::from_millis(33);
@@ -1319,13 +1465,12 @@ pub async fn perform_vcp_request<R: Runtime>(
             .send();
 
         tokio::select! {
-            _ = &mut abort_rx => {
+            _ = wait_for_cancellation(&mut abort_rx) => {
                 log::warn!("[VCPClient] Request aborted before response for message: {}", message_id_inner);
                 close_reasoning_block(&mut pending_aurora_chunk, &mut full_content, &mut reasoning_block_open);
                 flush_aurora_parse(&mut aurora_buffer, &mut pending_aurora_chunk, &mut last_aurora_parse, true);
                 aurora_buffer.finalize();
                 send_aurora_update(&mut aurora_buffer, true, true, Some("cancelled_by_user".to_string()), Some("请求已中止".to_string()));
-                active_requests_inner.remove(&message_id_inner);
                 return Ok((json!({ "fullContent": aurora_buffer.full_text, "streamingStarted": false }), true));
             }
             response_res = res_future => {
@@ -1340,7 +1485,7 @@ pub async fn perform_vcp_request<R: Runtime>(
                         loop {
                             tokio::select! {
                                 // 即使工具调用长时间不吐 token，也不能因 idle timeout 误杀连接；这里只响应用户中止和流自身结束。
-                                _ = &mut abort_rx => {
+                                _ = wait_for_cancellation(&mut abort_rx) => {
                                     is_aborted = true;
                                     log::warn!("[VCPClient] Stream deep-polling detected abort for message: {}", message_id_inner);
                                     close_reasoning_block(&mut pending_aurora_chunk, &mut full_content, &mut reasoning_block_open);
@@ -1348,8 +1493,6 @@ pub async fn perform_vcp_request<R: Runtime>(
                                     aurora_buffer.finalize();
                                     send_aurora_update(&mut aurora_buffer, true, true, Some("cancelled_by_user".to_string()), Some("请求已中止".to_string()));
 
-                                    // 显式清理，防止 race
-                                    active_requests_inner.remove(&message_id_inner);
                                     break;
                                 }
                                 line_res = lines.next() => {
@@ -1475,7 +1618,6 @@ pub async fn perform_vcp_request<R: Runtime>(
                             format!("VCP服务器错误: {} - {}", status, text),
                         ));
 
-                        active_requests_inner.remove(&message_id_inner);
                         return Err(format!("VCP Error: {}", status));
                     }
                     Err(e) => {
@@ -1485,14 +1627,12 @@ pub async fn perform_vcp_request<R: Runtime>(
                             format!("网络请求异常: {}", e),
                         ));
 
-                        active_requests_inner.remove(&message_id_inner);
                         return Err(e.to_string());
                     }
                 }
             }
         }
 
-        active_requests_inner.remove(&message_id_inner);
         Ok((
             json!({
                 "fullContent": aurora_buffer.full_text,
@@ -1503,16 +1643,25 @@ pub async fn perform_vcp_request<R: Runtime>(
         ))
     } else {
         // === 7. 非流式响应模式 ===
-        let response = client
+        let response_future = client
             .post(&final_url)
             .header(AUTHORIZATION, format!("Bearer {}", api_key))
             .header(CONTENT_TYPE, "application/json")
             .json(&request_body)
-            .send()
-            .await
-            .map_err(|e| format!("VCP请求失败: {}", e))?;
-
-        active_requests.remove(&message_id);
+            .send();
+        let response = tokio::select! {
+            _ = wait_for_cancellation(&mut abort_rx) => {
+                log::warn!("[VCPClient] Non-stream request aborted for message: {}", message_id);
+                return Ok((json!({
+                    "fullContent": "",
+                    "streamingStarted": false,
+                    "finishReason": "cancelled_by_user"
+                }), true));
+            }
+            response = response_future => {
+                response.map_err(|e| format!("VCP request failed: {}", e))?
+            }
+        };
 
         if !response.status().is_success() {
             let status = response.status();
@@ -1522,8 +1671,10 @@ pub async fn perform_vcp_request<R: Runtime>(
         let vcp_response = response
             .json::<Value>()
             .await
-            .map_err(|e| format!("JSON解析失败: {}", e))?;
-        Ok((json!({"response": vcp_response, "context": context}), false))
+            .map_err(|e| format!("VCP non-stream JSON parse failed: {}", e))?;
+        let mut normalized = normalize_non_stream_completion(vcp_response)?;
+        normalized["context"] = json!(context);
+        Ok((normalized, false))
     }
 }
 
@@ -1560,26 +1711,33 @@ pub fn interruptRequest(
         message_id,
         state.0.len()
     );
-    if let Some((_, sender)) = state.0.remove(&message_id) {
+    if let Some(control) = state.0.get(&message_id).map(|entry| entry.clone()) {
+        let first = control.cancel();
+        let status = if first {
+            "interrupted"
+        } else {
+            "already_cancelled"
+        };
         log::info!(
-            "[VCPClient] Found AbortController for messageId: {}, aborting...",
-            message_id
-        );
-        spawn_remote_interrupt(&message_id);
-        let _ = sender.send(());
-        REMOTE_INTERRUPT_CONTEXTS.remove(&message_id);
-        log::info!(
-            "[VCPClient] Request interrupted for messageId: {}. Remaining active requests: {}",
+            "[VCPClient] Interrupt status for messageId {}: {}",
             message_id,
-            state.0.len()
+            status
         );
-        Ok(json!({"success": true, "message": format!("Request {} interrupted", message_id)}))
+        Ok(json!({
+            "success": true,
+            "status": status,
+            "messageId": message_id
+        }))
     } else {
         log::warn!(
             "[VCPClient] No active request found for messageId: {}",
             message_id
         );
-        Err(format!("Request {} not found", message_id))
+        Ok(json!({
+            "success": false,
+            "status": "not_found",
+            "messageId": message_id
+        }))
     }
 }
 
@@ -1682,6 +1840,78 @@ pub fn normalize_vcp_url(url_str: &str) -> String {
         }
     }
     url_str.to_string()
+}
+
+#[cfg(test)]
+mod completion_response_tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_openai_non_stream_completion() {
+        let normalized = normalize_non_stream_completion(json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": "final answer" },
+                "finish_reason": "stop"
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(normalized["fullContent"], "final answer");
+        assert_eq!(normalized["finishReason"], "completed");
+        assert_eq!(normalized["streamingStarted"], false);
+    }
+
+    #[test]
+    fn preserves_reasoning_and_structured_text_content() {
+        let normalized = normalize_non_stream_completion(json!({
+            "choices": [{
+                "message": {
+                    "reasoning_content": "private reasoning",
+                    "content": [
+                        { "type": "text", "text": "first" },
+                        { "type": "output_text", "text": "second" }
+                    ]
+                },
+                "finish_reason": "length"
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            normalized["fullContent"],
+            "<think>private reasoning</think>first\nsecond"
+        );
+        assert_eq!(normalized["finishReason"], "length");
+    }
+
+    #[test]
+    fn rejects_non_completion_json() {
+        let error = normalize_non_stream_completion(json!({ "error": "bad gateway" })).unwrap_err();
+
+        assert!(error.contains("completion choice"));
+    }
+
+    #[test]
+    fn cancellation_is_idempotent_and_visible_to_late_subscribers() {
+        let control = ActiveRequestControl::new();
+        assert!(control.cancel());
+        assert!(!control.cancel());
+        assert!(control.is_cancelled());
+        assert!(*control.subscribe().borrow());
+    }
+
+    #[test]
+    fn stale_guard_does_not_remove_replacement_request() {
+        let requests = ActiveRequests::default();
+        let old_control = requests.register("same-id");
+        let guard = ActiveRequestGuard::new(requests.0.clone(), "same-id".to_string(), old_control);
+        let replacement = requests.register("same-id");
+
+        drop(guard);
+
+        let current = requests.0.get("same-id").unwrap();
+        assert!(Arc::ptr_eq(current.value(), &replacement));
+    }
 }
 
 #[cfg(test)]

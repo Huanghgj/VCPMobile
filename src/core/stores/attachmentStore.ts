@@ -103,18 +103,6 @@ export const useAttachmentStore = defineStore("attachment", () => {
     }
   });
 
-  listen<any>("vcp-multimodal-status", (event) => {
-    if (event.payload?.status !== "base64_ready") return;
-    const payloadChars = Number(event.payload?.payloadChars) || 0;
-    useNotificationStore().addNotification({
-      type: "success",
-      title: "图片已转换",
-      message: `Base64 多模态载荷已生成（${Math.round(payloadChars / 1024)} KB）`,
-      toastOnly: true,
-      duration: 2400,
-    });
-  });
-
   /**
    * 处理消息中的本地资源路径 (仅附件)，使用 Tauri 原生 asset:// 协议绕过 WebView 限制
    */

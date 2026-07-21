@@ -388,8 +388,8 @@ export const useAiLifecycleStore = defineStore(
         };
       }
 
-      if (streamStore.activeStreamingIds.size > 0 && !force) {
-        signals.push(`当前会话仍有 ${streamStore.activeStreamingIds.size} 个生成流`);
+      if (streamStore.isCurrentSessionGenerating && !force) {
+        signals.push("当前会话仍在准备或生成回复");
         return {
           id: `life_${now}_${Math.random().toString(36).slice(2, 8)}`,
           timestamp: now,
@@ -639,7 +639,7 @@ export const useAiLifecycleStore = defineStore(
       if (
         sessionStore.currentSelectedItem?.id !== decision.target.ownerId ||
         sessionStore.currentTopicId !== decision.target.topicId ||
-        streamStore.activeStreamingIds.size > 0
+        streamStore.isCurrentSessionGenerating
       ) {
         decision.status = "deferred";
         decision.failureReason = "目标会话已切换或仍在生成";

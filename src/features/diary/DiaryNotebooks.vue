@@ -64,6 +64,11 @@ const filteredNotes = computed(() => {
   );
 });
 
+// ── 多选 ──
+const selectMode = ref(false);
+const selected = ref<Set<string>>(new Set());
+const selectedCount = computed(() => selected.value.size);
+
 watch(
   () => props.currentFolder,
   (f) => {
@@ -82,11 +87,6 @@ const fmtDate = (iso: string) => {
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 };
-
-// ── 多选 ──
-const selectMode = ref(false);
-const selected = ref<Set<string>>(new Set());
-const selectedCount = computed(() => selected.value.size);
 
 const toggle = (file: string) => {
   const s = new Set(selected.value);

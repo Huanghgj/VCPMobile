@@ -1,8 +1,17 @@
 <script setup lang="ts">
-import { ref, watch, computed, onUnmounted } from "vue";
-import DOMPurify from "dompurify";
+import { ref, watch, computed, onMounted, onUnmounted, nextTick } from "vue";
 import { useThemeStore } from "../../../core/stores/theme";
+import { useChatHistoryStore } from "../../../core/stores/chatHistoryStore";
 import { useModalHistory } from "../../../core/composables/useModalHistory";
+import { useRenderVisibility } from "../../../core/composables/useRenderVisibility";
+import { wrapVcpButtonAction } from "../../../core/utils/htmlActions";
+import {
+  ACTIVE_HTML_MESSAGE_SOURCE,
+  ACTIVE_HTML_PARENT_SOURCE,
+  ACTIVE_HTML_PERMISSIONS,
+  ACTIVE_HTML_SANDBOX,
+  buildActiveHtmlDocument,
+} from "../../../core/utils/activeHtmlSandbox";
 
 const props = defineProps<{
   content: string;
@@ -13,15 +22,23 @@ const props = defineProps<{
 }>();
 
 const themeStore = useThemeStore();
+const historyStore = useChatHistoryStore();
 const isPreviewing = ref(!props.isStreaming);
 const isFullScreen = ref(false);
 const fullScreenTab = ref<"code" | "preview">("code");
+const blockRef = ref<HTMLElement | null>(null);
 const inlineIframeRef = ref<HTMLIFrameElement | null>(null);
 const fullscreenIframeRef = ref<HTMLIFrameElement | null>(null);
+const inlineHeight = ref(180);
+const fullscreenHeight = ref(480);
+const { state } = useRenderVisibility(blockRef, inlineHeight.value);
+const inlineMounted = computed(
+  () => isPreviewing.value && state.value !== "parked",
+);
 
 const { registerModal, unregisterModal } = useModalHistory();
 const modalId = `HtmlPreviewBlockFullScreen_${Math.random().toString(36).substring(2, 9)}`;
-const imageNonce = Math.random().toString(36).substring(2, 15);
+const bridgeNonce = Math.random().toString(36).substring(2, 15);
 
 watch(isFullScreen, (newVal) => {
   if (newVal) {
@@ -66,99 +83,145 @@ const copyCode = async () => {
   }
 };
 
-// 构造沙箱 HTML
+// Active content executes inside an opaque-origin iframe, not the app document.
 const sandboxHtml = computed(() => {
-  const content = props.content;
-  const isDark = themeStore.isDarkResolved;
-
-  const cleanHtml = DOMPurify.sanitize(content, {
-    USE_PROFILES: { html: true, svg: true, mathMl: true },
-    ADD_TAGS: ["style", "canvas"],
-    ADD_ATTR: [
-      "style",
-      "class",
-      "id",
-      "title",
-      "aria-label",
-      "alt",
-      "src",
-      "href",
-      "width",
-      "height",
-      "viewBox",
-    ],
-    FORBID_TAGS: [
-      "applet",
-      "embed",
-      "object",
-      "script",
-      "iframe",
-      "link",
-      "meta",
-    ],
-    FORBID_ATTR: ["srcdoc"],
-    ALLOW_UNKNOWN_PROTOCOLS: false,
-    WHOLE_DOCUMENT: true,
-    RETURN_DOM: false,
-  });
-
-  const vcpInjections =
-    `
-    <style>
-      ::-webkit-scrollbar { width: 5px !important; height: 5px !important; }
-      ::-webkit-scrollbar-track { background: transparent !important; }
-      ::-webkit-scrollbar-thumb { background: ${isDark ? "rgba(255,255,255,0.1)" : "rgba(0,0,0,0.1)"} !important; border-radius: 10px !important; }
-      html, body {
-        background-color: transparent !important;
-        color: ${isDark ? "#d1d5db" : "#374151"};
-      }
-      body { margin: 0; padding: 16px; box-sizing: border-box; min-height: 100%; }
-      canvas, img, video, iframe { max-width: 100% !important; }
-      img, canvas, svg, [style*="background-image"] { cursor: zoom-in; }
-    </style>
-    <` +
-    `script>
-      document.addEventListener('click', function(e) {
-        const target = e.target.closest('a');
-        if (target) {
-          const href = target.getAttribute('href');
-          if (!href || href === '#' || href.startsWith('javascript:')) {
-            e.preventDefault();
-          }
-        }
-
-        // 捕获并拦截图片点击，发送 postMessage 放大查看
-        const img = e.target.closest('img');
-        if (img) {
-          e.preventDefault();
-          window.parent.postMessage({
-            source: 'vcp-mobile',
-            type: 'rendered-image-click',
-            nonce: '${imageNonce}',
-            image: {
-              src: img.src,
-              alt: img.alt || '',
-              title: img.title || ''
-            }
-          }, '*');
-        }
-      }, true);
-
-      const _originalAlert = window.alert;
-      window.alert = function(msg) {
-        console.log('[VCP Sandbox Alert]:', msg);
-        try { _originalAlert(msg); } catch (e) {}
-      };
-    <` +
-    `/script>
-  `;
-
-  if (/<head[^>]*>/i.test(cleanHtml)) {
-    return cleanHtml.replace(/<head[^>]*>/i, `$&${vcpInjections}`);
-  } else {
-    return `<!DOCTYPE html><html><head>${vcpInjections}</head>${cleanHtml}</html>`;
-  }
+  return buildActiveHtmlDocument(
+    props.content,
+    themeStore.isDarkResolved,
+    bridgeNonce,
+  );
 });
+
+interface ActiveHtmlMessage {
+  source?: string;
+  type?: string;
+  nonce?: string;
+  height?: number;
+  deltaY?: number;
+  actionId?: string;
+  action?: string;
+}
+
+function trustedFrame(
+  event: MessageEvent<ActiveHtmlMessage>,
+): HTMLIFrameElement | null {
+  if (event.origin !== "null" || !event.source) return null;
+  const frames = [inlineIframeRef.value, fullscreenIframeRef.value];
+  return frames.find((frame) => frame?.contentWindow === event.source) || null;
+}
+
+function postToFrame(
+  frame: HTMLIFrameElement,
+  payload: Record<string, unknown>,
+) {
+  frame.contentWindow?.postMessage(
+    {
+      source: ACTIVE_HTML_PARENT_SOURCE,
+      nonce: bridgeNonce,
+      ...payload,
+    },
+    "*",
+  );
+}
+
+async function handleSandboxAction(
+  frame: HTMLIFrameElement,
+  data: ActiveHtmlMessage,
+) {
+  const actionId = data.actionId || "";
+  const payload = wrapVcpButtonAction(data.action || "");
+  if (!actionId || !payload) {
+    postToFrame(frame, { type: "ai-action-result", actionId, success: false });
+    return;
+  }
+
+  try {
+    const sent = await historyStore.sendMessage(payload);
+    if (!sent) throw new Error("AI action did not start a generation request");
+    postToFrame(frame, { type: "ai-action-result", actionId, success: true });
+  } catch (error) {
+    console.error("[HtmlPreviewBlock] Failed to send sandbox action:", error);
+    postToFrame(frame, { type: "ai-action-result", actionId, success: false });
+  }
+}
+
+function handleSandboxMessage(event: MessageEvent<ActiveHtmlMessage>) {
+  const data = event.data;
+  if (
+    !data ||
+    typeof data !== "object" ||
+    data.source !== ACTIVE_HTML_MESSAGE_SOURCE ||
+    data.nonce !== bridgeNonce
+  ) {
+    return;
+  }
+  const frame = trustedFrame(event);
+  if (!frame) return;
+
+  if (data.type === "render-size") {
+    const nextHeight = Math.ceil(Number(data.height));
+    if (Number.isFinite(nextHeight) && nextHeight > 0 && nextHeight < 100_000) {
+      if (frame === inlineIframeRef.value) inlineHeight.value = nextHeight;
+      if (frame === fullscreenIframeRef.value)
+        fullscreenHeight.value = nextHeight;
+    }
+  } else if (data.type === "render-ready") {
+    scheduleVisibilityUpdate();
+  } else if (data.type === "render-scroll") {
+    const deltaY = Number(data.deltaY);
+    if (!Number.isFinite(deltaY) || Math.abs(deltaY) > window.innerHeight) {
+      return;
+    }
+    frame.closest<HTMLElement>(".overflow-y-auto")?.scrollBy({ top: deltaY });
+  } else if (data.type === "ai-action") {
+    void handleSandboxAction(frame, data);
+  }
+}
+
+let visibilityFrame: number | null = null;
+
+function visibleBoundsForFrame(frame: HTMLIFrameElement) {
+  const rect = frame.getBoundingClientRect();
+  let viewportTop = 0;
+  let viewportBottom = window.innerHeight;
+  const scrollParent = frame.closest<HTMLElement>(".overflow-y-auto");
+  if (scrollParent) {
+    const parentRect = scrollParent.getBoundingClientRect();
+    viewportTop = Math.max(viewportTop, parentRect.top);
+    viewportBottom = Math.min(viewportBottom, parentRect.bottom);
+  }
+  const visible =
+    !document.hidden &&
+    rect.bottom > viewportTop &&
+    rect.top < viewportBottom &&
+    rect.right > 0 &&
+    rect.left < window.innerWidth;
+  return {
+    visible,
+    clipTop: Math.max(0, viewportTop - rect.top),
+    clipBottom: Math.max(0, Math.min(rect.height, viewportBottom - rect.top)),
+  };
+}
+
+function updateFrameVisibility() {
+  visibilityFrame = null;
+  for (const frame of [inlineIframeRef.value, fullscreenIframeRef.value]) {
+    if (!frame?.contentWindow) continue;
+    postToFrame(frame, {
+      type: "render-visibility",
+      ...visibleBoundsForFrame(frame),
+    });
+  }
+}
+
+function scheduleVisibilityUpdate() {
+  if (visibilityFrame !== null) return;
+  visibilityFrame = requestAnimationFrame(updateFrameVisibility);
+}
+
+function handleFrameLoad() {
+  scheduleVisibilityUpdate();
+}
 
 const openFullScreen = () => {
   isFullScreen.value = true;
@@ -193,20 +256,39 @@ watch(fullScreenTab, (val) => {
   isPreviewing.value = val === "preview";
 });
 
+watch([state, inlineHeight, isFullScreen, fullScreenTab], () => {
+  void nextTick(scheduleVisibilityUpdate);
+});
+
+onMounted(() => {
+  window.addEventListener("message", handleSandboxMessage);
+  window.addEventListener("resize", scheduleVisibilityUpdate);
+  window.addEventListener("scroll", scheduleVisibilityUpdate, true);
+  document.addEventListener("visibilitychange", scheduleVisibilityUpdate);
+});
+
 onUnmounted(() => {
   if (refreshTimer) clearTimeout(refreshTimer);
+  if (visibilityFrame !== null) cancelAnimationFrame(visibilityFrame);
+  window.removeEventListener("message", handleSandboxMessage);
+  window.removeEventListener("resize", scheduleVisibilityUpdate);
+  window.removeEventListener("scroll", scheduleVisibilityUpdate, true);
+  document.removeEventListener("visibilitychange", scheduleVisibilityUpdate);
   unregisterModal(modalId);
 });
 </script>
 
 <template>
   <div
-    class="html-preview-block mb-4 rounded-2xl border overflow-hidden transition-all duration-300"
-    :class="
-      themeStore.isDarkResolved
-        ? 'border-white/10 bg-[#0d1117]/80'
-        : 'border-black/5 bg-white/90'
-    "
+    ref="blockRef"
+    class="html-preview-block mb-4 overflow-hidden transition-all duration-300"
+    :class="[
+      isPreviewing ? 'html-preview-block--preview' : 'rounded-2xl border',
+      !isPreviewing &&
+        (themeStore.isDarkResolved
+          ? 'border-white/10 bg-[#0d1117]/80'
+          : 'border-black/5 bg-white/90'),
+    ]"
   >
     <!-- 全屏页面 (Kimi 风格沙箱) -->
     <Teleport to="body">
@@ -218,9 +300,15 @@ onUnmounted(() => {
         leave-from-class="translate-y-0 opacity-100"
         leave-to-class="translate-y-10 opacity-0"
       >
-        <div v-if="isFullScreen" class="fixed inset-0 z-editor flex flex-col pb-[calc(var(--vcp-safe-bottom,48px))]"
-          :class="themeStore.isDarkResolved ? 'bg-[#0d1117]' : 'bg-[#f6f8fa] text-gray-900'">
-          
+        <div
+          v-if="isFullScreen"
+          class="fixed inset-0 z-editor flex flex-col pb-[calc(var(--vcp-safe-bottom,48px))]"
+          :class="
+            themeStore.isDarkResolved
+              ? 'bg-[#0d1117]'
+              : 'bg-[#f6f8fa] text-gray-900'
+          "
+        >
           <!-- 全屏 Header -->
           <div
             class="h-14 flex items-center justify-between px-4 border-b pt-[var(--vcp-safe-top,0px)] box-content"
@@ -319,7 +407,7 @@ onUnmounted(() => {
 
           <!-- 全屏内容区 -->
           <div
-            class="flex-1 overflow-hidden relative"
+            class="flex-1 overflow-y-auto overflow-x-hidden relative"
             :class="themeStore.isDarkResolved ? 'bg-[#0d1117]' : 'bg-white'"
           >
             <div
@@ -343,11 +431,16 @@ onUnmounted(() => {
             <iframe
               v-if="fullScreenTab === 'preview'"
               ref="fullscreenIframeRef"
-              class="vcp-fullscreen-iframe w-full h-full border-none"
-              sandbox="allow-scripts"
+              class="vcp-fullscreen-iframe block w-full border-none"
+              :style="{ height: `${fullscreenHeight}px` }"
+              :sandbox="ACTIVE_HTML_SANDBOX"
+              :allow="ACTIVE_HTML_PERMISSIONS"
+              allowfullscreen
               loading="lazy"
               :srcdoc="sandboxHtml"
-              :data-vcp-image-nonce="imageNonce"
+              :data-vcp-image-nonce="bridgeNonce"
+              :data-vcp-bridge-nonce="bridgeNonce"
+              @load="handleFrameLoad"
             ></iframe>
           </div>
         </div>
@@ -356,6 +449,7 @@ onUnmounted(() => {
 
     <!-- 普通视图 Header (比全屏模式略小一点点，保持呼吸感) -->
     <div
+      v-if="!isPreviewing"
       class="h-12 flex items-center justify-between px-3.5 border-b relative z-10 box-content transition-colors duration-300"
       :class="
         themeStore.isDarkResolved
@@ -453,10 +547,10 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <!-- 普通视图内容 (自适应优化：预览时保持 380px，展示代码时根据内容自适应收缩) -->
+    <!-- Inline preview uses the sandbox-reported document height. -->
     <div
       class="relative transition-all duration-300 overflow-hidden no-swipe"
-      :class="[isPreviewing ? 'h-[380px]' : 'h-auto']"
+      :style="isPreviewing ? { height: `${inlineHeight}px` } : undefined"
     >
       <div
         v-show="!isPreviewing"
@@ -478,35 +572,126 @@ onUnmounted(() => {
         ><code class="hljs" v-html="highlightedCode"></code></pre>
       </div>
 
-      <div
-        v-if="isPreviewing"
-        class="absolute inset-0 no-swipe"
-        :class="themeStore.isDarkResolved ? 'bg-[#0d1117]' : 'bg-white'"
-      >
+      <div v-if="isPreviewing" class="absolute inset-0 no-swipe bg-transparent">
         <iframe
+          v-if="inlineMounted"
           ref="inlineIframeRef"
           class="vcp-inline-iframe w-full h-full border-none no-swipe"
-          sandbox="allow-scripts"
+          :sandbox="ACTIVE_HTML_SANDBOX"
+          :allow="ACTIVE_HTML_PERMISSIONS"
+          allowfullscreen
           loading="lazy"
           :srcdoc="sandboxHtml"
-          :data-vcp-image-nonce="imageNonce"
+          :data-vcp-image-nonce="bridgeNonce"
+          :data-vcp-bridge-nonce="bridgeNonce"
+          @load="handleFrameLoad"
         ></iframe>
+        <div
+          class="html-preview-floating-actions"
+          :class="
+            themeStore.isDarkResolved
+              ? 'bg-black/60 text-white border-white/10'
+              : 'bg-white/85 text-gray-700 border-black/10'
+          "
+        >
+          <button
+            type="button"
+            class="html-preview-action"
+            title="查看源码"
+            aria-label="查看源码"
+            @click.stop="isPreviewing = false"
+          >
+            <span class="i-ph:code-bold w-4 h-4" aria-hidden="true"></span>
+          </button>
+          <button
+            type="button"
+            class="html-preview-action active:rotate-180"
+            title="刷新网页"
+            aria-label="刷新网页"
+            @click.stop="refreshPreview"
+          >
+            <span
+              class="i-ph:arrow-clockwise-bold w-4 h-4"
+              aria-hidden="true"
+            ></span>
+          </button>
+          <button
+            type="button"
+            class="html-preview-action"
+            title="全屏显示"
+            aria-label="全屏显示"
+            @click.stop="openFullScreen"
+          >
+            <span
+              class="i-ph:arrows-out-bold w-4 h-4"
+              aria-hidden="true"
+            ></span>
+          </button>
+        </div>
       </div>
     </div>
   </div>
 </template>
 
 <style scoped>
-.html-preview-block {
+.html-preview-block:not(.html-preview-block--preview) {
   /* 极致轻盈的现代双层散焦微阴影，杜绝死黑与大范围污染 */
   box-shadow:
     0 4px 20px -6px rgba(0, 0, 0, 0.12),
     0 2px 8px -2px rgba(0, 0, 0, 0.04);
 }
 
-:root.dark .html-preview-block {
+:root.dark .html-preview-block:not(.html-preview-block--preview) {
   /* 暗色模式下微调投影透明度，维持极简科技感，避免脏底 */
   box-shadow: 0 4px 20px -6px rgba(0, 0, 0, 0.35);
+}
+
+.html-preview-block--preview {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.html-preview-floating-actions {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 2;
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid;
+  border-radius: 8px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.16);
+  backdrop-filter: blur(10px);
+}
+
+.html-preview-action {
+  display: inline-flex;
+  width: 30px;
+  height: 30px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  opacity: 0.78;
+  transition:
+    opacity 120ms ease,
+    background-color 120ms ease,
+    transform 180ms ease;
+}
+
+.html-preview-action:hover,
+.html-preview-action:focus-visible {
+  background: rgba(127, 127, 127, 0.18);
+  opacity: 1;
+}
+
+.html-preview-action:active {
+  transform: scale(0.92);
 }
 
 /* 高亮代码基础样式 */

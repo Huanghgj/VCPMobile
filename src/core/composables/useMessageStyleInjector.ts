@@ -1,5 +1,17 @@
+import { generate, parse, walk } from "css-tree";
+
 const injectedStyles = new Map<string, string>();
-const rawCssCache = new Map<string, string>();
+const styleSources = new Map<string, Map<string, string>>();
+const pendingRemovals = new Map<string, ReturnType<typeof setTimeout>>();
+
+const BLOCKED_AT_RULES = new Set([
+  "import",
+  "namespace",
+  "font-face",
+  "font-feature-values",
+  "font-palette-values",
+  "page",
+]);
 
 function escapeCssAttributeValue(value: string): string {
   return value.replace(/["\\\n\r\f]/g, (char) => {
@@ -16,263 +28,230 @@ function escapeCssAttributeValue(value: string): string {
   });
 }
 
-function sanitizeScopedCss(css: string): string {
-  return css
-    .replace(
-      /@(?:import|namespace|font-face|page)\b[^;{]*(?:;|\{[\s\S]*?\})/gi,
-      "",
-    )
-    .replace(/url\(\s*(['"]?)(?!data:image\/|#)[^)]+\1\s*\)/gi, "none")
-    .replace(/\bposition\s*:\s*(?:fixed|sticky)\s*;?/gi, "");
+function stableCssIdentifier(value: string): string {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
 }
 
-function findCssBoundary(css: string, start: number): number {
-  let quote = "";
-  let comment = false;
-  let parentheses = 0;
-  let brackets = 0;
-
-  for (let index = start; index < css.length; index += 1) {
-    const char = css[index];
-    const next = css[index + 1];
-
-    if (comment) {
-      if (char === "*" && next === "/") {
-        comment = false;
-        index += 1;
-      }
-      continue;
-    }
-    if (quote) {
-      if (char === "\\") {
-        index += 1;
-      } else if (char === quote) {
-        quote = "";
-      }
-      continue;
-    }
-    if (char === "/" && next === "*") {
-      comment = true;
-      index += 1;
-      continue;
-    }
-    if (char === '"' || char === "'") {
-      quote = char;
-      continue;
-    }
-    if (char === "(") parentheses += 1;
-    else if (char === ")") parentheses = Math.max(0, parentheses - 1);
-    else if (char === "[") brackets += 1;
-    else if (char === "]") brackets = Math.max(0, brackets - 1);
-    else if (
-      (char === "{" || char === ";") &&
-      parentheses === 0 &&
-      brackets === 0
-    ) {
-      return index;
-    }
-  }
-
-  return -1;
+function isKeyframesRule(node: any): boolean {
+  return (
+    node?.type === "Atrule" && /^(?:-[a-z]+-)?keyframes$/i.test(node.name || "")
+  );
 }
 
-function findMatchingCssBrace(css: string, openIndex: number): number {
-  let depth = 1;
-  let quote = "";
-  let comment = false;
-
-  for (let index = openIndex + 1; index < css.length; index += 1) {
-    const char = css[index];
-    const next = css[index + 1];
-
-    if (comment) {
-      if (char === "*" && next === "/") {
-        comment = false;
-        index += 1;
-      }
-      continue;
-    }
-    if (quote) {
-      if (char === "\\") {
-        index += 1;
-      } else if (char === quote) {
-        quote = "";
-      }
-      continue;
-    }
-    if (char === "/" && next === "*") {
-      comment = true;
-      index += 1;
-      continue;
-    }
-    if (char === '"' || char === "'") {
-      quote = char;
-      continue;
-    }
-    if (char === "{") depth += 1;
-    else if (char === "}") {
-      depth -= 1;
-      if (depth === 0) return index;
-    }
-  }
-
-  return -1;
-}
-
-function splitCssSelectorList(selectors: string): string[] {
-  const result: string[] = [];
-  let start = 0;
-  let quote = "";
-  let parentheses = 0;
-  let brackets = 0;
-
-  for (let index = 0; index < selectors.length; index += 1) {
-    const char = selectors[index];
-    if (quote) {
-      if (char === "\\") index += 1;
-      else if (char === quote) quote = "";
-      continue;
-    }
-    if (char === '"' || char === "'") quote = char;
-    else if (char === "(") parentheses += 1;
-    else if (char === ")") parentheses = Math.max(0, parentheses - 1);
-    else if (char === "[") brackets += 1;
-    else if (char === "]") brackets = Math.max(0, brackets - 1);
-    else if (char === "," && parentheses === 0 && brackets === 0) {
-      result.push(selectors.slice(start, index));
-      start = index + 1;
-    }
-  }
-  result.push(selectors.slice(start));
+function firstIdentifier(node: any): any | null {
+  let result: any | null = null;
+  if (!node) return result;
+  walk(node, {
+    visit: "Identifier",
+    enter(identifier: any) {
+      if (!result) result = identifier;
+    },
+  });
   return result;
 }
 
-function scopeSelector(selector: string, scopeSelector: string): string {
+function scopeSingleSelector(selector: string, scopeSelector: string): string {
   const trimmed = selector.trim();
-  if (!trimmed) return trimmed;
-  if (trimmed.includes(scopeSelector)) return trimmed;
-  if (/^(?:html|body|:root)\b/i.test(trimmed)) {
-    return trimmed.replace(/^(?:html|body|:root)\b/i, scopeSelector);
+  if (!trimmed || trimmed.includes(scopeSelector)) return trimmed;
+
+  if (/^(?::root|html|body)(?=$|[\s.#:[>+~])/i.test(trimmed)) {
+    return trimmed.replace(
+      /^(?::root|html|body)(?=$|[\s.#:[>+~])/i,
+      scopeSelector,
+    );
   }
-  if (trimmed === "#vcp-root") return `${scopeSelector} #vcp-root`;
   if (trimmed.startsWith(":") || trimmed.startsWith("::")) {
     return `${scopeSelector}${trimmed}`;
   }
   return `${scopeSelector} ${trimmed}`;
 }
 
-function scopeCssBlock(css: string, scopeSelectorValue: string): string {
-  let output = "";
-  let cursor = 0;
-
-  while (cursor < css.length) {
-    const boundary = findCssBoundary(css, cursor);
-    if (boundary < 0) {
-      output += css.slice(cursor);
-      break;
-    }
-    if (css[boundary] === ";") {
-      output += css.slice(cursor, boundary + 1);
-      cursor = boundary + 1;
-      continue;
-    }
-
-    const close = findMatchingCssBrace(css, boundary);
-    if (close < 0) {
-      output += css.slice(cursor);
-      break;
-    }
-
-    const rawHeader = css.slice(cursor, boundary);
-    const leading = rawHeader.match(/^\s*/)?.[0] || "";
-    const header = rawHeader.slice(leading.length).trim();
-    const body = css.slice(boundary + 1, close);
-
-    if (/^@(?:-[a-z]+-)?keyframes\b/i.test(header)) {
-      output += css.slice(cursor, close + 1);
-    } else if (/^@(media|supports|container|layer)\b/i.test(header)) {
-      output += `${leading}${header} {${scopeCssBlock(body, scopeSelectorValue)}}`;
-    } else if (header.startsWith("@")) {
-      output += css.slice(cursor, close + 1);
-    } else {
-      const scopedSelectors = splitCssSelectorList(header)
-        .map((selector) => scopeSelector(selector, scopeSelectorValue))
-        .join(", ");
-      output += `${leading}${scopedSelectors} {${body}}`;
-    }
-    cursor = close + 1;
-  }
-
-  return output;
-}
-
-export function scopeMessageCss(css: string, messageId: string): string {
-  const scopeSelectorValue = `[data-message-id="${escapeCssAttributeValue(messageId)}"]`;
-  return scopeCssBlock(sanitizeScopedCss(css), scopeSelectorValue);
+function isSafeCssUrl(value: string): boolean {
+  const trimmed = value.trim().replace(/^['"]|['"]$/g, "");
+  return /^(?:data:image\/|#)/i.test(trimmed);
 }
 
 /**
- * Composable that provides scoped style injection helpers for message bubbles.
- * Converts global-like selectors into scoped selectors targeting a specific message ID
- * to prevent user/agent-generated HTML preview styles from polluting the global application theme.
+ * Parses, sanitizes and scopes message CSS through a CSS AST. Keyframes are
+ * namespaced per message and animation references are rewritten with them.
  */
-export function useMessageStyleInjector() {
-  /**
-   * Scopes and injects raw CSS scoped to a specific message ID.
-   * Modifies selectors (except keyframe definitions) to be nested under `[data-message-id="..."]`.
-   */
-  const injectScopedCss = (css: string, messageId: string) => {
-    if (!css || !messageId) return;
-    const sanitizedCss = sanitizeScopedCss(css);
-    if (!sanitizedCss.trim()) return;
+export function scopeMessageCss(css: string, messageId: string): string {
+  if (!css.trim() || !messageId) return "";
 
-    // 提前去重校验：若原始 CSS 无变化，直接拦截，完全跳过后面重型 selector scoping 的正则运算
-    if (rawCssCache.get(messageId) === sanitizedCss) return;
-    rawCssCache.set(messageId, sanitizedCss);
+  const scopeSelector = `[data-message-id="${escapeCssAttributeValue(messageId)}"]`;
+  const keyframePrefix = `vcp-${stableCssIdentifier(messageId)}-`;
 
-    const scopedCss = scopeMessageCss(sanitizedCss, messageId);
+  try {
+    const ast = parse(css, {
+      context: "stylesheet",
+      parseCustomProperty: false,
+      positions: false,
+    }) as any;
+    const keyframeNames = new Map<string, string>();
+    const keyframeRules = new WeakSet<object>();
 
-    if (injectedStyles.get(messageId) === scopedCss) return;
-    injectedStyles.set(messageId, scopedCss);
+    walk(ast, {
+      enter(node: any, item: any, list: any) {
+        if (node.type === "Atrule") {
+          const name = String(node.name || "").toLowerCase();
+          if (BLOCKED_AT_RULES.has(name)) {
+            if (list && item) list.remove(item);
+            return;
+          }
+          if (isKeyframesRule(node)) {
+            const identifier = firstIdentifier(node.prelude);
+            if (identifier?.name) {
+              const original = identifier.name;
+              const namespaced = `${keyframePrefix}${original}`;
+              keyframeNames.set(original, namespaced);
+              identifier.name = namespaced;
+            }
+            node.block?.children?.forEach((rule: any) => {
+              if (rule?.type === "Rule") keyframeRules.add(rule);
+            });
+          }
+          return;
+        }
 
-    let styleEl = document.getElementById(`style-${messageId}`);
-    if (!styleEl) {
-      styleEl = document.createElement("style");
-      styleEl.id = `style-${messageId}`;
-      styleEl.setAttribute("data-vcp-scope-id", messageId);
-      document.head.appendChild(styleEl);
+        if (node.type === "Declaration") {
+          const property = String(node.property || "").toLowerCase();
+          const value = generate(node.value).trim();
+          if (
+            (property === "position" && /^(?:fixed|sticky)$/i.test(value)) ||
+            property === "behavior"
+          ) {
+            if (list && item) list.remove(item);
+            return;
+          }
+
+          let hasUnsafeUrl = false;
+          walk(node.value, {
+            visit: "Url",
+            enter(urlNode: any) {
+              if (!isSafeCssUrl(String(urlNode.value || ""))) {
+                hasUnsafeUrl = true;
+              }
+            },
+          });
+          if (hasUnsafeUrl && list && item) list.remove(item);
+        }
+      },
+    });
+
+    if (keyframeNames.size > 0) {
+      walk(ast, {
+        visit: "Declaration",
+        enter(declaration: any) {
+          const property = String(declaration.property || "").toLowerCase();
+          if (property !== "animation" && property !== "animation-name") return;
+          walk(declaration.value, {
+            visit: "Identifier",
+            enter(identifier: any) {
+              const replacement = keyframeNames.get(identifier.name);
+              if (replacement) identifier.name = replacement;
+            },
+          });
+        },
+      });
     }
-    styleEl.textContent = scopedCss;
-  };
 
-  /**
-   * Removes the scoped style element associated with a specific message ID.
-   * Uses a setTimeout delay to prevent the style sheet from being instantly removed
-   * and re-injected during the streaming-to-stable transition tick, which causes layout flicker.
-   */
-  const removeScopedCss = (messageId: string) => {
-    if (!messageId) return;
+    walk(ast, {
+      visit: "Rule",
+      enter(rule: any) {
+        if (keyframeRules.has(rule) || rule.prelude?.type !== "SelectorList") {
+          return;
+        }
 
-    // 立即注销 rawCss 活跃状态。如果后面有新静态块接管，它会同步重新执行 injectScopedCss 重新 set 写入
-    rawCssCache.delete(messageId);
+        const selectors: string[] = [];
+        rule.prelude.children.forEach((selector: any) => {
+          selectors.push(
+            scopeSingleSelector(generate(selector), scopeSelector),
+          );
+        });
+        rule.prelude = parse(selectors.join(","), {
+          context: "selectorList",
+          positions: false,
+        }) as any;
+      },
+    });
 
-    // 延迟 50ms 物理清理，给新静态块挂载和样式接管留出时间差
-    setTimeout(() => {
-      // 核心门禁：如果在这 50ms 期间有新块重新写入并接管了该 messageId，说明样式依然活跃，保留它
-      if (rawCssCache.has(messageId)) {
-        return;
-      }
+    return generate(ast);
+  } catch (error) {
+    console.warn("[RendererV2] Ignored invalid message CSS", error);
+    return "";
+  }
+}
 
-      const styleEl = document.getElementById(`style-${messageId}`);
-      if (styleEl) {
-        styleEl.remove();
-      }
+function updateStyleElement(messageId: string): void {
+  const pending = pendingRemovals.get(messageId);
+  if (pending) {
+    clearTimeout(pending);
+    pendingRemovals.delete(messageId);
+  }
+
+  const sources = styleSources.get(messageId);
+  const rawCss = sources
+    ? Array.from(sources.values()).filter(Boolean).join("\n")
+    : "";
+  const scopedCss = scopeMessageCss(rawCss, messageId);
+
+  if (!scopedCss) {
+    const timer = setTimeout(() => {
+      if ((styleSources.get(messageId)?.size || 0) > 0) return;
+      document.getElementById(`style-${messageId}`)?.remove();
       injectedStyles.delete(messageId);
+      pendingRemovals.delete(messageId);
     }, 50);
+    pendingRemovals.set(messageId, timer);
+    return;
+  }
+
+  if (injectedStyles.get(messageId) === scopedCss) return;
+  injectedStyles.set(messageId, scopedCss);
+
+  let styleElement = document.getElementById(`style-${messageId}`);
+  if (!styleElement) {
+    styleElement = document.createElement("style");
+    styleElement.id = `style-${messageId}`;
+    styleElement.setAttribute("data-vcp-scope-id", messageId);
+    document.head.appendChild(styleElement);
+  }
+  styleElement.textContent = scopedCss;
+}
+
+export function useMessageStyleInjector() {
+  const injectScopedCss = (
+    css: string,
+    messageId: string,
+    sourceId = "legacy",
+  ) => {
+    if (!messageId || !sourceId) return;
+    let sources = styleSources.get(messageId);
+    if (!sources) {
+      sources = new Map();
+      styleSources.set(messageId, sources);
+    }
+    if (css.trim()) sources.set(sourceId, css);
+    else sources.delete(sourceId);
+    updateStyleElement(messageId);
   };
 
-  return {
-    injectScopedCss,
-    removeScopedCss,
+  const removeScopedCss = (messageId: string, sourceId?: string) => {
+    if (!messageId) return;
+    if (sourceId) {
+      const sources = styleSources.get(messageId);
+      sources?.delete(sourceId);
+      if (sources?.size === 0) styleSources.delete(messageId);
+    } else {
+      styleSources.delete(messageId);
+    }
+    updateStyleElement(messageId);
   };
+
+  return { injectScopedCss, removeScopedCss };
 }

@@ -11,7 +11,8 @@ use crate::vcp_modules::group_speaking_policy::determine_naturerandom_speakers;
 use crate::vcp_modules::message_service;
 use crate::vcp_modules::stream_service_guard::StreamServiceGuard;
 use crate::vcp_modules::vcp_client::{
-    perform_vcp_request, ActiveRequests, CancelledGroupTurns, StreamEvent, VcpRequestPayload,
+    perform_vcp_request, ActiveRequestGuard, ActiveRequests, CancelledGroupTurns, StreamEvent,
+    VcpRequestPayload,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -26,6 +27,8 @@ pub struct GroupChatPayload {
     pub user_message: ChatMessage,
     #[serde(default)]
     pub turn_source: ChatTurnSource,
+    #[serde(default)]
+    pub turn_id: Option<String>,
     pub vcp_url: String,
     pub vcp_api_key: String,
 }
@@ -35,6 +38,7 @@ pub struct GroupChatParams {
     pub topic_id: String,
     pub user_message: ChatMessage,
     pub turn_source: ChatTurnSource,
+    pub turn_id: Option<String>,
     pub vcp_url: String,
     pub vcp_api_key: String,
     pub stream_channel: Option<Channel<crate::vcp_modules::vcp_client::StreamEvent>>,
@@ -79,6 +83,7 @@ pub async fn internal_process_group_chat_message(
     let topic_id = params.topic_id;
     let user_message = params.user_message;
     let turn_source = params.turn_source;
+    let turn_id = params.turn_id;
     let vcp_url = params.vcp_url;
     let vcp_api_key = params.vcp_api_key;
 
@@ -87,8 +92,12 @@ pub async fn internal_process_group_chat_message(
         group_id
     );
 
-    // 0. 重置该话题的中断标记 (确保开启新回合)
-    cancelled_turns.0.remove(&topic_id);
+    // 新前端为每一轮提供唯一 turnId，不需要清理旧标记；这样中止先于命令启动时也不会丢失。
+    // 旧调用方仍回退到 topicId，并沿用启动时清理历史标记的兼容行为。
+    let cancellation_key = turn_id.clone().unwrap_or_else(|| topic_id.clone());
+    if turn_id.is_none() {
+        cancelled_turns.0.remove(&cancellation_key);
+    }
 
     // 1. 加载群组配置
     let group_config =
@@ -259,7 +268,7 @@ pub async fn internal_process_group_chat_message(
 
     for speaker in speakers {
         // 检查全局中断令牌：如果话题已被标记为取消，立即停止接力赛
-        if cancelled_turns.0.contains(&topic_id) {
+        if cancelled_turns.0.contains(&cancellation_key) {
             log::info!(
                 "[GroupChatAppService] Group turn for topic {} was cancelled. Breaking loop.",
                 topic_id
@@ -306,6 +315,23 @@ pub async fn internal_process_group_chat_message(
             }
         }
         response_message_ids.push(message_id.clone());
+
+        let request_control = ActiveRequests(active_requests_map.clone()).register(&message_id);
+        let _request_guard = ActiveRequestGuard::new(
+            active_requests_map.clone(),
+            message_id.clone(),
+            request_control.clone(),
+        );
+        let preparing_context = Some(json!({
+            "groupId": group_id,
+            "topicId": topic_id,
+            "agentId": agent_id,
+            "isGroupMessage": true,
+            "agentName": agent_name
+        }));
+        if let Some(chan) = &stream_channel {
+            let _ = chan.send(StreamEvent::thinking(message_id.clone(), preparing_context));
+        }
 
         // 【优化点】：此时已识别出当前轮次的发言者 agent_name，立即提前启动前台服务保活，
         // 从而与接下来耗时的群组上下文组装、SQLite Tavern 级联编织等逻辑并行重叠。
@@ -361,7 +387,7 @@ pub async fn internal_process_group_chat_message(
             "model": model_to_use,
             "max_tokens": speaker.max_output_tokens,
             "contextTokenLimit": speaker.context_token_limit,
-            "stream": true
+            "stream": speaker.stream_output
         });
         if speaker.use_temperature {
             model_config["temperature"] = json!(speaker.temperature);
@@ -401,15 +427,10 @@ pub async fn internal_process_group_chat_message(
             context: context.clone(),
         };
 
-        // 发射 thinking 事件，让前端为当前接力的 Agent 创建思考占位消息
-        if let Some(chan) = &stream_channel {
-            let _ = chan.send(StreamEvent::thinking(message_id.clone(), context.clone()));
-        }
-
         // 执行请求 (串行等待)
         let res_result = perform_vcp_request(
             &app_handle,
-            active_requests_map,
+            request_control,
             request_payload,
             stream_channel.clone(),
         )
@@ -493,7 +514,7 @@ pub async fn internal_process_group_chat_message(
     );
 
     // 回合结束，清理中断标记
-    cancelled_turns.0.remove(&topic_id);
+    cancelled_turns.0.remove(&cancellation_key);
 
     Ok(json!({
         "status": "completed",
@@ -530,6 +551,7 @@ pub async fn handle_group_chat_message(
             topic_id: payload.topic_id,
             user_message: payload.user_message,
             turn_source: payload.turn_source,
+            turn_id: payload.turn_id,
             vcp_url: payload.vcp_url,
             vcp_api_key: payload.vcp_api_key,
             stream_channel: Some(stream_channel),

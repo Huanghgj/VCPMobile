@@ -12,6 +12,7 @@
     "io:append": "node scripts/nova_utils.cjs append",
     "memory:refresh": "node scripts/refresh_manifest.cjs",
     "check": "pnpm check:csp && vue-tsc --noEmit && cd src-tauri && cargo check",
+    "test:renderer": "vitest run src/core/utils/renderDocument.spec.ts src/core/utils/htmlActions.spec.ts src/core/composables/useMessageStyleInjector.spec.ts src/core/utils/activeHtmlSandbox.spec.ts",
     "check:csp": "node tools/verify_tauri_csp.cjs",
     "android:kotlin:check": "node tools/android_kotlin_check.cjs",
     "android:arm64:release": "node scripts/build_android_arm64_release.cjs",
@@ -26,6 +27,7 @@
     "@tauri-apps/api": "2.11.0",
     "@tauri-apps/plugin-opener": "2.5.4",
     "@vueuse/core": "^14.2.1",
+    "css-tree": "3.2.1",
     "date-fns": "^4.1.0",
     "dompurify": "^3.4.2",
     "katex": "^0.16.45",
@@ -44,6 +46,7 @@
   "devDependencies": {
     "@iconify-json/ph": "^1.2.2",
     "@tauri-apps/cli": "2.11.2",
+    "@types/css-tree": "^2.3.11",
     "@types/katex": "^0.16.8",
     "@types/sortablejs": "^1.15.9",
     "@typescript-eslint/eslint-plugin": "^8.59.1",
@@ -60,10 +63,12 @@
     "eslint-config-prettier": "^10.1.8",
     "eslint-plugin-prettier": "^5.5.5",
     "eslint-plugin-vue": "^10.9.0",
+    "jsdom": "^29.1.1",
     "prettier": "^3.8.3",
     "typescript": "~5.6.3",
     "unocss": "^66.6.8",
     "vite": "^6.4.2",
+    "vitest": "^4.1.10",
     "vue-tsc": "^2.2.12"
   }
 }

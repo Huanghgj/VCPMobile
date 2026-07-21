@@ -257,7 +257,7 @@ lazy_static! {
     // 这将彻底消除因正文提及 `<<<[TOOL_REQUEST]>>>` 等内联代码而引发的 AST 错误截断
     pub(crate) static ref TOOL_START: Regex = Regex::new(r"(?im)^[ \t]*<<<\[TOOL_REQUEST\]>>>").unwrap();
     pub(crate) static ref TOOL_END: Regex = Regex::new(r"(?im)^[ \t]*<<<\[END_TOOL_REQUEST\]>>>").unwrap();
-    pub(crate) static ref TOOL_NAME: Regex = Regex::new(r"<tool_name>([\s\S]*?)</tool_name>|tool_name:\s*「始(?:exp)?」([^「」]*)「末(?:exp)?」").unwrap();
+    pub(crate) static ref TOOL_NAME: Regex = Regex::new(r"<tool_name>([\s\S]*?)</tool_name>|tool_name:\s*「始(?:[A-Za-z][A-Za-z0-9_-]*)?」([^「」]*)「末(?:[A-Za-z][A-Za-z0-9_-]*)?」").unwrap();
 
     pub(crate) static ref THOUGHT_START: Regex = Regex::new(r"(?im)^[ \t]*\[--- VCP元思考链(?::\s*([^\]]*?))?\s*---\]").unwrap();
     pub(crate) static ref THOUGHT_END: Regex = Regex::new(r"(?im)^[ \t]*\[--- 元思考链结束 ---\]").unwrap();
@@ -273,9 +273,9 @@ lazy_static! {
 
     pub(crate) static ref BUTTON_CLICK: Regex = Regex::new(r"\[\[点击按钮:(.*?)\]\]").unwrap();
 
-    pub(crate) static ref MAID_REGEX: Regex = Regex::new(r"(?:maid|maidName):\s*「始(?:exp)?」([^「」]*)「末(?:exp)?」|Maid:\s*([^\n\r]*)").unwrap();
-    pub(crate) static ref DATE_REGEX: Regex = Regex::new(r"Date:\s*「始(?:exp)?」([^「」]*)「末(?:exp)?」|Date:\s*([^\n\r]*)").unwrap();
-    pub(crate) static ref CONTENT_REGEX: Regex = Regex::new(r"Content:\s*「始(?:exp)?」([\s\S]*?)「末(?:exp)?」|Content:\s*([\s\S]*)").unwrap();
+    pub(crate) static ref MAID_REGEX: Regex = Regex::new(r"(?:maid|maidName):\s*「始(?:[A-Za-z][A-Za-z0-9_-]*)?」([^「」]*)「末(?:[A-Za-z][A-Za-z0-9_-]*)?」|Maid:\s*([^\n\r]*)").unwrap();
+    pub(crate) static ref DATE_REGEX: Regex = Regex::new(r"Date:\s*「始(?:[A-Za-z][A-Za-z0-9_-]*)?」([^「」]*)「末(?:[A-Za-z][A-Za-z0-9_-]*)?」|Date:\s*([^\n\r]*)").unwrap();
+    pub(crate) static ref CONTENT_REGEX: Regex = Regex::new(r"Content:\s*「始(?:[A-Za-z][A-Za-z0-9_-]*)?」([\s\S]*?)「末(?:[A-Za-z][A-Za-z0-9_-]*)?」|Content:\s*([\s\S]*)").unwrap();
 
     pub(crate) static ref KV_REGEX: Regex = Regex::new(r"^-\s*([^:]+):\s*(.*)").unwrap();
 
@@ -298,12 +298,43 @@ lazy_static! {
     pub(crate) static ref HTML_TAG_BLOCK_RE: Regex =
         Regex::new(r"(?im)^[ \t]*<(?:style\b[^>]*>?|html[\s>]|!doctype\s+html|/?(?:div|section|article|header|footer|main|aside|figure|figcaption)\b[^>]*>)").unwrap();
 
+    static ref ACTIVE_HTML_RE: Regex = Regex::new(
+        r#"(?is)<\s*(?:script|iframe|canvas|link|meta|base)\b|\s+on[a-z0-9_-]+\s*=|\b(?:href|src)\s*=\s*["']?\s*javascript:"#,
+    )
+    .unwrap();
+
     pub(crate) static ref GENERIC_CODE_FENCE_START: Regex = Regex::new(r"(?im)^[ \t]*```[a-zA-Z0-9-]*[ \t]*\r?$").unwrap();
     pub(crate) static ref GENERIC_CODE_FENCE_END: Regex = Regex::new(r"(?im)^[ \t]*```[ \t]*\r?$").unwrap();
 
 
     static ref LIST_REGEX: Regex = Regex::new(r"^[ \t]*([-*]|\d+\.)[ \t]+").unwrap();
     static ref HTML_TAG_REGEX: Regex = Regex::new(r"(?i)^[ \t]*</?[a-zA-Z][a-zA-Z0-9]*[\s>/]").unwrap();
+}
+
+/// Returns the explicit closing marker unless a new top-level VCP protocol
+/// block starts first. The zero-width boundary recovery prevents one malformed
+/// tool request from consuming later tool results, role dividers, and replies.
+pub(crate) fn find_protocol_bounded_end(text: &str, end_marker: &Regex) -> Option<(usize, usize)> {
+    let explicit_end = end_marker.find(text);
+    let recovery_boundary = [
+        &*TOOL_START,
+        &*TOOL_RESULT_START,
+        &*DIARY_START,
+        &*ROLE_DIVIDER,
+        &*TOOL_CALL_SUMMARY_START,
+    ]
+    .into_iter()
+    .filter_map(|marker| marker.find(text))
+    .min_by_key(|marker| marker.start());
+
+    match (explicit_end, recovery_boundary) {
+        (Some(end), Some(boundary)) if boundary.start() < end.start() => {
+            Some((boundary.start(), boundary.start()))
+        }
+        (Some(end), _) => Some((end.start(), end.end())),
+        (None, Some(boundary)) => Some((boundary.start(), boundary.start())),
+        (None, None) => None,
+    }
 }
 
 /// 检测字符是否为自然语言的起始字符（CJK / 日文 / 韩文 / 标点）。
@@ -485,9 +516,10 @@ pub fn parse_content(raw_text: &str) -> Vec<ContentBlock> {
             let search_area = &remaining[content_start..];
 
             let (end_marker_start, end_marker_end, is_complete) = match block_type {
-                BlockType::Tool => TOOL_END.find(search_area).map_or((None, None, false), |m| {
-                    (Some(m.start()), Some(m.end()), true)
-                }),
+                BlockType::Tool => find_protocol_bounded_end(search_area, &TOOL_END)
+                    .map_or((None, None, false), |(start, end)| {
+                        (Some(start), Some(end), true)
+                    }),
                 BlockType::Thought => THOUGHT_END
                     .find(search_area)
                     .map_or((None, None, false), |m| {
@@ -498,10 +530,9 @@ pub fn parse_content(raw_text: &str) -> Vec<ContentBlock> {
                     .map_or((None, None, false), |m| {
                         (Some(m.start()), Some(m.end()), true)
                     }),
-                BlockType::ToolResult => TOOL_RESULT_END
-                    .find(search_area)
-                    .map_or((None, None, false), |m| {
-                        (Some(m.start()), Some(m.end()), true)
+                BlockType::ToolResult => find_protocol_bounded_end(search_area, &TOOL_RESULT_END)
+                    .map_or((None, None, false), |(start, end)| {
+                        (Some(start), Some(end), true)
                     }),
                 BlockType::Diary => DIARY_END
                     .find(search_area)
@@ -635,23 +666,37 @@ pub fn parse_content(raw_text: &str) -> Vec<ContentBlock> {
                 }
                 BlockType::HtmlContainer => {
                     let open_tag = &remaining[start_idx..end_idx];
-                    let deindented_inner = crate::vcp_modules::chat::pre_renderer::markdown_parser::trim_common_leading_indent(inner_content);
-                    let markdown_inner = crate::vcp_modules::chat::pre_renderer::markdown_parser::strip_stuck_container_close_before_fence(&deindented_inner);
-                    let mut nodes = vec![crate::vcp_modules::pre_renderer::MarkdownNode::raw_html(
-                        open_tag.to_string(),
-                    )];
-                    nodes.extend(crate::vcp_modules::pre_renderer::parse_markdown_to_ast(
-                        markdown_inner.as_ref(),
-                    ));
-                    if is_complete {
-                        if let (Some(s), Some(e)) = (end_marker_start, end_marker_end) {
-                            let close_tag = &search_area[s..e];
+                    let close_tag = if is_complete {
+                        end_marker_start
+                            .zip(end_marker_end)
+                            .map(|(s, e)| &search_area[s..e])
+                    } else {
+                        None
+                    };
+                    let mut full_html = format!("{}{}", open_tag, inner_content);
+                    if let Some(close_tag) = close_tag {
+                        full_html.push_str(close_tag);
+                    }
+
+                    if requires_active_html_preview(&full_html) {
+                        ContentBlock::html_preview(full_html)
+                    } else {
+                        let deindented_inner = crate::vcp_modules::chat::pre_renderer::markdown_parser::trim_common_leading_indent(inner_content);
+                        let markdown_inner = crate::vcp_modules::chat::pre_renderer::markdown_parser::strip_stuck_container_close_before_fence(&deindented_inner);
+                        let mut nodes =
+                            vec![crate::vcp_modules::pre_renderer::MarkdownNode::raw_html(
+                                open_tag.to_string(),
+                            )];
+                        nodes.extend(crate::vcp_modules::pre_renderer::parse_markdown_to_ast(
+                            markdown_inner.as_ref(),
+                        ));
+                        if let Some(close_tag) = close_tag {
                             nodes.push(crate::vcp_modules::pre_renderer::MarkdownNode::raw_html(
                                 close_tag.to_string(),
                             ));
                         }
+                        ContentBlock::markdown(None, Some(nodes))
                     }
-                    ContentBlock::markdown(None, Some(nodes))
                 }
                 BlockType::RoleDivider => {
                     let marker_text = &remaining[start_idx..end_idx];
@@ -921,6 +966,10 @@ pub(crate) fn parse_tool_call_summary(content: &str) -> Vec<ToolCallSummaryItem>
 
 pub fn is_html_tag_block(text: &str) -> bool {
     HTML_TAG_BLOCK_RE.is_match(text)
+}
+
+pub(crate) fn requires_active_html_preview(text: &str) -> bool {
+    ACTIVE_HTML_RE.is_match(text)
 }
 
 #[cfg(test)]
@@ -1362,6 +1411,115 @@ copy_button: should_not_send
                 .any(|block| block_contains_plain_text(block, "<div id=\"vcp-root\"")),
             "final HTML container was downgraded to visible text, got {blocks:#?}"
         );
+    }
+
+    #[test]
+    fn test_parse_content_recovers_after_unclosed_tool_request() {
+        let raw = r#"<<<[TOOL_REQUEST]>>>
+tool_name:「始」ComfyUIGen「末」,
+prompt:「始」first image「末」
+<<<[END_TOOL_REQUEST]>>>
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」ComfyUIGen「末」,
+negative_prompt:「始」truncated request
+<<<[ROLE_DIVIDE_USER]>>>
+
+[[VCP调用结果信息汇总:
+- 工具名称: ComfyUIGen
+- 执行状态: SUCCESS
+- 返回内容: image generated
+VCP调用结果结束]]
+
+[本轮工具调用摘要:]
+ComfyUIGen 调用成功。
+[本轮工具调用摘要结束]
+
+<<<[END_ROLE_DIVIDE_USER]>>>
+
+<style>.scene { color: red; }</style>
+<div id="vcp-root"><p data-probe="recovered-body">rich body recovered</p></div><<<[TOOL_REQUEST]>>>
+maid:「始」Mama「末」,
+tool_name:「始」DailyNote「末」,
+command:「始」create「末」,
+Date:「始」2026-07-20「末」,
+Content:「始ESCAPE」diary body only「末ESCAPE」,
+archery:「始」no_reply「末」
+<<<[END_TOOL_REQUEST]>>><details data-probe="details-body">
+<summary>Daily challenge</summary>
+
+details body remains visible
+</details>"#;
+
+        let blocks = parse_content(raw);
+        let comfy_tool_count = blocks
+            .iter()
+            .filter(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ToolUse { tool_name, .. } if tool_name == "ComfyUIGen"
+                )
+            })
+            .count();
+
+        assert_eq!(
+            comfy_tool_count, 2,
+            "both the closed and recovered tool requests must remain visible: {blocks:#?}"
+        );
+        assert!(
+            blocks.iter().any(|block| matches!(
+                block,
+                ContentBlock::ToolResult { tool_name, status, .. }
+                    if tool_name == "ComfyUIGen" && status.contains("SUCCESS")
+            )),
+            "tool result after the malformed request must remain visible: {blocks:#?}"
+        );
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block_contains_raw_html(block, "data-probe=\"recovered-body\"")),
+            "rich response after the malformed request must remain visible: {blocks:#?}"
+        );
+        assert!(
+            blocks.iter().any(|block| matches!(
+                block,
+                ContentBlock::Diary { content, .. } if content == "diary body only"
+            )),
+            "ESCAPE-wrapped DailyNote content must exclude wrapper and archery fields: {blocks:#?}"
+        );
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block_contains_raw_html(block, "data-probe=\"details-body\"")),
+            "details body stuck to DailyNote must remain renderable: {blocks:#?}"
+        );
+    }
+
+    #[test]
+    fn test_active_html_container_becomes_executable_preview() {
+        let raw = r#"<div id="web-app">
+<canvas id="scene"></canvas>
+<iframe src="https://example.com"></iframe>
+<script type="module">
+import * as THREE from "https://cdn.jsdelivr.net/npm/three/build/three.module.js";
+window.scene = new THREE.Scene();
+</script>
+</div>"#;
+
+        let blocks = parse_content(raw);
+
+        assert_eq!(blocks.len(), 1, "{blocks:#?}");
+        match &blocks[0] {
+            ContentBlock::HtmlPreview { content, .. } => {
+                assert!(content.contains("<canvas"), "{content}");
+                assert!(
+                    content.contains("<iframe src=\"https://example.com\""),
+                    "{content}"
+                );
+                assert!(content.contains("three.module.js"), "{content}");
+                assert!(content.ends_with("</div>"), "{content}");
+            }
+            other => panic!("expected active html preview, got {other:?}"),
+        }
     }
 
     #[test]

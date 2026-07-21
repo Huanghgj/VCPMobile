@@ -50,9 +50,19 @@ export function renderSafeMarkdown(
 ): string {
   if (!text) return "";
   try {
-    return sanitizeMarkdownHtml(marked.parse(text) as string, options);
+    return sanitizeMarkdownHtml(renderMarkdownToHtml(text), options);
   } catch (e) {
     console.error("[safeMarkdown] marked parse failed:", e);
     return escapeHtml(text);
   }
+}
+
+/**
+ * Markdown-to-HTML compilation without sanitization. Renderer V2 uses this only
+ * as an intermediate value, then extracts styles and sanitizes the complete
+ * HTML5 fragment in one pass.
+ */
+export function renderMarkdownToHtml(text: string): string {
+  if (!text) return "";
+  return marked.parse(text) as string;
 }
