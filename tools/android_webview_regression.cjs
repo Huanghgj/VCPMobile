@@ -199,6 +199,105 @@ async function injectRegressionProbe(client) {
   })()`);
 }
 
+async function runLatestReplyWithoutTouch(client) {
+  return client.evaluate(`(async () => {
+    const app = document.querySelector('#app')?.__vue_app__;
+    const pinia = app && [
+      ...Object.getOwnPropertySymbols(app._context.provides)
+        .map((symbol) => app._context.provides[symbol]),
+      ...Object.values(app._context.provides)
+    ].find((value) => value?._s instanceof Map);
+    const store = pinia?._s?.get('chatHistory');
+    if (!store) throw new Error('chatHistory Pinia store is unavailable');
+    const list = document.querySelector(${JSON.stringify(selector)});
+    if (!list) throw new Error('Chat scroll container is unavailable');
+
+    // This deliberately uses only programmatic state changes. No touch, wheel,
+    // scrollIntoView or pointer event is dispatched after the reply is added.
+    list.scrollTo({ top: list.scrollHeight, behavior: 'auto' });
+    list.dispatchEvent(new Event('scroll'));
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    const startingBottomGap = list.scrollHeight - list.scrollTop - list.clientHeight;
+    const now = Date.now();
+    const id = 'codex_android_latest_reply_' + now;
+    const elementId = 'android-no-touch-reply-' + now;
+    const previous = store.currentChatHistory.at(-1) || {};
+    const html = [
+      '<div id="' + elementId + '" style="padding:20px;background:#172033;color:#f8fafc">',
+      '<h2>Latest reply appeared without touching the screen</h2>',
+      '<details open><summary>Default folded details probe</summary><p>Folded content</p></details>',
+      '<div style="height:260px">Iframe first-paint probe</div>',
+      '</div>'
+    ].join('');
+    const message = {
+      ...previous,
+      id,
+      role: 'assistant',
+      name: 'Latest Reply No-Touch Probe',
+      content: html,
+      timestamp: now,
+      blocks: [{ type: 'html-preview', content: html, hash: id + '-first' }],
+      tailBlock: null,
+      tailContent: '',
+      renderRevision: now
+    };
+    store.currentChatHistory.push(message);
+    const reactiveMessage = store.currentChatHistory.find((item) => item.id === id);
+    if (!reactiveMessage) throw new Error('Inserted latest reply is unavailable');
+
+    const waitFor = async (predicate, timeout = 4000) => {
+      const deadline = performance.now() + timeout;
+      while (performance.now() < deadline) {
+        const value = predicate();
+        if (value) return value;
+        await new Promise((resolve) => setTimeout(resolve, 40));
+      }
+      return null;
+    };
+    const findFrame = () => document.querySelector('[data-message-id="' + id + '"] iframe');
+    const firstFrame = await waitFor(() => {
+      const frame = findFrame();
+      return frame && frame.getBoundingClientRect().height > 0 ? frame : null;
+    });
+    const initialIframeHeight = firstFrame?.getBoundingClientRect().height || 0;
+    await new Promise((resolve) => setTimeout(resolve, 450));
+    const firstBottomGap = list.scrollHeight - list.scrollTop - list.clientHeight;
+
+    const html2 = html.replace('without touching the screen', 'after final render revision');
+    reactiveMessage.content = html2;
+    reactiveMessage.blocks = [{ type: 'html-preview', content: html2, hash: id + '-final' }];
+    reactiveMessage.renderRevision = now + 1;
+    const completedFrame = await waitFor(() => {
+      const frame = findFrame();
+      return frame?.srcdoc?.includes('after final render revision') ? frame : null;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 450));
+    const finalBottomGap = list.scrollHeight - list.scrollTop - list.clientHeight;
+    const result = {
+      id,
+      startingBottomGap,
+      initialIframeMounted: Boolean(firstFrame),
+      initialIframeHeight,
+      initialBottomGap: firstBottomGap,
+      completedIframeMounted: Boolean(completedFrame),
+      completedIframeHeight: completedFrame?.getBoundingClientRect().height || 0,
+      completedSrcdocRefreshed: Boolean(completedFrame?.srcdoc?.includes('after final render revision')),
+      finalBottomGap
+    };
+    if (
+      !result.initialIframeMounted ||
+      result.initialIframeHeight <= 0 ||
+      !result.completedIframeMounted ||
+      !result.completedSrcdocRefreshed ||
+      Math.abs(result.initialBottomGap) > 4 ||
+      Math.abs(result.finalBottomGap) > 4
+    ) {
+      throw new Error('Latest reply no-touch regression failed: ' + JSON.stringify(result));
+    }
+    return result;
+  })()`);
+}
+
 function runAdbInput(inputArgs) {
   return new Promise((resolve, reject) => {
     const child = spawn("adb", ["-s", device, "shell", "input", "touchscreen", ...inputArgs], {
@@ -553,9 +652,10 @@ async function runAnimationVisibility(client) {
   await client.evaluate(selectorExpression("element.scrollTop = 0; return element.scrollTop;"));
   await sleep(900);
   const offscreenIframeCount = await client.evaluate("document.querySelectorAll('iframe').length");
-  const offscreen = offscreenIframeCount
+  const offscreenProbe = offscreenIframeCount
     ? await captureProbeAnimationState(client)
-    : { destroyed: true };
+    : null;
+  const offscreen = offscreenProbe || { destroyed: true };
 
   await showLatestPreview();
   await sleep(900);
@@ -620,6 +720,7 @@ async function main() {
     let result;
     if (mode === "inspect") result = await inspect(client, page);
     else if (mode === "inject-probe") result = await injectRegressionProbe(client);
+    else if (mode === "latest-reply") result = await runLatestReplyWithoutTouch(client);
     else if (mode === "swipe") {
       result = {
         inputMode,

@@ -12,7 +12,7 @@
     "io:append": "node scripts/nova_utils.cjs append",
     "memory:refresh": "node scripts/refresh_manifest.cjs",
     "check": "pnpm check:csp && vue-tsc --noEmit && cd src-tauri && cargo check",
-    "test:renderer": "vitest run src/core/utils/renderDocument.spec.ts src/core/utils/htmlActions.spec.ts src/core/composables/useMessageStyleInjector.spec.ts src/core/composables/useChatScroll.spec.ts src/core/utils/activeHtmlSandbox.spec.ts",
+    "test:renderer": "vitest run src/core/utils/renderDocument.spec.ts src/core/utils/htmlActions.spec.ts src/core/composables/useMessageStyleInjector.spec.ts src/core/composables/useChatScroll.spec.ts src/core/composables/useRenderVisibility.spec.ts src/core/utils/activeHtmlSandbox.spec.ts",
     "check:csp": "node tools/verify_tauri_csp.cjs",
     "android:kotlin:check": "node tools/android_kotlin_check.cjs",
     "android:arm64:release": "node scripts/build_android_arm64_release.cjs",

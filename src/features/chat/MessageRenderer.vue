@@ -766,6 +766,11 @@ const renderHeavyContent = async () => {
   }
 };
 
+function handleEmbeddedContentRendered() {
+  void renderHeavyContent();
+  emit("rendered", props.message.id);
+}
+
 // Watch for content changes and trigger heavy rendering
 // Note: blocks array reference changes when Rust parser returns new AST,
 // so shallow watch is sufficient. Avoid deep watch to prevent O(n) traversal
@@ -984,7 +989,7 @@ function formatTime(ts: number) {
                     :block="block"
                     :message-id="message.id"
                     :source-id="block.__renderKey"
-                    @rendered="renderHeavyContent"
+                    @rendered="handleEmbeddedContentRendered"
                   />
 
                   <ToolBlock
@@ -1013,6 +1018,7 @@ function formatTime(ts: number) {
                     :message-id="message.id"
                     :is-streaming="isStreaming"
                     :is-active-stream="isMessageInActiveStream"
+                    @rendered="handleEmbeddedContentRendered"
                   />
 
                   <ToolSummaryBlock
@@ -1037,7 +1043,7 @@ function formatTime(ts: number) {
                 :message-id="message.id"
                 source-id="stream-tail"
                 streaming
-                @rendered="renderHeavyContent"
+                @rendered="handleEmbeddedContentRendered"
               />
               <ToolBlock
                 v-else-if="
@@ -1064,6 +1070,7 @@ function formatTime(ts: number) {
                 :message-id="message.id"
                 :is-streaming="isStreaming"
                 :is-active-stream="isMessageInActiveStream"
+                @rendered="handleEmbeddedContentRendered"
               />
               <ToolSummaryBlock
                 v-else-if="message.tailBlock.type === 'tool-call-summary'"

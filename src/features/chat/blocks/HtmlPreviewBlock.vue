@@ -32,9 +32,17 @@ const fullscreenIframeRef = ref<HTMLIFrameElement | null>(null);
 const inlineHeight = ref(180);
 const fullscreenHeight = ref(480);
 const { state } = useRenderVisibility(blockRef, inlineHeight.value);
+const hasInlineFrameMeasured = ref(false);
+const inlinePreviewReachedViewport = ref(false);
 const inlineMounted = computed(
-  () => isPreviewing.value && state.value !== "parked",
+  () =>
+    isPreviewing.value &&
+    (props.isActiveStream ||
+      !hasInlineFrameMeasured.value ||
+      !inlinePreviewReachedViewport.value ||
+      state.value !== "parked"),
 );
+const emit = defineEmits<{ rendered: [] }>();
 
 const { registerModal, unregisterModal } = useModalHistory();
 const modalId = `HtmlPreviewBlockFullScreen_${Math.random().toString(36).substring(2, 9)}`;
@@ -54,10 +62,26 @@ watch(
   () => props.isStreaming,
   (streaming) => {
     if (!streaming) {
+      hasInlineFrameMeasured.value = false;
+      inlinePreviewReachedViewport.value = false;
       isPreviewing.value = true;
     }
   },
 );
+
+watch(
+  () => props.content,
+  () => {
+    hasInlineFrameMeasured.value = false;
+    inlinePreviewReachedViewport.value = false;
+  },
+);
+
+watch([state, isPreviewing], ([nextState, previewing]) => {
+  if (previewing && nextState === "visible") {
+    inlinePreviewReachedViewport.value = true;
+  }
+});
 
 // 代码预览转义处理 (优先使用后端预渲染 syntect 高亮，无值时回退为安全 HTML 转义)
 const highlightedCode = computed(() => {
@@ -165,6 +189,12 @@ function handleSandboxMessage(event: MessageEvent<ActiveHtmlMessage>) {
         Math.abs(inlineHeight.value - nextHeight) >= 2
       ) {
         inlineHeight.value = nextHeight;
+      }
+      if (frame === inlineIframeRef.value) {
+        hasInlineFrameMeasured.value = true;
+        // A successful first iframe measurement must participate in the chat
+        // scroll pipeline even when its height matches the 180px placeholder.
+        emit("rendered");
       }
       if (
         frame === fullscreenIframeRef.value &&

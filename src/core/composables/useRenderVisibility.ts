@@ -18,10 +18,17 @@ export function useRenderVisibility(
     typeof document === "undefined" ? true : !document.hidden,
   );
   const cachedHeight = ref(Math.max(0, initialHeight));
+  // A zero-height parked node cannot re-enter an IntersectionObserver viewport
+  // on its own. Do not allow parking until this concrete instance has measured
+  // real layout at least once.
+  const hasMeasured = ref(false);
 
   const state = computed<RenderVisibilityState>(() => {
-    if (!isForeground.value) return "parked";
+    if (!isForeground.value) {
+      return hasMeasured.value ? "parked" : "prewarm";
+    }
     if (isVisible.value) return "visible";
+    if (!hasMeasured.value) return "prewarm";
     return isNearViewport.value ? "prewarm" : "parked";
   });
 
@@ -33,7 +40,10 @@ export function useRenderVisibility(
     const element = target.value;
     if (!element || state.value === "parked") return;
     const height = Math.ceil(element.getBoundingClientRect().height);
-    if (height > 0) cachedHeight.value = height;
+    if (height > 0) {
+      cachedHeight.value = height;
+      hasMeasured.value = true;
+    }
   };
 
   const handleVisibilityChange = () => {
@@ -90,6 +100,7 @@ export function useRenderVisibility(
   return {
     state,
     cachedHeight,
+    hasMeasured,
     isVisible,
     isForeground,
     rememberHeight,

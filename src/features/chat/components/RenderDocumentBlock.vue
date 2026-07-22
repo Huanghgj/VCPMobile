@@ -46,7 +46,12 @@ function restoreDetailsState() {
 }
 
 function renderCompiledDocument() {
-  if (!root.value || state.value === "parked") return;
+  if (
+    !root.value ||
+    (state.value === "parked" && cachedHeight.value > 0)
+  ) {
+    return;
+  }
   root.value.style.removeProperty("height");
   patchRenderDocumentRoot(root.value, compiled.value.html);
   restoreDetailsState();
@@ -80,6 +85,10 @@ watch(state, async (nextState) => {
   await nextTick();
   if (!root.value) return;
   if (nextState === "parked") {
+    // Never replace a never-rendered block with an empty, zero-height node.
+    // It would be unable to trigger IntersectionObserver again until the user
+    // manually scrolls the chat.
+    if (cachedHeight.value <= 0) return;
     if (!parked) {
       rememberHeight();
       captureDetailsState();
