@@ -443,7 +443,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div ref="rootRef" class="px-1 py-1 w-full transition-opacity duration-300 no-swipe relative flex flex-col gap-1.5" :class="{ 'opacity-70 pointer-events-none': disabled }">
+  <div ref="rootRef" class="vcp-motion-surface px-1 py-1 w-full transition-opacity duration-300 no-swipe relative flex flex-col gap-1.5" :class="{ 'opacity-70 pointer-events-none': disabled }">
     <!-- 全局群组停止按钮 -->
     <GroupStopAllButton />
 

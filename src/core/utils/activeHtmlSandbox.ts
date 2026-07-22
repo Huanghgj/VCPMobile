@@ -39,7 +39,7 @@ export function buildActiveHtmlDocument(
       ::-webkit-scrollbar { width: 5px !important; height: 5px !important; }
       ::-webkit-scrollbar-track { background: transparent !important; }
       ::-webkit-scrollbar-thumb { background: ${scrollbar} !important; border-radius: 10px !important; }
-      html, body { background-color: transparent; color: ${foreground}; overflow-x: hidden !important; overflow-y: hidden !important; }
+      html, body { background-color: transparent; color: ${foreground}; overflow-x: hidden !important; overflow-y: hidden !important; touch-action: pan-x pinch-zoom; overscroll-behavior: none; }
       body { margin: 0; padding: 16px; box-sizing: border-box; min-height: 0; }
       canvas, img, video, iframe { max-width: 100% !important; }
       img, canvas, svg, [style*="background-image"] { cursor: zoom-in; }
@@ -61,8 +61,16 @@ export function buildActiveHtmlDocument(
         let measureFrame = 0;
         let visibilityFrame = 0;
         let frameCallbacksEnabled = true;
+        let lastMeasuredHeight = 0;
+        let lastVisibilityKey = '';
+        let runtimeTargetsDirty = true;
+        let frameTargets = [];
+        let mediaTargets = [];
+        let touchStartX = null;
+        let touchStartY = null;
         let touchX = null;
         let touchY = null;
+        let touchAxis = null;
         const pendingButtons = new Map();
         const controlledAnimations = new WeakSet();
         const pausedMedia = new WeakSet();
@@ -83,11 +91,18 @@ export function buildActiveHtmlDocument(
           return rect.bottom > clipTop && rect.top < clipBottom && rect.right > 0 && rect.left < innerWidth;
         };
 
+        const refreshRuntimeTargets = () => {
+          if (!runtimeTargetsDirty) return;
+          runtimeTargetsDirty = false;
+          frameTargets = Array.from(document.querySelectorAll('canvas, video, [data-vcp-animate]'));
+          mediaTargets = Array.from(document.querySelectorAll('audio, video'));
+        };
+
         const shouldRunFrames = () => {
           if (!parentVisible) return false;
-          const frameTargets = document.querySelectorAll('canvas, video, [data-vcp-animate]');
+          refreshRuntimeTargets();
           if (frameTargets.length === 0) return true;
-          return Array.from(frameTargets).some(inClip);
+          return frameTargets.some(inClip);
         };
 
         const flushQueuedFrames = () => {
@@ -132,7 +147,10 @@ export function buildActiveHtmlDocument(
             root ? root.scrollHeight : 0,
             root ? root.offsetHeight : 0,
           );
-          post('render-size', { height: Math.max(1, Math.ceil(height)) });
+          const nextHeight = Math.max(1, Math.ceil(height));
+          if (Math.abs(nextHeight - lastMeasuredHeight) < 1) return;
+          lastMeasuredHeight = nextHeight;
+          post('render-size', { height: nextHeight });
         };
 
         const scheduleMeasure = () => {
@@ -143,28 +161,34 @@ export function buildActiveHtmlDocument(
         const syncVisibility = () => {
           visibilityFrame = 0;
           document.documentElement.classList.toggle('vcp-preview-hidden', !parentVisible);
-          const elements = document.querySelectorAll('*');
-          for (const element of elements) {
-            const visible = inClip(element);
-            if (typeof element.getAnimations === 'function') {
-              for (const animation of element.getAnimations({ subtree: false })) {
-                if (!visible && (animation.playState === 'running' || animation.playState === 'pending')) {
-                  animation.pause();
-                  controlledAnimations.add(animation);
-                } else if (visible && controlledAnimations.has(animation) && animation.playState === 'paused') {
-                  animation.play();
-                  controlledAnimations.delete(animation);
-                }
-              }
+          const animations = typeof document.getAnimations === 'function'
+            ? document.getAnimations()
+            : [];
+          for (const animation of animations) {
+            const effectTarget = animation.effect && animation.effect.target;
+            const target = effectTarget instanceof Element
+              ? effectTarget
+              : effectTarget && effectTarget.element instanceof Element
+                ? effectTarget.element
+                : null;
+            const visible = target instanceof Element ? inClip(target) : parentVisible;
+            if (!visible && (animation.playState === 'running' || animation.playState === 'pending')) {
+              animation.pause();
+              controlledAnimations.add(animation);
+            } else if (visible && controlledAnimations.has(animation) && animation.playState === 'paused') {
+              animation.play();
+              controlledAnimations.delete(animation);
             }
-            if (element instanceof HTMLMediaElement) {
-              if (!visible && !element.paused) {
-                pausedMedia.add(element);
-                element.pause();
-              } else if (visible && pausedMedia.has(element)) {
-                pausedMedia.delete(element);
-                void element.play().catch(() => {});
-              }
+          }
+          refreshRuntimeTargets();
+          for (const media of mediaTargets) {
+            const visible = inClip(media);
+            if (!visible && !media.paused) {
+              pausedMedia.add(media);
+              media.pause();
+            } else if (visible && pausedMedia.has(media)) {
+              pausedMedia.delete(media);
+              void media.play().catch(() => {});
             }
           }
           frameCallbacksEnabled = shouldRunFrames();
@@ -203,14 +227,42 @@ export function buildActiveHtmlDocument(
           return action.replace(/\\]\\]/g, '] ]').slice(0, MAX_ACTION_LENGTH);
         };
 
-        const prepareDocument = () => {
-          document.querySelectorAll('details:not([data-vcp-collapsed])').forEach((details) => {
+        const prepareSubtree = (node) => {
+          const detailsNodes = [];
+          const imageNodes = [];
+          if (node instanceof HTMLDetailsElement) detailsNodes.push(node);
+          if (node instanceof HTMLImageElement) imageNodes.push(node);
+          if (typeof node.querySelectorAll === 'function') {
+            detailsNodes.push(...node.querySelectorAll('details:not([data-vcp-collapsed])'));
+            imageNodes.push(...node.querySelectorAll('img'));
+          }
+          detailsNodes.forEach((details) => {
             if (!details.hasAttribute('open')) details.setAttribute('open', '');
           });
-          document.querySelectorAll('img').forEach((image) => {
+          imageNodes.forEach((image) => {
             if (!image.hasAttribute('loading')) image.loading = 'lazy';
             if (!image.hasAttribute('decoding')) image.decoding = 'async';
           });
+        };
+
+        const prepareDocument = () => {
+          prepareSubtree(document);
+          runtimeTargetsDirty = true;
+          scheduleMeasure();
+          scheduleVisibilitySync();
+        };
+
+        const handleMutations = (mutations) => {
+          let addedContent = false;
+          for (const mutation of mutations) {
+            for (const node of mutation.addedNodes) {
+              if (!(node instanceof Element)) continue;
+              prepareSubtree(node);
+              addedContent = true;
+            }
+          }
+          if (!addedContent) return;
+          runtimeTargetsDirty = true;
           scheduleMeasure();
           scheduleVisibilitySync();
         };
@@ -249,30 +301,46 @@ export function buildActiveHtmlDocument(
 
         document.addEventListener('touchstart', (event) => {
           if (event.touches.length !== 1) {
+            touchStartX = null;
+            touchStartY = null;
             touchX = null;
             touchY = null;
+            touchAxis = null;
             return;
           }
-          touchX = event.touches[0].clientX;
-          touchY = event.touches[0].clientY;
+          touchStartX = touchX = event.touches[0].clientX;
+          touchStartY = touchY = event.touches[0].clientY;
+          touchAxis = null;
         }, { passive: true, capture: true });
 
         document.addEventListener('touchmove', (event) => {
-          if (event.touches.length !== 1 || touchX === null || touchY === null) return;
+          if (
+            event.touches.length !== 1 ||
+            touchStartX === null || touchStartY === null ||
+            touchX === null || touchY === null
+          ) return;
           const nextX = event.touches[0].clientX;
           const nextY = event.touches[0].clientY;
-          const deltaX = touchX - nextX;
+          if (touchAxis === null) {
+            const totalX = nextX - touchStartX;
+            const totalY = nextY - touchStartY;
+            if (Math.max(Math.abs(totalX), Math.abs(totalY)) < 6) return;
+            touchAxis = Math.abs(totalY) > Math.abs(totalX) ? 'vertical' : 'horizontal';
+          }
           const deltaY = touchY - nextY;
           touchX = nextX;
           touchY = nextY;
-          if (Math.abs(deltaY) <= Math.abs(deltaX) || Math.abs(deltaY) < 1) return;
+          if (touchAxis !== 'vertical' || Math.abs(deltaY) < 0.5) return;
           event.preventDefault();
           post('render-scroll', { deltaY });
         }, { passive: false, capture: true });
 
         const resetTouch = () => {
+          touchStartX = null;
+          touchStartY = null;
           touchX = null;
           touchY = null;
+          touchAxis = null;
         };
         document.addEventListener('touchend', resetTouch, { passive: true, capture: true });
         document.addEventListener('touchcancel', resetTouch, { passive: true, capture: true });
@@ -282,9 +350,15 @@ export function buildActiveHtmlDocument(
           const data = event.data;
           if (!data || data.source !== parentSource || data.nonce !== nonce) return;
           if (data.type === 'render-visibility') {
-            parentVisible = Boolean(data.visible);
-            clipTop = Number.isFinite(data.clipTop) ? data.clipTop : 0;
-            clipBottom = Number.isFinite(data.clipBottom) ? data.clipBottom : Number.POSITIVE_INFINITY;
+            const nextVisible = Boolean(data.visible);
+            const nextClipTop = Number.isFinite(data.clipTop) ? data.clipTop : 0;
+            const nextClipBottom = Number.isFinite(data.clipBottom) ? data.clipBottom : Number.POSITIVE_INFINITY;
+            const nextKey = nextVisible + ':' + Math.round(nextClipTop) + ':' + Math.round(nextClipBottom);
+            if (nextKey === lastVisibilityKey) return;
+            lastVisibilityKey = nextKey;
+            parentVisible = nextVisible;
+            clipTop = nextClipTop;
+            clipBottom = nextClipBottom;
             scheduleVisibilitySync();
           } else if (data.type === 'ai-action-result') {
             const button = pendingButtons.get(data.actionId);
@@ -304,19 +378,19 @@ export function buildActiveHtmlDocument(
           prepareDocument();
           const resizeObserver = new ResizeObserver(() => {
             scheduleMeasure();
-            scheduleVisibilitySync();
           });
           resizeObserver.observe(document.documentElement);
           if (document.body) resizeObserver.observe(document.body);
-          const mutationObserver = new MutationObserver(prepareDocument);
+          const mutationObserver = new MutationObserver(handleMutations);
           mutationObserver.observe(document.documentElement, {
             childList: true,
-            subtree: true,
-            attributes: true,
-            attributeFilter: ['class', 'style', 'open', 'src']
+            subtree: true
           });
-          document.fonts?.ready.then(prepareDocument).catch(() => {});
-          window.addEventListener('load', prepareDocument);
+          document.fonts?.ready.then(scheduleMeasure).catch(() => {});
+          document.addEventListener('load', scheduleMeasure, true);
+          document.addEventListener('toggle', scheduleMeasure, true);
+          window.addEventListener('resize', scheduleMeasure);
+          window.addEventListener('load', scheduleMeasure);
           post('render-ready');
         };
 

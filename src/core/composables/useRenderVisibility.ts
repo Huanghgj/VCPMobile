@@ -98,7 +98,7 @@ export function useRenderVisibility(
 
 export class ViewportAnimationController {
   private observer: IntersectionObserver | null = null;
-  private elements = new Set<HTMLElement>();
+  private elements = new Set<Element>();
   private frameId: number | null = null;
   private refreshTimer: ReturnType<typeof setTimeout> | null = null;
   private lastRefreshAt = 0;
@@ -148,22 +148,29 @@ export class ViewportAnimationController {
       this.frameId = null;
       this.lastRefreshAt = performance.now();
       observer.disconnect();
+      this.elements.forEach((element) =>
+        element.classList.remove("vcp-element-offscreen"),
+      );
       this.elements.clear();
 
-      const candidates = [
-        this.root,
-        ...Array.from(
-          this.root.querySelectorAll<HTMLElement>(
-            "[class], [style], canvas, svg, video, [data-vcp-animate]",
-          ),
+      const candidates = new Set<Element>([
+        ...this.root.querySelectorAll<Element>(
+          "canvas, video, [data-vcp-animate]",
         ),
-      ];
+      ]);
+      if (typeof this.root.getAnimations === "function") {
+        for (const animation of this.root.getAnimations({ subtree: true })) {
+          const effectTarget = (animation.effect as KeyframeEffect | null)?.target;
+          const element =
+            effectTarget instanceof Element
+              ? effectTarget
+              : (effectTarget as { element?: Element } | null)?.element;
+          if (element instanceof Element && this.root.contains(element)) {
+            candidates.add(element);
+          }
+        }
+      }
       for (const element of candidates) {
-        const style = getComputedStyle(element);
-        const animated =
-          style.animationName !== "none" ||
-          element.matches("canvas, svg, video, [data-vcp-animate]");
-        if (!animated) continue;
         this.elements.add(element);
         observer.observe(element);
         if (!this.active) element.classList.add("vcp-element-offscreen");

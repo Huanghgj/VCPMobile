@@ -44,6 +44,7 @@ export function useChatScroll(options: UseChatScrollOptions) {
   let scrollThrottleId: number | null = null;
   let resizeObserver: ResizeObserver | null = null;
   let scrollRafId: number | null = null;
+  let contentNotifyRafId: number | null = null;
   let loadMoreDebounceId: number | null = null;
 
   const scrollToBottom = (smooth = false) => {
@@ -130,14 +131,16 @@ export function useChatScroll(options: UseChatScrollOptions) {
   };
 
   // --- 内容变化处理（等效于 ResizeObserver 的布局稳定信号）---
-  const handleContentChange = () => {
+  const handleContentChange = (force = false) => {
     const list = messageListRef.value;
     if (!list) return;
 
     const currentScrollHeight = list.scrollHeight;
     // 高度物理守卫：物理高度若无实质变化，瞬间拦截并退出。这极大释放了 CPU 性能，并从物理上秒杀了用户手动上滑时的误置底无限回弹 Bug
-    if (currentScrollHeight === lastScrollHeight) return;
-    lastScrollHeight = currentScrollHeight;
+    if (currentScrollHeight === lastScrollHeight && !force) return;
+    if (currentScrollHeight !== lastScrollHeight) {
+      lastScrollHeight = currentScrollHeight;
+    }
 
     // 场景1：首屏加载完成（initial → following/free）
     if (scrollScene.value === "initial") {
@@ -216,6 +219,18 @@ export function useChatScroll(options: UseChatScrollOptions) {
       cancelAnimationFrame(scrollRafId);
       scrollRafId = null;
     }
+  };
+
+  const notifyContentChange = () => {
+    if (contentNotifyRafId !== null) {
+      cancelAnimationFrame(contentNotifyRafId);
+    }
+    contentNotifyRafId = requestAnimationFrame(() => {
+      contentNotifyRafId = requestAnimationFrame(() => {
+        contentNotifyRafId = null;
+        handleContentChange(true);
+      });
+    });
   };
 
   // --- scroll 事件 ---
@@ -357,6 +372,10 @@ export function useChatScroll(options: UseChatScrollOptions) {
       clearTimeout(loadMoreDebounceId);
       loadMoreDebounceId = null;
     }
+    if (contentNotifyRafId !== null) {
+      cancelAnimationFrame(contentNotifyRafId);
+      contentNotifyRafId = null;
+    }
   };
 
   const startAutoScroll = () => {
@@ -381,6 +400,10 @@ export function useChatScroll(options: UseChatScrollOptions) {
       clearTimeout(loadMoreDebounceId);
       loadMoreDebounceId = null;
     }
+    if (contentNotifyRafId !== null) {
+      cancelAnimationFrame(contentNotifyRafId);
+      contentNotifyRafId = null;
+    }
     if (typeof window !== "undefined") {
       window.removeEventListener("vcp-lifecycle", onVcpLifecycleResume);
     }
@@ -399,6 +422,7 @@ export function useChatScroll(options: UseChatScrollOptions) {
     startAutoScroll,
     stopAutoScroll,
     checkAndLoadMore,
+    notifyContentChange,
     reset,
     dispose,
   };

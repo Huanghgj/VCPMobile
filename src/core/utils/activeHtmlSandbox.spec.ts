@@ -37,6 +37,16 @@ describe("active HTML sandbox document", () => {
     expect(result).toContain("<body>");
   });
 
+  it("emits a syntactically valid bridge script", () => {
+    const result = buildActiveHtmlDocument("<div>probe</div>", false, "nonce-js");
+    const bridge = result.match(
+      /<script data-vcp-preview-bridge>([\s\S]*?)<\/script>/,
+    )?.[1];
+
+    expect(bridge).toBeTruthy();
+    expect(() => new Function(bridge || "")).not.toThrow();
+  });
+
   it("keeps the requested capabilities while omitting same-origin access", () => {
     expect(ACTIVE_HTML_SANDBOX).toContain("allow-scripts");
     expect(ACTIVE_HTML_SANDBOX).toContain("allow-pointer-lock");
@@ -56,7 +66,15 @@ describe("active HTML sandbox document", () => {
     expect(result).toContain("new ResizeObserver");
     expect(result).toContain("post('render-size'");
     expect(result).toContain("post('render-scroll'");
-    expect(result).toContain("Math.abs(deltaY) <= Math.abs(deltaX)");
+    expect(result).toContain("Math.abs(totalY) > Math.abs(totalX)");
+    expect(result).toContain("Math.abs(nextHeight - lastMeasuredHeight)");
+    expect(result).toContain("touch-action: pan-x pinch-zoom");
+    expect(result).toContain("document.getAnimations()");
+    expect(result).toContain("effectTarget.element instanceof Element");
+    expect(result).toContain("new MutationObserver(handleMutations)");
+    expect(result).not.toContain("document.querySelectorAll('*')");
+    expect(result).not.toContain("attributes: true");
+    expect(result).not.toContain("attributeFilter: ['class', 'style'");
     expect(result).toContain("event.preventDefault()");
     expect(result).toContain("data.type === 'render-visibility'");
     expect(result).toContain("data.nonce !== nonce");

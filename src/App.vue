@@ -788,6 +788,14 @@ body,
   animation-play-state: paused !important;
 }
 
+/* Keep continuous motion limited to chat content and the composer. */
+body :where(*):not(.vcp-motion-surface):not(.vcp-motion-surface *),
+body :where(*):not(.vcp-motion-surface):not(.vcp-motion-surface *)::before,
+body :where(*):not(.vcp-motion-surface):not(.vcp-motion-surface *)::after {
+  animation: none !important;
+  will-change: auto !important;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

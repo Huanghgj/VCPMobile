@@ -67,6 +67,7 @@ const props = defineProps<{
   agentId?: string;
   depth?: number;
 }>();
+const emit = defineEmits<{ rendered: [messageId: string] }>();
 
 const overlayStore = useOverlayStore();
 const notificationStore = useNotificationStore();
@@ -784,6 +785,19 @@ watch(isMessageInActiveStream, (inStream, wasInStream) => {
   }
 });
 
+watch(
+  () => props.message.renderRevision,
+  async (revision, previousRevision) => {
+    if (revision === undefined || revision === previousRevision) return;
+    await nextTick();
+    emit("rendered", props.message.id);
+    await renderHeavyContent();
+    await nextTick();
+    emit("rendered", props.message.id);
+  },
+  { flush: "post" },
+);
+
 // === Context Menu ===
 const showMessageContextMenu = async () => {
   const actions: any[] = [];
@@ -926,6 +940,7 @@ function formatTime(ts: number) {
     class="vcp-message-item flex flex-col w-full mb-6 animate-fade-in px-1 min-w-0"
     :data-message-id="message.id"
     :data-role="message.role"
+    :data-render-revision="message.renderRevision"
   >
     <!-- 统一的气泡循环渲染列表 -->
     <template v-for="(bubble, bubbleIndex) in messageBubbles" :key="bubble.id">

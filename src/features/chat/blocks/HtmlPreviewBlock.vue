@@ -161,24 +161,59 @@ function handleSandboxMessage(event: MessageEvent<ActiveHtmlMessage>) {
   if (data.type === "render-size") {
     const nextHeight = Math.ceil(Number(data.height));
     if (Number.isFinite(nextHeight) && nextHeight > 0 && nextHeight < 100_000) {
-      if (frame === inlineIframeRef.value) inlineHeight.value = nextHeight;
-      if (frame === fullscreenIframeRef.value)
+      if (
+        frame === inlineIframeRef.value &&
+        Math.abs(inlineHeight.value - nextHeight) >= 2
+      ) {
+        inlineHeight.value = nextHeight;
+      }
+      if (
+        frame === fullscreenIframeRef.value &&
+        Math.abs(fullscreenHeight.value - nextHeight) >= 2
+      ) {
         fullscreenHeight.value = nextHeight;
+      }
     }
   } else if (data.type === "render-ready") {
-    scheduleVisibilityUpdate();
+    lastFrameVisibility.delete(frame);
+    scheduleVisibilityUpdate(true);
   } else if (data.type === "render-scroll") {
     const deltaY = Number(data.deltaY);
     if (!Number.isFinite(deltaY) || Math.abs(deltaY) > window.innerHeight) {
       return;
     }
-    frame.closest<HTMLElement>(".overflow-y-auto")?.scrollBy({ top: deltaY });
+    queueParentScroll(frame, deltaY);
   } else if (data.type === "ai-action") {
     void handleSandboxAction(frame, data);
   }
 }
 
 let visibilityFrame: number | null = null;
+let visibilityTimer: ReturnType<typeof setTimeout> | null = null;
+let lastVisibilitySyncAt = 0;
+let parentScrollFrame: number | null = null;
+const lastFrameVisibility = new WeakMap<HTMLIFrameElement, string>();
+const pendingScrollDeltas = new Map<HTMLElement, number>();
+
+function flushParentScroll() {
+  parentScrollFrame = null;
+  for (const [scrollParent, deltaY] of pendingScrollDeltas) {
+    scrollParent.scrollTop += deltaY;
+  }
+  pendingScrollDeltas.clear();
+}
+
+function queueParentScroll(frame: HTMLIFrameElement, deltaY: number) {
+  const scrollParent = frame.closest<HTMLElement>(".overflow-y-auto");
+  if (!scrollParent) return;
+  pendingScrollDeltas.set(
+    scrollParent,
+    (pendingScrollDeltas.get(scrollParent) || 0) + deltaY,
+  );
+  if (parentScrollFrame === null) {
+    parentScrollFrame = requestAnimationFrame(flushParentScroll);
+  }
+}
 
 function visibleBoundsForFrame(frame: HTMLIFrameElement) {
   const rect = frame.getBoundingClientRect();
@@ -205,22 +240,53 @@ function visibleBoundsForFrame(frame: HTMLIFrameElement) {
 
 function updateFrameVisibility() {
   visibilityFrame = null;
+  lastVisibilitySyncAt = performance.now();
   for (const frame of [inlineIframeRef.value, fullscreenIframeRef.value]) {
     if (!frame?.contentWindow) continue;
+    const bounds = visibleBoundsForFrame(frame);
+    const signature = [
+      bounds.visible ? 1 : 0,
+      Math.round(bounds.clipTop),
+      Math.round(bounds.clipBottom),
+    ].join(":");
+    if (lastFrameVisibility.get(frame) === signature) continue;
+    lastFrameVisibility.set(frame, signature);
     postToFrame(frame, {
       type: "render-visibility",
-      ...visibleBoundsForFrame(frame),
+      ...bounds,
     });
   }
 }
 
-function scheduleVisibilityUpdate() {
+function scheduleVisibilityUpdate(immediate: boolean | Event = false) {
   if (visibilityFrame !== null) return;
-  visibilityFrame = requestAnimationFrame(updateFrameVisibility);
+  if (immediate === true) {
+    if (visibilityTimer) {
+      clearTimeout(visibilityTimer);
+      visibilityTimer = null;
+    }
+    visibilityFrame = requestAnimationFrame(updateFrameVisibility);
+    return;
+  }
+
+  const remaining = 96 - (performance.now() - lastVisibilitySyncAt);
+  if (remaining <= 0) {
+    visibilityFrame = requestAnimationFrame(updateFrameVisibility);
+  } else if (!visibilityTimer) {
+    visibilityTimer = setTimeout(() => {
+      visibilityTimer = null;
+      if (visibilityFrame === null) {
+        visibilityFrame = requestAnimationFrame(updateFrameVisibility);
+      }
+    }, remaining);
+  }
 }
 
-function handleFrameLoad() {
-  scheduleVisibilityUpdate();
+function handleFrameLoad(event: Event) {
+  if (event.currentTarget instanceof HTMLIFrameElement) {
+    lastFrameVisibility.delete(event.currentTarget);
+  }
+  scheduleVisibilityUpdate(true);
 }
 
 const openFullScreen = () => {
@@ -269,7 +335,10 @@ onMounted(() => {
 
 onUnmounted(() => {
   if (refreshTimer) clearTimeout(refreshTimer);
+  if (visibilityTimer) clearTimeout(visibilityTimer);
   if (visibilityFrame !== null) cancelAnimationFrame(visibilityFrame);
+  if (parentScrollFrame !== null) cancelAnimationFrame(parentScrollFrame);
+  pendingScrollDeltas.clear();
   window.removeEventListener("message", handleSandboxMessage);
   window.removeEventListener("resize", scheduleVisibilityUpdate);
   window.removeEventListener("scroll", scheduleVisibilityUpdate, true);
@@ -281,7 +350,7 @@ onUnmounted(() => {
 <template>
   <div
     ref="blockRef"
-    class="html-preview-block mb-4 overflow-hidden transition-all duration-300"
+    class="html-preview-block mb-4 overflow-hidden"
     :class="[
       isPreviewing ? 'html-preview-block--preview' : 'rounded-2xl border',
       !isPreviewing &&
@@ -436,7 +505,6 @@ onUnmounted(() => {
               :sandbox="ACTIVE_HTML_SANDBOX"
               :allow="ACTIVE_HTML_PERMISSIONS"
               allowfullscreen
-              loading="lazy"
               :srcdoc="sandboxHtml"
               :data-vcp-image-nonce="bridgeNonce"
               :data-vcp-bridge-nonce="bridgeNonce"
@@ -549,7 +617,7 @@ onUnmounted(() => {
 
     <!-- Inline preview uses the sandbox-reported document height. -->
     <div
-      class="relative transition-all duration-300 overflow-hidden no-swipe"
+      class="relative overflow-hidden no-swipe"
       :style="isPreviewing ? { height: `${inlineHeight}px` } : undefined"
     >
       <div
@@ -580,7 +648,6 @@ onUnmounted(() => {
           :sandbox="ACTIVE_HTML_SANDBOX"
           :allow="ACTIVE_HTML_PERMISSIONS"
           allowfullscreen
-          loading="lazy"
           :srcdoc="sandboxHtml"
           :data-vcp-image-nonce="bridgeNonce"
           :data-vcp-bridge-nonce="bridgeNonce"

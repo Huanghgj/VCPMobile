@@ -18,7 +18,7 @@ const mergedStyle = computed(() => {
     isStreaming ? 'streaming' : '',
   ]">
     <div
-      class="vcp-bubble-container message-bubble rounded-2xl transition-all duration-300 relative min-w-[60px] min-h-[36px]"
+      class="vcp-motion-surface vcp-bubble-container message-bubble rounded-2xl transition-all duration-300 relative min-w-[60px] min-h-[36px]"
       :class="[
         isUser ? 'p-3 w-fit max-w-[85%] vcp-bubble-user' : 'p-1.5 w-fit max-w-[100%] min-w-[1rem] vcp-bubble-agent'
       ]" :style="mergedStyle">

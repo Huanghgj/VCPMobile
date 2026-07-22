@@ -896,6 +896,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
           msg!.tailBlock = undefined;
           msg!.tailFrame = undefined;
           msg!.tailSnapshot = undefined;
+          msg!.renderRevision = (msg!.renderRevision ?? 0) + 1;
 
           // === 🚀 输出流式诊断提示与回放指南（开发模式生效，Release 构建时自动摇树切除） ===
           if (import.meta.env.DEV) {

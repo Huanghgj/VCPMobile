@@ -62,6 +62,7 @@ const {
   startAutoScroll,
   stopAutoScroll,
   checkAndLoadMore,
+  notifyContentChange,
   reset: resetChatScroll,
   dispose: disposeChatScroll,
 } = useChatScroll({
@@ -307,6 +308,7 @@ onUnmounted(() => {
           :message="msg"
           :agent-id="sessionStore.currentSelectedItem?.id"
           :data-message-id="msg.id"
+          @rendered="notifyContentChange"
         />
         <!-- 底部留白，避免最后一条消息被输入框遮挡 -->
         <div class="h-20"></div>

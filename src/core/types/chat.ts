@@ -122,6 +122,7 @@ export interface ChatMessage {
   tailBlock?: ContentBlock;
   tailFrame?: TailFrame;
   tailSnapshot?: MarkdownNode[];
+  renderRevision?: number;   // Final-render signal; never persisted.
 }
 
 export type AstMutation =
