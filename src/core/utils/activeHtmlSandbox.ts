@@ -39,7 +39,7 @@ export function buildActiveHtmlDocument(
       ::-webkit-scrollbar { width: 5px !important; height: 5px !important; }
       ::-webkit-scrollbar-track { background: transparent !important; }
       ::-webkit-scrollbar-thumb { background: ${scrollbar} !important; border-radius: 10px !important; }
-      html, body { background-color: transparent; color: ${foreground}; overflow-x: hidden !important; overflow-y: hidden !important; touch-action: pan-x pinch-zoom; overscroll-behavior: none; }
+      html, body { background-color: transparent; color: ${foreground}; overflow-x: hidden !important; overflow-y: hidden !important; touch-action: pan-y pinch-zoom; overscroll-behavior: auto; }
       body { margin: 0; padding: 16px; box-sizing: border-box; min-height: 0; }
       canvas, img, video, iframe { max-width: 100% !important; }
       img, canvas, svg, [style*="background-image"] { cursor: zoom-in; }
@@ -66,11 +66,6 @@ export function buildActiveHtmlDocument(
         let runtimeTargetsDirty = true;
         let frameTargets = [];
         let mediaTargets = [];
-        let touchStartX = null;
-        let touchStartY = null;
-        let touchX = null;
-        let touchY = null;
-        let touchAxis = null;
         const pendingButtons = new Map();
         const controlledAnimations = new WeakSet();
         const pausedMedia = new WeakSet();
@@ -228,13 +223,18 @@ export function buildActiveHtmlDocument(
         };
 
         const prepareSubtree = (node) => {
+          const detailsNodes = [];
           const imageNodes = [];
+          if (node instanceof HTMLDetailsElement) detailsNodes.push(node);
           if (node instanceof HTMLImageElement) imageNodes.push(node);
           if (typeof node.querySelectorAll === 'function') {
+            detailsNodes.push(...node.querySelectorAll('details'));
             imageNodes.push(...node.querySelectorAll('img'));
           }
+          detailsNodes.forEach((details) => {
+            details.open = false;
+          });
           imageNodes.forEach((image) => {
-            if (!image.hasAttribute('loading')) image.loading = 'lazy';
             if (!image.hasAttribute('decoding')) image.decoding = 'async';
           });
         };
@@ -292,52 +292,6 @@ export function buildActiveHtmlDocument(
           button.setAttribute('aria-busy', 'true');
           post('ai-action', { actionId, action });
         }, true);
-
-        document.addEventListener('touchstart', (event) => {
-          if (event.touches.length !== 1) {
-            touchStartX = null;
-            touchStartY = null;
-            touchX = null;
-            touchY = null;
-            touchAxis = null;
-            return;
-          }
-          touchStartX = touchX = event.touches[0].clientX;
-          touchStartY = touchY = event.touches[0].clientY;
-          touchAxis = null;
-        }, { passive: true, capture: true });
-
-        document.addEventListener('touchmove', (event) => {
-          if (
-            event.touches.length !== 1 ||
-            touchStartX === null || touchStartY === null ||
-            touchX === null || touchY === null
-          ) return;
-          const nextX = event.touches[0].clientX;
-          const nextY = event.touches[0].clientY;
-          if (touchAxis === null) {
-            const totalX = nextX - touchStartX;
-            const totalY = nextY - touchStartY;
-            if (Math.max(Math.abs(totalX), Math.abs(totalY)) < 6) return;
-            touchAxis = Math.abs(totalY) > Math.abs(totalX) ? 'vertical' : 'horizontal';
-          }
-          const deltaY = touchY - nextY;
-          touchX = nextX;
-          touchY = nextY;
-          if (touchAxis !== 'vertical' || Math.abs(deltaY) < 0.5) return;
-          event.preventDefault();
-          post('render-scroll', { deltaY });
-        }, { passive: false, capture: true });
-
-        const resetTouch = () => {
-          touchStartX = null;
-          touchStartY = null;
-          touchX = null;
-          touchY = null;
-          touchAxis = null;
-        };
-        document.addEventListener('touchend', resetTouch, { passive: true, capture: true });
-        document.addEventListener('touchcancel', resetTouch, { passive: true, capture: true });
 
         window.addEventListener('message', (event) => {
           if (event.source !== window.parent) return;

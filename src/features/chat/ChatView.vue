@@ -99,19 +99,6 @@ watch(
   { immediate: true }
 );
 
-// --- 阻止非交互空白区域的 touchmove，防止 WebView viewport 被拖动 ---
-const handleContainerTouchMove = (e: TouchEvent) => {
-  // 系统滚动过程中事件不可取消，强行 preventDefault 会报错
-  if (!e.cancelable) return;
-  if (e.target instanceof Element) {
-    const scrollable = e.target.closest(
-      ".overflow-y-auto, .overflow-x-auto, textarea, input, .vcp-scrollable, button, a",
-    );
-    if (scrollable) return;
-  }
-  e.preventDefault();
-};
-
 const handleVcpButtonClick = (e: any) => {
   if (e.detail && e.detail.text) {
     historyStore.sendMessage(e.detail.text);
@@ -200,7 +187,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div ref="chatViewContainerRef" class="chat-view-container flex flex-col h-full w-full min-w-0 relative bg-transparent overflow-hidden" @touchmove="handleContainerTouchMove">
+  <div ref="chatViewContainerRef" class="chat-view-container flex flex-col h-full w-full min-w-0 relative bg-transparent overflow-hidden">
     <!-- 1. Header (强制保底高度 80px，确保刘海屏可见) -->
     <header class="vcp-header-fixed shrink-0 flex items-center justify-between gap-3 px-4 border-b border-white/5">
       <div class="flex items-center gap-3 min-w-0 flex-1">

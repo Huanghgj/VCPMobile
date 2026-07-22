@@ -97,7 +97,6 @@ interface ActiveHtmlMessage {
   type?: string;
   nonce?: string;
   height?: number;
-  deltaY?: number;
   actionId?: string;
   action?: string;
 }
@@ -177,12 +176,6 @@ function handleSandboxMessage(event: MessageEvent<ActiveHtmlMessage>) {
   } else if (data.type === "render-ready") {
     lastFrameVisibility.delete(frame);
     scheduleVisibilityUpdate(true);
-  } else if (data.type === "render-scroll") {
-    const deltaY = Number(data.deltaY);
-    if (!Number.isFinite(deltaY) || Math.abs(deltaY) > window.innerHeight) {
-      return;
-    }
-    queueParentScroll(frame, deltaY);
   } else if (data.type === "ai-action") {
     void handleSandboxAction(frame, data);
   }
@@ -191,29 +184,7 @@ function handleSandboxMessage(event: MessageEvent<ActiveHtmlMessage>) {
 let visibilityFrame: number | null = null;
 let visibilityTimer: ReturnType<typeof setTimeout> | null = null;
 let lastVisibilitySyncAt = 0;
-let parentScrollFrame: number | null = null;
 const lastFrameVisibility = new WeakMap<HTMLIFrameElement, string>();
-const pendingScrollDeltas = new Map<HTMLElement, number>();
-
-function flushParentScroll() {
-  parentScrollFrame = null;
-  for (const [scrollParent, deltaY] of pendingScrollDeltas) {
-    scrollParent.scrollTop += deltaY;
-  }
-  pendingScrollDeltas.clear();
-}
-
-function queueParentScroll(frame: HTMLIFrameElement, deltaY: number) {
-  const scrollParent = frame.closest<HTMLElement>(".overflow-y-auto");
-  if (!scrollParent) return;
-  pendingScrollDeltas.set(
-    scrollParent,
-    (pendingScrollDeltas.get(scrollParent) || 0) + deltaY,
-  );
-  if (parentScrollFrame === null) {
-    parentScrollFrame = requestAnimationFrame(flushParentScroll);
-  }
-}
 
 function visibleBoundsForFrame(frame: HTMLIFrameElement) {
   const rect = frame.getBoundingClientRect();
@@ -337,8 +308,6 @@ onUnmounted(() => {
   if (refreshTimer) clearTimeout(refreshTimer);
   if (visibilityTimer) clearTimeout(visibilityTimer);
   if (visibilityFrame !== null) cancelAnimationFrame(visibilityFrame);
-  if (parentScrollFrame !== null) cancelAnimationFrame(parentScrollFrame);
-  pendingScrollDeltas.clear();
   window.removeEventListener("message", handleSandboxMessage);
   window.removeEventListener("resize", scheduleVisibilityUpdate);
   window.removeEventListener("scroll", scheduleVisibilityUpdate, true);

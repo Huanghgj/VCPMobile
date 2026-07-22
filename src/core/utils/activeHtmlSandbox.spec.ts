@@ -65,10 +65,12 @@ describe("active HTML sandbox document", () => {
     expect(result).toContain("overflow-y: hidden !important");
     expect(result).toContain("new ResizeObserver");
     expect(result).toContain("post('render-size'");
-    expect(result).toContain("post('render-scroll'");
-    expect(result).toContain("Math.abs(totalY) > Math.abs(totalX)");
+    expect(result).not.toContain("post('render-scroll'");
+    expect(result).not.toContain("document.addEventListener('touchmove'");
     expect(result).toContain("Math.abs(nextHeight - lastMeasuredHeight)");
-    expect(result).toContain("touch-action: pan-x pinch-zoom");
+    expect(result).toContain("touch-action: pan-y pinch-zoom");
+    expect(result).toContain("overscroll-behavior: auto");
+    expect(result).not.toContain("image.loading = 'lazy'");
     expect(result).toContain("document.getAnimations()");
     expect(result).toContain("effectTarget.element instanceof Element");
     expect(result).toContain("new MutationObserver(handleMutations)");
@@ -83,7 +85,7 @@ describe("active HTML sandbox document", () => {
     expect(result).toContain('"nonce-visible"');
   });
 
-  it("keeps details collapsed unless the source explicitly opens them", () => {
+  it("closes details during sandbox initialization and subtree insertion", () => {
     const result = buildActiveHtmlDocument(
       '<details id="default"><summary>默认</summary>正文</details>' +
         '<details id="expanded" open><summary>展开</summary>正文</details>',
@@ -91,7 +93,7 @@ describe("active HTML sandbox document", () => {
       "nonce-details",
     );
 
-    expect(result).toContain('<details id="default">');
-    expect(result).toContain('<details id="expanded" open>');
+    expect(result).toContain("detailsNodes.push(...node.querySelectorAll('details'))");
+    expect(result).toContain("details.open = false");
   });
 });

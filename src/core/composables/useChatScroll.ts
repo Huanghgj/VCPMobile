@@ -35,9 +35,11 @@ export function useChatScroll(options: UseChatScrollOptions) {
   const showScrollToBottom = ref(false);
   const scrollScene = ref<ScrollScene>("initial");
 
-  // 高性能测量与安全保护罩状态
   let lastScrollHeight = 0;
-  const isInitialRendering = ref(true);
+  let lastKnownScrollTop = 0;
+  let userInteracting = false;
+  let pinnedToBottom = true;
+  let interactionStartScrollTop = 0;
 
   // 加载锚点：记录加载前视口中最顶部可见消息
   let loadAnchor: { messageId: string; offsetFromTop: number } | null = null;
@@ -46,14 +48,22 @@ export function useChatScroll(options: UseChatScrollOptions) {
   let scrollRafId: number | null = null;
   let contentNotifyRafId: number | null = null;
   let loadMoreDebounceId: number | null = null;
+  let interactionEndTimer: ReturnType<typeof setTimeout> | null = null;
 
   const scrollToBottom = (smooth = false) => {
     const list = messageListRef.value;
     if (!list) return;
+    userInteracting = false;
+    pinnedToBottom = true;
+    showScrollToBottom.value = false;
+    if (scrollScene.value !== "loading-top") {
+      scrollScene.value = "following";
+    }
     list.scrollTo({
       top: list.scrollHeight,
       behavior: smooth ? "smooth" : "auto",
     });
+    lastKnownScrollTop = list.scrollTop;
   };
 
   // --- 锚定元素 ---
@@ -101,9 +111,6 @@ export function useChatScroll(options: UseChatScrollOptions) {
   const evaluateAutoLoadMore = () => {
     const list = messageListRef.value;
     if (!list) return;
-
-    // 首屏防抖稳定后，关闭首屏渲染保护罩
-    isInitialRendering.value = false;
 
     if (
       scrollScene.value !== "initial" &&
@@ -153,7 +160,7 @@ export function useChatScroll(options: UseChatScrollOptions) {
         } else {
           // 首屏无消息，切换到 free，允许用户上滑尝试加载
           scrollScene.value = "free";
-          isInitialRendering.value = false; // 空状态直接解除首屏保护罩
+          pinnedToBottom = false;
         }
       }
       return;
@@ -173,7 +180,11 @@ export function useChatScroll(options: UseChatScrollOptions) {
     }
 
     // 场景3：跟随模式下的新内容/流式追加
-    if (scrollScene.value === "following" && !showScrollToBottom.value) {
+    if (
+      scrollScene.value === "following" &&
+      pinnedToBottom &&
+      !userInteracting
+    ) {
       scrollToBottom(false);
       // 普通流式追加期间不要反复创建/取消自动续载定时器；只有内容仍不足一屏时才需要续载。
       if (currentScrollHeight <= list.clientHeight + 10) {
@@ -233,39 +244,24 @@ export function useChatScroll(options: UseChatScrollOptions) {
     });
   };
 
-  // --- scroll 事件 ---
-  const onScroll = () => {
-    if (scrollThrottleId) return; // 已调度，节流中
-    scrollThrottleId = requestAnimationFrame(() => {
-      scrollThrottleId = null;
-      const list = messageListRef.value;
-      if (!list) return;
+  const syncScrollPosition = () => {
+    const list = messageListRef.value;
+    if (!list) return;
+    const movedTowardHistory = list.scrollTop < lastKnownScrollTop - 1;
+    lastKnownScrollTop = list.scrollTop;
+    const nearTop = list.scrollTop < 100;
+    const nearBottom =
+      list.scrollHeight - list.scrollTop - list.clientHeight < 150;
 
-      // 如果首屏渲染尚未彻底完成稳定（高度还在持续图片加载增长），屏蔽自由滚动，防止状态机提前叛逃
-      if (isInitialRendering.value) {
-        showScrollToBottom.value = false;
-        scrollScene.value = "following";
-        return;
-      }
-
-      const nearTop = list.scrollTop < 100;
-      const nearBottom =
-        list.scrollHeight - list.scrollTop - list.clientHeight < 150;
-
-      // 更新底部按钮显隐
+    if (movedTowardHistory) {
+      pinnedToBottom = false;
       showScrollToBottom.value = !nearBottom;
-
-      // 场景切换：following ↔ free
-      if (nearBottom && scrollScene.value === "free") {
-        scrollScene.value = "following";
-      } else if (!nearBottom && scrollScene.value === "following") {
+      if (scrollScene.value !== "loading-top") {
         scrollScene.value = "free";
       }
-
-      // 触发顶部加载（仅在 free 状态下，避免 following 模式误触）
       if (
         nearTop &&
-        scrollScene.value === "free" &&
+        scrollScene.value !== "loading-top" &&
         hasMoreHistory.value &&
         !isLoadingHistory.value
       ) {
@@ -273,8 +269,88 @@ export function useChatScroll(options: UseChatScrollOptions) {
         scrollScene.value = "loading-top";
         onLoadMore();
       }
+      return;
+    }
+
+    if (
+      !userInteracting &&
+      pinnedToBottom &&
+      scrollScene.value === "following"
+    ) {
+      showScrollToBottom.value = false;
+      return;
+    }
+
+    pinnedToBottom = nearBottom && !userInteracting;
+    showScrollToBottom.value = !nearBottom;
+
+    if (scrollScene.value !== "loading-top") {
+      scrollScene.value = pinnedToBottom ? "following" : "free";
+    }
+
+    if (
+      nearTop &&
+      scrollScene.value === "free" &&
+      hasMoreHistory.value &&
+      !isLoadingHistory.value
+    ) {
+      prepareLoadAnchor();
+      scrollScene.value = "loading-top";
+      onLoadMore();
+    }
+  };
+
+  const scheduleScrollPositionSync = () => {
+    if (scrollThrottleId !== null) return;
+    scrollThrottleId = requestAnimationFrame(() => {
+      scrollThrottleId = null;
+      syncScrollPosition();
     });
   };
+
+  const beginUserInteraction = () => {
+    if (interactionEndTimer) {
+      clearTimeout(interactionEndTimer);
+      interactionEndTimer = null;
+    }
+    userInteracting = true;
+    pinnedToBottom = false;
+    interactionStartScrollTop = messageListRef.value?.scrollTop || 0;
+    if (scrollScene.value === "following") {
+      scrollScene.value = "free";
+    }
+  };
+
+  const endUserInteraction = () => {
+    if (interactionEndTimer) clearTimeout(interactionEndTimer);
+    interactionEndTimer = setTimeout(() => {
+      interactionEndTimer = null;
+      const list = messageListRef.value;
+      const movedTowardHistory = Boolean(
+        list && list.scrollTop < interactionStartScrollTop - 1,
+      );
+      userInteracting = false;
+      if (movedTowardHistory) {
+        pinnedToBottom = false;
+        const nearBottom = Boolean(
+          list && list.scrollHeight - list.scrollTop - list.clientHeight < 150,
+        );
+        showScrollToBottom.value = !nearBottom;
+        if (scrollScene.value !== "loading-top") {
+          scrollScene.value = "free";
+        }
+        return;
+      }
+      syncScrollPosition();
+    }, 80);
+  };
+
+  const onWheel = () => {
+    beginUserInteraction();
+    endUserInteraction();
+  };
+
+  const onScroll = () => scheduleScrollPositionSync();
 
   // --- 回前台自愈：复位可能被 WebView 丢帧卡死的 rAF 守卫 ---
   // 应用切到后台时，已排程但未执行的 requestAnimationFrame 回调可能被 WebView 丢弃，
@@ -316,10 +392,19 @@ export function useChatScroll(options: UseChatScrollOptions) {
   const stopWatchListRef = watch(messageListRef, (el, oldEl) => {
     if (oldEl) {
       oldEl.removeEventListener("scroll", onScroll);
+      oldEl.removeEventListener("touchstart", beginUserInteraction);
+      oldEl.removeEventListener("touchend", endUserInteraction);
+      oldEl.removeEventListener("touchcancel", endUserInteraction);
+      oldEl.removeEventListener("wheel", onWheel);
     }
     if (el) {
       startContentObserver();
+      lastKnownScrollTop = el.scrollTop;
       el.addEventListener("scroll", onScroll, { passive: true });
+      el.addEventListener("touchstart", beginUserInteraction, { passive: true });
+      el.addEventListener("touchend", endUserInteraction, { passive: true });
+      el.addEventListener("touchcancel", endUserInteraction, { passive: true });
+      el.addEventListener("wheel", onWheel, { passive: true });
       stopWatchListRef();
     }
   });
@@ -349,7 +434,10 @@ export function useChatScroll(options: UseChatScrollOptions) {
       showScrollToBottom.value = false;
       loadAnchor = null;
       lastScrollHeight = 0;
-      isInitialRendering.value = true;
+      lastKnownScrollTop = 0;
+      userInteracting = false;
+      pinnedToBottom = true;
+      interactionStartScrollTop = 0;
     }
   });
 
@@ -359,7 +447,10 @@ export function useChatScroll(options: UseChatScrollOptions) {
     showScrollToBottom.value = false;
     loadAnchor = null;
     lastScrollHeight = 0;
-    isInitialRendering.value = true;
+    lastKnownScrollTop = 0;
+    userInteracting = false;
+    pinnedToBottom = true;
+    interactionStartScrollTop = 0;
     if (scrollRafId) {
       cancelAnimationFrame(scrollRafId);
       scrollRafId = null;
@@ -375,6 +466,10 @@ export function useChatScroll(options: UseChatScrollOptions) {
     if (contentNotifyRafId !== null) {
       cancelAnimationFrame(contentNotifyRafId);
       contentNotifyRafId = null;
+    }
+    if (interactionEndTimer) {
+      clearTimeout(interactionEndTimer);
+      interactionEndTimer = null;
     }
   };
 
@@ -404,6 +499,10 @@ export function useChatScroll(options: UseChatScrollOptions) {
       cancelAnimationFrame(contentNotifyRafId);
       contentNotifyRafId = null;
     }
+    if (interactionEndTimer) {
+      clearTimeout(interactionEndTimer);
+      interactionEndTimer = null;
+    }
     if (typeof window !== "undefined") {
       window.removeEventListener("vcp-lifecycle", onVcpLifecycleResume);
     }
@@ -412,6 +511,10 @@ export function useChatScroll(options: UseChatScrollOptions) {
     }
     if (messageListRef.value) {
       messageListRef.value.removeEventListener("scroll", onScroll);
+      messageListRef.value.removeEventListener("touchstart", beginUserInteraction);
+      messageListRef.value.removeEventListener("touchend", endUserInteraction);
+      messageListRef.value.removeEventListener("touchcancel", endUserInteraction);
+      messageListRef.value.removeEventListener("wheel", onWheel);
     }
     loadAnchor = null;
   };

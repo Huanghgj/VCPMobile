@@ -93,7 +93,7 @@ describe("Renderer V2 document compiler", () => {
     expect(compiled.html).toContain("https://example.com/a.png");
   });
 
-  it("keeps details collapsed by default while respecting an explicit open state", () => {
+  it("keeps details collapsed by default even when generated HTML requests open", () => {
     const compiled = compileRenderFragment(
       {
         type: "markdown",
@@ -111,7 +111,7 @@ describe("Renderer V2 document compiler", () => {
     ).toBe(false);
     expect(
       template.content.querySelector<HTMLDetailsElement>("#expanded")?.open,
-    ).toBe(true);
+    ).toBe(false);
   });
 });
 

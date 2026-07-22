@@ -67,6 +67,7 @@ watch(
     if (activeSourceId !== props.sourceId) {
       removeScopedCss(props.messageId, activeSourceId);
       activeSourceId = props.sourceId;
+      detailsState.clear();
     }
     injectScopedCss(compiled.value.css, props.messageId, activeSourceId);
     await nextTick();

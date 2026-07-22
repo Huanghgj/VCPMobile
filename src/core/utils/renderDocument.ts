@@ -193,6 +193,9 @@ function html5NormalizeAndSanitize(
   const normalized = document.createElement("template");
   normalized.innerHTML = sanitized;
   moveTrailingNodesIntoRichRoot(normalized.content);
+  normalized.content.querySelectorAll("details").forEach((details) => {
+    details.removeAttribute("open");
+  });
   assignStableRenderKeys(normalized.content, messageId);
   return { html: normalized.innerHTML, css };
 }
