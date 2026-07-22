@@ -93,13 +93,13 @@ describe("Renderer V2 document compiler", () => {
     expect(compiled.html).toContain("https://example.com/a.png");
   });
 
-  it("opens details by default while respecting an explicit collapsed marker", () => {
+  it("keeps details collapsed by default while respecting an explicit open state", () => {
     const compiled = compileRenderFragment(
       {
         type: "markdown",
         content:
           "<details id='default'><summary>默认</summary>正文</details>" +
-          "<details id='collapsed' data-vcp-collapsed><summary>折叠</summary>正文</details>",
+          "<details id='expanded' open><summary>展开</summary>正文</details>",
       },
       "message-details",
     );
@@ -108,10 +108,10 @@ describe("Renderer V2 document compiler", () => {
 
     expect(
       template.content.querySelector<HTMLDetailsElement>("#default")?.open,
-    ).toBe(true);
-    expect(
-      template.content.querySelector<HTMLDetailsElement>("#collapsed")?.open,
     ).toBe(false);
+    expect(
+      template.content.querySelector<HTMLDetailsElement>("#expanded")?.open,
+    ).toBe(true);
   });
 });
 

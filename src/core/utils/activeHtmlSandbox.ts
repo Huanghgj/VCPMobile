@@ -228,17 +228,11 @@ export function buildActiveHtmlDocument(
         };
 
         const prepareSubtree = (node) => {
-          const detailsNodes = [];
           const imageNodes = [];
-          if (node instanceof HTMLDetailsElement) detailsNodes.push(node);
           if (node instanceof HTMLImageElement) imageNodes.push(node);
           if (typeof node.querySelectorAll === 'function') {
-            detailsNodes.push(...node.querySelectorAll('details:not([data-vcp-collapsed])'));
             imageNodes.push(...node.querySelectorAll('img'));
           }
-          detailsNodes.forEach((details) => {
-            if (!details.hasAttribute('open')) details.setAttribute('open', '');
-          });
           imageNodes.forEach((image) => {
             if (!image.hasAttribute('loading')) image.loading = 'lazy';
             if (!image.hasAttribute('decoding')) image.decoding = 'async';

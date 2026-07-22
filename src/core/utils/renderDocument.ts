@@ -193,11 +193,6 @@ function html5NormalizeAndSanitize(
   const normalized = document.createElement("template");
   normalized.innerHTML = sanitized;
   moveTrailingNodesIntoRichRoot(normalized.content);
-  normalized.content.querySelectorAll("details").forEach((details) => {
-    if (!details.hasAttribute("data-vcp-collapsed")) {
-      details.setAttribute("open", "");
-    }
-  });
   assignStableRenderKeys(normalized.content, messageId);
   return { html: normalized.innerHTML, css };
 }

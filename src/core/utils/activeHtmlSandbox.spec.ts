@@ -79,7 +79,19 @@ describe("active HTML sandbox document", () => {
     expect(result).toContain("data.type === 'render-visibility'");
     expect(result).toContain("data.nonce !== nonce");
     expect(result).toContain("post('ai-action'");
-    expect(result).toContain("details:not([data-vcp-collapsed])");
+    expect(result).not.toContain("details:not([data-vcp-collapsed])");
     expect(result).toContain('"nonce-visible"');
+  });
+
+  it("keeps details collapsed unless the source explicitly opens them", () => {
+    const result = buildActiveHtmlDocument(
+      '<details id="default"><summary>默认</summary>正文</details>' +
+        '<details id="expanded" open><summary>展开</summary>正文</details>',
+      false,
+      "nonce-details",
+    );
+
+    expect(result).toContain('<details id="default">');
+    expect(result).toContain('<details id="expanded" open>');
   });
 });
