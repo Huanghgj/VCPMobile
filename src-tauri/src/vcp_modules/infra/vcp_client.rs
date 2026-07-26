@@ -794,6 +794,11 @@ fn extract_text_for_hash(content: &Value) -> String {
     String::new()
 }
 
+fn extract_non_empty_text(value: Option<&Value>) -> Option<String> {
+    let text = value.map(extract_text_for_hash)?;
+    (!text.trim().is_empty()).then_some(text)
+}
+
 fn normalize_non_stream_completion(response: Value) -> Result<Value, String> {
     let (full_content, finish_reason) = {
         let choice = response
@@ -801,23 +806,31 @@ fn normalize_non_stream_completion(response: Value) -> Result<Value, String> {
             .and_then(Value::as_array)
             .and_then(|choices| choices.first())
             .ok_or_else(|| {
-                "VCP non-stream response did not contain a completion choice".to_string()
+                let detail = response
+                    .get("error")
+                    .map(Value::to_string)
+                    .unwrap_or_else(|| "missing choices[0]".to_string());
+                format!("VCP non-stream response did not contain a completion choice: {detail}")
             })?;
         let message = choice.get("message");
-        let content = message
-            .and_then(|value| value.get("content"))
-            .or_else(|| choice.get("text"))
-            .map(extract_text_for_hash)
-            .unwrap_or_default();
-        let reasoning = message
-            .and_then(|value| {
-                value
-                    .get("reasoning_content")
-                    .or_else(|| value.get("reasoningContent"))
-                    .or_else(|| value.get("reasoning"))
+        let content = extract_non_empty_text(message.and_then(|value| value.get("content")))
+            .or_else(|| extract_non_empty_text(message.and_then(|value| value.get("refusal"))))
+            .or_else(|| {
+                extract_non_empty_text(choice.get("delta").and_then(|value| value.get("content")))
             })
-            .and_then(Value::as_str)
-            .unwrap_or("");
+            .or_else(|| extract_non_empty_text(choice.get("text")))
+            .unwrap_or_default();
+        let reasoning = ["reasoning_content", "reasoningContent", "reasoning"]
+            .into_iter()
+            .find_map(|key| extract_non_empty_text(message.and_then(|value| value.get(key))))
+            .or_else(|| {
+                ["reasoning_content", "reasoningContent", "reasoning"]
+                    .into_iter()
+                    .find_map(|key| {
+                        extract_non_empty_text(choice.get("delta").and_then(|value| value.get(key)))
+                    })
+            })
+            .unwrap_or_default();
 
         let full_content = if reasoning.is_empty() {
             content
@@ -839,12 +852,36 @@ fn normalize_non_stream_completion(response: Value) -> Result<Value, String> {
         (full_content, finish_reason)
     };
 
+    if full_content.trim().is_empty() {
+        return Err(
+            "VCP non-stream response contained no assistant content or reasoning".to_string(),
+        );
+    }
+
     Ok(json!({
         "response": response,
         "fullContent": full_content,
         "streamingStarted": false,
         "finishReason": finish_reason
     }))
+}
+
+fn non_stream_content_event(
+    normalized: &Value,
+    message_id: String,
+    context: Option<Value>,
+) -> Result<StreamEvent, String> {
+    let content = normalized
+        .get("fullContent")
+        .and_then(Value::as_str)
+        .filter(|content| !content.trim().is_empty())
+        .ok_or_else(|| "VCP non-stream response normalized to empty content".to_string())?;
+
+    Ok(StreamEvent::data(
+        message_id,
+        Value::String(content.to_string()),
+        context,
+    ))
 }
 
 fn get_or_calculate_message_hash(content: &Value) -> String {
@@ -1353,21 +1390,19 @@ pub async fn perform_vcp_request<R: Runtime>(
         let mut is_aborted = false;
         let mut aurora_buffer = AuroraBuffer::new();
         let mut pending_aurora_chunk = String::new();
-        let mut last_aurora_parse = std::time::Instant::now() - Duration::from_millis(33);
+        let mut last_aurora_parse = std::time::Instant::now() - Duration::from_millis(80);
         let mut last_aurora_content_len = 0usize;
+        let mut last_aurora_stable_count = 0usize;
+        let mut aurora_sequence = 0u64;
         let aurora_has_rendered = AtomicBool::new(false);
         let mut reasoning_block_open = false;
 
-        // 自适应降帧：tail 越大，单帧 IPC 载荷越重（CodeBlock/RawHtml 走整节点 Replace，
-        // 每帧重发整块），故按 tail 字节数降低解析/推送频率，把每秒 IPC 载荷压到可控范围。
-        // 基准依据见 chat/ast_bench.rs：解析本身极廉价，瓶颈在 IPC 体量。
-        //   < 8KB   → 33ms  (30Hz，正常流式，无感)
-        //   8-24KB  → 100ms (10Hz，体感为模型"稍稳重"，渲染连续不留白)
-        //   ≥ 24KB  → 200ms (5Hz，超大块仍持续推进，仅更新略缓)
+        // 移动端优先的提交节奏：活动 tail 只传原文，但每次 IPC 仍会唤醒 WebView。
+        // 小块控制在 12.5Hz，中块约 8Hz，大块 5Hz；终帧始终立即刷新。
         fn adaptive_parse_interval_ms(tail_len: usize) -> u128 {
             match tail_len {
-                0..=8_191 => 33,
-                8_192..=24_575 => 100,
+                0..=8_191 => 80,
+                8_192..=24_575 => 120,
                 _ => 200,
             }
         }
@@ -1392,7 +1427,7 @@ pub async fn perform_vcp_request<R: Runtime>(
             }
         }
 
-        // 辅助闭包：发送 Aurora 更新事件。AST frame 是主路径，contentDelta 保留给旧前端兜底。
+        // 每帧只发送原文 delta、新闭合块和一个轻量活动 tail。
         let mut send_aurora_update = |buffer: &mut AuroraBuffer,
                                       stable_changed: bool,
                                       tail_changed: bool,
@@ -1409,21 +1444,25 @@ pub async fn perform_vcp_request<R: Runtime>(
             } else {
                 None
             };
-            let tail_frame = buffer.take_tail_frame();
-            let tail_snapshot = tail_frame.as_ref().and_then(|frame| frame.snapshot.clone());
+            let stable_blocks_delta = if stable_changed {
+                let start = last_aurora_stable_count.min(buffer.stable_blocks.len());
+                let delta = buffer.stable_blocks[start..].to_vec();
+                last_aurora_stable_count = buffer.stable_blocks.len();
+                (!delta.is_empty()).then_some(delta)
+            } else {
+                None
+            };
+            aurora_sequence = aurora_sequence.saturating_add(1);
 
             let mut event = StreamEvent::aurora(
                 message_id_inner.clone(),
                 AuroraUpdate {
-                    stable_blocks: stable_changed.then(|| buffer.stable_blocks.clone()),
+                    sequence: aurora_sequence,
+                    stable_blocks_delta,
                     stable_changed,
                     tail_block: tail_changed.then(|| buffer.tail_block.clone()).flatten(),
-                    tail: tail_changed
-                        .then(|| AuroraBuffer::balance_html_tags(&buffer.tail_content)),
                     tail_changed,
                     content_delta,
-                    tail_frame,
-                    tail_snapshot,
                     content: is_final.then(|| buffer.full_text.clone()),
                 },
                 context_inner.clone(),
@@ -1554,8 +1593,7 @@ pub async fn perform_vcp_request<R: Runtime>(
                                                             &mut last_aurora_parse,
                                                             false,
                                                         );
-                                                        let has_mutations = !aurora_buffer.pending_mutations.is_empty();
-                                                        if stable_changed || tail_changed || has_mutations {
+                                                        if stable_changed || tail_changed {
                                                             send_aurora_update(&mut aurora_buffer, stable_changed, tail_changed, None, None);
                                                         }
                                                     }
@@ -1659,21 +1697,80 @@ pub async fn perform_vcp_request<R: Runtime>(
                 }), true));
             }
             response = response_future => {
-                response.map_err(|e| format!("VCP request failed: {}", e))?
+                match response {
+                    Ok(response) => response,
+                    Err(error) => {
+                        let error = format!("VCP non-stream request failed: {error}");
+                        send_stream_event(StreamEvent::error(
+                            message_id.clone(),
+                            context.clone(),
+                            error.clone(),
+                        ));
+                        return Err(error);
+                    }
+                }
             }
         };
 
-        if !response.status().is_success() {
-            let status = response.status();
-            return Err(format!("VCP响应错误: {}", status));
+        let status = response.status();
+        let response_text = match response.text().await {
+            Ok(text) => text,
+            Err(error) => {
+                let error = format!("VCP non-stream response read failed: {error}");
+                send_stream_event(StreamEvent::error(
+                    message_id.clone(),
+                    context.clone(),
+                    error.clone(),
+                ));
+                return Err(error);
+            }
+        };
+
+        if !status.is_success() {
+            let detail: String = response_text.chars().take(512).collect();
+            let error = if detail.trim().is_empty() {
+                format!("VCP non-stream response failed with HTTP {status}")
+            } else {
+                format!("VCP non-stream response failed with HTTP {status}: {detail}")
+            };
+            send_stream_event(StreamEvent::error(
+                message_id.clone(),
+                context.clone(),
+                error.clone(),
+            ));
+            return Err(error);
         }
 
-        let vcp_response = response
-            .json::<Value>()
-            .await
-            .map_err(|e| format!("VCP non-stream JSON parse failed: {}", e))?;
-        let mut normalized = normalize_non_stream_completion(vcp_response)?;
-        normalized["context"] = json!(context);
+        let vcp_response = match serde_json::from_str::<Value>(&response_text) {
+            Ok(response) => response,
+            Err(error) => {
+                let error = format!("VCP non-stream JSON parse failed: {error}");
+                send_stream_event(StreamEvent::error(
+                    message_id.clone(),
+                    context.clone(),
+                    error.clone(),
+                ));
+                return Err(error);
+            }
+        };
+        let mut normalized = match normalize_non_stream_completion(vcp_response) {
+            Ok(normalized) => normalized,
+            Err(error) => {
+                send_stream_event(StreamEvent::error(
+                    message_id.clone(),
+                    context.clone(),
+                    error.clone(),
+                ));
+                return Err(error);
+            }
+        };
+        normalized["context"] = json!(context.clone());
+
+        // Non-streaming responses still travel through the same message channel as SSE.
+        // Publishing the complete text before the terminal event prevents an empty
+        // placeholder when a caller or older frontend treats `end` as metadata only.
+        let content_event = non_stream_content_event(&normalized, message_id, context)?;
+        send_stream_event(content_event);
         Ok((normalized, false))
     }
 }
@@ -1889,6 +1986,62 @@ mod completion_response_tests {
         let error = normalize_non_stream_completion(json!({ "error": "bad gateway" })).unwrap_err();
 
         assert!(error.contains("completion choice"));
+        assert!(error.contains("bad gateway"));
+    }
+
+    #[test]
+    fn rejects_empty_non_stream_completion() {
+        let error = normalize_non_stream_completion(json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": null },
+                "finish_reason": "stop"
+            }]
+        }))
+        .unwrap_err();
+
+        assert!(error.contains("no assistant content"));
+    }
+
+    #[test]
+    fn accepts_delta_and_refusal_fallbacks() {
+        let delta = normalize_non_stream_completion(json!({
+            "choices": [{
+                "delta": { "content": "provider fallback" },
+                "finish_reason": "stop"
+            }]
+        }))
+        .unwrap();
+        assert_eq!(delta["fullContent"], "provider fallback");
+
+        let refusal = normalize_non_stream_completion(json!({
+            "choices": [{
+                "message": { "content": null, "refusal": "request refused" },
+                "finish_reason": "stop"
+            }]
+        }))
+        .unwrap();
+        assert_eq!(refusal["fullContent"], "request refused");
+    }
+
+    #[test]
+    fn builds_data_event_for_non_stream_content() {
+        let normalized = normalize_non_stream_completion(json!({
+            "choices": [{
+                "message": { "content": "one-shot answer" },
+                "finish_reason": "stop"
+            }]
+        }))
+        .unwrap();
+        let context = json!({ "agentId": "agent-1", "topicId": "topic-1" });
+
+        let event =
+            non_stream_content_event(&normalized, "message-1".to_string(), Some(context.clone()))
+                .unwrap();
+
+        assert_eq!(event.r#type, "data");
+        assert_eq!(event.message_id, "message-1");
+        assert_eq!(event.chunk, Some(json!("one-shot answer")));
+        assert_eq!(event.context, Some(context));
     }
 
     #[test]

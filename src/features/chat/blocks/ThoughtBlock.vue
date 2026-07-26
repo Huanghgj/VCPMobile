@@ -207,18 +207,9 @@ html.dark .vcp-thought-block {
 }
 
 .custom-spin {
-  animation: vcp-spin 1s linear infinite;
-  will-change: transform;
-  transform: translate3d(0, 0, 0);
-}
-
-@keyframes vcp-spin {
-  from {
-    transform: rotate(0deg) translate3d(0, 0, 0);
-  }
-
-  to {
-    transform: rotate(360deg) translate3d(0, 0, 0);
-  }
+  animation: none;
+  will-change: auto;
+  transform: none;
+  opacity: 0.85;
 }
 </style>

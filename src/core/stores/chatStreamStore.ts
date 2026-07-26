@@ -1,16 +1,16 @@
 import { defineStore } from "pinia";
 import { ref, computed, reactive, onScopeDispose } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import {
-  acquireScreenKeep,
-  releaseScreenKeep,
-} from "../composables/useScreenKeeper";
 import { useChatSessionStore } from "./chatSessionStore";
 import { useAssistantStore } from "./assistant";
 import { useAvatarStore } from "./avatar";
 import { useTopicStore } from "./topicListManager";
 import { clearMessageCache } from "../utils/astRenderer";
-import type { ChatMessage, MessageShell, TailFrame } from "../types/chat";
+import {
+  advanceAuroraSequence,
+  appendStableBlocksDelta,
+} from "../utils/auroraStream";
+import type { ChatMessage, MessageShell } from "../types/chat";
 
 export const useChatStreamStore = defineStore("chatStream", () => {
   const streamingMessageId = ref<string | null>(null);
@@ -32,7 +32,6 @@ export const useChatStreamStore = defineStore("chatStream", () => {
       }
     >
   >({});
-  const activeStreamTotal = ref(0);
   const pendingGenerations = reactive<
     Record<
       string,
@@ -49,6 +48,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
   const lifecycleDirectiveHiddenMessageIds = new Set<string>();
   const streamBlockSignatures = new Map<string, string>();
   const streamTailSignatures = new Map<string, string>();
+  const lastAuroraSequences = new Map<string, number>();
 
   function isStreamDebugEnabled(): boolean {
     return Boolean(import.meta.env.DEV && (window as any).__VCP_STREAM_DEBUG__);
@@ -65,36 +65,6 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     });
   }
 
-  function streamDebugLog(...args: unknown[]): void {
-    if (isStreamDebugEnabled()) {
-      console.warn(...args);
-    }
-  }
-
-  function mergeTailFrame(
-    existing: TailFrame | null,
-    incoming: TailFrame
-  ): TailFrame {
-    const incomingMutations = incoming.mutations || [];
-    if (!existing || incoming.reset || incoming.epoch !== existing.epoch) {
-      return {
-        ...incoming,
-        mutations: incoming.reset ? [] : [...incomingMutations],
-        snapshot: incoming.snapshot ? [...incoming.snapshot] : undefined,
-      };
-    }
-
-    return {
-      ...incoming,
-      reset: existing.reset || incoming.reset,
-      snapshot: incoming.snapshot || existing.snapshot,
-      mutations: [
-        ...(existing.reset ? [] : existing.mutations || []),
-        ...incomingMutations,
-      ],
-    };
-  }
-
   const cleanupTimers = new Set<ReturnType<typeof setTimeout>>();
 
   // ===== 低功耗流式帧合并暂存池 =====
@@ -102,10 +72,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
   type PendingStreamUpdate = {
     content: string | null;
     blocks: any[] | null;
-    tailContent: string | null;
     tailBlock: any | null | undefined;
-    tailFrame: TailFrame | null;
-    tailSnapshot: any[] | null;
     animationFrameId: number | null;
     renderTimerId: ReturnType<typeof setTimeout> | null;
     fallbackTimerId: ReturnType<typeof setTimeout> | null;
@@ -113,8 +80,8 @@ export const useChatStreamStore = defineStore("chatStream", () => {
   };
 
   const rAFPendingUpdates = new Map<string, PendingStreamUpdate>();
-  const STREAM_RENDER_INTERVAL_MS = 66.7; // 约 15Hz：移动端流式可读且显著降低 DOM/AST diff 唤醒频率
-  const STREAM_RENDER_MAX_LATENCY_MS = 180; // WebView 忙碌时 rAF 可能延迟，超过该时间强制提交 pending 帧
+  const STREAM_RENDER_INTERVAL_MS = 100; // 10Hz：贴近可读速度，显著减少 WebView 唤醒
+  const STREAM_RENDER_MAX_LATENCY_MS = 240;
 
   const isDocumentHidden = () =>
     typeof document !== "undefined" && document.hidden;
@@ -122,17 +89,8 @@ export const useChatStreamStore = defineStore("chatStream", () => {
   const hasPendingRAFData = (up: {
     content: string | null;
     blocks: any[] | null;
-    tailContent: string | null;
     tailBlock: any | null | undefined;
-    tailFrame: TailFrame | null;
-    tailSnapshot: any[] | null;
-  }) =>
-    up.content !== null ||
-    up.blocks !== null ||
-    up.tailContent !== null ||
-    up.tailBlock !== undefined ||
-    up.tailFrame !== null ||
-    up.tailSnapshot !== null;
+  }) => up.content !== null || up.blocks !== null || up.tailBlock !== undefined;
 
   const cancelScheduledCommit = (up: {
     animationFrameId: number | null;
@@ -171,12 +129,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
         if (msg) {
           if (up.content !== null) msg.content = up.content;
           if (up.blocks !== null) msg.blocks = up.blocks;
-          // 漏洞 1 修复：同步强刷收尾时，必须将暂存池中的 tail 字段强刷，绝不允许丢字闪烁
-          if (up.tailContent !== null) msg.tailContent = up.tailContent;
           if (up.tailBlock !== undefined) msg.tailBlock = up.tailBlock;
-          if (up.tailSnapshot !== null)
-            msg.tailSnapshot = up.tailSnapshot as any;
-          if (up.tailFrame !== null) msg.tailFrame = up.tailFrame;
         }
       }
       rAFPendingUpdates.delete(messageId);
@@ -239,7 +192,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     if (!key) return false;
     return Boolean(
       (sessionActiveStreams.value[key]?.length || 0) > 0 ||
-        pendingGenerations[key],
+      pendingGenerations[key],
     );
   });
 
@@ -253,7 +206,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
   const isMessageStreamingInSession = (
     messageId: string,
     itemId?: string | null,
-    topicId?: string | null
+    topicId?: string | null,
   ) => {
     if (!itemId || !topicId || !isMessageInActiveStream(messageId))
       return false;
@@ -312,6 +265,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     auroraActiveMessageIds.delete(messageId);
     streamBlockSignatures.delete(messageId);
     streamTailSignatures.delete(messageId);
+    lastAuroraSequences.delete(messageId);
     clearRAFUpdate(messageId, false);
   };
 
@@ -355,7 +309,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
   const addSessionStream = (
     ownerId: string,
     topicId: string,
-    messageId: string
+    messageId: string,
   ) => {
     const key = `${ownerId}:${topicId}`;
     const streams = sessionActiveStreams.value[key] ?? [];
@@ -376,11 +330,6 @@ export const useChatStreamStore = defineStore("chatStream", () => {
       itemId: ownerId,
       topicId,
     };
-    if (activeStreamTotal.value === 0) {
-      acquireScreenKeep();
-    }
-    activeStreamTotal.value++;
-
     // 新增流时检查并执行上限保护
     enforceStreamPoolLimit();
   };
@@ -388,16 +337,14 @@ export const useChatStreamStore = defineStore("chatStream", () => {
   const removeSessionStream = (
     ownerId: string,
     topicId: string,
-    messageId: string
+    messageId: string,
   ) => {
     const key = `${ownerId}:${topicId}`;
     const streams = sessionActiveStreams.value[key];
-    let didRemove = false;
     if (streams) {
       const index = streams.indexOf(messageId);
       if (index !== -1) {
         streams.splice(index, 1);
-        didRemove = true;
         const nextRefCount = (activeStreamRefCounts[messageId] || 0) - 1;
         if (nextRefCount > 0) {
           activeStreamRefCounts[messageId] = nextRefCount;
@@ -405,14 +352,10 @@ export const useChatStreamStore = defineStore("chatStream", () => {
           delete activeStreamRefCounts[messageId];
           delete activeStreamContexts[messageId];
         }
-        activeStreamTotal.value = Math.max(0, activeStreamTotal.value - 1);
       }
       if (streams.length === 0) {
         delete sessionActiveStreams.value[key];
       }
-    }
-    if (didRemove && activeStreamTotal.value === 0) {
-      releaseScreenKeep();
     }
     // 同时从全局池中移除 (延迟移除，确保 finalizeStream 能拿到对象)
     const cleanupTimer = setTimeout(() => {
@@ -423,13 +366,13 @@ export const useChatStreamStore = defineStore("chatStream", () => {
   };
 
   const blocksSignature = (
-    blocks: Array<{ hash?: string; type?: string }> = []
+    blocks: Array<{ hash?: string; type?: string }> = [],
   ) => blocks.map((block) => block.hash || block.type || "").join("|");
 
   const tailSignature = (
-    tailBlock: { hash?: string; type?: string } | undefined,
-    tail?: string
-  ) => tailBlock?.hash || `${tailBlock?.type || ""}:${tail || ""}`;
+    tailBlock: { hash?: string; type?: string; content?: string } | undefined,
+  ) =>
+    tailBlock?.hash || `${tailBlock?.type || ""}:${tailBlock?.content || ""}`;
 
   const blockNeedsCompiledNodes = (block: any) =>
     block &&
@@ -447,10 +390,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
       update = {
         content: null,
         blocks: null,
-        tailContent: null,
         tailBlock: undefined,
-        tailFrame: null,
-        tailSnapshot: null,
         animationFrameId: null,
         renderTimerId: null,
         fallbackTimerId: null,
@@ -476,19 +416,13 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     if (m) {
       if (up.content !== null) m.content = up.content;
       if (up.blocks !== null) m.blocks = up.blocks;
-      if (up.tailContent !== null) m.tailContent = up.tailContent;
       if (up.tailBlock !== undefined) m.tailBlock = up.tailBlock;
-      if (up.tailSnapshot !== null) m.tailSnapshot = up.tailSnapshot as any;
-      if (up.tailFrame !== null) m.tailFrame = up.tailFrame;
     }
     up.lastRenderTime = performance.now();
     // 重置当前提交周期内的合并暂存状态
     up.content = null;
     up.blocks = null;
-    up.tailContent = null;
     up.tailBlock = undefined;
-    up.tailFrame = null;
-    up.tailSnapshot = null;
   };
 
   const scheduleRAFCommit = (messageId: string) => {
@@ -574,17 +508,11 @@ export const useChatStreamStore = defineStore("chatStream", () => {
       if (m) {
         if (up.content !== null) m.content = up.content;
         if (up.blocks !== null) m.blocks = up.blocks;
-        if (up.tailContent !== null) m.tailContent = up.tailContent;
         if (up.tailBlock !== undefined) m.tailBlock = up.tailBlock;
-        if (up.tailSnapshot !== null) m.tailSnapshot = up.tailSnapshot as any;
-        if (up.tailFrame !== null) m.tailFrame = up.tailFrame;
       }
       up.content = null;
       up.blocks = null;
-      up.tailContent = null;
       up.tailBlock = undefined;
-      up.tailFrame = null;
-      up.tailSnapshot = null;
       up.lastRenderTime = performance.now();
     });
   };
@@ -614,7 +542,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     callbacks?: {
       onMessageCreated?: (msg: ChatMessage, topicId: string) => void;
       onStreamFinished?: (messageId: string, topicId: string) => void;
-    }
+    },
   ) => {
     const actualMessageId = event.messageId || event.message_id || "";
     const { chunk, type, context } = event;
@@ -645,6 +573,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
       auroraActiveMessageIds.delete(actualMessageId);
       streamBlockSignatures.delete(actualMessageId);
       streamTailSignatures.delete(actualMessageId);
+      lastAuroraSequences.delete(actualMessageId);
       clearMessageCache(actualMessageId);
       lifecycleDirectiveHiddenMessageIds.delete(actualMessageId);
       msg = reactive<ChatMessage>({
@@ -696,7 +625,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
       }).catch((e) => {
         console.error(
           "[ChatStreamStore] Failed to persist initial thinking skeleton:",
-          e
+          e,
         );
       });
     }
@@ -739,34 +668,37 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     } else if (type === "aurora") {
       const aurora = event.aurora;
       if (aurora) {
+        const sequence = Number(aurora.sequence || 0);
+        const previousSequence = lastAuroraSequences.get(actualMessageId) || 0;
+        const nextSequence = advanceAuroraSequence(previousSequence, sequence);
+        if (nextSequence === null) return;
+        if (sequence > 0) {
+          lastAuroraSequences.set(actualMessageId, nextSequence);
+        }
         auroraActiveMessageIds.add(actualMessageId);
         recordStreamTrace({
           messageId: actualMessageId,
           auroraPayload: {
+            sequence,
             stableChanged: aurora.stableChanged,
-            stableBlocksCount: aurora.stableBlocks?.length || 0,
+            stableBlocksCount:
+              aurora.stableBlocksDelta?.length ||
+              aurora.stableBlocks?.length ||
+              0,
             stableBlocksHashes:
-              aurora.stableBlocks?.map((b: any) => b.hash) || [],
+              (aurora.stableBlocksDelta || aurora.stableBlocks)?.map(
+                (b: any) => b.hash,
+              ) || [],
             tailChanged: aurora.tailChanged,
-            tailContent: aurora.tail || "",
+            tailContent: aurora.tailBlock?.content || "",
             tailBlockType: aurora.tailBlock?.type || null,
             contentDeltaLength: aurora.contentDelta?.length || 0,
-            tailFrame: aurora.tailFrame
-              ? {
-                  epoch: aurora.tailFrame.epoch,
-                  revision: aurora.tailFrame.revision,
-                  frameSeq: aurora.tailFrame.frameSeq,
-                  reset: aurora.tailFrame.reset,
-                  mutationsCount: aurora.tailFrame.mutations?.length || 0,
-                  hasSnapshot: !!aurora.tailFrame.snapshot,
-                }
-              : null,
           },
           msgSnapshot: msg
             ? {
                 contentLength: msg.content?.length || 0,
                 blocksCount: msg.blocks?.length || 0,
-                tailContentLength: msg.tailContent?.length || 0,
+                tailContentLength: msg.tailBlock?.content?.length || 0,
               }
             : null,
         });
@@ -776,16 +708,23 @@ export const useChatStreamStore = defineStore("chatStream", () => {
 
         // 2. 覆盖写入暂存数据（稀疏合并）
         if (typeof aurora.content === "string") {
-          const lifecycleMarkerIndex = aurora.content.indexOf("<<<[VCP_LIFECYCLE]>>>");
+          const lifecycleMarkerIndex = aurora.content.indexOf(
+            "<<<[VCP_LIFECYCLE]>>>",
+          );
           if (lifecycleMarkerIndex >= 0) {
             lifecycleDirectiveHiddenMessageIds.add(actualMessageId);
-            update.content = aurora.content.slice(0, lifecycleMarkerIndex).trimEnd();
+            update.content = aurora.content
+              .slice(0, lifecycleMarkerIndex)
+              .trimEnd();
           } else if (!lifecycleDirectiveHiddenMessageIds.has(actualMessageId)) {
             update.content = aurora.content;
           }
         } else if (typeof aurora.contentDelta === "string") {
-          const combined = (update.content ?? msg!.content ?? "") + aurora.contentDelta;
-          const lifecycleMarkerIndex = combined.indexOf("<<<[VCP_LIFECYCLE]>>>");
+          const combined =
+            (update.content ?? msg!.content ?? "") + aurora.contentDelta;
+          const lifecycleMarkerIndex = combined.indexOf(
+            "<<<[VCP_LIFECYCLE]>>>",
+          );
           if (lifecycleMarkerIndex >= 0) {
             lifecycleDirectiveHiddenMessageIds.add(actualMessageId);
             update.content = combined.slice(0, lifecycleMarkerIndex).trimEnd();
@@ -793,49 +732,36 @@ export const useChatStreamStore = defineStore("chatStream", () => {
             update.content = combined;
           }
         }
-        if (aurora.stableChanged && aurora.stableBlocks) {
+        if (aurora.stableBlocksDelta?.length) {
+          const currentBlocks = update.blocks ?? msg!.blocks ?? [];
+          update.blocks = appendStableBlocksDelta(
+            currentBlocks,
+            aurora.stableBlocksDelta,
+          );
+        } else if (aurora.stableChanged && aurora.stableBlocks) {
+          // Mixed-version fallback for an older backend that sends snapshots.
           const nextSignature = blocksSignature(aurora.stableBlocks);
           if (streamBlockSignatures.get(actualMessageId) !== nextSignature) {
             update.blocks = aurora.stableBlocks;
             streamBlockSignatures.set(actualMessageId, nextSignature);
           }
         }
-        if (aurora.tailFrame) {
-          streamDebugLog(
-            `[chatStreamStore] Received tailFrame seq=${
-              aurora.tailFrame.frameSeq
-            } mutations=${
-              aurora.tailFrame.mutations?.length || 0
-            } for ${actualMessageId}`
-          );
-          update.tailFrame = mergeTailFrame(update.tailFrame, aurora.tailFrame);
-          if (aurora.tailFrame.snapshot) {
-            update.tailSnapshot = aurora.tailFrame.snapshot as any[];
-          }
-        }
-        if (aurora.tailSnapshot) {
-          update.tailSnapshot = aurora.tailSnapshot as any[];
-        }
         if (aurora.tailChanged) {
           if (lifecycleDirectiveHiddenMessageIds.has(actualMessageId)) {
-            update.tailContent = "";
             update.tailBlock = null;
-            return;
-          }
-          const nextTail = aurora.tail || "";
-          const nextTailBlock = (aurora.tailBlock as any) || null;
-          const nextTailSignature = tailSignature(
-            nextTailBlock || undefined,
-            nextTail
-          );
-          if (streamTailSignatures.get(actualMessageId) !== nextTailSignature) {
-            update.tailContent = nextTail;
-            update.tailBlock = nextTailBlock;
-            streamTailSignatures.set(actualMessageId, nextTailSignature);
+          } else {
+            const nextTailBlock = (aurora.tailBlock as any) || null;
+            const nextTailSignature = tailSignature(nextTailBlock || undefined);
+            if (
+              streamTailSignatures.get(actualMessageId) !== nextTailSignature
+            ) {
+              update.tailBlock = nextTailBlock;
+              streamTailSignatures.set(actualMessageId, nextTailSignature);
+            }
           }
         }
 
-        // 3. 申请低功耗合并渲染（约 15Hz，上屏前稀疏合并 Aurora 高频帧）
+        // 3. 申请低功耗合并渲染（10Hz，上屏前合并 IPC 帧）
         scheduleRAFCommit(actualMessageId);
       }
 
@@ -848,11 +774,12 @@ export const useChatStreamStore = defineStore("chatStream", () => {
       const finishReason = event.finishReason;
       const hadError = msg!.finishReason === "error";
 
-      // 漏洞 1 & 2 & 3 修复：同步强制秒结，防止 tailContent 闪烁回滚丢失
+      // 收尾前同步提交缓冲，防止最后一帧丢字或闪烁。
       clearRAFUpdate(actualMessageId, true);
       auroraActiveMessageIds.delete(actualMessageId);
       streamBlockSignatures.delete(actualMessageId);
       streamTailSignatures.delete(actualMessageId);
+      lastAuroraSequences.delete(actualMessageId);
       if (finishReason) msg!.finishReason = finishReason;
 
       if (streamingMessageId.value === actualMessageId)
@@ -891,11 +818,8 @@ export const useChatStreamStore = defineStore("chatStream", () => {
         } catch (e) {
           console.error("[ChatStreamStore] process_message_content failed:", e);
         } finally {
-          // 漏洞 1 终极解决：在最终编译树成功上屏后，才同步清空临时 tail，实现绝对零闪烁和无缝平滑交接
-          msg!.tailContent = "";
+          // 最终编译树上屏后再清空活动 tail，保持无缝交接。
           msg!.tailBlock = undefined;
-          msg!.tailFrame = undefined;
-          msg!.tailSnapshot = undefined;
           msg!.renderRevision = (msg!.renderRevision ?? 0) + 1;
 
           // === 🚀 输出流式诊断提示与回放指南（开发模式生效，Release 构建时自动摇树切除） ===
@@ -904,15 +828,15 @@ export const useChatStreamStore = defineStore("chatStream", () => {
               `%c[VCP Stream Debugger] 🎉 流式传输结束！当前录制帧数: ${
                 (window as any).__VCP_STREAM_TRACES__?.length || 0
               }`,
-              "color: #10b981; font-weight: bold; font-size: 13px;"
+              "color: #10b981; font-weight: bold; font-size: 13px;",
             );
             console.log(
               `%c👉 运行指令 A 可一键获取帧轨迹总览:\n   console.table(window.__VCP_STREAM_TRACES__.map((t, idx) => ({ '帧号': idx, '相对时间(ms)': Math.round(t.timestamp - window.__VCP_STREAM_TRACES__[0].timestamp), 'Stable变动': t.auroraPayload.stableChanged, 'Stable块数': t.auroraPayload.stableBlocksCount, 'Tail变动': t.auroraPayload.tailChanged, 'Tail内容': t.auroraPayload.tailContent.substring(0, 15) })))`,
-              "color: #3b82f6;"
+              "color: #3b82f6;",
             );
             console.log(
               `%c👉 运行指令 B 进行任意相邻帧 Diff 比对（如 12 帧与 13 帧）:\n   const fA = window.__VCP_STREAM_TRACES__[12]; const fB = window.__VCP_STREAM_TRACES__[13]; console.log("=== 帧12 Tail ===", fA.auroraPayload.tailContent); console.log("=== 帧13 Stable Hashes ===", fB.auroraPayload.stableBlocksHashes); console.log("=== 帧13 Tail ===", fB.auroraPayload.tailContent);`,
-              "color: #8b5cf6;"
+              "color: #8b5cf6;",
             );
           }
         }
@@ -933,17 +857,17 @@ export const useChatStreamStore = defineStore("chatStream", () => {
    */
   const stopMessage = async (
     messageId: string,
-    onUpdateMessage?: (msgId: string) => Promise<void>
+    onUpdateMessage?: (msgId: string) => Promise<void>,
   ) => {
     console.log(
-      `[ChatStreamStore] Sending interrupt signal for message: ${messageId}`
+      `[ChatStreamStore] Sending interrupt signal for message: ${messageId}`,
     );
     try {
       await invoke("interruptRequest", { messageId: messageId });
     } catch (e) {
       console.error(
         `[ChatStreamStore] Failed to interrupt stream for ${messageId}:`,
-        e
+        e,
       );
       return;
     }
@@ -961,6 +885,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     auroraActiveMessageIds.delete(messageId);
     streamBlockSignatures.delete(messageId);
     streamTailSignatures.delete(messageId);
+    lastAuroraSequences.delete(messageId);
 
     if (streamingMessageId.value === messageId) {
       streamingMessageId.value = null;
@@ -984,7 +909,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
    */
   const stopGroupTurn = async (topicId: string) => {
     console.log(
-      `[ChatStreamStore] Global Group Interruption for topic: ${topicId}`
+      `[ChatStreamStore] Global Group Interruption for topic: ${topicId}`,
     );
     try {
       const ownerId = sessionStore.currentSelectedItem?.id;
@@ -1035,12 +960,12 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     });
 
     rAFPendingUpdates.clear();
+    auroraActiveMessageIds.clear();
     sealedStreamMessageIds.clear();
     terminalStreamMessageIds.clear();
-    if (activeStreamTotal.value > 0) {
-      activeStreamTotal.value = 0;
-      releaseScreenKeep();
-    }
+    streamBlockSignatures.clear();
+    streamTailSignatures.clear();
+    lastAuroraSequences.clear();
     for (const id of Object.keys(activeStreamContexts)) {
       delete activeStreamContexts[id];
     }

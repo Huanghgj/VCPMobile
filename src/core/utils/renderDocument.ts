@@ -1,4 +1,5 @@
 import type { ContentBlock } from "../types/chat";
+import { generate, parse } from "css-tree";
 import { renderMarkdownNodesToHtml } from "./astRenderer";
 import {
   escapeHtml,
@@ -127,22 +128,56 @@ function renderBlockSource(block: ContentBlock, messageId: string): string {
   }
 }
 
-function moveTrailingNodesIntoRichRoot(fragment: DocumentFragment): void {
-  const root = fragment.querySelector<HTMLElement>("#vcp-root");
-  if (!root) return;
-  root.dataset.vcpRenderVersion = String(RENDER_DOCUMENT_VERSION);
+function isEmptyHiddenPlaceholder(root: HTMLElement): boolean {
+  const inlineDisplay = root.style.display.trim().toLowerCase();
+  const ariaHidden = root.getAttribute("aria-hidden")?.toLowerCase() === "true";
+  const hidden = root.hidden || inlineDisplay === "none" || ariaHidden;
+  if (!hidden) return false;
 
-  let topLevel: Node = root;
-  while (topLevel.parentNode && topLevel.parentNode !== fragment) {
-    topLevel = topLevel.parentNode;
-  }
-  if (topLevel.parentNode !== fragment) return;
+  const clone = root.cloneNode(true) as HTMLElement;
+  clone
+    .querySelectorAll("style, script, template")
+    .forEach((node) => node.remove());
+  return !clone.textContent?.trim() && clone.children.length === 0;
+}
 
-  let sibling = topLevel.nextSibling;
-  while (sibling) {
-    const next = sibling.nextSibling;
-    root.appendChild(sibling);
-    sibling = next;
+function isHiddenGeneratedRoot(root: HTMLElement): boolean {
+  return (
+    root.hidden ||
+    root.style.display.trim().toLowerCase() === "none" ||
+    root.getAttribute("aria-hidden")?.toLowerCase() === "true"
+  );
+}
+
+/**
+ * `vcp-root` belongs to the generated document, not to the application DOM.
+ * Normalize every occurrence so duplicate IDs and an early hidden placeholder
+ * cannot capture or hide later response content.
+ */
+function normalizeGeneratedRichRoots(fragment: DocumentFragment): void {
+  const roots = Array.from(
+    fragment.querySelectorAll<HTMLElement>('[id="vcp-root" i]'),
+  );
+
+  for (const root of roots) {
+    if (!root.isConnected && !fragment.contains(root)) continue;
+
+    if (isEmptyHiddenPlaceholder(root)) {
+      root.remove();
+      continue;
+    }
+
+    if (
+      isHiddenGeneratedRoot(root) &&
+      root.querySelector<HTMLElement>('[id="vcp-root" i]')
+    ) {
+      root.replaceWith(...Array.from(root.childNodes));
+      continue;
+    }
+
+    root.removeAttribute("id");
+    root.dataset.vcpGeneratedRoot = "";
+    root.dataset.vcpRenderVersion = String(RENDER_DOCUMENT_VERSION);
   }
 }
 
@@ -153,6 +188,158 @@ function extractStyles(fragment: DocumentFragment): string {
     style.remove();
   });
   return styles.join("\n");
+}
+
+const CSS_NUMBER = String.raw`[+-]?(?:\d+(?:\.\d*)?|\.\d+)`;
+const CSS_DIMENSION_UNITS = [
+  "svmin",
+  "lvmin",
+  "dvmin",
+  "svmax",
+  "lvmax",
+  "dvmax",
+  "dpcm",
+  "dppx",
+  "svw",
+  "lvw",
+  "dvw",
+  "svh",
+  "lvh",
+  "dvh",
+  "svi",
+  "lvi",
+  "dvi",
+  "svb",
+  "lvb",
+  "dvb",
+  "vmin",
+  "vmax",
+  "grad",
+  "turn",
+  "khz",
+  "rcap",
+  "rch",
+  "rex",
+  "ric",
+  "rlh",
+  "rem",
+  "cap",
+  "deg",
+  "rad",
+  "dpi",
+  "px",
+  "cm",
+  "mm",
+  "in",
+  "pc",
+  "pt",
+  "em",
+  "ex",
+  "ch",
+  "ic",
+  "lh",
+  "vw",
+  "vh",
+  "vi",
+  "vb",
+  "ms",
+  "hz",
+  "fr",
+  "q",
+  "s",
+  "x",
+].join("|");
+const GLUED_DIMENSION_BOUNDARY = new RegExp(
+  `(${CSS_NUMBER})(${CSS_DIMENSION_UNITS})(?=${CSS_NUMBER}(?:${CSS_DIMENSION_UNITS}|%))`,
+  "gi",
+);
+const GLUED_HEX_STOP = /#([0-9a-f]+)%/gi;
+const VALID_HEX_LENGTHS = [8, 6, 4, 3] as const;
+
+function restoreHexStopBoundary(match: string, body: string): string {
+  // A valid hash length is more likely a color followed by a stray `%` than a
+  // missing boundary, so leave that ambiguous case untouched.
+  if (VALID_HEX_LENGTHS.includes(body.length as 3 | 4 | 6 | 8)) return match;
+
+  for (const colorLength of VALID_HEX_LENGTHS) {
+    const stop = body.slice(colorLength);
+    if (
+      colorLength < body.length &&
+      /^\d{1,3}$/.test(stop) &&
+      Number(stop) <= 100
+    ) {
+      return `#${body.slice(0, colorLength)} ${stop}%`;
+    }
+  }
+  return match;
+}
+
+function restoreCssTokenBoundaries(value: string): string {
+  return value
+    .replace(GLUED_DIMENSION_BOUNDARY, "$1$2 ")
+    .replace(GLUED_HEX_STOP, restoreHexStopBoundary);
+}
+
+function browserAcceptsDeclaration(property: string, value: string): boolean {
+  if (!property || property.startsWith("--")) return true;
+  const probe = document.createElement("span");
+  probe.style.setProperty(property, value);
+  return probe.style.getPropertyValue(property) !== "";
+}
+
+function repairMalformedInlineStyle(rawStyle: string): string {
+  let ast: any;
+  try {
+    ast = parse(rawStyle, {
+      context: "declarationList",
+      parseCustomProperty: false,
+      positions: false,
+      onParseError: () => {},
+    });
+  } catch {
+    return rawStyle;
+  }
+
+  let changed = false;
+  ast.children.forEach((declaration: any) => {
+    if (declaration.type !== "Declaration") return;
+    const value = generate(declaration.value);
+    if (browserAcceptsDeclaration(declaration.property, value)) return;
+
+    const repaired = restoreCssTokenBoundaries(value);
+    if (
+      repaired === value ||
+      !browserAcceptsDeclaration(declaration.property, repaired)
+    ) {
+      return;
+    }
+
+    try {
+      declaration.value = parse(repaired, {
+        context: "value",
+        parseCustomProperty: false,
+        positions: false,
+      });
+      changed = true;
+    } catch {
+      // Keep the original declaration when the candidate cannot be parsed.
+    }
+  });
+
+  return changed ? generate(ast) : rawStyle;
+}
+
+function repairMalformedGeneratedInlineStyles(
+  fragment: DocumentFragment,
+): void {
+  fragment.querySelectorAll<HTMLElement>("[style]").forEach((element) => {
+    const rawStyle = element.getAttribute("style") || "";
+    const repairedStyle = repairMalformedInlineStyle(rawStyle);
+    if (repairedStyle !== rawStyle) {
+      element.setAttribute("style", repairedStyle);
+      element.dataset.vcpStyleRepaired = "";
+    }
+  });
 }
 
 function assignStableRenderKeys(
@@ -183,8 +370,9 @@ function html5NormalizeAndSanitize(
 } {
   const template = document.createElement("template");
   template.innerHTML = sourceHtml;
+  repairMalformedGeneratedInlineStyles(template.content);
   const css = extractStyles(template.content);
-  moveTrailingNodesIntoRichRoot(template.content);
+  normalizeGeneratedRichRoots(template.content);
 
   const sanitized = sanitizeMarkdownHtml(template.innerHTML, {
     allowRichHtml: true,
@@ -192,7 +380,7 @@ function html5NormalizeAndSanitize(
   });
   const normalized = document.createElement("template");
   normalized.innerHTML = sanitized;
-  moveTrailingNodesIntoRichRoot(normalized.content);
+  normalizeGeneratedRichRoots(normalized.content);
   normalized.content.querySelectorAll("details").forEach((details) => {
     details.removeAttribute("open");
   });

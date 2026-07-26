@@ -147,19 +147,6 @@ pub enum InlineNode {
 }
 
 impl MarkdownNode {
-    pub fn get_hash(&self) -> Option<u64> {
-        match self {
-            MarkdownNode::Paragraph { hash, .. } => *hash,
-            MarkdownNode::Heading { hash, .. } => *hash,
-            MarkdownNode::CodeBlock { hash, .. } => *hash,
-            MarkdownNode::Blockquote { hash, .. } => *hash,
-            MarkdownNode::List { hash, .. } => *hash,
-            MarkdownNode::Table { hash, .. } => *hash,
-            MarkdownNode::ThematicBreak => None,
-            MarkdownNode::RawHtml { hash, .. } => *hash,
-        }
-    }
-
     pub fn paragraph(children: Vec<InlineNode>) -> Self {
         Self::Paragraph {
             children,
@@ -285,22 +272,6 @@ impl MarkdownNode {
 }
 
 impl InlineNode {
-    pub fn get_hash(&self) -> Option<u64> {
-        match self {
-            InlineNode::Text { .. } => None,
-            InlineNode::Strong { hash, .. } => *hash,
-            InlineNode::Emphasis { hash, .. } => *hash,
-            InlineNode::Code { .. } => None,
-            InlineNode::Link { hash, .. } => *hash,
-            InlineNode::Image { hash, .. } => *hash,
-            InlineNode::Break => None,
-            InlineNode::InlineMath { hash, .. } => *hash,
-            InlineNode::VcpCustom { hash, .. } => *hash,
-            InlineNode::Strikethrough { hash, .. } => *hash,
-            InlineNode::RawHtmlInline { hash, .. } => *hash,
-        }
-    }
-
     pub fn text(value: String) -> Self {
         Self::Text { value }
     }

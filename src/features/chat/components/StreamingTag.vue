@@ -8,16 +8,6 @@
 
 <style scoped>
 .custom-ping {
-  animation: vcp-ping 1s cubic-bezier(0, 0, 0.2, 1) infinite;
-  /* 强行隔离重绘并提升到合成层 */
-  will-change: transform, opacity;
-  transform: translate3d(0, 0, 0);
-}
-
-@keyframes vcp-ping {
-  75%, 100% {
-    transform: scale(2) translate3d(0, 0, 0);
-    opacity: 0;
-  }
+  opacity: 0.85;
 }
 </style>

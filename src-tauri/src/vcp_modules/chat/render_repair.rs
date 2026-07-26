@@ -313,9 +313,15 @@ fn has_renderable_vcp_root_continuation(fragment: &str, start: usize) -> bool {
         .unwrap();
     }
 
-    fragment
-        .get(start..)
-        .is_some_and(|rest| RICH_HTML_CONTINUATION.is_match(rest.trim_start()))
+    fragment.get(start..).is_some_and(|rest| {
+        let rest = rest.trim_start();
+        if let Some(gt) = find_tag_end(rest, 0) {
+            if is_vcp_root_open_tag(&rest[..=gt]) {
+                return false;
+            }
+        }
+        RICH_HTML_CONTINUATION.is_match(rest)
+    })
 }
 
 fn has_later_orphan_close(fragment: &str, start: usize, tag_name: &str) -> bool {
@@ -480,12 +486,14 @@ fn closing_fence_marker(opening: &str) -> String {
 
 fn find_tag_end(text: &str, lt: usize) -> Option<usize> {
     let mut quote: Option<char> = None;
-    for (offset, ch) in text[lt + 1..].char_indices() {
+    let scan_start = lt.checked_add(1)?;
+    let suffix = text.get(scan_start..)?;
+    for (offset, ch) in suffix.char_indices() {
         match quote {
             Some(q) if ch == q => quote = None,
             Some(_) => {}
             None if ch == '"' || ch == '\'' => quote = Some(ch),
-            None if ch == '>' => return Some(lt + 1 + offset),
+            None if ch == '>' => return Some(scan_start + offset),
             None => {}
         }
     }
@@ -703,5 +711,18 @@ mod tests {
                 "<div data-probe=\"second\">second</div></div>"
             )
         );
+    }
+
+    #[test]
+    fn keeps_sequential_vcp_roots_as_separate_documents() {
+        let input = concat!(
+            "<div id=\"vcp-root\" style=\"display:none\"></div>",
+            "<div id=\"vcp-root\"><p data-probe=\"final\">visible</p></div>"
+        );
+
+        let repaired = repair_html_fragment(input);
+
+        assert_eq!(repaired, input);
+        assert!(!repaired.contains("display:none\"><div id=\"vcp-root\""));
     }
 }

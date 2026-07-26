@@ -111,9 +111,7 @@ const isStreaming = computed(() => {
 
 const renderDocument = computed(() => {
   const allowFallback =
-    !!props.message.content &&
-    (!isStreaming.value ||
-      (!props.message.tailBlock && !props.message.tailContent));
+    !!props.message.content && (!isStreaming.value || !props.message.tailBlock);
   return createRenderDocument(
     props.message.blocks,
     props.message.tailBlock,
@@ -545,19 +543,9 @@ function buildRenderDebugReport(
         isStreaming: isStreaming.value,
         hasContentOnMessage: Boolean(props.message.content),
         rawContentLength: rawContent.length,
-        tailContentLength: props.message.tailContent?.length || 0,
+        tailContentLength: props.message.tailBlock?.content?.length || 0,
         tailBlockType: props.message.tailBlock?.type || null,
         tailHasNodes: Boolean(props.message.tailBlock?.nodes?.length),
-        tailFrame: props.message.tailFrame
-          ? {
-              epoch: props.message.tailFrame.epoch,
-              revision: props.message.tailFrame.revision,
-              frameSeq: props.message.tailFrame.frameSeq,
-              reset: props.message.tailFrame.reset === true,
-              mutationCount: props.message.tailFrame.mutations?.length || 0,
-              snapshotCount: props.message.tailFrame.snapshot?.length || 0,
-            }
-          : null,
       },
       parserComparison: {
         current: currentSummary,
@@ -973,8 +961,7 @@ function formatTime(ts: number) {
               isStreaming &&
               bubbleIndex === messageBubbles.length - 1 &&
               (!message.blocks || message.blocks.length === 0) &&
-              !message.tailBlock &&
-              !message.tailContent
+              !message.tailBlock
             "
           />
 
@@ -1035,7 +1022,7 @@ function formatTime(ts: number) {
                 bubbleIndex === messageBubbles.length - 1 &&
                 message.tailBlock
               "
-              class="streaming-tail opacity-90"
+              class="streaming-tail"
             >
               <RenderDocumentBlock
                 v-if="isPlainBlock(message.tailBlock.type)"
@@ -1043,7 +1030,6 @@ function formatTime(ts: number) {
                 :message-id="message.id"
                 source-id="stream-tail"
                 streaming
-                @rendered="handleEmbeddedContentRendered"
               />
               <ToolBlock
                 v-else-if="
@@ -1061,7 +1047,6 @@ function formatTime(ts: number) {
                 :message-id="message.id"
                 source-id="stream-tail-thought"
                 :default-expanded="isMessageInActiveStream"
-                @rendered="renderHeavyContent"
               />
               <HtmlPreviewBlock
                 v-else-if="message.tailBlock.type === 'html-preview'"
@@ -1070,7 +1055,6 @@ function formatTime(ts: number) {
                 :message-id="message.id"
                 :is-streaming="isStreaming"
                 :is-active-stream="isMessageInActiveStream"
-                @rendered="handleEmbeddedContentRendered"
               />
               <ToolSummaryBlock
                 v-else-if="message.tailBlock.type === 'tool-call-summary'"
@@ -1081,13 +1065,12 @@ function formatTime(ts: number) {
               v-if="
                 isStreaming &&
                 bubbleIndex === messageBubbles.length - 1 &&
-                message.tailContent &&
-                (!message.tailBlock ||
-                  !isRenderableTailBlock(message.tailBlock.type))
+                message.tailBlock?.content &&
+                !isRenderableTailBlock(message.tailBlock.type)
               "
-              class="opacity-70 italic animate-pulse"
+              class="streaming-fallback"
             >
-              {{ message.tailContent }}
+              {{ message.tailBlock.content }}
             </div>
           </div>
 

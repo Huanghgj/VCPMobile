@@ -46,7 +46,6 @@ export function useChatScroll(options: UseChatScrollOptions) {
   let scrollThrottleId: number | null = null;
   let resizeObserver: ResizeObserver | null = null;
   let scrollRafId: number | null = null;
-  let contentNotifyRafId: number | null = null;
   let loadMoreDebounceId: number | null = null;
   let interactionEndTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -232,17 +231,9 @@ export function useChatScroll(options: UseChatScrollOptions) {
     }
   };
 
-  const notifyContentChange = () => {
-    if (contentNotifyRafId !== null) {
-      cancelAnimationFrame(contentNotifyRafId);
-    }
-    contentNotifyRafId = requestAnimationFrame(() => {
-      contentNotifyRafId = requestAnimationFrame(() => {
-        contentNotifyRafId = null;
-        handleContentChange(true);
-      });
-    });
-  };
+  // Kept for component API compatibility. ResizeObserver is the single source
+  // of layout-change notifications, so render events do not force extra reads.
+  const notifyContentChange = () => {};
 
   const syncScrollPosition = () => {
     const list = messageListRef.value;
@@ -463,10 +454,6 @@ export function useChatScroll(options: UseChatScrollOptions) {
       clearTimeout(loadMoreDebounceId);
       loadMoreDebounceId = null;
     }
-    if (contentNotifyRafId !== null) {
-      cancelAnimationFrame(contentNotifyRafId);
-      contentNotifyRafId = null;
-    }
     if (interactionEndTimer) {
       clearTimeout(interactionEndTimer);
       interactionEndTimer = null;
@@ -494,10 +481,6 @@ export function useChatScroll(options: UseChatScrollOptions) {
     if (loadMoreDebounceId) {
       clearTimeout(loadMoreDebounceId);
       loadMoreDebounceId = null;
-    }
-    if (contentNotifyRafId !== null) {
-      cancelAnimationFrame(contentNotifyRafId);
-      contentNotifyRafId = null;
     }
     if (interactionEndTimer) {
       clearTimeout(interactionEndTimer);

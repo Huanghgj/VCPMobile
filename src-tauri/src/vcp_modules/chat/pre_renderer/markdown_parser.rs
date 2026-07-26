@@ -541,10 +541,6 @@ pub fn parse_markdown_to_ast(text: &str) -> Vec<MarkdownNode> {
     parse_markdown_to_ast_opt(text, false)
 }
 
-pub fn parse_markdown_to_ast_streaming(text: &str) -> Vec<MarkdownNode> {
-    parse_markdown_to_ast_opt(text, true)
-}
-
 fn parse_markdown_to_ast_opt(text: &str, is_streaming: bool) -> Vec<MarkdownNode> {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         parse_markdown_to_ast_impl(text, is_streaming)
@@ -1265,6 +1261,27 @@ copy_button: should_not_send
         assert!(
             contains_raw_html(&nodes, "data-vcp-copy-code"),
             "expected copy button HTML to remain renderable after the yaml block, got {nodes:#?}"
+        );
+    }
+
+    #[test]
+    fn preserves_inline_css_token_boundaries_in_raw_html_nodes() {
+        let inline_style = concat!(
+            "background:linear-gradient(180deg,#fdf6e9 0%,#fcebd4 40%,",
+            "#f9e0c0 100%);padding:20px 16px 24px;opacity:1"
+        );
+        let input = format!(r#"<div id="vcp-root" style="{inline_style}"><p>visible</p></div>"#);
+
+        let nodes = parse_markdown_to_ast(&input);
+
+        assert!(
+            contains_raw_html(&nodes, inline_style),
+            "inline CSS changed while building raw HTML AST nodes: {nodes:#?}"
+        );
+        let serialized = serde_json::to_string(&nodes).expect("serialize markdown AST");
+        assert!(
+            serialized.contains(inline_style),
+            "inline CSS changed while serializing markdown AST: {serialized}"
         );
     }
 }

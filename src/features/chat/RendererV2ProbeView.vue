@@ -13,7 +13,7 @@ let streamUpdateScheduled = false;
 const stableBlock: ContentBlock = {
   type: "markdown",
   content: [
-    '<div id="vcp-root" data-testid="probe-rich-root" style="padding:20px;border-radius:16px;background:#172033;color:#f8fafc">',
+    '<div id="vcp-root" data-testid="probe-rich-root" style="padding:20px 16px 24px;border-radius:16px;background:linear-gradient(180deg,#fdf6e9 0%,#fcebd4 40%,#f9e0c0 100%);color:#3d2b1f;opacity:1">',
     "<style>",
     "@keyframes blurIn { from { opacity:0; transform:translateY(8px) } to { opacity:1; transform:translateY(0) } }",
     ".probe-scene { animation:blurIn .8s ease both; border:2px solid rgb(94,234,212); padding:12px; border-radius:10px }",

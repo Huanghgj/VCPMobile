@@ -311,13 +311,30 @@ lazy_static! {
     static ref HTML_TAG_REGEX: Regex = Regex::new(r"(?i)^[ \t]*</?[a-zA-Z][a-zA-Z0-9]*[\s>/]").unwrap();
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProtocolBlockEnd {
+    pub content_end: usize,
+    pub marker_end: usize,
+    pub complete: bool,
+}
+
 /// Returns the explicit closing marker unless a new top-level VCP protocol
-/// block starts first. The zero-width boundary recovery prevents one malformed
-/// tool request from consuming later tool results, role dividers, and replies.
-pub(crate) fn find_protocol_bounded_end(text: &str, end_marker: &Regex) -> Option<(usize, usize)> {
+/// block starts first. A recovered block ends at a zero-width boundary so one
+/// malformed event cannot consume later independent events.
+pub(crate) fn find_protocol_bounded_end(
+    text: &str,
+    end_marker: &Regex,
+) -> Option<ProtocolBlockEnd> {
+    lazy_static! {
+        static ref TOP_LEVEL_THINK_START: Regex =
+            Regex::new(r"(?im)^[ \t]*<think(?:ing)?>").unwrap();
+    }
+
     let explicit_end = end_marker.find(text);
     let recovery_boundary = [
         &*TOOL_START,
+        &*THOUGHT_START,
+        &*TOP_LEVEL_THINK_START,
         &*TOOL_RESULT_START,
         &*DIARY_START,
         &*ROLE_DIVIDER,
@@ -328,11 +345,21 @@ pub(crate) fn find_protocol_bounded_end(text: &str, end_marker: &Regex) -> Optio
     .min_by_key(|marker| marker.start());
 
     match (explicit_end, recovery_boundary) {
-        (Some(end), Some(boundary)) if boundary.start() < end.start() => {
-            Some((boundary.start(), boundary.start()))
-        }
-        (Some(end), _) => Some((end.start(), end.end())),
-        (None, Some(boundary)) => Some((boundary.start(), boundary.start())),
+        (Some(end), Some(boundary)) if boundary.start() < end.start() => Some(ProtocolBlockEnd {
+            content_end: boundary.start(),
+            marker_end: boundary.start(),
+            complete: false,
+        }),
+        (Some(end), _) => Some(ProtocolBlockEnd {
+            content_end: end.start(),
+            marker_end: end.end(),
+            complete: true,
+        }),
+        (None, Some(boundary)) => Some(ProtocolBlockEnd {
+            content_end: boundary.start(),
+            marker_end: boundary.start(),
+            complete: false,
+        }),
         (None, None) => None,
     }
 }
@@ -517,32 +544,31 @@ pub fn parse_content(raw_text: &str) -> Vec<ContentBlock> {
 
             let (end_marker_start, end_marker_end, is_complete) = match block_type {
                 BlockType::Tool => find_protocol_bounded_end(search_area, &TOOL_END)
-                    .map_or((None, None, false), |(start, end)| {
-                        (Some(start), Some(end), true)
+                    .map_or((None, None, false), |end| {
+                        (Some(end.content_end), Some(end.marker_end), end.complete)
                     }),
-                BlockType::Thought => THOUGHT_END
-                    .find(search_area)
-                    .map_or((None, None, false), |m| {
-                        (Some(m.start()), Some(m.end()), true)
+                BlockType::Thought => find_protocol_bounded_end(search_area, &THOUGHT_END)
+                    .map_or((None, None, false), |end| {
+                        (Some(end.content_end), Some(end.marker_end), end.complete)
                     }),
-                BlockType::Think => THINK_END
-                    .find(search_area)
-                    .map_or((None, None, false), |m| {
-                        (Some(m.start()), Some(m.end()), true)
+                BlockType::Think => find_protocol_bounded_end(search_area, &THINK_END)
+                    .map_or((None, None, false), |end| {
+                        (Some(end.content_end), Some(end.marker_end), end.complete)
                     }),
                 BlockType::ToolResult => find_protocol_bounded_end(search_area, &TOOL_RESULT_END)
-                    .map_or((None, None, false), |(start, end)| {
-                        (Some(start), Some(end), true)
+                    .map_or((None, None, false), |end| {
+                        (Some(end.content_end), Some(end.marker_end), end.complete)
                     }),
-                BlockType::Diary => DIARY_END
-                    .find(search_area)
-                    .map_or((None, None, false), |m| {
-                        (Some(m.start()), Some(m.end()), true)
+                BlockType::Diary => find_protocol_bounded_end(search_area, &DIARY_END)
+                    .map_or((None, None, false), |end| {
+                        (Some(end.content_end), Some(end.marker_end), end.complete)
                     }),
-                BlockType::ToolCallSummary => TOOL_CALL_SUMMARY_END
-                    .find(search_area)
-                    .map_or((None, None, false), |m| {
-                        (Some(m.start()), Some(m.end()), true)
+                BlockType::ToolCallSummary => find_protocol_bounded_end(
+                    search_area,
+                    &TOOL_CALL_SUMMARY_END,
+                )
+                    .map_or((None, None, false), |end| {
+                        (Some(end.content_end), Some(end.marker_end), end.complete)
                     }),
                 BlockType::HtmlFence => HTML_FENCE_END
                     .find(search_area)
@@ -572,7 +598,8 @@ pub fn parse_content(raw_text: &str) -> Vec<ContentBlock> {
             };
 
             // 容错处理：未闭合的块（流式中断）降级为普通 Markdown
-            if !is_complete
+            if end_marker_start.is_none()
+                && !is_complete
                 && !matches!(
                     block_type,
                     BlockType::HtmlFence
@@ -1414,6 +1441,29 @@ copy_button: should_not_send
     }
 
     #[test]
+    fn test_parse_content_preserves_inline_css_token_boundaries() {
+        let inline_style = concat!(
+            "background:linear-gradient(180deg,#fdf6e9 0%,#fcebd4 40%,",
+            "#f9e0c0 100%);padding:20px 16px 24px;opacity:1"
+        );
+        let raw = format!(r#"<div id="vcp-root" style="{inline_style}"><p>visible</p></div>"#);
+
+        let blocks = parse_content(&raw);
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block_contains_raw_html(block, inline_style)),
+            "inline CSS changed while parsing content: {blocks:#?}"
+        );
+
+        let serialized = serde_json::to_string(&blocks).expect("serialize parsed blocks");
+        assert!(
+            serialized.contains(inline_style),
+            "inline CSS changed while serializing parsed blocks: {serialized}"
+        );
+    }
+
+    #[test]
     fn test_parse_content_recovers_after_unclosed_tool_request() {
         let raw = r#"<<<[TOOL_REQUEST]>>>
 tool_name:「始」ComfyUIGen「末」,
@@ -1492,6 +1542,41 @@ details body remains visible
                 .any(|block| block_contains_raw_html(block, "data-probe=\"details-body\"")),
             "details body stuck to DailyNote must remain renderable: {blocks:#?}"
         );
+    }
+
+    #[test]
+    fn test_parse_content_resynchronizes_unclosed_think_before_tool() {
+        let raw = concat!(
+            "<think>unfinished reasoning\n",
+            "<<<[TOOL_REQUEST]>>>\n",
+            "<tool_name>ComfyUIGen</tool_name>\n",
+            "prompt: image\n",
+            "<<<[END_TOOL_REQUEST]>>>\n",
+            "</think>\n",
+            "<div id=\"vcp-root\"><p data-probe=\"final-body\">visible</p></div>"
+        );
+
+        let blocks = parse_content(raw);
+
+        assert!(
+            blocks.iter().any(|block| matches!(
+                block,
+                ContentBlock::Thought { content, is_complete: false, .. }
+                    if content.trim() == "unfinished reasoning"
+            )),
+            "unclosed think block should stop at the next protocol event: {blocks:#?}"
+        );
+        assert!(
+            blocks.iter().any(|block| matches!(
+                block,
+                ContentBlock::ToolUse { tool_name, is_complete: true, .. }
+                    if tool_name == "ComfyUIGen"
+            )),
+            "tool after malformed think must remain independent: {blocks:#?}"
+        );
+        assert!(blocks
+            .iter()
+            .any(|block| block_contains_raw_html(block, "data-probe=\"final-body\"")));
     }
 
     #[test]

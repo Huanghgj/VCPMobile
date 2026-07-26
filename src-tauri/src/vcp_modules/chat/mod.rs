@@ -1,6 +1,3 @@
-#[cfg(test)]
-pub mod ast_bench;
-pub mod ast_diff;
 pub mod aurora_pipeline;
 pub mod chat_manager;
 pub mod content_parser;

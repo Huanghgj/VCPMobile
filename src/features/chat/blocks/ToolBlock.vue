@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch, onMounted, onUnmounted } from "vue";
+import { ref, watch, onUnmounted } from "vue";
 import {
   ChevronDown,
   ChevronUp,
@@ -44,7 +44,7 @@ const props = withDefaults(
   }>(),
   {
     defaultExpanded: false,
-  }
+  },
 );
 
 const isExpanded = ref(props.defaultExpanded);
@@ -53,7 +53,7 @@ watch(
   () => props.defaultExpanded,
   (newVal) => {
     isExpanded.value = newVal;
-  }
+  },
 );
 
 const isFullScreen = ref(false);
@@ -112,33 +112,8 @@ const copyAllDetails = () => {
       console.error("[ToolBlock] Copy all failed:", err);
     });
 };
-const toolBlockRef = ref<HTMLElement | null>(null);
-let observer: IntersectionObserver | null = null;
-
-const isToolAnimating = computed(
-  () => props.type === "tool-use" && !props.block.is_complete
-);
-
-onMounted(() => {
-  if (!toolBlockRef.value) return;
-  observer = new IntersectionObserver(
-    (entries) => {
-      entries.forEach((entry) => {
-        if (entry.isIntersecting) {
-          toolBlockRef.value?.classList.remove("vcp-animation-paused");
-        } else {
-          toolBlockRef.value?.classList.add("vcp-animation-paused");
-        }
-      });
-    },
-    { threshold: 0 }
-  );
-  observer.observe(toolBlockRef.value);
-});
-
 onUnmounted(() => {
   unregisterModal(modalId);
-  observer?.disconnect();
   parsedMarkdownCache.clear();
 });
 
@@ -168,11 +143,9 @@ const isImageValue = (key: string, value: string): boolean => {
 
 <template>
   <div
-    ref="toolBlockRef"
     class="vcp-tool-block my-2 rounded-xl transition-all duration-300 overflow-hidden"
     :class="[
       type === 'tool-use' ? 'is-tool-use' : 'is-tool-result tool-bubble',
-      isToolAnimating ? 'is-tool-animating' : '',
       isExpanded ? 'shadow-md' : 'shadow-sm',
     ]"
   >
@@ -397,45 +370,6 @@ const isImageValue = (key: string, value: string): boolean => {
 </template>
 
 <style scoped>
-/* --- Animations --- */
-@keyframes vcp-bubble-background-flow-kf {
-  0% {
-    background-position: 0% 50%;
-  }
-
-  50% {
-    background-position: 100% 50%;
-  }
-
-  100% {
-    background-position: 0% 50%;
-  }
-}
-
-@keyframes vcp-bubble-border-flow-kf {
-  0% {
-    background-position: 0% 50%;
-  }
-
-  50% {
-    background-position: 200% 50%;
-  }
-
-  100% {
-    background-position: 0% 50%;
-  }
-}
-
-@keyframes vcp-icon-rotate {
-  0% {
-    transform: rotate(0deg) translate3d(0, 0, 0);
-  }
-
-  100% {
-    transform: rotate(360deg) translate3d(0, 0, 0);
-  }
-}
-
 .animate-slide-down {
   animation: slideDown 0.3s cubic-bezier(0.4, 0, 0.2, 1);
 }
@@ -452,27 +386,14 @@ const isImageValue = (key: string, value: string): boolean => {
   }
 }
 
-/* 离屏时暂停无限动画以节省 GPU */
-.vcp-tool-block.vcp-animation-paused.is-tool-animating,
-.vcp-tool-block.vcp-animation-paused.is-tool-animating::after,
-.vcp-tool-block.vcp-animation-paused.is-tool-animating .tool-icon-container {
-  animation-play-state: paused !important;
-}
-
 /* --- Tool Use Bubble --- */
 .vcp-tool-block.is-tool-use {
   background: linear-gradient(145deg, #3a7bd5 0%, #00d2ff 100%) !important;
   background-size: 200% 200% !important;
+  background-position: 50% 50%;
   color: #ffffff !important;
   border: none !important;
   position: relative;
-  /* GPU 硬件加速与合成层隔离 */
-  will-change: transform, opacity;
-  transform: translate3d(0, 0, 0);
-}
-
-.vcp-tool-block.is-tool-animating {
-  animation: vcp-bubble-background-flow-kf 20s ease-in-out infinite;
 }
 
 .vcp-tool-block.is-tool-use::after {
@@ -496,15 +417,17 @@ const isImageValue = (key: string, value: string): boolean => {
     #76c4f7
   );
   background-size: 300% 300%;
-  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
-  mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  background-position: 50% 50%;
+  -webkit-mask:
+    linear-gradient(#fff 0 0) content-box,
+    linear-gradient(#fff 0 0);
+  mask:
+    linear-gradient(#fff 0 0) content-box,
+    linear-gradient(#fff 0 0);
   -webkit-mask-composite: xor;
   mask-composite: exclude;
   z-index: 0;
   pointer-events: none;
-  /* 隔离复杂的遮罩平移重绘污染 */
-  will-change: transform, opacity;
-  transform: translate3d(0, 0, 0);
 }
 
 .vcp-tool-block.is-tool-use .tool-header-content {
@@ -515,34 +438,16 @@ const isImageValue = (key: string, value: string): boolean => {
 .vcp-tool-block.is-tool-use .tool-icon-container {
   background: transparent !important;
   color: rgba(255, 255, 255, 0.9) !important;
-}
-
-.vcp-tool-block.is-tool-animating::after {
-  animation: vcp-bubble-border-flow-kf 7s linear infinite;
-}
-
-.vcp-tool-block.is-tool-animating .tool-icon-container {
-  animation: vcp-icon-rotate 4s linear infinite;
-  /* 图标高频旋转开启硬件加速 */
-  will-change: transform;
-  transform: translate3d(0, 0, 0);
+  animation: none;
+  will-change: auto;
+  transform: none;
 }
 
 .custom-spin {
-  animation: vcp-spin 1s linear infinite;
-  /* 提升至 GPU 合成层 */
-  will-change: transform;
-  transform: translate3d(0, 0, 0);
-}
-
-@keyframes vcp-spin {
-  from {
-    transform: rotate(0deg) translate3d(0, 0, 0);
-  }
-
-  to {
-    transform: rotate(360deg) translate3d(0, 0, 0);
-  }
+  animation: none;
+  will-change: auto;
+  transform: none;
+  opacity: 0.85;
 }
 
 .vcp-tool-block.is-tool-use .tool-label {
@@ -655,7 +560,8 @@ html.dark .vcp-fullscreen-tool-panel.is-tool-result .vcp-fullscreen-header {
 /* --- Transitions --- */
 .fade-slide-enter-active,
 .fade-slide-leave-active {
-  transition: opacity 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+  transition:
+    opacity 0.25s cubic-bezier(0.4, 0, 0.2, 1),
     transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
 }
 

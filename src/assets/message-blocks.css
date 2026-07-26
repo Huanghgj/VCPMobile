@@ -280,7 +280,10 @@ html.dark .vcp-rich-html-block [id="vcp-root"] {
   color: rgba(255, 255, 255, 0.82);
   cursor: pointer;
   pointer-events: auto;
-  transition: background-color 120ms ease, color 120ms ease, transform 120ms ease;
+  transition:
+    background-color 120ms ease,
+    color 120ms ease,
+    transform 120ms ease;
 }
 
 .vcp-markdown-block .vcp-code-copy-btn:active {
@@ -644,55 +647,9 @@ html:not(.dark) .vcp-html-block .punctuation {
    === VCP Flow Blocks Styles (ThoughtBlock & ToolBlock 100% Shared Styles) ===
    ========================================================================== */
 
-/* --- 1. Animation Keyframes (集中声明，提升渲染管线解析效率) --- */
+/* --- 1. Finite Interaction Animation --- */
 
-/* 基础匀速自旋转动画（用于 Loading 状态，提升至 GPU 合成层） */
-@keyframes vcp-spin {
-  from {
-    transform: rotate(0deg) translate3d(0, 0, 0);
-  }
-  to {
-    transform: rotate(360deg) translate3d(0, 0, 0);
-  }
-}
-
-/* 工具图标专属轻量匀速旋转 */
-@keyframes vcp-icon-rotate {
-  0% {
-    transform: rotate(0deg) translate3d(0, 0, 0);
-  }
-  100% {
-    transform: rotate(360deg) translate3d(0, 0, 0);
-  }
-}
-
-/* ToolUse 气泡背景 3D 流动渐变动效 */
-@keyframes vcp-bubble-background-flow-kf {
-  0% {
-    background-position: 0% 50%;
-  }
-  50% {
-    background-position: 100% 50%;
-  }
-  100% {
-    background-position: 0% 50%;
-  }
-}
-
-/* ToolUse 气泡外流动边框渐变动效 */
-@keyframes vcp-bubble-border-flow-kf {
-  0% {
-    background-position: 0% 50%;
-  }
-  50% {
-    background-position: 200% 50%;
-  }
-  100% {
-    background-position: 0% 50%;
-  }
-}
-
-/* 抽屉/内容区下拉展开动效 */
+/* 抽屉/内容区只在展开时播放一次。 */
 @keyframes slideDown {
   from {
     opacity: 0;
@@ -770,15 +727,13 @@ html.dark .vcp-thought-block {
 .vcp-tool-block {
   transition: all 0.3s;
   position: relative;
-  will-change: transform, opacity;
-  transform: translate3d(0, 0, 0);
 }
 
 /* ToolUse 状态：3D 流光渐变背景与发光气泡效果 */
 .vcp-tool-block.is-tool-use {
   background: linear-gradient(145deg, #3a7bd5 0%, #00d2ff 100%) !important;
   background-size: 200% 200% !important;
-  animation: vcp-bubble-background-flow-kf 20s ease-in-out infinite;
+  background-position: 50% 50%;
   color: #ffffff !important;
   border: none !important;
 }
@@ -805,7 +760,7 @@ html.dark .vcp-thought-block {
     #76c4f7
   );
   background-size: 300% 300%;
-  animation: vcp-bubble-border-flow-kf 7s linear infinite;
+  background-position: 50% 50%;
   -webkit-mask:
     linear-gradient(#fff 0 0) content-box,
     linear-gradient(#fff 0 0);
@@ -816,8 +771,6 @@ html.dark .vcp-thought-block {
   mask-composite: exclude;
   z-index: 0;
   pointer-events: none;
-  will-change: transform, opacity;
-  transform: translate3d(0, 0, 0);
 }
 
 /* ToolResult 状态：亮色模式下作为默认基础样式呈现 */
@@ -840,13 +793,10 @@ html.dark .vcp-tool-block.is-tool-result {
   z-index: 1;
 }
 
-/* 工具图标容器：ToolUse 流式状态下保持匀速自旋转 */
+/* ToolUse 保持静态状态标识，避免流式期间持续唤醒 GPU。 */
 .vcp-tool-block.is-tool-use .tool-icon-container {
   background: transparent !important;
   color: rgba(255, 255, 255, 0.9) !important;
-  animation: vcp-icon-rotate 4s linear infinite;
-  will-change: transform;
-  transform: translate3d(0, 0, 0);
 }
 
 .vcp-tool-block.is-tool-use .tool-label {
@@ -936,23 +886,14 @@ html.dark .vcp-fullscreen-tool-panel.is-tool-result .vcp-fullscreen-header {
 
 /* --- 5. 动效控制与渲染性能硬化类 --- */
 
-/* 统一的高画质 CSS 自旋转加速类 */
+/* 流式状态使用静态图标，避免常驻合成层。 */
 .custom-spin {
-  animation: vcp-spin 1s linear infinite;
-  will-change: transform;
-  transform: translate3d(0, 0, 0);
+  opacity: 0.85;
 }
 
 /* 滑动下拉动画类 */
 .animate-slide-down {
   animation: slideDown 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-}
-
-/* 离屏优化：当工具块不可见时自动暂停无限动画，节省移动端 GPU 资源与耗电 */
-.vcp-tool-block.vcp-animation-paused.is-tool-use,
-.vcp-tool-block.vcp-animation-paused.is-tool-use::after,
-.vcp-tool-block.vcp-animation-paused.is-tool-use .tool-icon-container {
-  animation-play-state: paused !important;
 }
 
 /* 全屏模态淡入滑动过渡 */

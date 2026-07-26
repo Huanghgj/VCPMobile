@@ -118,31 +118,8 @@ export interface ChatMessage {
   topic_id?: string; // 兼容两种写法
 
   // 以下为纯前端运行时 UI 状态 (Ephemeral)，绝不进行持久化
-  tailContent?: string;      // Aurora: 尾随区 Markdown (高频变动)
   tailBlock?: ContentBlock;
-  tailFrame?: TailFrame;
-  tailSnapshot?: MarkdownNode[];
   renderRevision?: number;   // Final-render signal; never persisted.
-}
-
-export type AstMutation =
-  | { op: "add"; id: string; parent: string; node: MarkdownNode }
-  | { op: "add_inline"; id: string; parent: string; node: InlineNode }
-  | { op: "add_list_item"; id: string; parent: string; children: MarkdownNode[] }
-  | { op: "text"; id: string; value: string }
-  | { op: "append"; id: string; chunk: string }
-  | { op: "prop"; id: string; key: string; value: string }
-  | { op: "replace"; id: string; node: MarkdownNode }
-  | { op: "replace_inline"; id: string; node: InlineNode }
-  | { op: "remove"; id: string };
-
-export interface TailFrame {
-  epoch: number;
-  revision: number;
-  frameSeq: number;
-  reset?: boolean;
-  snapshot?: MarkdownNode[];
-  mutations: AstMutation[];
 }
 
 /**
@@ -200,14 +177,14 @@ export interface StreamBlock {
  * Aurora 语义沉淀更新，由 Rust 流式管道推送
  */
 export interface AuroraUpdate {
+  sequence: number;
+  stableBlocksDelta?: StreamBlock[];
+  /** Legacy full snapshot accepted during mixed-version upgrades. */
   stableBlocks?: StreamBlock[];
   stableChanged?: boolean;
   tailBlock?: StreamBlock;
-  tail?: string;
   tailChanged?: boolean;
   contentDelta?: string;
-  tailFrame?: TailFrame;
-  tailSnapshot?: MarkdownNode[];
   content?: string;
 }
 

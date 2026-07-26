@@ -34,6 +34,7 @@ pub enum StreamBlock {
     Tool {
         tool_name: String,
         content: String,
+        is_complete: bool,
         hash: String,
     },
     #[serde(rename = "tool-result")]
@@ -103,10 +104,11 @@ impl StreamBlock {
         }
     }
 
-    pub fn tool(tool_name: String, content: String, hash: String) -> Self {
+    pub fn tool(tool_name: String, content: String, is_complete: bool, hash: String) -> Self {
         Self::Tool {
             tool_name,
             content,
+            is_complete,
             hash,
         }
     }
@@ -228,7 +230,7 @@ impl StreamBlockParser {
                 let content_start = end;
                 let search_area = &remaining[content_start..];
 
-                if let Some((end_start, end_end)) = find_end_marker(
+                if let Some((end_start, end_end, is_complete)) = find_end_marker(
                     remaining,
                     start,
                     end,
@@ -243,6 +245,7 @@ impl StreamBlockParser {
                         start,
                         end,
                         end_end,
+                        is_complete,
                     );
                     blocks.push(block);
                     pos += content_start + end_end;
@@ -311,6 +314,18 @@ impl StreamBlockParser {
 
     /// 将未闭合的流式尾部构造成临时语义块；普通 Markdown 由调用方按性能预算处理。
     pub fn build_incomplete_semantic_tail_block(tail: &str) -> Option<StreamBlock> {
+        Self::build_incomplete_semantic_tail_block_with_nodes(tail, true)
+    }
+
+    /// 流式热路径只需要语义类型和原文；节点树在块闭合时再生成。
+    pub fn build_incomplete_semantic_tail_block_lightweight(tail: &str) -> Option<StreamBlock> {
+        Self::build_incomplete_semantic_tail_block_with_nodes(tail, false)
+    }
+
+    fn build_incomplete_semantic_tail_block_with_nodes(
+        tail: &str,
+        include_nodes: bool,
+    ) -> Option<StreamBlock> {
         let trimmed = tail.trim();
         if trimmed.is_empty() {
             return None;
@@ -319,13 +334,14 @@ impl StreamBlockParser {
         if let Some(caps) = THINK_START.captures(trimmed) {
             let marker = caps.get(0)?;
             let content = trimmed[marker.end()..].trim().to_string();
-            let nodes = crate::vcp_modules::pre_renderer::parse_markdown_to_ast(&content);
+            let nodes = include_nodes
+                .then(|| crate::vcp_modules::pre_renderer::parse_markdown_to_ast(&content));
             let hash = HashAggregator::compute_content_hash(&format!("think:{}", content));
             return Some(StreamBlock::thought(
                 "思考过程".to_string(),
                 content,
                 false,
-                Some(nodes),
+                nodes,
                 hash,
             ));
         }
@@ -338,15 +354,10 @@ impl StreamBlockParser {
                 .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| "元思考链".to_string());
             let content = trimmed[marker.end()..].trim().to_string();
-            let nodes = crate::vcp_modules::pre_renderer::parse_markdown_to_ast(&content);
+            let nodes = include_nodes
+                .then(|| crate::vcp_modules::pre_renderer::parse_markdown_to_ast(&content));
             let hash = HashAggregator::compute_content_hash(&format!("{}:{}", theme, content));
-            return Some(StreamBlock::thought(
-                theme,
-                content,
-                false,
-                Some(nodes),
-                hash,
-            ));
+            return Some(StreamBlock::thought(theme, content, false, nodes, hash));
         }
 
         None
@@ -404,23 +415,31 @@ fn find_end_marker(
     end: usize,
     block_type: &BlockType,
     allow_vcp_root_completion: bool,
-) -> Option<(usize, usize)> {
+) -> Option<(usize, usize, bool)> {
     let content_start = end;
     let search_area = &remaining[content_start..];
 
     if let BlockType::HtmlContainer = block_type {
         let marker_text = &remaining[start..end];
-        if !allow_vcp_root_completion
-            && crate::vcp_modules::render_repair::is_vcp_root_open_tag(marker_text)
-        {
-            return None;
-        }
         if let Some(caps) =
             crate::vcp_modules::content_parser::HTML_CONTAINER_OPEN_RE.captures(marker_text)
         {
             let tag_name = caps.get(1).unwrap().as_str().to_lowercase();
-            return crate::vcp_modules::chat::pre_renderer::markdown_parser::find_matching_close_tag(remaining, content_start, &tag_name)
-                .map(|(s, e)| (s - content_start, e - content_start));
+            let close =
+                crate::vcp_modules::chat::pre_renderer::markdown_parser::find_matching_close_tag(
+                    remaining,
+                    content_start,
+                    &tag_name,
+                );
+            if !allow_vcp_root_completion
+                && crate::vcp_modules::render_repair::is_vcp_root_open_tag(marker_text)
+            {
+                let (_, close_end) = close?;
+                if !starts_with_protocol_marker(&remaining[close_end..]) {
+                    return None;
+                }
+            }
+            return close.map(|(s, e)| (s - content_start, e - content_start, true));
         }
         return None;
     }
@@ -430,30 +449,73 @@ fn find_end_marker(
             return crate::vcp_modules::content_parser::find_protocol_bounded_end(
                 search_area,
                 &TOOL_END,
-            );
+            )
+            .map(|end| (end.content_end, end.marker_end, end.complete));
         }
-        BlockType::Thought => THOUGHT_END.find(search_area),
-        BlockType::Think => THINK_END.find(search_area),
+        BlockType::Thought => {
+            return crate::vcp_modules::content_parser::find_protocol_bounded_end(
+                search_area,
+                &THOUGHT_END,
+            )
+            .map(|end| (end.content_end, end.marker_end, end.complete));
+        }
+        BlockType::Think => {
+            return crate::vcp_modules::content_parser::find_protocol_bounded_end(
+                search_area,
+                &THINK_END,
+            )
+            .map(|end| (end.content_end, end.marker_end, end.complete));
+        }
         BlockType::ToolResult => {
             return crate::vcp_modules::content_parser::find_protocol_bounded_end(
                 search_area,
                 &TOOL_RESULT_END,
-            );
+            )
+            .map(|end| (end.content_end, end.marker_end, end.complete));
         }
-        BlockType::Diary => DIARY_END.find(search_area),
+        BlockType::Diary => {
+            return crate::vcp_modules::content_parser::find_protocol_bounded_end(
+                search_area,
+                &DIARY_END,
+            )
+            .map(|end| (end.content_end, end.marker_end, end.complete));
+        }
         BlockType::ToolCallSummary => {
-            crate::vcp_modules::content_parser::TOOL_CALL_SUMMARY_END.find(search_area)
+            return crate::vcp_modules::content_parser::find_protocol_bounded_end(
+                search_area,
+                &crate::vcp_modules::content_parser::TOOL_CALL_SUMMARY_END,
+            )
+            .map(|end| (end.content_end, end.marker_end, end.complete));
         }
         BlockType::HtmlFence | BlockType::CodeFence => GENERIC_CODE_FENCE_END.find(search_area),
         BlockType::HtmlDoc => HTML_DOC_END.find(search_area),
         BlockType::HtmlContainer => unreachable!(),
         BlockType::RoleDivider => {
             // RoleDivider 是单行标记，自闭合
-            return Some((0, 0));
+            return Some((0, 0, true));
         }
         BlockType::Style => STYLE_TAG_END.find(search_area),
     };
-    m.map(|m| (m.start(), m.end()))
+    m.map(|m| (m.start(), m.end(), true))
+}
+
+/// A generated `#vcp-root` normally stays mutable until the stream ends because
+/// models sometimes append more HTML after an early closing tag. A following
+/// protocol marker is an unambiguous boundary, so the root can be settled and
+/// the protocol block must be parsed independently while the stream is active.
+fn starts_with_protocol_marker(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    [
+        &*TOOL_START,
+        &*THOUGHT_START,
+        &*THINK_START,
+        &*TOOL_RESULT_START,
+        &*DIARY_START,
+        &*ROLE_DIVIDER,
+        &*crate::vcp_modules::content_parser::TOOL_CALL_SUMMARY_START,
+    ]
+    .into_iter()
+    .any(|marker| marker.find(trimmed).is_some_and(|found| found.start() == 0))
 }
 
 /// 从匹配的标记构建 StreamBlock
@@ -464,6 +526,7 @@ fn build_stream_block(
     start_idx: usize,
     end_idx: usize,
     end_end: usize,
+    is_complete: bool,
 ) -> StreamBlock {
     match block_type {
         BlockType::Tool => {
@@ -479,7 +542,7 @@ fn build_stream_block(
                     "{}:{}",
                     tool_name, inner_content
                 ));
-                StreamBlock::tool(tool_name, inner_content.to_string(), hash)
+                StreamBlock::tool(tool_name, inner_content.to_string(), is_complete, hash)
             }
         }
         BlockType::Thought => {
@@ -493,7 +556,13 @@ fn build_stream_block(
                 crate::vcp_modules::chat::pre_renderer::parse_markdown_to_ast(inner_content);
             let hash =
                 HashAggregator::compute_content_hash(&format!("{}:{}", theme, inner_content));
-            StreamBlock::thought(theme, inner_content.to_string(), true, Some(nodes), hash)
+            StreamBlock::thought(
+                theme,
+                inner_content.to_string(),
+                is_complete,
+                Some(nodes),
+                hash,
+            )
         }
         BlockType::Think => {
             let nodes =
@@ -502,7 +571,7 @@ fn build_stream_block(
             StreamBlock::thought(
                 "思考过程".to_string(),
                 inner_content.to_string(),
-                true,
+                is_complete,
                 Some(nodes),
                 hash,
             )
@@ -1357,6 +1426,73 @@ details body remains visible
     }
 
     #[test]
+    fn test_stream_settles_closed_vcp_root_before_daily_note() {
+        let raw = concat!(
+            "<div id=\"vcp-root\"><p data-probe=\"final-body\">visible</p></div>",
+            "<<<[TOOL_REQUEST]>>>\n",
+            "maid:「始」Mama「末」,\n",
+            "tool_name:「始」DailyNote「末」,\n",
+            "command:「始」create「末」,\n",
+            "Date:「始」2026-07-26「末」,\n",
+            "Content:「始ESCAPE」stream diary body「末ESCAPE」,\n",
+            "archery:「始」no_reply「末」\n",
+            "<<<[END_TOOL_REQUEST]>>>"
+        );
+
+        let mut parser = StreamBlockParser::new();
+        let (blocks, tail) = parser.process(raw);
+
+        assert!(
+            tail.is_empty(),
+            "closed protocol blocks must not leak into tail"
+        );
+        assert!(blocks
+            .iter()
+            .any(|block| stream_block_contains_raw_html(block, "data-probe=\"final-body\"")));
+        assert!(blocks.iter().any(|block| matches!(
+            block,
+            StreamBlock::Diary { maid, date, content, .. }
+                if maid == "Mama" && date == "2026-07-26" && content == "stream diary body"
+        )));
+    }
+
+    #[test]
+    fn test_finalize_resynchronizes_unclosed_think_before_tool() {
+        let raw = concat!(
+            "<think>unfinished reasoning\n",
+            "<<<[TOOL_REQUEST]>>>\n",
+            "<tool_name>ComfyUIGen</tool_name>\n",
+            "prompt: image\n",
+            "<<<[END_TOOL_REQUEST]>>>\n",
+            "</think>\n",
+            "<div id=\"vcp-root\"><p data-probe=\"final-body\">visible</p></div>"
+        );
+
+        let mut parser = StreamBlockParser::new();
+        let blocks = parser.finalize(raw);
+
+        assert!(
+            blocks.iter().any(|block| matches!(
+                block,
+                StreamBlock::Thought { content, is_complete: false, .. }
+                    if content.trim() == "unfinished reasoning"
+            )),
+            "unclosed think block should stop at the next protocol event: {blocks:#?}"
+        );
+        assert!(
+            blocks.iter().any(|block| matches!(
+                block,
+                StreamBlock::Tool { tool_name, is_complete: true, .. }
+                    if tool_name == "ComfyUIGen"
+            )),
+            "tool after malformed think must remain independent: {blocks:#?}"
+        );
+        assert!(blocks
+            .iter()
+            .any(|block| stream_block_contains_raw_html(block, "data-probe=\"final-body\"")));
+    }
+
+    #[test]
     fn test_finalize_active_html_container_becomes_executable_preview() {
         let raw = r#"<div id="web-app">
 <canvas id="scene"></canvas>
@@ -1442,7 +1578,9 @@ details body remains visible
     fn every_stream_chunk_boundary_matches_one_shot_render_document() {
         let raw = concat!(
             "前言段落。\n\n",
-            "<div id=\"vcp-root\" style=\"padding:20px\">",
+            "<div id=\"vcp-root\" style=\"background:linear-gradient(180deg,",
+            "#fdf6e9 0%,#fcebd4 40%,#f9e0c0 100%);padding:20px 16px 24px;",
+            "opacity:1\">",
             "<style>@keyframes blurIn { from { opacity:0 } to { opacity:1 } }",
             ".scene { animation:blurIn .4s ease }</style>",
             "<section class=\"scene\" data-probe=\"first\">first</section>",
@@ -1453,6 +1591,12 @@ details body remains visible
 
         let mut one_shot = StreamBlockParser::new();
         let expected = serde_json::to_value(one_shot.finalize(raw)).unwrap();
+        let expected_json = serde_json::to_string(&expected).unwrap();
+        assert!(expected_json.contains("#fdf6e9 0%"), "{expected_json}");
+        assert!(
+            expected_json.contains("padding:20px 16px 24px"),
+            "{expected_json}"
+        );
         let boundaries: Vec<usize> = raw
             .char_indices()
             .map(|(index, _)| index)

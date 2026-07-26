@@ -116,7 +116,8 @@ describe("useRenderVisibility", () => {
 
     const block: ContentBlock = {
       type: "markdown",
-      content: '<section id="latest-reply-probe">Latest reply renders itself</section>',
+      content:
+        '<section id="latest-reply-probe">Latest reply renders itself</section>',
     };
     const app = createApp(
       defineComponent({
@@ -140,11 +141,94 @@ describe("useRenderVisibility", () => {
     expect(root?.style.height).toBe("120px");
     expect(root?.children.length).toBe(0);
 
-    IntersectionObserverStub.instances.forEach((observer) => observer.emit(true));
+    IntersectionObserverStub.instances.forEach((observer) =>
+      observer.emit(true),
+    );
     await flushVue();
     expect(host.querySelector("#latest-reply-probe")?.textContent).toBe(
       "Latest reply renders itself",
     );
+    app.unmount();
+  });
+
+  it("uses markstream for a growing plain markdown tail inside the app host", async () => {
+    await import("markstream-vue");
+    vi.stubGlobal("IntersectionObserver", IntersectionObserverStub);
+    vi.stubGlobal("ResizeObserver", ResizeObserverStub);
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+      callback(0);
+      return 1;
+    });
+    vi.stubGlobal("cancelAnimationFrame", () => {});
+
+    const block = ref<ContentBlock>({
+      type: "markdown",
+      content: "## Streaming title\n\npartial **bold",
+    });
+    const app = createApp(
+      defineComponent({
+        setup() {
+          return () =>
+            h(RenderDocumentBlock, {
+              block: block.value,
+              messageId: "streaming-markdown",
+              sourceId: "stream-tail",
+              streaming: true,
+            });
+        },
+      }),
+    );
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    app.mount(host);
+    await flushVue();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await flushVue();
+
+    expect(host.querySelector("[data-vcp-render-host]")).not.toBeNull();
+    expect(host.querySelector(".markstream-vue")).not.toBeNull();
+    expect(host.textContent).toContain("Streaming title");
+
+    block.value = {
+      type: "markdown",
+      content: "## Streaming title\n\npartial **bold** complete",
+    };
+    await flushVue();
+    expect(host.textContent).toContain("complete");
+    app.unmount();
+  });
+
+  it("keeps streaming rich HTML on the sanitized document renderer", async () => {
+    vi.stubGlobal("IntersectionObserver", IntersectionObserverStub);
+    vi.stubGlobal("ResizeObserver", ResizeObserverStub);
+
+    const app = createApp(
+      defineComponent({
+        setup() {
+          return () =>
+            h(RenderDocumentBlock, {
+              block: {
+                type: "markdown",
+                content:
+                  '<div id="vcp-root"><p data-probe="rich-stream">rich</p></div>',
+              } satisfies ContentBlock,
+              messageId: "streaming-rich-html",
+              sourceId: "stream-tail",
+              streaming: true,
+            });
+        },
+      }),
+    );
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    app.mount(host);
+    await flushVue();
+
+    expect(host.querySelector(".markstream-vue")).toBeNull();
+    expect(host.querySelector('[data-probe="rich-stream"]')?.textContent).toBe(
+      "rich",
+    );
+    expect(host.querySelector("#vcp-root")).toBeNull();
     app.unmount();
   });
 });
