@@ -236,7 +236,7 @@ pub async fn bootstrap(app: &AppHandle) -> Result<(), String> {
             }
 
             // Best-effort refresh from server (does not block startup)
-            match refresh_emoticon_library_internal(&h).await {
+            match refresh_emoticon_library_internal(&h, false).await {
                 Ok(count) => info!(
                     "[Lifecycle] Emoticon library auto-refreshed: {} items",
                     count

@@ -818,7 +818,10 @@ export function useNotificationProcessor() {
               message = prefix ? `${prefix}${prefix.endsWith(':') ? ' ' : ': '}${errorMsg}` : errorMsg;
               isPreformatted = false;
             }
-          } catch (e) { }
+          } catch (e) {
+            // 容错：探测解析，如果不是 JSON 格式则忽略该错误，保留原始前缀格式
+            console.debug('[useNotificationProcessor] Failed to parse error JSON part:', e);
+          }
         }
 
         // 尝试解析内部元数据 (MaidName, timestamp)

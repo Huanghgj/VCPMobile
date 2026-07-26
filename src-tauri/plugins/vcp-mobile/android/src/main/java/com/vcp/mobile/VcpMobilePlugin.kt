@@ -22,6 +22,7 @@ import app.tauri.annotation.TauriPlugin
 import androidx.activity.result.ActivityResult
 import app.tauri.plugin.Plugin
 import android.content.Intent
+import android.content.ComponentName
 import android.util.Log
 import androidx.core.content.FileProvider
 import android.webkit.MimeTypeMap
@@ -53,6 +54,14 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 import com.topjohnwu.superuser.Shell
+import androidx.media3.common.MediaItem
+import androidx.media3.common.MimeTypes
+import androidx.media3.transformer.Transformer
+import androidx.media3.transformer.TransformationRequest
+import androidx.media3.transformer.ExportException
+import androidx.media3.transformer.ExportResult
+import androidx.media3.transformer.EditedMediaItem
+import androidx.media3.transformer.Composition
 
 @TauriPlugin(permissions = [
     Permission(strings = ["android.permission.POST_NOTIFICATIONS"], alias = "notification"),
@@ -64,8 +73,34 @@ import com.topjohnwu.superuser.Shell
 ])
 class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
 
-    init {
-        instanceRef = java.lang.ref.WeakReference(this)
+    private val activityLifecycleCallbacks = object : android.app.Application.ActivityLifecycleCallbacks {
+        override fun onActivityResumed(a: Activity) {
+            if (a === activity) {
+                isAppInForeground = true
+
+                if (com.vcp.mobile.service.ForegroundGuardian.isScreenKeepOnRequired) {
+                    activity.runOnUiThread {
+                        activity.window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    }
+                }
+            }
+        }
+        override fun onActivityPaused(a: Activity) {
+            if (a === activity) {
+                isAppInForeground = false
+
+                if (com.vcp.mobile.service.ForegroundGuardian.isScreenKeepOnRequired) {
+                    activity.runOnUiThread {
+                        activity.window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    }
+                }
+            }
+        }
+        override fun onActivityCreated(a: Activity, savedInstanceState: android.os.Bundle?) {}
+        override fun onActivityStarted(a: Activity) {}
+        override fun onActivityStopped(a: Activity) {}
+        override fun onActivitySaveInstanceState(a: Activity, outState: android.os.Bundle) {}
+        override fun onActivityDestroyed(a: Activity) {}
     }
 
     companion object {
@@ -93,6 +128,40 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
 
     val pluginActivity: Activity get() = activity
     var webViewRef: WebView? = null
+    private var isAppInForeground = true
+    private var pendingNotificationData: JSObject? = null
+
+    private fun handleNotificationIntent(intent: Intent) {
+        val topicId = intent.getStringExtra("topicId")
+        val ownerId = intent.getStringExtra("ownerId")
+        val requestId = intent.getStringExtra("requestId")
+        if (topicId != null && ownerId != null) {
+            Log.i(TAG, "[handleNotificationIntent] Found notification click: topicId=$topicId, ownerId=$ownerId, requestId=$requestId")
+            val data = JSObject().apply {
+                put("topicId", topicId)
+                put("ownerId", ownerId)
+                put("requestId", requestId ?: "")
+            }
+            pendingNotificationData = data
+
+            val webView = webViewRef
+            if (webView != null) {
+                val dataJson = data.toString()
+                val safeJson = escapeJsonForJsString(dataJson)
+                val script = "window.dispatchEvent(new CustomEvent('vcp-notification-click', { detail: JSON.parse(\"$safeJson\") }))"
+                activity.runOnUiThread {
+                    webView.evaluateJavascript(script, null)
+                }
+            } else {
+                Log.w(TAG, "[handleNotificationIntent] WebView not ready, caching notification data")
+            }
+
+            // Consume the intent extras so they don't fire again
+            intent.removeExtra("topicId")
+            intent.removeExtra("ownerId")
+            intent.removeExtra("requestId")
+        }
+    }
     private val keyboardInsetsManager = KeyboardInsetsManager(activity)
     private val lifecycleBridge = LifecycleBridge()
     private val batteryStatusManager = BatteryStatusManager(activity)
@@ -113,6 +182,34 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
     private var networkCallback: android.net.ConnectivityManager.NetworkCallback? = null
     private var lastConnected: Boolean? = null
     private var isNetworkMonitoringStarted = false
+
+    // ==================================================================
+    // SSE Proxy Service Binder & IPC (Messenger)
+    // ==================================================================
+    // ==================================================================
+    // SSE Proxy Service Lifecycle
+    // ==================================================================
+    private fun startHelperServiceInternal() {
+        try {
+            val intent = Intent(activity, com.vcp.mobile.service.SseProxyService::class.java)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                activity.startForegroundService(intent)
+            } else {
+                activity.startService(intent)
+            }
+            Log.i(TAG, "SseProxyService start initiated.")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start SseProxyService: ", e)
+        }
+    }
+
+    init {
+        instanceRef = java.lang.ref.WeakReference(this)
+        activity.application.registerActivityLifecycleCallbacks(activityLifecycleCallbacks)
+        startOomScoreGuard()
+        startHelperServiceInternal()
+    }
+
 
     // ==================================================================
     // Permissions & App Control
@@ -145,7 +242,13 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
         val locationGranted = ContextCompat.checkSelfPermission(activity, android.Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
             ContextCompat.checkSelfPermission(activity, android.Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
 
-        val batteryOptimizationIgnored = pm.isIgnoringBatteryOptimizations(activity.packageName)
+        val am = activity.getSystemService(Context.ACTIVITY_SERVICE) as? android.app.ActivityManager
+        val isRestricted = if (Build.VERSION.SDK_INT >= 28) {
+            am?.isBackgroundRestricted ?: false
+        } else {
+            false
+        }
+        val batteryOptimizationIgnored = pm.isIgnoringBatteryOptimizations(activity.packageName) && !isRestricted
         val overlayGranted = floatingWindowManager.hasOverlayPermission()
 
         val result = JSObject()
@@ -208,6 +311,268 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
         invoke.resolve()
     }
 
+    @Command
+    fun check_notification_listener_permission(invoke: Invoke) {
+        val context = activity.applicationContext
+        val pkgName = context.packageName
+        val flat = Settings.Secure.getString(context.contentResolver, "enabled_notification_listeners")
+        var isEnabled = false
+        if (!flat.isNullOrEmpty()) {
+            val names = flat.split(":")
+            for (name in names) {
+                val cn = ComponentName.unflattenFromString(name)
+                if (cn != null && cn.packageName == pkgName) {
+                    isEnabled = true
+                    break
+                }
+            }
+        }
+        val ret = JSObject()
+        ret.put("enabled", isEnabled)
+        invoke.resolve(ret)
+    }
+
+    @Command
+    fun request_notification_listener_permission(invoke: Invoke) {
+        try {
+            val intent = Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            activity.startActivity(intent)
+            invoke.resolve()
+        } catch (e: Exception) {
+            invoke.reject("Failed to open notification listener settings: ${e.message}")
+        }
+    }
+
+    private fun startOomScoreGuard() {
+        fileIoExecutor.execute {
+            try {
+                // 利用 topjohnwu 的 superuser 库检查 root 状态
+                if (Shell.getShell().isRoot) {
+                    val pid = android.os.Process.myPid()
+                    Log.i(TAG, "OomScoreGuard: Root detected. Locking OOM score adj for PID $pid to -900.")
+                    while (true) {
+                        try {
+                            // 强行把 oom_score_adj 改为 -900
+                            Shell.cmd("echo -900 > /proc/$pid/oom_score_adj").exec()
+                        } catch (e: Exception) {
+                            Log.e(TAG, "OomScoreGuard: Write command failed", e)
+                        }
+                        // 每 20 秒循环锁定一次，应对部分定制系统后台回收机制的复原
+                        Thread.sleep(20000)
+                    }
+                } else {
+                    Log.i(TAG, "OomScoreGuard: Non-root device. Skipping OOM score lock.")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "OomScoreGuard error", e)
+            }
+        }
+    }
+
+    private fun checkAutoStartStatus(): String {
+        val manufacturer = Build.MANUFACTURER.lowercase(Locale.ROOT)
+        if (manufacturer.contains("xiaomi") || manufacturer.contains("redmi") ||
+            manufacturer.contains("vivo") || manufacturer.contains("meizu")) {
+            val ops = activity.getSystemService(Context.APP_OPS_SERVICE) as? android.app.AppOpsManager
+            if (ops != null) {
+                try {
+                    val method = ops.javaClass.getMethod(
+                        "checkOpNoThrow",
+                        Int::class.javaPrimitiveType,
+                        Int::class.javaPrimitiveType,
+                        String::class.java
+                    )
+                    // 10008 is OP_AUTO_START in MIUI / HyperOS / Flyme / OriginOS
+                    val mode = method.invoke(
+                        ops,
+                        10008,
+                        activity.applicationInfo.uid,
+                        activity.packageName
+                    ) as Int
+                    return if (mode == android.app.AppOpsManager.MODE_ALLOWED) "true" else "false"
+                } catch (e: Exception) {
+                    Log.e(TAG, "checkAutoStartStatus: reflection failed", e)
+                }
+            }
+        }
+        return "unsupported"
+    }
+
+    @Command
+    fun checkAutoStartPermission(invoke: Invoke) {
+        val status = checkAutoStartStatus()
+        val result = JSObject()
+        result.put("status", status)
+        invoke.resolve(result)
+    }
+
+    @Command
+    fun requestAutoStartPermission(invoke: Invoke) {
+        val manufacturer = Build.MANUFACTURER.lowercase(Locale.ROOT)
+        var success = false
+        val intents = mutableListOf<Intent>()
+
+        if (manufacturer.contains("xiaomi") || manufacturer.contains("redmi")) {
+            // 小米 / HyperOS
+            intents.add(Intent().setComponent(ComponentName("com.miui.securitycenter", "com.miui.permcenter.autostart.AutoStartManagementActivity")))
+        } else if (manufacturer.contains("huawei") || manufacturer.contains("honor")) {
+            // 华为 / 荣耀
+            intents.add(Intent().setComponent(ComponentName("com.huawei.systemmanager", "com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity")))
+            intents.add(Intent().setComponent(ComponentName("com.huawei.systemmanager", "com.huawei.systemmanager.optimize.bootstart.BootStartActivity")))
+        } else if (manufacturer.contains("oppo") || manufacturer.contains("oneplus") || manufacturer.contains("realme")) {
+            // OPPO / 一加 / 真我
+            // 针对自启动跳错，我们优先拉起系统应用管理主页，或直接拉起应用详情页，保障在 OPPO/ColorOS 上的准确性
+            intents.add(Intent(Settings.ACTION_MANAGE_APPLICATIONS_SETTINGS))
+        } else if (manufacturer.contains("vivo")) {
+            // VIVO
+            intents.add(Intent().setComponent(ComponentName("com.iqoo.secure", "com.iqoo.secure.ui.phoneoptimize.BgStartUpManager")))
+            intents.add(Intent().setComponent(ComponentName("com.vivo.permissionmanager", "com.vivo.permissionmanager.activity.BgStartUpManagerActivity")))
+            intents.add(Intent().setComponent(ComponentName("com.iqoo.secure", "com.iqoo.secure.MainActivity")))
+        } else if (manufacturer.contains("meizu")) {
+            // 魅族
+            intents.add(Intent().setComponent(ComponentName("com.meizu.safe", "com.meizu.safe.permission.SmartBGActivity")))
+            intents.add(Intent().setComponent(ComponentName("com.meizu.safe", "com.meizu.safe.MainActivity")))
+        }
+
+        // 尝试打开厂商特定的 Activity
+        for (intent in intents) {
+            try {
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                activity.startActivity(intent)
+                success = true
+                break
+            } catch (e: Exception) {
+                // Try next
+            }
+        }
+
+        // 兜底退避
+        if (!success) {
+            try {
+                val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                    data = Uri.parse("package:${activity.packageName}")
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                activity.startActivity(intent)
+                success = true
+            } catch (e: Exception) {
+                try {
+                    val intent = Intent(Settings.ACTION_SETTINGS).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    activity.startActivity(intent)
+                    success = true
+                } catch (e2: Exception) {}
+            }
+        }
+
+        val result = JSObject()
+        result.put("success", success)
+        invoke.resolve(result)
+    }
+
+    @Command
+    fun requestPowerManagementPermission(invoke: Invoke) {
+        val manufacturer = Build.MANUFACTURER.lowercase(Locale.ROOT)
+        var success = false
+        val intents = mutableListOf<Intent>()
+
+        if (manufacturer.contains("xiaomi") || manufacturer.contains("redmi")) {
+            // 小米省电策略
+            try {
+                val miuiIntent = Intent("miui.intent.action.OP_POWER_PRIORITY_SETTINGS").apply {
+                    putExtra("package_name", activity.packageName)
+                    putExtra("package_label", activity.applicationInfo.loadLabel(activity.packageManager).toString())
+                }
+                intents.add(miuiIntent)
+            } catch (e: Exception) {}
+            intents.add(Intent().setComponent(ComponentName("com.miui.powerkeeper", "com.miui.powerkeeper.ui.HiddenAppsConfigActivity")).apply {
+                putExtra("package_name", activity.packageName)
+                putExtra("package_label", activity.applicationInfo.loadLabel(activity.packageManager).toString())
+            })
+            intents.add(Intent().setComponent(ComponentName("com.miui.securitycenter", "com.miui.powercenter.PowerSettings")))
+        } else if (manufacturer.contains("oppo") || manufacturer.contains("oneplus") || manufacturer.contains("realme")) {
+            // OPPO 省电与后台完全行为
+            intents.add(Intent().setComponent(ComponentName("com.coloros.oppoguardelf", "com.coloros.powermanager.fuelgaurd.PowerUsageModelActivity")))
+            intents.add(Intent().setComponent(ComponentName("com.coloros.oppoguardelf", "com.coloros.powermanager.fuelgaurd.PowerSavedModeActivity")))
+            try {
+                intents.add(Intent(Intent.ACTION_POWER_USAGE_SUMMARY))
+            } catch (e: Exception) {}
+        } else if (manufacturer.contains("huawei") || manufacturer.contains("honor")) {
+            // 华为
+            intents.add(Intent().setComponent(ComponentName("com.huawei.systemmanager", "com.huawei.systemmanager.power.ui.PowerConsumptionActivity")))
+            intents.add(Intent().setComponent(ComponentName("com.huawei.systemmanager", "com.huawei.systemmanager.optimize.process.ProtectActivity")))
+        } else if (manufacturer.contains("vivo")) {
+            // VIVO
+            intents.add(Intent().setComponent(ComponentName("com.iqoo.secure", "com.iqoo.secure.ui.poweroptimize.PowerOptimizeActivity")))
+        }
+
+        // 尝试打开特定的电池设置页面
+        for (intent in intents) {
+            try {
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                activity.startActivity(intent)
+                success = true
+                break
+            } catch (e: Exception) {
+                // Try next
+            }
+        }
+
+        // 兜底退避
+        if (!success) {
+            try {
+                val intent = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                activity.startActivity(intent)
+                success = true
+            } catch (e: Exception) {
+                try {
+                    val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                        data = Uri.parse("package:${activity.packageName}")
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    activity.startActivity(intent)
+                    success = true
+                } catch (e2: Exception) {}
+            }
+        }
+
+        val result = JSObject()
+        result.put("success", success)
+        invoke.resolve(result)
+    }
+
+    @Command
+    fun getFreeDiskSpace(invoke: Invoke) {
+        try {
+            val path = Environment.getDataDirectory()
+            val stat = android.os.StatFs(path.path)
+            val blockSize = stat.blockSizeLong
+            val availableBlocks = stat.availableBlocksLong
+            val totalBlocks = stat.blockCountLong
+
+            val freeBytes = availableBlocks * blockSize
+            val totalBytes = totalBlocks * blockSize
+
+            val freeGB = freeBytes.toDouble() / (1024.0 * 1024.0 * 1024.0)
+            val totalGB = totalBytes.toDouble() / (1024.0 * 1024.0 * 1024.0)
+
+            val result = JSObject()
+            result.put("freeBytes", freeBytes.toDouble())
+            result.put("freeGb", freeGB)
+            result.put("totalBytes", totalBytes.toDouble())
+            result.put("totalGb", totalGB)
+            invoke.resolve(result)
+        } catch (e: Exception) {
+            Log.e(TAG, "getFreeDiskSpace failed", e)
+            invoke.reject(e.message ?: "Failed to get free disk space")
+        }
+    }
+
     // ==================================================================
     // Permission Result Callbacks
     // ==================================================================
@@ -250,7 +615,13 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
         val locationGranted = ContextCompat.checkSelfPermission(activity, android.Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
             ContextCompat.checkSelfPermission(activity, android.Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
 
-        val batteryOptimizationIgnored = pm.isIgnoringBatteryOptimizations(activity.packageName)
+        val am = activity.getSystemService(Context.ACTIVITY_SERVICE) as? android.app.ActivityManager
+        val isRestricted = if (Build.VERSION.SDK_INT >= 28) {
+            am?.isBackgroundRestricted ?: false
+        } else {
+            false
+        }
+        val batteryOptimizationIgnored = pm.isIgnoringBatteryOptimizations(activity.packageName) && !isRestricted
         val overlayGranted = floatingWindowManager.hasOverlayPermission()
 
         val json = """{"notification":$notificationGranted,"storage":$storageGranted,"microphone":$microphoneGranted,"camera":$cameraGranted,"battery":$batteryOptimizationIgnored,"overlay":$overlayGranted,"location":$locationGranted}"""
@@ -427,6 +798,82 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     @Command
+    fun writeClipboard(invoke: Invoke) {
+        try {
+            val args = invoke.parseArgs(WriteClipboardArgs::class.java)
+            activity.runOnUiThread {
+                try {
+                    val clipboard = activity.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                    val clip = android.content.ClipData.newPlainText("VCP Distributed Copy", args.content)
+                    clipboard.setPrimaryClip(clip)
+                    invoke.resolve()
+                } catch (e: Exception) {
+                    invoke.reject(e.message ?: "Failed to write clipboard on UI thread")
+                }
+            }
+        } catch (e: Exception) {
+            invoke.reject(e.message ?: "Failed to parse arguments")
+        }
+    }
+
+    @Command
+    fun readClipboard(invoke: Invoke) {
+        try {
+            activity.runOnUiThread {
+                try {
+                    val clipboard = activity.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                    val clipData = clipboard.primaryClip
+                    val content = if (clipData != null && clipData.itemCount > 0) {
+                        clipData.getItemAt(0).text?.toString() ?: ""
+                    } else {
+                        ""
+                    }
+                    val result = JSObject().apply {
+                        put("content", content)
+                    }
+                    invoke.resolve(result)
+                } catch (e: Exception) {
+                    invoke.reject(e.message ?: "Failed to read clipboard on UI thread")
+                }
+            }
+        } catch (e: Exception) {
+            invoke.reject(e.message ?: "Failed to execute readClipboard")
+        }
+    }
+
+    @Command
+    fun sendLocalNotification(invoke: Invoke) {
+        try {
+            val args = invoke.parseArgs(SendLocalNotificationArgs::class.java)
+            val context = activity.applicationContext
+            val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+
+            val channelId = "vcp_distributed_alert"
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                val channel = android.app.NotificationChannel(
+                    channelId,
+                    "VCP 分布式节点提醒",
+                    android.app.NotificationManager.IMPORTANCE_HIGH
+                )
+                notificationManager.createNotificationChannel(channel)
+            }
+
+            val notification = androidx.core.app.NotificationCompat.Builder(context, channelId)
+                .setContentTitle(args.title)
+                .setContentText(args.body)
+                .setSmallIcon(context.applicationInfo.icon)
+                .setPriority(androidx.core.app.NotificationCompat.PRIORITY_HIGH)
+                .setAutoCancel(true)
+                .build()
+
+            notificationManager.notify((System.currentTimeMillis() % 100000).toInt(), notification)
+            invoke.resolve()
+        } catch (e: Exception) {
+            invoke.reject(e.message ?: "Failed to send notification")
+        }
+    }
+
+    @Command
     fun runRootCommand(invoke: Invoke) {
         try {
             val args = invoke.parseArgs(RunRootCommandArgs::class.java)
@@ -520,8 +967,42 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     // ==================================================================
-    // Stream Service
+    // Foreground Guardian & Stream Service
     // ==================================================================
+    @Command
+    fun acquireForeground(invoke: Invoke) {
+        try {
+            val args = invoke.parseArgs(AcquireForegroundArgs::class.java)
+            com.vcp.mobile.service.ForegroundGuardian.acquire(activity, args.tag, args.priority, args.label, args.screenKeepOn)
+            if (args.screenKeepOn) {
+                activity.runOnUiThread {
+                    activity.window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                }
+            }
+            invoke.resolve()
+        } catch (e: Exception) {
+            Log.e(TAG, "acquireForeground failed", e)
+            invoke.reject(e.message ?: "Unknown error")
+        }
+    }
+
+    @Command
+    fun releaseForeground(invoke: Invoke) {
+        try {
+            val args = invoke.parseArgs(ReleaseForegroundArgs::class.java)
+            com.vcp.mobile.service.ForegroundGuardian.release(activity, args.tag)
+            if (!com.vcp.mobile.service.ForegroundGuardian.isScreenKeepOnRequired) {
+                activity.runOnUiThread {
+                    activity.window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                }
+            }
+            invoke.resolve()
+        } catch (e: Exception) {
+            Log.e(TAG, "releaseForeground failed", e)
+            invoke.reject(e.message ?: "Unknown error")
+        }
+    }
+
     @Command
     fun startStreamingService(invoke: Invoke) {
         try {
@@ -555,9 +1036,36 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
                     invoke.resolve()
                     return
                 }
+                invoke.resolve()
+                return
             }
 
-            startServiceCompatible(intent)
+            if (args.agentName.contains("[数据同步]")) {
+                com.vcp.mobile.service.ForegroundGuardian.acquire(
+                    activity, "sync",
+                    com.vcp.mobile.service.ForegroundGuardian.PRIORITY_SYNC,
+                    args.agentName, true
+                )
+                activity.runOnUiThread {
+                    activity.window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                }
+            } else if (args.agentName.contains("[预渲染重建]")) {
+                com.vcp.mobile.service.ForegroundGuardian.acquire(
+                    activity, "prerender",
+                    com.vcp.mobile.service.ForegroundGuardian.PRIORITY_PRERENDER,
+                    args.agentName, true
+                )
+                activity.runOnUiThread {
+                    activity.window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                }
+            } else {
+                com.vcp.mobile.service.ForegroundGuardian.acquire(
+                    activity, "stream:${args.agentName}",
+                    com.vcp.mobile.service.ForegroundGuardian.PRIORITY_STREAM,
+                    args.agentName, false
+                )
+            }
+
             invoke.resolve()
         } catch (e: Exception) {
             Log.e(TAG, "startStreamingService failed", e)
@@ -582,8 +1090,10 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
     @Command
     fun stopStreamingService(invoke: Invoke) {
         try {
-            val intent = StreamKeepaliveService.createIntent(activity, "")
-            activity.stopService(intent)
+            com.vcp.mobile.service.ForegroundGuardian.releaseAllLocks()
+            activity.runOnUiThread {
+                activity.window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            }
             invoke.resolve()
         } catch (e: Exception) {
             Log.e(TAG, "stopStreamingService failed", e)
@@ -814,15 +1324,18 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
         webViewRef = webView
 
         keyboardInsetsManager.attach(webView)
-        lifecycleBridge.attach(activity, webView)
+        lifecycleBridge.attach(activity, this)
 
         // 冷启动：处理传递给 Activity 的初始 intent
         shareIntentHandler.handleShareIntent(activity.intent)
         shareIntentHandler.injectShareData(webView)
+        handleNotificationIntent(activity.intent)
     }
 
     override fun onDestroy(activity: AppCompatActivity) {
+        activity.application.unregisterActivityLifecycleCallbacks(activityLifecycleCallbacks)
         webViewRef = null
+        lifecycleBridge.detach()
         try {
             if (networkCallback != null) {
                 val cm = activity.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
@@ -870,6 +1383,7 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         shareIntentHandler.handleShareIntent(intent)
+        handleNotificationIntent(intent)
     }
 
     // ==================================================================
@@ -1080,7 +1594,7 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
                 }
 
                 // 2. 获取 MIME 类型
-                val mimeType = contentResolver.getType(uri) ?: "application/octet-stream"
+                var mimeType = contentResolver.getType(uri) ?: "application/octet-stream"
                 Log.i(TAG, "[onPickFileResult] Processing picked file: $originalName (size=$size, mime=$mimeType)")
 
                 // 3. 发送预准备事件给前端，让前端立即创建进度卡片
@@ -1096,7 +1610,7 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
 
                 // 4. 流式安全拷贝至 cacheDir 并同步计算 SHA-256 (64KB buffer)
                 val uploadsDir = java.io.File(context.cacheDir, "uploads").apply { mkdirs() }
-                val tempFile = java.io.File(uploadsDir, "pick_${System.currentTimeMillis()}_temp")
+                var tempFile = java.io.File(uploadsDir, "pick_${System.currentTimeMillis()}_temp")
                 currentTempFile = tempFile
                 val digest = java.security.MessageDigest.getInstance("SHA-256")
 
@@ -1139,12 +1653,99 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
                 }
 
                 val hashBytes = digest.digest()
-                val hash = hashBytes.joinToString("") { "%02x".format(it) }
+                var hash = hashBytes.joinToString("") { "%02x".format(it) }
 
                 // 内容寻址哈希命名重命名去重
-                val fileExtension = java.io.File(originalName).extension.let {
+                val ext = originalName.substringAfterLast(".").lowercase()
+                val sdkInt = Build.VERSION.SDK_INT
+                val isUnsupportedVideo = ext in listOf("mkv", "avi", "flv", "wmv", "ts")
+                val isUnsupportedAudio = ext in listOf("wma", "aiff")
+                val isUnsupportedHeic = (ext == "heic" || ext == "heif") && sdkInt < 28
+                val isUnsupportedAvif = ext == "avif" && sdkInt < 31
+                val isUnsupportedOpus = ext == "opus" && sdkInt < 29
+                val needTranscode = isUnsupportedVideo || isUnsupportedAudio ||
+                    isUnsupportedHeic || isUnsupportedAvif || isUnsupportedOpus
+
+                var fileExtension = java.io.File(originalName).extension.let {
                     if (it.isEmpty()) "" else ".$it"
                 }
+
+                if (needTranscode) {
+                    Log.i(TAG, "[onPickFileResult] File need transcode: $originalName (ext=$ext, sdk=$sdkInt)")
+                    val isAudioOnly = isUnsupportedAudio || isUnsupportedOpus || (ext == "ogg" && sdkInt < 29)
+                    val isImageOnly = isUnsupportedHeic || isUnsupportedAvif
+                    val outputSuffix = if (isAudioOnly) "m4a" else if (isImageOnly) "jpg" else "mp4"
+                    val transcodedFile = java.io.File(uploadsDir, "transcoded_${System.currentTimeMillis()}.$outputSuffix")
+                    currentTempFile = transcodedFile
+
+                    val latch = CountDownLatch(1)
+                    var transcodeError: Throwable? = null
+
+                    activity.runOnUiThread {
+                        try {
+                            val request = TransformationRequest.Builder()
+                                .setVideoMimeType(if (!isAudioOnly && !isImageOnly) MimeTypes.VIDEO_H264 else null)
+                                .setAudioMimeType(MimeTypes.AUDIO_AAC)
+                                .build()
+
+                            @Suppress("DEPRECATION")
+                            val transformer = Transformer.Builder(context)
+                                .setTransformationRequest(request)
+                                .addListener(object : Transformer.Listener {
+                                    override fun onCompleted(composition: Composition, result: ExportResult) {
+                                        latch.countDown()
+                                    }
+
+                                    override fun onError(composition: Composition, result: ExportResult, exception: ExportException) {
+                                        transcodeError = exception
+                                        latch.countDown()
+                                    }
+                                })
+                                .build()
+
+                            val mediaItem = MediaItem.fromUri(Uri.fromFile(tempFile))
+                            val editedMediaItem = EditedMediaItem.Builder(mediaItem)
+                                .setRemoveAudio(false)
+                                .build()
+
+                            transformer.start(editedMediaItem, transcodedFile.absolutePath)
+                        } catch (e: Throwable) {
+                            transcodeError = e
+                            latch.countDown()
+                        }
+                    }
+
+                    if (!latch.await(300, java.util.concurrent.TimeUnit.SECONDS)) {
+                        transcodeError = java.util.concurrent.TimeoutException("Transcoding timed out after 5 minutes")
+                    }
+
+                    if (transcodeError != null) {
+                        try { transcodedFile.delete() } catch (_: Exception) {}
+                        throw transcodeError!!
+                    }
+
+                    // 转码成功，物理删除原格式的临时文件以释放空间
+                    try { tempFile.delete() } catch (_: Exception) {}
+
+                    // 重新计算转码后文件的 CAS SHA-256 哈希
+                    val newDigest = java.security.MessageDigest.getInstance("SHA-256")
+                    java.io.FileInputStream(transcodedFile).use { fis ->
+                        val buf = ByteArray(65536)
+                        var n: Int
+                        while (fis.read(buf).also { n = it } != -1) {
+                            newDigest.update(buf, 0, n)
+                        }
+                    }
+                    val newHashBytes = newDigest.digest()
+                    hash = newHashBytes.joinToString("") { "%02x".format(it) }
+
+                    // 更新下游变量
+                    fileExtension = ".$outputSuffix"
+                    mimeType = if (isAudioOnly) "audio/mp4" else if (isImageOnly) "image/jpeg" else "video/mp4"
+                    originalName = originalName.substringBeforeLast(".") + "." + outputSuffix
+                    tempFile = transcodedFile
+                }
+
                 val finalTempFile = java.io.File(uploadsDir, "$hash$fileExtension")
 
                 if (finalTempFile.exists()) {
@@ -1997,6 +2598,28 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
             invoke.reject(e.message ?: "Unknown error")
         }
     }
+
+    @Command
+    fun startHelperService(invoke: Invoke) {
+        try {
+            startHelperServiceInternal()
+            invoke.resolve()
+        } catch (e: Exception) {
+            Log.e(TAG, "startHelperService failed", e)
+            invoke.reject(e.message ?: "Unknown error")
+        }
+    }
+
+    @Command
+    fun getPendingNotification(invoke: Invoke) {
+        val data = pendingNotificationData
+        if (data != null) {
+            pendingNotificationData = null
+            invoke.resolve(data)
+        } else {
+            invoke.resolve(JSObject())
+        }
+    }
 }
 
 @InvokeArg
@@ -2098,4 +2721,28 @@ class ClassifyAffectArgs {
     // First use may need to copy and verify the 38 MB model on slower devices.
     // Warm inference remains much faster, while this still provides a hard cap.
     var timeoutMs: Int = 2500
+}
+
+@InvokeArg
+class AcquireForegroundArgs {
+    lateinit var tag: String
+    var priority: Int = 0
+    lateinit var label: String
+    var screenKeepOn: Boolean = false
+}
+
+@InvokeArg
+class ReleaseForegroundArgs {
+    lateinit var tag: String
+}
+
+@InvokeArg
+class WriteClipboardArgs {
+    lateinit var content: String
+}
+
+@InvokeArg
+class SendLocalNotificationArgs {
+    lateinit var title: String
+    lateinit var body: String
 }

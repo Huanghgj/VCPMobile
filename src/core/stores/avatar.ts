@@ -32,50 +32,50 @@ const extractDominantColorFromBlob = (blobUrl: string): Promise<string> => {
           resolve("#808080");
           return;
         }
-        
+
         ctx.drawImage(img, 0, 0, 16, 16);
         const imgData = ctx.getImageData(0, 0, 16, 16).data;
-        
+
         const colorBuckets = new Map<string, { r: number, g: number, b: number, count: number }>();
         let rSum = 0, gSum = 0, bSum = 0, count = 0;
-        
+
         for (let i = 0; i < imgData.length; i += 4) {
           const r = imgData[i];
           const g = imgData[i + 1];
           const b = imgData[i + 2];
           const a = imgData[i + 3];
-          
+
           if (a < 128) continue; // 忽略透明像素
-          
+
           // 计算亮度与色度以进行过滤
           const max = Math.max(r, g, b);
           const min = Math.min(r, g, b);
           const chroma = max - min;
-          
+
           // 排除纯黑、纯白以及低饱和度的灰色
           if (max < 30 || min > 225 || chroma < 25) {
             continue;
           }
-          
+
           // 512-bin 相似色归纳量化
           const rBin = Math.floor(r / 32);
           const gBin = Math.floor(g / 32);
           const bBin = Math.floor(b / 32);
           const binKey = `${rBin},${gBin},${bBin}`;
-          
+
           const bucket = colorBuckets.get(binKey) || { r: 0, g: 0, b: 0, count: 0 };
           bucket.r += r;
           bucket.g += g;
           bucket.b += b;
           bucket.count++;
           colorBuckets.set(binKey, bucket);
-          
+
           rSum += r;
           gSum += g;
           bSum += b;
           count++;
         }
-        
+
         let bestBucket = null;
         let maxCount = 0;
         for (const bucket of colorBuckets.values()) {
@@ -84,7 +84,7 @@ const extractDominantColorFromBlob = (blobUrl: string): Promise<string> => {
             bestBucket = bucket;
           }
         }
-        
+
         if (bestBucket) {
           const r = Math.round(bestBucket.r / bestBucket.count);
           const g = Math.round(bestBucket.g / bestBucket.count);
@@ -113,7 +113,7 @@ const extractDominantColorFromBlob = (blobUrl: string): Promise<string> => {
 export const useAvatarStore = defineStore("avatar", () => {
   // 使用 reactive 包装 Map，配合同步访问
   const cache = reactive(new Map<string, AvatarCache>());
-  
+
   // 用于追踪正在进行的请求，防止并发重复请求同一个 ID
   const pending = new Map<string, Promise<string>>();
   // 用于追踪正在进行的 dominant_color 计算，防止重复触发
@@ -126,8 +126,8 @@ export const useAvatarStore = defineStore("avatar", () => {
    * 获取头像 URL (带自动缓存和版本检查)
    */
   const getAvatarUrl = async (
-    ownerType: string, 
-    ownerId: string, 
+    ownerType: string,
+    ownerId: string,
     version: number = 0
   ): Promise<string> => {
     const key = `${ownerType}:${ownerId}`;
@@ -161,7 +161,7 @@ export const useAvatarStore = defineStore("avatar", () => {
           if (result.dominant_color === null) {
             if (!inFlightCompute.has(key)) {
               inFlightCompute.add(key);
-              
+
               const bytes = new Uint8Array(result.image_data);
               const blob = new Blob([bytes], { type: result.mime_type });
               const tempBlobUrl = URL.createObjectURL(blob);
@@ -204,9 +204,9 @@ export const useAvatarStore = defineStore("avatar", () => {
               cache.delete(firstKey);
             }
           }
-          cache.set(key, { 
-            blobUrl, 
-            version: Math.max(result.updated_at, version) 
+          cache.set(key, {
+            blobUrl,
+            version: Math.max(result.updated_at, version)
           });
           preloadImage(blobUrl).catch(() => {});
           return blobUrl;
@@ -236,9 +236,6 @@ export const useAvatarStore = defineStore("avatar", () => {
     dominantColors.delete(key);
   };
 
-  /**
-   * 同步获取已缓存的 dominant_color，未缓存时返回 undefined
-   */
   const getDominantColor = (ownerType: string, ownerId: string): string | undefined => {
     return dominantColors.get(`${ownerType}:${ownerId}`);
   };

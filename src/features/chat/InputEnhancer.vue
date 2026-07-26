@@ -17,7 +17,6 @@ const tarvenStore = useTarvenStore();
 
 const openTarvenSelector = () => {
   if (props.disabled) return;
-  if (navigator.vibrate) navigator.vibrate(50);
   tarvenStore.isSelectorOpen = true;
 };
 
@@ -119,7 +118,6 @@ const handleSTTTouchStart = async (e: TouchEvent) => {
     await startListening((_text) => {
       // 实时流式回调更新 transcriptionResult
     });
-    if (navigator.vibrate) navigator.vibrate(50);
   } catch (err: any) {
     isSTTActive.value = false;
     notificationStore.addNotification({
@@ -139,7 +137,6 @@ const handleSTTTouchMove = (e: TouchEvent) => {
   if (diffY < -60) {
     if (!isSwipeCancel.value) {
       isSwipeCancel.value = true;
-      if (navigator.vibrate) navigator.vibrate(30);
     }
   } else {
     isSwipeCancel.value = false;
@@ -214,7 +211,6 @@ const handleIconTouchStart = (e: TouchEvent) => {
     isLongPressRecording.value = true;
     try {
       await startRecording();
-      if (navigator.vibrate) navigator.vibrate(50);
     } catch (err: any) {
       isLongPressRecording.value = false;
       isIconLongPress = false;
@@ -230,7 +226,6 @@ const handleIconTouchMove = (e: TouchEvent) => {
   if (diffY < -60) {
     if (!isSwipeCancel.value) {
       isSwipeCancel.value = true;
-      if (navigator.vibrate) navigator.vibrate(30);
     }
   } else {
     isSwipeCancel.value = false;

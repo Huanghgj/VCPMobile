@@ -2,8 +2,8 @@
 id: PLUGIN-KEYBOARD-004
 title: 键盘 Insets 管理
 description: 通过 WindowInsetsCompat 监听键盘状态并实时推送到前端
-version: 1.0.3
-date: 2026-06-05
+version: 1.1.3
+date: 2026-07-04
 related_files:
   - src-tauri/plugins/vcp-mobile/android/src/main/java/com/vcp/mobile/KeyboardInsetsManager.kt
 ---
@@ -14,14 +14,14 @@ related_files:
 
 监听 Android 系统软键盘的弹出与收起事件，将键盘高度、可见性状态及安全区域底部距离通过 `evaluateJavascript` 实时注入前端，使 Vue 层能够动态调整输入框和消息列表的布局，避免键盘遮挡内容。
 
-> **设计决策**：使用 `evaluateJavascript` + `CustomEvent` 而非 Tauri 官方事件通道（`Plugin.trigger()`），因为前端使用 `window.addEventListener` 监听，与 `vcp-lifecycle` 事件保持一致的接收范式。参见 `docs/ANDROID_PLUGIN_MANAGEMENT.md` §4.1。
+> **设计决策**：使用 `evaluateJavascript` + `CustomEvent` 而非 Tauri 官方事件通道（`Plugin.trigger()`），因为前端使用 `window.addEventListener` 监听，与 `vcp-hardware-back`、`vcp-exit-requested` 等窗口级事件保持一致的接收范式。v1.1.3 起生命周期事件已迁移至 Tauri Event `vcp-lifecycle-changed`。参见 `docs/ANDROID_PLUGIN_MANAGEMENT.md` §4.1。
 
 ---
 
 ## 2. 代码结构
 
 ```
-src-tauri/plugins/vcp-mobile/android/.../KeyboardInsetsManager.kt (92 lines)
+src-tauri/plugins/vcp-mobile/android/.../KeyboardInsetsManager.kt (94 lines)
 ├── KeyboardInsetsManager(activity: Activity)
 │   ├── attach(webView: WebView)
 │   ├── queryCurrentState(): KeyboardState
@@ -183,3 +183,7 @@ override fun load(webView: WebView) {
 2. **不干预 WebView 布局**：`KeyboardInsetsManager` 仅负责**信息推送**，不通过 `setPadding` 修改 WebView 布局。前端通过 CSS `env(safe-area-inset-bottom)` 和动态计算完全接管布局调整。
 
 3. **`safeAreaBottom` 的用途**：部分设备使用手势导航栏（无实体按钮），`safeAreaBottom` 帮助前端区分"键盘高度"和"导航栏高度"，避免双重 padding。
+
+---
+
+*最后更新：2026-07-04 | VCP Mobile v1.1.3*

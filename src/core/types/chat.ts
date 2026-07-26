@@ -186,6 +186,7 @@ export interface AuroraUpdate {
   tailChanged?: boolean;
   contentDelta?: string;
   content?: string;
+  chunk?: string;
 }
 
 /**

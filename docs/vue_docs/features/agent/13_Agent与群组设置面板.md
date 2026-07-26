@@ -2,8 +2,8 @@
 id: VUE-AGEN-013
 title: Agent与群组设置面板
 description: VCP Mobile 前端 AgentSettingsView 与 GroupSettingsView 的表单设计、头像裁剪与配置持久化
-version: 1.0.3
-date: 2026-06-05
+version: 1.1.3
+date: 2026-07-04
 ---
 
 # 13. Agent与群组设置面板
@@ -23,15 +23,15 @@ date: 2026-06-05
 
 | 文件 | 行数 | 职责 |
 |------|------|------|
-| `AgentSettingsView.vue` | 400 | Agent 个人设置面板：基本信息、模型参数、提示词 |
-| `GroupSettingsView.vue` | 445 | 群组设置面板：成员管理、发言策略、统一模型、提示词 |
+| `AgentSettingsView.vue` | 398 | Agent 个人设置面板：基本信息、模型参数、提示词 |
+| `GroupSettingsView.vue` | 440 | 群组设置面板：成员管理、发言策略、统一模型、提示词 |
 | `AgentsCreator.vue` | 107 | Agent / Group 创建触发器，创建成功后自动打开对应设置面板 |
-| `assistant.ts` | 261 | Pinia Store：封装 IPC 调用，提供 `saveAgent` / `saveGroup` / `saveAvatar` 等 Action |
-| `avatar.ts` | 250 | 头像缓存、Blob URL 管理、Canvas 主色调提取 |
-| `chatSessionStore.ts` | 103 | 会话切换，删除 Agent/Group 时清空当前选中项 |
+| `assistant.ts` | 327 | Pinia Store：封装 IPC 调用，提供 `saveAgent` / `saveGroup` / `saveAvatar` 等 Action |
+| `avatar.ts` | 288 | 头像缓存、Blob URL 管理、Canvas 主色调提取 |
+| `chatSessionStore.ts` | 188 | 会话切换，删除 Agent/Group 时清空当前选中项 |
 | `AvatarCropper.vue` | 144 | `vue-cropper` 封装：圆形裁剪、旋转、缩放、确认输出 Blob |
-| `ModelSelector.vue` | 420 | BottomSheet 风格模型选择器：搜索、Tag 过滤、虚拟滚动 |
-| `VcpAvatar.vue` | 111 | 头像展示组件：缓存优先加载、Fallback 首字母、主色调边框 |
+| `ModelSelector.vue` | 525 | BottomSheet 风格模型选择器：搜索、Tag 过滤、延迟测试 |
+| `VcpAvatar.vue` | 128 | 头像展示组件：缓存优先加载、Fallback 首字母、主色调边框 |
 
 ### 1.3 在整体架构中的位置
 
@@ -150,8 +150,7 @@ interface AgentConfig {
   name: string;
   avatar?: string;
   avatarCalculatedColor?: string;
-  systemPrompt: string;
-  mobileSystemPrompt?: string;
+  mobileSystemPrompt?: string;  // 本机专用提示词，留空则回退到后端 `systemPrompt`
   model: string;
   temperature: number;
   contextTokenLimit: number;
@@ -223,7 +222,7 @@ interface AgentConfig {
 ```
 
 数据流：
-1. 打开面板时调用 `invoke("get_agents")` 拉取全部 Agent 列表（`allAgents`）
+1. 打开面板时读取 `assistantStore.agents` 填充全部 Agent 列表（`allAgents`）
 2. 勾选 Agent 时将其 ID 加入 `groupConfig.members`，并自动以 Agent 名称初始化 `memberTags[agentId]`
 3. 取消勾选时从 `members` 和 `memberTags` 中移除
 4. `memberTags` 的值将作为该 Agent 在群组中的**触发标签**（如 `@Planner`），供 `naturerandom` 模式匹配
@@ -354,68 +353,55 @@ const extractDominantColorFromBlob = (blobUrl: string): Promise<string> => {
 
 ---
 
-## 5. 配置保存策略
+## 5. 配置保存策略（关闭时保存）
 
-### 5.1 全量保存（save_agent_config / save_group_config）
+### 5.1 关闭时保存（saveOnClose）— v1.1.2 重构，v1.1.3 沿用
 
-虽然 Rust 侧提供了 `update_agent_config`（JSON Patch 风格合并），但**前端设置面板统一使用全量保存**，以简化逻辑：
+v1.1.2 将保存策略从**深度 Watch + 防抖自动保存**改为**关闭时保存（Save-on-Close）**。核心变化：
+
+- **移除**：`watch(deep)` + `setTimeout(debounce)` 自动保存机制
+- **新增**：`saveOnClose()` 函数 — 面板关闭时（`isOpen` 变为 `false` 或 `onBeforeUnmount`）触发一次性保存
 
 ```ts
-// assistant.ts
-const saveAgent = async (agent: AgentConfig) => {
-  await invoke("save_agent_config", { agent });
-  await fetchAgents();  // 刷新列表，确保侧边栏同步
+// AgentSettingsView.vue / GroupSettingsView.vue — v1.1.2
+const saveOnClose = async (): Promise<boolean> => {
+    // 1. 深比较：当前配置与原始快照是否一致
+    if (JSON.stringify(currentConfig.value) === JSON.stringify(originalConfig.value)) {
+        return true; // 无变更，直接跳过
+    }
+    // 2. 更新快照（在等待保存前，防止重入）
+    originalConfig.value = JSON.parse(JSON.stringify(currentConfig.value));
+    // 3. 执行保存
+    try {
+        await saveConfig(currentConfig.value);
+        return true;
+    } catch (error) {
+        // 4. 失败：回滚快照 + Toast 通知
+        originalConfig.value = previousSnapshot;
+        notificationStore.addNotification({
+            title: '保存失败', message: String(error),
+            type: 'error', toastOnly: true, duration: 3000,
+        });
+        return false;
+    }
 };
+
+watch(() => props.isOpen, (newVal) => { if (!newVal) saveOnClose(); });
+onBeforeUnmount(() => saveOnClose());
 ```
 
-全量保存的优劣：
-- **优点**：前端无需维护字段级 diff 逻辑；Rust 侧通过事务化写入保证原子性
-- **缺点**：每次保存传输完整配置对象；但在移动端 WiFi/USB 调试环境下，对象体积（<1KB）可忽略
+### 5.2 设计理由
 
-### 5.2 防抖与自动保存
+| 维度 | 旧版（Watch+Debounce） | 新版（Save-on-Close） |
+|------|----------------------|---------------------|
+| IPC 频率 | 每次按键可能触发（O(n)） | 每次打开-关闭周期仅 1 次（O(1)） |
+| 输入流畅度 | 深度比较降低编辑器响应 | 无后台比较负担 |
+| 失败反馈 | `console.error` + 隐式重试 | 显式 Toast + 快照回滚 |
+| 数据安全性 | 依赖 Watch 在组件存活期间持续重试 | `onBeforeUnmount` 兜底 + 失败可重试 |
 
-两个视图均实现了**深度 Watch + 防抖**的自动保存机制：
+### 5.3 保存失败的回滚策略
 
-```ts
-// AgentSettingsView.vue (防抖 800ms)
-watch(agentConfig, () => {
-  if (!originalConfig.value) return;
-  if (JSON.stringify(agentConfig.value) === JSON.stringify(originalConfig.value)) return;
-  if (saveTimeout) clearTimeout(saveTimeout);
-  saveTimeout = setTimeout(() => autoSave(), 800);
-}, { deep: true });
-
-// GroupSettingsView.vue (防抖 1000ms)
-watch(groupConfig, () => {
-  if (!originalConfig.value) return;
-  if (JSON.stringify(groupConfig.value) === JSON.stringify(originalConfig.value)) return;
-  if (saveTimeout) clearTimeout(saveTimeout);
-  saveTimeout = setTimeout(() => autoSave(), 1000);
-}, { deep: true });
-```
-
-**为什么 GroupSettingsView 使用更长的 1000ms？**
-- 群组配置包含成员列表的频繁勾选操作（checkbox toggle），稍长的防抖可降低连续勾选时的后端调用频率。
-
-### 5.3 保存状态反馈
-
-Header 右上角提供实时保存状态指示：
-
-```vue
-<div :class="{ 'opacity-100': isSaving || saveSuccess, 'opacity-0': !isSaving && !saveSuccess }">
-  <span v-if="isSaving" class="text-blue-400 animate-pulse">保存中...</span>
-  <span v-else-if="saveSuccess" class="text-green-500">已自动保存 ✅</span>
-</div>
-```
-
-- `saveSuccess` 持续 2 秒后自动淡出（通过 `saveSuccessTimer` 控制）
-- 无保存操作时完全隐藏，避免界面常驻噪音
-
-### 5.4 保存失败的回滚策略
-
-当前实现**不自动回滚**：若 `autoSave()` 抛出异常，仅通过 `console.error` 输出并触发 `assistant.ts` 中的 Toast 错误通知。用户输入保留在本地 `agentConfig` / `groupConfig` 中，下次 Watch 触发时会再次尝试保存。
-
-> 注意：由于 `originalConfig` 仅在保存**成功**后才更新，保存失败时下一次 Watch 仍会检测到差异并重新触发保存，形成隐式的重试机制。
+失败时回滚 `originalConfig` 快照，使下次关闭仍检测到差异并重试。同时通过 `notificationStore.addNotification({ toastOnly: true })` 向用户展示错误 Toast。详见 [17_通知中心与Toast联动](17_通知中心与Toast联动.md)。
 
 ---
 
@@ -503,7 +489,7 @@ originalConfig.value = JSON.parse(JSON.stringify(config))
 VcpAvatar 自动加载头像（cache hit 时同步显示）
 ```
 
-### 7.2 修改配置后的保存时序
+### 7.2 修改配置后的保存时序（Save-on-Close）
 
 ```
 用户修改 input (如 name)
@@ -512,20 +498,25 @@ VcpAvatar 自动加载头像（cache hit 时同步显示）
 v-model ──→ agentConfig.name 变更
     │
     ▼
-deep watch 触发
+用户继续编辑，期间不触发保存
+    │
+    ▼
+用户点击返回 / overlayStore.closeAgentSettings()
+    │
+    ▼
+props.isOpen 变为 false
+    │
+    ▼
+watch(isOpen) 触发 saveOnClose()
     │
     ▼
 JSON.stringify 比对 originalConfig → 发现差异
     │
     ▼
-clearTimeout(saveTimeout)
-setTimeout(autoSave, 800)
+isSaving = true
     │
     ▼
-(800ms 内无新输入)
-    │
-    ▼
-autoSave() ──→ isSaving = true
+originalConfig 先同步更新为当前值（防重入）
     │
     ▼
 assistantStore.saveAgent(agentConfig.value)
@@ -540,9 +531,10 @@ Rust: 按 Agent ID 取锁 → BEGIN TRANSACTION → UPSERT → COMMIT
 返回成功
     │
     ▼
-saveSuccess = true; originalConfig = 最新快照
-fetchAgents() ──→ 刷新侧边栏列表
-Toast 通知: "Agent 配置保存成功"
+saveSuccess = true（2s 后熄灭）
+    │
+    ▼
+若保存失败 → originalConfig 回滚为 previousSnapshot，Toast 提示用户
 ```
 
 ### 7.3 头像上传的时序
@@ -707,4 +699,4 @@ if (!groupConfig.value.memberTags[agentId]) {
 | **JSON Patch 风格** | `update_agent_config` 的更新方式：读取 → 合并 → 写入 | `agent_service.rs:193` |
 
 ---
-*最后更新：2026-06-05 | VCP Mobile v1.0.3*
+*最后更新：2026-07-04 | VCP Mobile v1.1.3*

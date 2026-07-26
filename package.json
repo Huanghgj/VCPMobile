@@ -45,7 +45,9 @@
     "vue-router": "^5.0.6"
   },
   "devDependencies": {
+    "@iconify-json/heroicons": "^1.2.3",
     "@iconify-json/ph": "^1.2.2",
+    "@pinia/testing": "^1.0.3",
     "@tauri-apps/cli": "2.11.2",
     "@types/css-tree": "^2.3.11",
     "@types/katex": "^0.16.8",
@@ -60,6 +62,8 @@
     "@unocss/transformer-variant-group": "^66.6.8",
     "@unocss/vite": "^66.6.8",
     "@vitejs/plugin-vue": "^5.2.4",
+    "@vitest/coverage-v8": "^4.1.9",
+    "@vue/test-utils": "^2.4.11",
     "eslint": "^10.2.1",
     "eslint-config-prettier": "^10.1.8",
     "eslint-plugin-prettier": "^5.5.5",

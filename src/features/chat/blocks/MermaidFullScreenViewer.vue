@@ -313,7 +313,6 @@ const exportToGallery = () => {
         console.error("Canvas serialization failed:", err);
       }
     }
-    URL.revokeObjectURL(url);
   };
 
   img.onerror = (e) => {

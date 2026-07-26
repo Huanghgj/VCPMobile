@@ -14,7 +14,9 @@ use vcp_modules::agent_service::{
     create_agent, delete_agent, get_agents, get_assistants_snapshot, read_agent_config,
     save_agent_config, update_agent_config,
 };
-use vcp_modules::avatar_service::{get_avatar, save_avatar_data, store_dominant_color};
+use vcp_modules::avatar_service::{
+    batch_get_avatars, get_avatar, save_avatar_data, store_dominant_color,
+};
 use vcp_modules::chat_manager::{
     append_single_message, append_stream_skeleton_message, delete_messages, load_chat_history,
     load_chat_history_streamed, patch_single_message, truncate_history_after_timestamp,
@@ -62,7 +64,7 @@ use vcp_modules::message_repository::{process_message_content, rebuild_all_pre_r
 use vcp_modules::message_service::{fetch_raw_message_content, re_render_message};
 use vcp_modules::model_manager::{
     get_cached_models, get_favorite_models, get_hot_models, record_model_usage, refresh_models,
-    toggle_favorite_model,
+    start_batch_model_test, stop_all_model_tests, test_model_connectivity, toggle_favorite_model,
 };
 use vcp_modules::settings_manager::{read_settings, set_theme, update_settings, write_settings};
 
@@ -283,6 +285,7 @@ pub fn run() {
             update_agent_config,
             save_avatar_data,
             get_avatar,
+            batch_get_avatars,
             store_dominant_color,
             read_settings,
             write_settings,
@@ -313,6 +316,9 @@ pub fn run() {
             get_favorite_models,
             toggle_favorite_model,
             record_model_usage,
+            test_model_connectivity,
+            start_batch_model_test,
+            stop_all_model_tests,
             summarize_topic,
             init_vcp_log_connection,
             send_vcp_log_message,

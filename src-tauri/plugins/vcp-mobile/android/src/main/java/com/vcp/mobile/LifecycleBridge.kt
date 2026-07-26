@@ -5,6 +5,7 @@ import android.content.res.Configuration
 import android.webkit.WebView
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
+import app.tauri.plugin.JSObject
 import java.lang.ref.WeakReference
 
 /**
@@ -15,87 +16,80 @@ import java.lang.ref.WeakReference
  */
 class LifecycleBridge : DefaultLifecycleObserver {
 
-    private var webViewRef: WebView? = null
     private var activityRef: WeakReference<Activity>? = null
+    private var pluginRef: WeakReference<VcpMobilePlugin>? = null
 
-    fun attach(activity: Activity, webView: WebView) {
-        webViewRef = webView
+    fun attach(activity: Activity, plugin: VcpMobilePlugin) {
         activityRef = WeakReference(activity)
-        if (activity is LifecycleOwner) {
-            activity.lifecycle.addObserver(this)
+        pluginRef = WeakReference(plugin)
+        // 升级为进程级生命周期监听，完美防抖，免疫 Activity 重建与切换
+        activity.runOnUiThread {
+            androidx.lifecycle.ProcessLifecycleOwner.get().lifecycle.addObserver(this)
         }
     }
 
-    override fun onDestroy(owner: LifecycleOwner) {
-        webViewRef = null
+    fun detach() {
+        val activity = activityRef?.get()
+        if (activity != null) {
+            activity.runOnUiThread {
+                try {
+                    androidx.lifecycle.ProcessLifecycleOwner.get().lifecycle.removeObserver(this)
+                } catch (_: Exception) {}
+            }
+        } else {
+            try {
+                androidx.lifecycle.ProcessLifecycleOwner.get().lifecycle.removeObserver(this)
+            } catch (_: Exception) {}
+        }
         activityRef = null
-        owner.lifecycle.removeObserver(this)
+        pluginRef = null
+    }
+
+    override fun onDestroy(owner: LifecycleOwner) {
+        detach()
         super.onDestroy(owner)
     }
 
     override fun onResume(owner: LifecycleOwner) {
-        emit("vcp-lifecycle", mapOf("state" to "resume"))
+        emit(mapOf("state" to "resume"))
     }
 
     override fun onPause(owner: LifecycleOwner) {
-        emit("vcp-lifecycle", mapOf("state" to "pause"))
+        emit(mapOf("state" to "pause"))
     }
 
     override fun onStop(owner: LifecycleOwner) {
-        emit("vcp-lifecycle", mapOf("state" to "stop"))
+        emit(mapOf("state" to "stop"))
     }
 
     fun onConfigurationChanged(newConfig: Configuration) {
         val uiMode = newConfig.uiMode and Configuration.UI_MODE_NIGHT_MASK
         val isDark = uiMode == Configuration.UI_MODE_NIGHT_YES
-        emit("vcp-lifecycle", mapOf(
+        emit(mapOf(
             "state" to "config-changed",
             "isDarkMode" to isDark
         ))
     }
 
     fun onLowMemory() {
-        emit("vcp-lifecycle", mapOf("state" to "low-memory"))
+        emit(mapOf("state" to "low-memory"))
     }
 
-    private fun emit(eventName: String, detail: Map<String, Any?>) {
-        val json = serializeValue(detail)
-        val script = "window.dispatchEvent(new CustomEvent('$eventName', { detail: $json }))"
-        val activity = activityRef?.get()
-        if (activity != null) {
-            activity.runOnUiThread {
-                webViewRef?.evaluateJavascript(script, null)
-            }
-        } else {
-            webViewRef?.post {
-                webViewRef?.evaluateJavascript(script, null)
-            }
-        }
-    }
-
-    private fun serializeValue(value: Any?): String {
-        return when (value) {
-            null -> "null"
-            is String -> "\"${escapeJson(value)}\""
-            is Boolean -> value.toString()
-            is Number -> value.toString()
-            is Map<*, *> -> {
-                val entries = value.entries.joinToString(", ") { (k, v) ->
-                    "\"$k\": ${serializeValue(v)}"
+    private fun emit(detail: Map<String, Any?>) {
+        // 向 Rust 侧派发强类型的原生生命周期事件，规避 WebView 被冻结时 JS 无法执行的痛点
+        val plugin = pluginRef?.get()
+        if (plugin != null) {
+            val triggerData = JSObject()
+            for ((key, value) in detail) {
+                when (value) {
+                    is String -> triggerData.put(key, value)
+                    is Boolean -> triggerData.put(key, value)
+                    is Int -> triggerData.put(key, value)
+                    is Double -> triggerData.put(key, value)
+                    is Long -> triggerData.put(key, value)
                 }
-                "{ $entries }"
             }
-            else -> "\"${escapeJson(value.toString())}\""
+            plugin.trigger("lifecycle", triggerData)
         }
-    }
-
-    private fun escapeJson(s: String): String {
-        return s
-            .replace("\\", "\\\\")
-            .replace("\"", "\\\"")
-            .replace("\b", "\\b")
-            .replace("\n", "\\n")
-            .replace("\r", "\\r")
-            .replace("\t", "\\t")
     }
 }
