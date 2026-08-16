@@ -30,6 +30,13 @@ lazy_static! {
     static ref HTML_CONTAINER_CLOSE_BEFORE_FENCE_RE: Regex =
         Regex::new(r"(?im)</(?P<tag>div|section|article|header|footer|main|aside|figure|figcaption)>[ \t]*(?:\r?\n[ \t]*)?(?P<fence>```[a-zA-Z0-9-]*[ \t]*\r?$)").unwrap();
 
+    static ref PARAGRAPH_OPEN_RE: Regex =
+        Regex::new(r"(?im)^[ \t]*<p\b[^>]*>").unwrap();
+
+    static ref PARAGRAPH_FLOW_BREAK_RE: Regex = Regex::new(
+        r"(?im)(?:\r?\n[ \t]*\r?\n|^[ \t]*<(?:address|article|aside|blockquote|details|dialog|div|dl|fieldset|figcaption|figure|footer|form|h[1-6]|header|hgroup|hr|main|menu|nav|ol|p|pre|section|summary|table|ul)\b|^[ \t]{0,3}(?:#{1,6}[ \t]+|(?:[-+*]|\d+[.)])[ \t]+|>[ \t]?|```|~~~))"
+    ).unwrap();
+
     // 仅在 字母/数字 + ** + 标点 的模式下注入零宽空格，修复 CommonMark left-flanking 判定失效。
     // 前驱限定为 [\p{L}\p{N}] 确保不会误触发闭合符号（闭合 ** 前驱通常是标点或 \u{200B}）。
     static ref FLANKING_FIX_LEFT: Regex =
@@ -64,15 +71,70 @@ fn normalize_container_breaking_code_fences(text: &str) -> Cow<'_, str> {
         return Cow::Borrowed(text);
     }
 
-    HTML_CONTAINER_CLOSE_BEFORE_FENCE_RE.replace_all(text, "</${tag}>\n${fence}")
+    // CommonMark HTML blocks end at a blank line, not merely at a tag boundary.
+    HTML_CONTAINER_CLOSE_BEFORE_FENCE_RE.replace_all(text, "</${tag}>\n\n${fence}")
 }
 
-pub(crate) fn strip_stuck_container_close_before_fence(text: &str) -> Cow<'_, str> {
+pub(crate) fn strip_stuck_container_close_before_fence<'a>(
+    text: &'a str,
+    container_tag: &str,
+) -> Cow<'a, str> {
     if !text.contains("```") || !text.contains("</") {
         return Cow::Borrowed(text);
     }
 
-    HTML_CONTAINER_CLOSE_BEFORE_FENCE_RE.replace_all(text, "${fence}")
+    let fence_ranges = collect_code_fence_ranges(text);
+    let comment_ranges: Vec<std::ops::Range<usize>> = COMMENT_RE
+        .find_iter(text)
+        .map(|m| m.start()..m.end())
+        .collect();
+    let mut nested_depth = 0usize;
+    let mut removals = Vec::new();
+
+    for cap in TAG_SCANNER.captures_iter(text) {
+        let full_match = cap.get(0).unwrap();
+        let start = full_match.start();
+        if fence_ranges.iter().any(|range| range.contains(&start))
+            || comment_ranges.iter().any(|range| range.contains(&start))
+        {
+            continue;
+        }
+
+        let tag_name = cap.get(2).unwrap().as_str();
+        if !tag_name.eq_ignore_ascii_case(container_tag) {
+            continue;
+        }
+
+        let tag_text = full_match.as_str();
+        let is_close = cap.get(1).unwrap().as_str() == "</";
+        let is_self_closing = tag_text.trim_end().ends_with("/>");
+        if is_self_closing || is_void_html_tag(tag_name) {
+            continue;
+        }
+
+        if is_close {
+            if nested_depth == 0 && stuck_code_fence_after_close(text, full_match.end()).is_some() {
+                removals.push(full_match.start()..full_match.end());
+            } else {
+                nested_depth = nested_depth.saturating_sub(1);
+            }
+        } else {
+            nested_depth += 1;
+        }
+    }
+
+    if removals.is_empty() {
+        return Cow::Borrowed(text);
+    }
+
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for range in removals {
+        output.push_str(&text[cursor..range.start]);
+        cursor = range.end;
+    }
+    output.push_str(&text[cursor..]);
+    Cow::Owned(output)
 }
 
 /// 剥除块级 $$ 公式行的多余前导缩进，防止 pulldown-cmark 将其误判为缩进代码块。
@@ -231,7 +293,7 @@ fn extract_html_containers(text: &str) -> (Cow<'_, str>, Vec<(String, Vec<Markdo
 
             // 递归解析内部内容
             let deindented_inner = trim_common_leading_indent(&inner_text);
-            let markdown_inner = strip_stuck_container_close_before_fence(&deindented_inner);
+            let markdown_inner = strip_stuck_container_close_before_fence(&deindented_inner, &tag);
             let inner_nodes = parse_markdown_to_ast(markdown_inner.as_ref());
             containers.push((open_tag, inner_nodes, close_tag));
 
@@ -247,6 +309,75 @@ fn extract_html_containers(text: &str) -> (Cow<'_, str>, Vec<(String, Vec<Markdo
 
     result.push_str(&text[last_pos..]);
     (Cow::Owned(result), containers)
+}
+
+/// Promote an invalid paragraph wrapper to a flow container before Markdown
+/// parsing. Generated responses sometimes use a styled `<p>` around multiple
+/// paragraphs or block elements. CommonMark then emits nested `<p>` elements,
+/// and the HTML5 parser closes the styled wrapper before its content.
+fn promote_multiblock_paragraph_wrappers(text: &str) -> Cow<'_, str> {
+    if !text.contains("<p") && !text.contains("<P") {
+        return Cow::Borrowed(text);
+    }
+
+    let fence_ranges = collect_code_fence_ranges(text);
+    let inline_code_ranges: Vec<std::ops::Range<usize>> = INLINE_CODE_RE
+        .find_iter(text)
+        .map(|m| m.start()..m.end())
+        .collect();
+    let comment_ranges: Vec<std::ops::Range<usize>> = COMMENT_RE
+        .find_iter(text)
+        .map(|m| m.start()..m.end())
+        .collect();
+
+    let mut result = String::with_capacity(text.len());
+    let mut last_pos = 0;
+    let mut changed = false;
+
+    for opening in PARAGRAPH_OPEN_RE.find_iter(text) {
+        if opening.start() < last_pos
+            || fence_ranges
+                .iter()
+                .any(|range| range.contains(&opening.start()))
+            || inline_code_ranges
+                .iter()
+                .any(|range| range.contains(&opening.start()))
+            || comment_ranges
+                .iter()
+                .any(|range| range.contains(&opening.start()))
+        {
+            continue;
+        }
+
+        let Some((close_start, close_end)) = find_matching_close_tag(text, opening.end(), "p")
+        else {
+            continue;
+        };
+        let inner = &text[opening.end()..close_start];
+        if !PARAGRAPH_FLOW_BREAK_RE.is_match(inner) {
+            continue;
+        }
+
+        result.push_str(&text[last_pos..opening.start()]);
+        let open_tag = opening.as_str();
+        let tag_offset = open_tag
+            .find('<')
+            .expect("paragraph opening match always contains '<'");
+        result.push_str(&open_tag[..tag_offset + 1]);
+        result.push_str("div");
+        result.push_str(&open_tag[tag_offset + 2..]);
+        result.push_str(inner);
+        result.push_str("</div>");
+        last_pos = close_end;
+        changed = true;
+    }
+
+    if !changed {
+        return Cow::Borrowed(text);
+    }
+
+    result.push_str(&text[last_pos..]);
+    Cow::Owned(result)
 }
 
 /// 去除文本中所有非空行的公共前导缩进（空格/制表符）。
@@ -562,6 +693,7 @@ fn parse_markdown_to_ast_impl(text: &str, is_streaming: bool) -> Vec<MarkdownNod
     let text_fixed = fix_flanking_delimiters(text.as_ref());
     let text = preprocess_latex_math(&text_fixed);
     let text = strip_display_math_indent(text.as_ref());
+    let text = promote_multiblock_paragraph_wrappers(text.as_ref());
     let (text, containers) = extract_html_containers(text.as_ref());
 
     let mut nodes = Vec::new();
@@ -1112,6 +1244,21 @@ fn process_text_magic(text: &str) -> Vec<InlineNode> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn strips_only_the_container_close_that_would_escape_before_a_fence() {
+        let escaped = "</div>```text\nvalue\n```";
+        assert_eq!(
+            strip_stuck_container_close_before_fence(escaped, "div"),
+            "```text\nvalue\n```"
+        );
+
+        let nested = "<div data-probe=\"body\"><div>value</div></div>```text\nvalue\n```";
+        assert_eq!(
+            strip_stuck_container_close_before_fence(nested, "div"),
+            nested
+        );
+    }
+
     fn contains_yaml_code_block(nodes: &[MarkdownNode]) -> bool {
         nodes.iter().any(|node| match node {
             MarkdownNode::CodeBlock { lang, code, .. } => {
@@ -1283,5 +1430,55 @@ copy_button: should_not_send
             serialized.contains(inline_style),
             "inline CSS changed while serializing markdown AST: {serialized}"
         );
+    }
+
+    #[test]
+    fn promotes_styled_paragraph_wrapping_multiple_markdown_paragraphs() {
+        let input = r#"<div id="vcp-root" style="color:#e6ddd4">
+<p style="margin-top:20px; padding:16px; border-left:2px solid #5a4a6a;">
+
+First paragraph.
+
+Second paragraph.
+
+</p>
+</div>"#;
+
+        let nodes = parse_markdown_to_ast(input);
+        let serialized = serde_json::to_string(&nodes).expect("serialize markdown AST");
+
+        assert!(
+            contains_raw_html(
+                &nodes,
+                "<div style=\"margin-top:20px; padding:16px; border-left:2px solid #5a4a6a;\">"
+            ),
+            "expected the invalid paragraph wrapper to become a div: {nodes:#?}"
+        );
+        assert!(
+            contains_raw_html(&nodes, "</div>"),
+            "expected the promoted wrapper to retain a closing tag: {nodes:#?}"
+        );
+        assert!(serialized.contains("First paragraph."));
+        assert!(serialized.contains("Second paragraph."));
+        assert!(!serialized.contains("<p style="));
+    }
+
+    #[test]
+    fn keeps_short_html_paragraphs_and_code_examples_unchanged() {
+        let input = r#"<p style="color:red">Short inline paragraph.</p>
+
+`<p style="color:blue">inline code</p>`
+
+```html
+<p style="color:green">
+
+code block paragraph
+
+</p>
+```"#;
+
+        let promoted = promote_multiblock_paragraph_wrappers(input);
+
+        assert_eq!(promoted.as_ref(), input);
     }
 }

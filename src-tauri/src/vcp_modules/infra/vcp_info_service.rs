@@ -78,6 +78,9 @@ pub async fn set_vcp_info_heartbeat(interval_ms: u64) {
 }
 
 fn emit_info_status<R: tauri::Runtime>(app: &AppHandle<R>, status: &str, message: &str) {
+    if !crate::vcp_modules::infra::lifecycle_manager::is_app_in_foreground(app) {
+        return;
+    }
     let payload = serde_json::json!({
         "type": "vcp-info-status",
         "status": status,
@@ -89,6 +92,9 @@ fn emit_info_status<R: tauri::Runtime>(app: &AppHandle<R>, status: &str, message
 }
 
 fn emit_info_payload_to_notification<R: tauri::Runtime>(app: &AppHandle<R>, payload: Value) {
+    if !crate::vcp_modules::infra::lifecycle_manager::is_app_in_foreground(app) {
+        return;
+    }
     let _ = app.emit(
         "vcp-system-event",
         serde_json::json!({
@@ -160,14 +166,20 @@ pub async fn init_vcp_info_connection_internal<R: tauri::Runtime>(
     key: String,
 ) -> Result<(), String> {
     if url.trim().is_empty() || key.trim().is_empty() {
-        let _ = WS_INFO_URL_CHANNEL.0.send(None);
+        WS_INFO_URL_CHANNEL
+            .0
+            .send(None)
+            .map_err(|_| "VCPInfo control channel is unavailable".to_string())?;
         return Ok(());
     }
 
     let ws_url = parse_info_url(&url, &key)?;
 
     // 存入 watch channel 供监听器线程消费
-    let _ = WS_INFO_URL_CHANNEL.0.send(Some(ws_url));
+    WS_INFO_URL_CHANNEL
+        .0
+        .send(Some(ws_url))
+        .map_err(|_| "VCPInfo control channel is unavailable".to_string())?;
 
     if INFO_CONNECTION_ACTIVE.swap(true, Ordering::SeqCst) {
         return Ok(());
@@ -415,14 +427,16 @@ async fn process_incoming_vcp_info<R: tauri::Runtime>(
                     }
                 }
 
-                // 5. 发送前端广播事件
-                let _ = app_handle.emit(
-                    "vcp-info-event",
-                    serde_json::json!({
-                        "type": "vcp-info-message",
-                        "data": metadata
-                    }),
-                );
+                // 后台期间仅保留 Rust 内存索引，避免向冻结的 WebView 堆积事件。
+                if crate::vcp_modules::infra::lifecycle_manager::is_app_in_foreground(app_handle) {
+                    let _ = app_handle.emit(
+                        "vcp-info-event",
+                        serde_json::json!({
+                            "type": "vcp-info-message",
+                            "data": metadata
+                        }),
+                    );
+                }
             }
             Err(e) => {
                 log::error!("[VCPInfo] Zstd compression failed: {}", e);

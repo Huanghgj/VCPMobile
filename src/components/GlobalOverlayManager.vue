@@ -17,10 +17,22 @@ const handlePromptConfirm = (val: string) => {
 };
 
 const handleEditorSave = async (newContent: string) => {
-  if (overlayStore.editorConfig?.onSave) {
-    await overlayStore.editorConfig.onSave(newContent);
+  try {
+    if (overlayStore.editorConfig?.onSave) {
+      await overlayStore.editorConfig.onSave(newContent);
+    }
+    overlayStore.closeEditor();
+  } catch (error) {
+    console.error("[GlobalOverlayManager] Editor save failed:", error);
   }
-  overlayStore.closeEditor();
+};
+
+const handleConfirm = () => {
+  overlayStore.confirmConfig?.onConfirm();
+};
+
+const handleConfirmCancel = () => {
+  overlayStore.confirmConfig?.onCancel();
 };
 </script>
 
@@ -36,8 +48,7 @@ const handleEditorSave = async (newContent: string) => {
     <VcpConfirm v-if="overlayStore.confirmConfig" :is-open="!!overlayStore.confirmConfig"
       :title="overlayStore.confirmConfig.title" :message="overlayStore.confirmConfig.message"
       :is-danger="overlayStore.confirmConfig.isDanger" :only-confirm="overlayStore.confirmConfig.onlyConfirm"
-      @confirm="overlayStore.confirmConfig.onConfirm()" @cancel="overlayStore.confirmConfig.onCancel()"
-      @update:isOpen="!$event && overlayStore.confirmConfig.onCancel()" />
+      @confirm="handleConfirm" @cancel="handleConfirmCancel" />
 
     <!-- 全局 Context Menu -->
     <ContextMenuSheet v-if="overlayStore.contextMenuConfig" :is-open="!!overlayStore.contextMenuConfig"

@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-set-keepalive-mode"
+description = "Enables the set_keepalive_mode command without any pre-configured scope."
+commands.allow = ["set_keepalive_mode"]
+
+[[permission]]
+identifier = "deny-set-keepalive-mode"
+description = "Denies the set_keepalive_mode command without any pre-configured scope."
+commands.deny = ["set_keepalive_mode"]

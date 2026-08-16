@@ -2,7 +2,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 use tauri::{ipc::Channel, AppHandle, Manager};
 use tokio::io::AsyncWriteExt;
@@ -13,6 +13,10 @@ const FRONTEND_DIST_SUFFIX: &str = ".zip";
 const GITHUB_API_LATEST_URL: &str = "https://api.github.com/repos/MRiecy/VCPMobile/releases/latest";
 const GITHUB_API_LIST_URL: &str =
     "https://api.github.com/repos/MRiecy/VCPMobile/releases?per_page=1";
+const MAX_FRONTEND_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_FRONTEND_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_FRONTEND_EXTRACTED_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_FRONTEND_ENTRIES: usize = 10_000;
 
 /// 前端更新包元信息
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -192,19 +196,32 @@ fn verify_unzipped_files(update_dir: &Path) -> Result<(), String> {
             .as_str()
             .ok_or_else(|| format!("manifest 中 {} 的 hash 不是字符串", relative_path))?;
 
-        let file_path = update_dir.join(relative_path.trim_start_matches('/'));
+        let relative_path = Path::new(relative_path);
+        if relative_path.is_absolute()
+            || relative_path.components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+        {
+            return Err("manifest.json 包含非法文件路径".to_string());
+        }
+        let file_path = update_dir.join(relative_path);
         if !file_path.exists() {
-            return Err(format!("校验失败: 缺少文件 {}", relative_path));
+            return Err(format!("校验失败: 缺少文件 {}", relative_path.display()));
         }
 
         let content = std::fs::read(&file_path)
-            .map_err(|e| format!("读取文件 {} 失败: {}", relative_path, e))?;
+            .map_err(|e| format!("读取文件 {} 失败: {}", relative_path.display(), e))?;
         let actual_hash = format!("{:x}", sha2::Sha256::digest(&content));
 
         if actual_hash != expected_hash {
             return Err(format!(
                 "校验失败: {} hash 不匹配 (期望: {}, 实际: {})",
-                relative_path, expected_hash, actual_hash
+                relative_path.display(),
+                expected_hash,
+                actual_hash
             ));
         }
     }
@@ -221,8 +238,8 @@ fn cleanup_old_versions(updates_dir: &Path, keep: usize) -> Result<(), String> {
             let path = entry.path();
             if path.is_dir() {
                 let name = path.file_name()?.to_string_lossy().to_string();
-                // 简单过滤：排除特殊文件，保留看起来像版本号的目录
-                if name != "active_version" && name != "boot_manifest.json" {
+                // 只处理真正的 semver 目录，避免把 staging 或其他维护目录算作版本。
+                if semver::Version::parse(&name).is_ok() {
                     Some((name, path))
                 } else {
                     None
@@ -303,9 +320,8 @@ pub(crate) async fn download_frontend_update_inner(
         .map_err(|e| format!("获取缓存目录失败: {}", e))?;
 
     let download_dir = cache_dir.join("frontend_update_downloads");
-    if !download_dir.exists() {
-        let _ = std::fs::create_dir_all(&download_dir);
-    }
+    std::fs::create_dir_all(&download_dir)
+        .map_err(|e| format!("创建前端更新下载目录失败: {}", e))?;
 
     let file_name = download_url
         .path_segments()
@@ -336,6 +352,9 @@ pub(crate) async fn download_frontend_update_inner(
     }
 
     let total = res.content_length();
+    if total.is_some_and(|size| size > MAX_FRONTEND_ARCHIVE_BYTES) {
+        return Err("前端更新包超过 128MB 安全限制".to_string());
+    }
     let mut downloaded: u64 = 0;
     let mut stream = res.bytes_stream();
     let mut file = tokio::fs::File::create(&zip_path)
@@ -344,10 +363,24 @@ pub(crate) async fn download_frontend_update_inner(
 
     use futures_util::StreamExt;
     while let Some(chunk_result) = stream.next().await {
-        let chunk = chunk_result.map_err(|e| format!("下载流错误: {}", e))?;
-        file.write_all(&chunk)
-            .await
-            .map_err(|e| format!("写入文件失败: {}", e))?;
+        let chunk = match chunk_result {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                drop(file);
+                let _ = tokio::fs::remove_file(&zip_path).await;
+                return Err(format!("下载流错误: {}", error));
+            }
+        };
+        if downloaded.saturating_add(chunk.len() as u64) > MAX_FRONTEND_ARCHIVE_BYTES {
+            drop(file);
+            let _ = tokio::fs::remove_file(&zip_path).await;
+            return Err("前端更新包超过 128MB 安全限制".to_string());
+        }
+        if let Err(error) = file.write_all(&chunk).await {
+            drop(file);
+            let _ = tokio::fs::remove_file(&zip_path).await;
+            return Err(format!("写入文件失败: {}", error));
+        }
         downloaded += chunk.len() as u64;
         if let Some(ref ch) = on_progress {
             let _ = ch.send(DownloadProgress { downloaded, total });
@@ -416,52 +449,107 @@ pub async fn apply_frontend_update(
     let version = version_from_zip;
 
     let version_dir = updates_dir.join(&version);
-    if version_dir.exists() {
-        let _ = std::fs::remove_dir_all(&version_dir);
-    }
-    std::fs::create_dir_all(&version_dir).map_err(|e| e.to_string())?;
+    let staging_dir = updates_dir.join(format!(".staging-{}-{}", version, uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&staging_dir).map_err(|e| e.to_string())?;
 
-    // 解压 zip
-    let file =
-        std::fs::File::open(&canonical_zip_path).map_err(|e| format!("打开 zip 失败: {}", e))?;
-    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("读取 zip 失败: {}", e))?;
+    let extract_result: Result<(), String> = async {
+        // 解压 zip
+        let file = std::fs::File::open(&canonical_zip_path)
+            .map_err(|e| format!("打开 zip 失败: {}", e))?;
+        let mut archive =
+            zip::ZipArchive::new(file).map_err(|e| format!("读取 zip 失败: {}", e))?;
+        if archive.len() > MAX_FRONTEND_ENTRIES {
+            return Err(format!(
+                "前端更新包条目过多（最多 {} 个）",
+                MAX_FRONTEND_ENTRIES
+            ));
+        }
 
-    let mut yield_ctrl = crate::vcp_modules::infra::utils::YieldCounter::new(100);
+        let mut yield_ctrl = crate::vcp_modules::infra::utils::YieldCounter::new(100);
+        let mut extracted_bytes = 0u64;
+        let mut copy_buffer = [0u8; 64 * 1024];
 
-    for i in 0..archive.len() {
-        yield_ctrl.tick().await;
+        for i in 0..archive.len() {
+            yield_ctrl.tick().await;
 
-        let mut file_in_zip = archive
-            .by_index(i)
-            .map_err(|e| format!("解压条目失败: {}", e))?;
-        let enclosed_name = file_in_zip
-            .enclosed_name()
-            .ok_or_else(|| format!("zip 条目路径非法: {}", file_in_zip.name()))?;
-        let out_path = version_dir.join(enclosed_name);
+            let mut file_in_zip = archive
+                .by_index(i)
+                .map_err(|e| format!("解压条目失败: {}", e))?;
+            let enclosed_name = file_in_zip
+                .enclosed_name()
+                .ok_or_else(|| format!("zip 条目路径非法: {}", file_in_zip.name()))?;
+            if file_in_zip.size() > MAX_FRONTEND_ENTRY_BYTES {
+                return Err(format!("zip 条目过大: {}", file_in_zip.name()));
+            }
+            extracted_bytes = extracted_bytes
+                .checked_add(file_in_zip.size())
+                .ok_or_else(|| "前端更新包解压大小溢出".to_string())?;
+            if extracted_bytes > MAX_FRONTEND_EXTRACTED_BYTES {
+                return Err("前端更新包解压后超过 512MB 安全限制".to_string());
+            }
+            let out_path = staging_dir.join(enclosed_name);
 
-        if file_in_zip.is_dir() {
-            std::fs::create_dir_all(&out_path).map_err(|e| e.to_string())?;
-        } else {
-            if let Some(parent) = out_path.parent() {
-                if !parent.exists() {
+            if file_in_zip.is_dir() {
+                std::fs::create_dir_all(&out_path).map_err(|e| e.to_string())?;
+            } else {
+                if let Some(parent) = out_path.parent() {
                     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
                 }
+                let mut out_file = std::fs::File::create(&out_path).map_err(|e| e.to_string())?;
+                let mut entry_bytes = 0u64;
+                loop {
+                    let read = file_in_zip
+                        .read(&mut copy_buffer)
+                        .map_err(|e| format!("读取 zip 内容失败: {}", e))?;
+                    if read == 0 {
+                        break;
+                    }
+                    entry_bytes = entry_bytes.saturating_add(read as u64);
+                    if entry_bytes > MAX_FRONTEND_ENTRY_BYTES {
+                        return Err(format!("zip 条目实际内容过大: {}", file_in_zip.name()));
+                    }
+                    out_file
+                        .write_all(&copy_buffer[..read])
+                        .map_err(|e| e.to_string())?;
+                }
             }
-            let mut out_file = std::fs::File::create(&out_path).map_err(|e| e.to_string())?;
-            let mut buf = Vec::with_capacity(file_in_zip.size() as usize);
-            file_in_zip
-                .read_to_end(&mut buf)
-                .map_err(|e| format!("读取 zip 内容失败: {}", e))?;
-            out_file.write_all(&buf).map_err(|e| e.to_string())?;
         }
+
+        if !staging_dir.join("index.html").is_file() {
+            return Err("前端更新包缺少 index.html".to_string());
+        }
+        verify_unzipped_files(&staging_dir)?;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = extract_result {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        return Err(error);
     }
 
-    // 校验
-    verify_unzipped_files(&version_dir)?;
+    if version_dir.exists() {
+        let active_version = read_active_version(&app);
+        if active_version.as_deref() == Some(version.as_str()) {
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            let _ = tokio::fs::remove_file(&canonical_zip_path).await;
+            return Ok(());
+        }
+        std::fs::remove_dir_all(&version_dir).map_err(|e| e.to_string())?;
+    }
+    std::fs::rename(&staging_dir, &version_dir).map_err(|error| {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        format!("提交前端更新目录失败: {}", error)
+    })?;
 
-    // 写入 active_version
+    // 用同目录临时文件切换激活标记，避免直接截断 active_version。
     let active_version_path = get_active_version_path(&app)?;
-    std::fs::write(&active_version_path, &version).map_err(|e| e.to_string())?;
+    let pending_active_version_path = updates_dir.join(".active_version.pending");
+    std::fs::write(&pending_active_version_path, &version).map_err(|e| e.to_string())?;
+    if active_version_path.exists() {
+        std::fs::remove_file(&active_version_path).map_err(|e| e.to_string())?;
+    }
+    std::fs::rename(&pending_active_version_path, &active_version_path)
+        .map_err(|e| format!("激活前端更新失败: {}", e))?;
 
     // 注意：已移除运行期即时物理垃圾清理，以防当前在用资源被删除引发 chunk 加载失败
     // 垃圾物理清理已安全后置到冷启动 setup 阶段执行
@@ -582,8 +670,9 @@ pub fn rollback_if_needed(app: &AppHandle) {
         );
         let version_dir = updates_dir.join(&active_version);
         let _ = std::fs::remove_dir_all(&version_dir);
-        let active_version_path = get_active_version_path(app).unwrap();
-        let _ = std::fs::remove_file(&active_version_path);
+        if let Ok(active_version_path) = get_active_version_path(app) {
+            let _ = std::fs::remove_file(&active_version_path);
+        }
         return;
     }
 
@@ -593,7 +682,12 @@ pub fn rollback_if_needed(app: &AppHandle) {
         .get(&active_version)
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
-    let obj = entry.as_object_mut().unwrap();
+    if !entry.is_object() {
+        entry = serde_json::json!({});
+    }
+    let Some(obj) = entry.as_object_mut() else {
+        return;
+    };
     obj.insert(
         "boot_attempt_count".to_string(),
         serde_json::json!(boot_attempt_count + 1),
@@ -634,4 +728,53 @@ fn clear_frontend_updates_sync(app: &AppHandle) -> Result<(), String> {
         let _ = std::fs::remove_dir_all(&updates_dir);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frontend_download_url_is_limited_to_the_expected_github_release_path() {
+        assert!(validate_github_frontend_download_url(
+            "https://github.com/MRiecy/VCPMobile/releases/download/v1.2.3/frontend-dist-v1.2.3.zip"
+        )
+        .is_ok());
+        assert!(validate_github_frontend_download_url(
+            "http://github.com/MRiecy/VCPMobile/releases/download/v1.2.3/frontend-dist-v1.2.3.zip"
+        )
+        .is_err());
+        assert!(validate_github_frontend_download_url(
+            "https://github.com.evil.invalid/MRiecy/VCPMobile/releases/download/v1.2.3/frontend-dist-v1.2.3.zip"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn manifest_cannot_hash_files_outside_the_update_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("manifest.json"),
+            r#"{"files":{"../secret":"00"}}"#,
+        )
+        .unwrap();
+
+        let error = verify_unzipped_files(temp.path()).unwrap_err();
+        assert!(error.contains("非法文件路径"));
+    }
+
+    #[test]
+    fn version_cleanup_ignores_staging_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["1.0.0", "1.1.0", "1.2.0", ".staging-1.3.0-test"] {
+            std::fs::create_dir(temp.path().join(name)).unwrap();
+        }
+
+        cleanup_old_versions(temp.path(), 2).unwrap();
+
+        assert!(!temp.path().join("1.0.0").exists());
+        assert!(temp.path().join("1.1.0").exists());
+        assert!(temp.path().join("1.2.0").exists());
+        assert!(temp.path().join(".staging-1.3.0-test").exists());
+    }
 }

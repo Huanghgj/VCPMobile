@@ -2,7 +2,10 @@
 import { ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import AttachmentViewer from "./AttachmentViewer.vue";
-import AttachmentRenderer from './AttachmentRenderer.vue';
+import AttachmentRenderer from "./AttachmentRenderer.vue";
+import { useChatHistoryStore } from "../../../core/stores/chatHistoryStore";
+import { useOverlayStore } from "../../../core/stores/overlay";
+import { useNotificationStore } from "../../../core/stores/notification";
 
 interface Attachment {
   type: string;
@@ -21,32 +24,75 @@ interface Attachment {
   createdAt?: number;
 }
 
-defineProps<{
+const props = defineProps<{
   attachments: Attachment[];
+  messageId?: string;
+  topicId?: string;
 }>();
 
 const isViewerOpen = ref(false);
 const activeFile = ref<Attachment | null>(null);
+const overlayStore = useOverlayStore();
+const notificationStore = useNotificationStore();
 
-const IMAGE_WHITELIST = ["jpg", "jpeg", "png", "gif", "webp", "svg", "bmp", "heic", "heif", "avif"];
-const TEXT_WHITELIST = [
-  "txt", "md", "csv", "json", "js", "ts", "py", "rs", "java", "c", "cpp",
-  "h", "go", "rb", "php", "swift", "kt", "html", "css", "xml", "yaml",
-  "yml", "toml", "ini", "log", "sql", "vue", "jsx", "tsx"
+const IMAGE_WHITELIST = [
+  "jpg",
+  "jpeg",
+  "png",
+  "gif",
+  "webp",
+  "svg",
+  "bmp",
+  "heic",
+  "heif",
+  "avif",
 ];
+const TEXT_WHITELIST = [
+  "txt",
+  "md",
+  "csv",
+  "json",
+  "js",
+  "ts",
+  "py",
+  "rs",
+  "java",
+  "c",
+  "cpp",
+  "h",
+  "go",
+  "rb",
+  "php",
+  "swift",
+  "kt",
+  "html",
+  "css",
+  "xml",
+  "yaml",
+  "yml",
+  "toml",
+  "ini",
+  "log",
+  "sql",
+  "vue",
+  "jsx",
+  "tsx",
+];
+const VIDEO_WHITELIST = ["mp4", "m4v", "webm", "mov", "mkv", "avi"];
+const AUDIO_WHITELIST = ["mp3", "m4a", "aac", "wav", "ogg", "flac", "opus"];
 
 const isPreviewableText = (att: Attachment): boolean => {
   const ext = att.name.split(".").pop()?.toLowerCase() || "";
-  
+
   // 核心加固：若存在后缀且完全不属于文本白名单，绝不判定为文本（杜绝 MIME 误判）
   if (ext && !TEXT_WHITELIST.includes(ext)) {
     return false;
   }
-  
+
   if (TEXT_WHITELIST.includes(ext)) {
     return true;
   }
-  
+
   const type = (att.type || "").toLowerCase();
   return (
     type.startsWith("text/") ||
@@ -58,10 +104,15 @@ const isPreviewableText = (att: Attachment): boolean => {
 
 const openViewer = (att: Attachment) => {
   const ext = att.name.split(".").pop()?.toLowerCase() || "";
-  const isImage = IMAGE_WHITELIST.includes(ext) || (att.type || "").startsWith("image/");
+  const isImage =
+    IMAGE_WHITELIST.includes(ext) || (att.type || "").startsWith("image/");
   const isText = isPreviewableText(att);
+  const isMedia =
+    VIDEO_WHITELIST.includes(ext) ||
+    AUDIO_WHITELIST.includes(ext) ||
+    /^(?:video|audio)\//i.test(att.type || "");
 
-  if (isImage || isText) {
+  if (isImage || isText || isMedia) {
     activeFile.value = att;
     isViewerOpen.value = true;
   } else {
@@ -75,6 +126,40 @@ const openExternal = async (path: string) => {
     await invoke("open_file", { path });
   } catch (e) {
     console.error("[AttachmentPreview] Open failed:", e);
+    notificationStore.addNotification({
+      type: "error",
+      title: "无法打开附件",
+      message: e instanceof Error ? e.message : String(e),
+      toastOnly: true,
+    });
+  }
+};
+
+const removeAttachment = async (index: number) => {
+  const attachment = props.attachments[index];
+  if (!attachment?.hash || !props.messageId || !props.topicId) return;
+
+  const confirmed = await overlayStore.showConfirm({
+    title: "移除附件",
+    message: "确定要从这条历史消息中移除该附件吗？",
+    isDanger: true,
+  });
+  if (!confirmed) return;
+
+  try {
+    await useChatHistoryStore().deleteAttachment(
+      props.topicId,
+      props.messageId,
+      attachment.hash,
+    );
+  } catch (error) {
+    console.error("[AttachmentPreview] Failed to delete attachment:", error);
+    notificationStore.addNotification({
+      type: "error",
+      title: "附件删除失败",
+      message: error instanceof Error ? error.message : String(error),
+      toastOnly: true,
+    });
   }
 };
 </script>
@@ -85,14 +170,15 @@ const openExternal = async (path: string) => {
   >
     <div
       v-for="(att, index) in attachments"
-      :key="index"
+      :key="att.hash || index"
       class="attachment-item relative group"
       @click="openViewer(att)"
     >
       <AttachmentRenderer
         :file="att"
         :index="index"
-        :show-remove="false"
+        :show-remove="!!props.messageId && !!props.topicId && !!att.hash"
+        @remove="removeAttachment"
       />
     </div>
 

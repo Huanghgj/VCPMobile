@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use tauri::{Assets, Runtime};
 use tauri_utils::assets::{AssetKey, AssetsIter, CspHash};
 
@@ -30,10 +30,12 @@ impl<R: Runtime> OtaAssets<R> {
 impl<R: Runtime> Assets<R> for OtaAssets<R> {
     fn get(&self, key: &AssetKey) -> Option<Cow<'_, [u8]>> {
         if !self.update_dir.as_os_str().is_empty() {
-            let fs_path = self.update_dir.join(key.as_ref().trim_start_matches('/'));
-            if fs_path.is_file() {
-                if let Ok(bytes) = std::fs::read(&fs_path) {
-                    return Some(Cow::Owned(bytes));
+            if let Some(relative_path) = safe_asset_relative_path(key.as_ref()) {
+                let fs_path = self.update_dir.join(relative_path);
+                if fs_path.is_file() {
+                    if let Ok(bytes) = std::fs::read(&fs_path) {
+                        return Some(Cow::Owned(bytes));
+                    }
                 }
             }
         }
@@ -47,6 +49,22 @@ impl<R: Runtime> Assets<R> for OtaAssets<R> {
     fn csp_hashes(&self, html_path: &AssetKey) -> Box<dyn Iterator<Item = CspHash<'_>> + '_> {
         self.embedded.csp_hashes(html_path)
     }
+}
+
+fn safe_asset_relative_path(key: &str) -> Option<&Path> {
+    let path = Path::new(key.trim_start_matches('/'));
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return None;
+    }
+    Some(path)
 }
 
 /// 空 Assets 实现，仅用于 `set_assets` 时临时占位以取出旧的 embedded。
@@ -63,5 +81,21 @@ impl<R: Runtime> Assets<R> for EmptyAssets {
 
     fn csp_hashes(&self, _html_path: &AssetKey) -> Box<dyn Iterator<Item = CspHash<'_>> + '_> {
         Box::new(std::iter::empty())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_asset_relative_path;
+
+    #[test]
+    fn update_asset_paths_stay_relative_to_the_version_directory() {
+        assert_eq!(
+            safe_asset_relative_path("/assets/app.js").and_then(|path| path.to_str()),
+            Some("assets/app.js")
+        );
+        assert!(safe_asset_relative_path("../secrets.txt").is_none());
+        assert!(safe_asset_relative_path("assets/../../secrets.txt").is_none());
+        assert!(safe_asset_relative_path("").is_none());
     }
 }

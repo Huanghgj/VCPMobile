@@ -94,6 +94,7 @@ export interface Attachment {
   imageFrames?: string[];
   thumbnailPath?: string;
   createdAt?: number;
+  transient?: boolean; // Only included in the current model request; never persisted.
 }
 
 /**
@@ -120,6 +121,8 @@ export interface ChatMessage {
   // 以下为纯前端运行时 UI 状态 (Ephemeral)，绝不进行持久化
   tailBlock?: ContentBlock;
   renderRevision?: number;   // Final-render signal; never persisted.
+  transientContext?: string;
+  transientSystemPrompt?: string;
 }
 
 /**

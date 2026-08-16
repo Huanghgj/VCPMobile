@@ -105,7 +105,7 @@ pub async fn cleanup_orphaned_attachments(
     let used_hashes: std::collections::HashSet<String> = sqlx::query_as::<_, (String,)>(
         "SELECT DISTINCT ma.hash FROM message_attachments ma \
              INNER JOIN messages m ON ma.topic_id = m.topic_id AND ma.msg_id = m.msg_id \
-             WHERE m.deleted_at IS NULL",
+             WHERE m.deleted_at IS NULL AND ma.deleted_at IS NULL",
     )
     .fetch_all(&db_state.pool)
     .await
@@ -280,7 +280,7 @@ pub async fn cleanup_single_orphaned_attachment(
         "SELECT EXISTS(\
          SELECT 1 FROM message_attachments ma \
          INNER JOIN messages m ON ma.topic_id = m.topic_id AND ma.msg_id = m.msg_id \
-         WHERE ma.hash = ? AND m.deleted_at IS NULL)",
+         WHERE ma.hash = ? AND m.deleted_at IS NULL AND ma.deleted_at IS NULL)",
     )
     .bind(&hash)
     .fetch_one(&db_state.pool)

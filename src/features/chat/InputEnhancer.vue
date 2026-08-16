@@ -7,7 +7,6 @@ import { useChatStreamStore } from '../../core/stores/chatStreamStore';
 import { useAttachmentStore } from '../../core/stores/attachmentStore';
 import { useNotificationStore } from '../../core/stores/notification';
 import { useTarvenStore } from '../../core/stores/tarvenStore';
-import { useLongTextPaste } from './composables/useLongTextPaste';
 import { useSpeechRecognition } from '../../core/composables/useSpeechRecognition';
 import { useAudioRecorder } from '../../core/composables/useAudioRecorder';
 import StagedAttachmentPreview from './StagedAttachmentPreview.vue';
@@ -409,12 +408,11 @@ const handleKeydown = (e: KeyboardEvent) => {
 };
 
 const triggerFilePick = async (mode: 'camera' | 'gallery' | 'file') => {
-  if (props.disabled) return;
+  if (props.disabled || attachmentStore.isPickingAttachment) return;
+  showAttachMenu.value = false;
   emit('attach');
   await attachmentStore.handleAttachment(mode);
 };
-
-const { handlePaste, handleBeforeInput } = useLongTextPaste(input);
 
 const removeStagedAttachment = (index: number) => {
   attachmentStore.removeStaged(index);
@@ -509,8 +507,6 @@ onUnmounted(() => {
             v-model="input"
             @focus="handleFocus"
             @keydown="handleKeydown"
-            @paste="handlePaste"
-            @beforeinput="handleBeforeInput"
             rows="1"
             class="w-full bg-transparent border-none focus:outline-none focus:ring-0 text-[var(--primary-text)] text-[15px] placeholder-opacity-40 resize-none leading-[1.25] py-[8px] scrollbar-hide vcp-textarea"
             style="max-height: 114px;"

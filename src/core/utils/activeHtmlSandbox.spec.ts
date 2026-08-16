@@ -3,6 +3,8 @@ import {
   ACTIVE_HTML_PERMISSIONS,
   ACTIVE_HTML_SANDBOX,
   buildActiveHtmlDocument,
+  rewriteGeneratedClipboardButtons,
+  rewriteGeneratedMediaSources,
 } from "./activeHtmlSandbox";
 
 describe("active HTML sandbox document", () => {
@@ -37,8 +39,60 @@ describe("active HTML sandbox document", () => {
     expect(result).toContain("<body>");
   });
 
+  it("repairs a generated copy button whose quoted text breaks onclick HTML", () => {
+    const copied = `<推进>\n例：聊天时说"小姨下周要来我们家玩"\n</推进>`;
+    const source = `<button onclick="
+      const text = \`${copied}\`;
+      navigator.clipboard.writeText(text).then(() => { this.innerText = '✓ 已复制'; });
+    " style="position:absolute">📋 复制</button>`;
+
+    const result = rewriteGeneratedClipboardButtons(source);
+    const encoded = result.match(/data-vcp-copy-code="([^"]*)"/)?.[1];
+
+    expect(result).not.toContain("onclick=");
+    expect(result).toContain('data-vcp-copy-encoded="uri"');
+    expect(result).toContain('style="position:absolute"');
+    expect(decodeURIComponent(encoded || "")).toBe(copied);
+  });
+
+  it("rewrites direct clipboard literals but leaves unrelated handlers intact", () => {
+    const copyButton = `<button onclick="navigator.clipboard.writeText('copy me')">Copy</button>`;
+    const unrelated = `<button onclick="window.__clicked = true">Run</button>`;
+
+    expect(rewriteGeneratedClipboardButtons(copyButton)).toContain(
+      'data-vcp-copy-code="copy%20me"',
+    );
+    expect(rewriteGeneratedClipboardButtons(unrelated)).toBe(unrelated);
+  });
+
+  it("maps relative generated media names to registered attachment URLs", () => {
+    const source = `<video controls><source src="e322d33d.mp4" type="video/mp4"></video>`;
+    const result = rewriteGeneratedMediaSources(source, {
+      "e322d33d.mp4":
+        "http://asset.localhost/video%20file.mp4?token=1&source=chat",
+    });
+
+    expect(result).toContain(
+      'src="http://asset.localhost/video%20file.mp4?token=1&amp;source=chat"',
+    );
+  });
+
+  it("does not replace remote media or unrelated relative files", () => {
+    const source =
+      '<video src="https://example.com/clip.mp4"></video><audio src="other.mp3"></audio>';
+    expect(
+      rewriteGeneratedMediaSources(source, {
+        "clip.mp4": "asset://local/clip.mp4",
+      }),
+    ).toBe(source);
+  });
+
   it("emits a syntactically valid bridge script", () => {
-    const result = buildActiveHtmlDocument("<div>probe</div>", false, "nonce-js");
+    const result = buildActiveHtmlDocument(
+      "<div>probe</div>",
+      false,
+      "nonce-js",
+    );
     const bridge = result.match(
       /<script data-vcp-preview-bridge>([\s\S]*?)<\/script>/,
     )?.[1];
@@ -81,6 +135,18 @@ describe("active HTML sandbox document", () => {
     expect(result).toContain("data.type === 'render-visibility'");
     expect(result).toContain("data.nonce !== nonce");
     expect(result).toContain("post('ai-action'");
+    expect(result).toContain("target.closest(actionSelector)");
+    expect(result).toContain('const actionSelector = "[data-vcp-send]"');
+    expect(result).not.toContain("[style*='cursor:pointer']");
+    expect(result).not.toContain('"button,');
+    expect(result).toContain("target.closest('[data-vcp-copy-code]')");
+    expect(result).toContain("button.setAttribute('aria-disabled', 'true')");
+    expect(result).toContain("post('copy-text'");
+    expect(result).toContain("data.type === 'copy-result'");
+    expect(result).toContain("if (!event.isTrusted) return");
+    expect(result).toContain("crypto.randomUUID");
+    expect(result).toContain("nativeParentPostMessage");
+    expect(result).toContain("post('bridge-ready')");
     expect(result).not.toContain("details:not([data-vcp-collapsed])");
     expect(result).toContain('"nonce-visible"');
   });
@@ -93,7 +159,9 @@ describe("active HTML sandbox document", () => {
       "nonce-details",
     );
 
-    expect(result).toContain("detailsNodes.push(...node.querySelectorAll('details'))");
+    expect(result).toContain(
+      "detailsNodes.push(...node.querySelectorAll('details'))",
+    );
     expect(result).toContain("details.open = false");
   });
 });

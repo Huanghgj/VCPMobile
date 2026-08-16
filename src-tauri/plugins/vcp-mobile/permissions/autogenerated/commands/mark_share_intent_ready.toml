@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-mark-share-intent-ready"
+description = "Enables the mark_share_intent_ready command without any pre-configured scope."
+commands.allow = ["mark_share_intent_ready"]
+
+[[permission]]
+identifier = "deny-mark-share-intent-ready"
+description = "Denies the mark_share_intent_ready command without any pre-configured scope."
+commands.deny = ["mark_share_intent_ready"]

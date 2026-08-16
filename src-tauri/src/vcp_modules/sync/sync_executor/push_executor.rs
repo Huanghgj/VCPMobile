@@ -9,10 +9,16 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, Runtime};
 use tokio::sync::RwLock;
+use tokio_util::io::ReaderStream;
 
-async fn query_avatar_color(pool: &sqlx::SqlitePool, agent_id: &str) -> Option<String> {
+const MAX_SYNC_ATTACHMENT_BYTES: u64 = 100 * 1024 * 1024;
+
+async fn query_avatar_color(
+    pool: &sqlx::SqlitePool,
+    agent_id: &str,
+) -> Result<Option<String>, String> {
     if agent_id.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     sqlx::query_scalar::<sqlx::Sqlite, Option<String>>(
@@ -21,16 +27,143 @@ async fn query_avatar_color(pool: &sqlx::SqlitePool, agent_id: &str) -> Option<S
     .bind(agent_id)
     .fetch_optional(pool)
     .await
-    .ok()
-    .flatten()
-    .flatten()
+    .map_err(|error| format!("Failed to query avatar color for {agent_id}: {error}"))
+    .map(|value| value.flatten())
+}
+
+async fn ensure_http_success(response: reqwest::Response, operation: &str) -> Result<(), String> {
+    if response.status().is_success() {
+        return Ok(());
+    }
+
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    Err(format!(
+        "{} failed: HTTP {} body={}",
+        operation, status, body
+    ))
 }
 
 /// 批量 Push 单 topic 处理结果
+#[derive(Debug)]
 pub struct PushBatchResult {
     pub topic_id: String,
     pub success: bool,
     pub error: Option<String>,
+}
+
+fn parse_push_messages_batch_response(
+    body: &str,
+    expected_topic_ids: &HashSet<String>,
+) -> Result<(Vec<PushBatchResult>, Vec<String>), String> {
+    let mut results = Vec::with_capacity(expected_topic_ids.len());
+    let mut seen_topic_ids = HashSet::with_capacity(expected_topic_ids.len());
+    let mut needed_hashes = Vec::new();
+
+    for (index, line) in body.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let data: serde_json::Value = serde_json::from_str(line).map_err(|error| {
+            format!(
+                "Malformed batch push response at line {}: {}",
+                index + 1,
+                error
+            )
+        })?;
+        if let Some(stream_error) = data.get("_stream_error") {
+            return Err(format!(
+                "Batch push response stream error: {}",
+                stream_error
+                    .as_str()
+                    .unwrap_or("invalid stream error payload")
+            ));
+        }
+
+        let topic_id = data
+            .get("topicId")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "Batch push response line {} is missing a valid topicId",
+                    index + 1
+                )
+            })?
+            .to_string();
+        if !expected_topic_ids.contains(&topic_id) {
+            return Err(format!(
+                "Batch push response contains unexpected topicId: {topic_id}"
+            ));
+        }
+        if !seen_topic_ids.insert(topic_id.clone()) {
+            return Err(format!(
+                "Batch push response contains duplicate topicId: {topic_id}"
+            ));
+        }
+
+        let success = data
+            .get("success")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| {
+                format!("Batch push response for {topic_id} is missing boolean success")
+            })?;
+        let error = match data.get("error") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(value)) => Some(value.clone()),
+            Some(_) => {
+                return Err(format!(
+                    "Batch push response for {topic_id} has a non-string error"
+                ));
+            }
+        };
+
+        if success {
+            match data.get("neededAttachmentHashes") {
+                None | Some(serde_json::Value::Null) => {}
+                Some(serde_json::Value::Array(values)) => {
+                    for value in values {
+                        let hash = value
+                            .as_str()
+                            .filter(|hash| !hash.is_empty())
+                            .ok_or_else(|| {
+                                format!(
+                                    "Batch push response for {topic_id} contains an invalid attachment hash"
+                                )
+                            })?;
+                        needed_hashes.push(hash.to_string());
+                    }
+                }
+                Some(_) => {
+                    return Err(format!(
+                        "Batch push response for {topic_id} has invalid neededAttachmentHashes"
+                    ));
+                }
+            }
+        }
+
+        results.push(PushBatchResult {
+            topic_id,
+            success,
+            error,
+        });
+    }
+
+    let mut missing_topic_ids = expected_topic_ids
+        .difference(&seen_topic_ids)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing_topic_ids.is_empty() {
+        missing_topic_ids.sort();
+        return Err(format!(
+            "Batch push response is missing topics: {}",
+            missing_topic_ids.join(", ")
+        ));
+    }
+
+    Ok((results, needed_hashes))
 }
 
 pub struct PushExecutor;
@@ -50,16 +183,17 @@ impl PushExecutor {
         let idempotency_key = generate_idempotency_key("push", "agent", agent_id);
         let url = format!("{}/api/mobile-sync/upload-entity", http_url);
 
-        let _ = client
+        let response = client
             .post(&url)
             .header("x-sync-token", sync_token)
             .header("Authorization", format!("Bearer {}", sync_token))
             .header("x-idempotency-key", idempotency_key)
             .json(&serde_json::json!({ "id": agent_id, "type": "agent", "data": dto }))
             .send()
-            .await;
+            .await
+            .map_err(|e| format!("Push agent request failed: {}", e))?;
 
-        Ok(())
+        ensure_http_success(response, "Push agent").await
     }
 
     pub async fn push_group<R: Runtime>(
@@ -77,16 +211,17 @@ impl PushExecutor {
         let idempotency_key = generate_idempotency_key("push", "group", group_id);
         let url = format!("{}/api/mobile-sync/upload-entity", http_url);
 
-        let _ = client
+        let response = client
             .post(&url)
             .header("x-sync-token", sync_token)
             .header("Authorization", format!("Bearer {}", sync_token))
             .header("x-idempotency-key", idempotency_key)
             .json(&serde_json::json!({ "id": group_id, "type": "group", "data": dto }))
             .send()
-            .await;
+            .await
+            .map_err(|e| format!("Push group request failed: {}", e))?;
 
-        Ok(())
+        ensure_http_success(response, "Push group").await
     }
 
     /// 批量 Push 实体 (Agent/Group/Topic)
@@ -134,7 +269,7 @@ impl PushExecutor {
         let db = app.state::<DbState>();
 
         let row = sqlx::query(
-            "SELECT image_data, mime_type FROM avatars WHERE owner_id = ? AND owner_type = ?",
+            "SELECT image_data, mime_type FROM avatars WHERE owner_id = ? AND owner_type = ? AND deleted_at IS NULL",
         )
         .bind(owner_id)
         .bind(owner_type)
@@ -150,14 +285,21 @@ impl PushExecutor {
                 "{}/api/mobile-sync/upload-avatar?id={}&type={}",
                 http_url, owner_id, owner_type
             );
-            let _ = client
+            let response = client
                 .post(&url)
                 .header("x-sync-token", sync_token)
                 .header("Authorization", format!("Bearer {}", sync_token))
                 .header("Content-Type", mime_type)
                 .body(image_data)
                 .send()
-                .await;
+                .await
+                .map_err(|e| format!("Push avatar request failed: {}", e))?;
+            ensure_http_success(response, "Push avatar").await?;
+        } else {
+            return Err(format!(
+                "Active avatar not found for {} {}",
+                owner_type, owner_id
+            ));
         }
 
         Ok(())
@@ -186,7 +328,8 @@ impl PushExecutor {
         // 1. 批量查询 topic 的 owner 信息
         let placeholders = topic_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
         let topic_query = format!(
-            "SELECT topic_id, owner_id, owner_type FROM topics WHERE topic_id IN ({})",
+            "SELECT topic_id, owner_id, owner_type FROM topics \
+             WHERE topic_id IN ({}) AND deleted_at IS NULL",
             placeholders
         );
         let mut q = sqlx::query(&topic_query);
@@ -203,6 +346,10 @@ impl PushExecutor {
             let otype: String = row.get("owner_type");
             owner_map.insert(tid, (oid, otype));
         }
+        if owner_map.is_empty() {
+            log::info!("[PushExecutor] Skipping message push: no active topics remain");
+            return Ok(Vec::new());
+        }
 
         // 2. 批量加载所有 topic 的消息（一次 SQL）
         let messages_by_topic =
@@ -214,7 +361,7 @@ impl PushExecutor {
         for tid in topic_ids {
             let history = messages_by_topic.get(tid).cloned().unwrap_or_default();
             if let Some((_owner_id, owner_type)) = owner_map.get(tid) {
-                let dto_messages = build_message_dtos(app, &history, owner_type).await;
+                let dto_messages = build_message_dtos(app, &history, owner_type).await?;
                 let line = serde_json::json!({
                     "topicId": tid,
                     "messages": dto_messages,
@@ -246,55 +393,9 @@ impl PushExecutor {
 
         // 4. 解析 NDJSON 响应
         let body = response.text().await.map_err(|e| e.to_string())?;
-        let mut results = Vec::new();
-        let mut all_needed_hashes: Vec<String> = Vec::new();
-
-        for line in body.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-
-            let data: serde_json::Value = match serde_json::from_str(line) {
-                Ok(v) => v,
-                Err(e) => {
-                    log::error!(
-                        "[PushExecutor] Batch push: NDJSON parse error on line: {:.100}... ({})",
-                        line,
-                        e
-                    );
-                    continue;
-                }
-            };
-            let tid = data["topicId"].as_str().unwrap_or("").to_string();
-            if tid.is_empty() {
-                log::error!(
-                    "[PushExecutor] Batch push: NDJSON line missing topicId: {:.100}...",
-                    line
-                );
-                continue;
-            }
-
-            let success = data["success"].as_bool().unwrap_or(false);
-            let error = data["error"].as_str().map(|s| s.to_string());
-
-            if success {
-                // 收集此 topic 需要的附件 hash
-                if let Some(needed) = data["neededAttachmentHashes"].as_array() {
-                    for h in needed {
-                        if let Some(hash) = h.as_str() {
-                            all_needed_hashes.push(hash.to_string());
-                        }
-                    }
-                }
-            }
-
-            results.push(PushBatchResult {
-                topic_id: tid,
-                success,
-                error,
-            });
-        }
+        let expected_topic_ids = owner_map.keys().cloned().collect::<HashSet<_>>();
+        let (results, all_needed_hashes) =
+            parse_push_messages_batch_response(&body, &expected_topic_ids)?;
 
         // 5. 去重后上传附件（复用现有 3 并发上传逻辑）
         if !all_needed_hashes.is_empty() {
@@ -324,10 +425,21 @@ impl PushExecutor {
                     .collect();
                 let upload_results = futures_util::future::join_all(futures).await;
                 let mut tracker_guard = uploaded_hashes.write().await;
+                let mut upload_errors = Vec::new();
                 for (hash, result) in chunk.iter().zip(upload_results) {
-                    if result.is_ok() {
-                        tracker_guard.insert(hash.clone());
+                    match result {
+                        Ok(()) => {
+                            tracker_guard.insert(hash.clone());
+                        }
+                        Err(error) => upload_errors.push(format!("{hash}: {error}")),
                     }
+                }
+                drop(tracker_guard);
+                if !upload_errors.is_empty() {
+                    return Err(format!(
+                        "Failed to upload required attachments: {}",
+                        upload_errors.join("; ")
+                    ));
                 }
             }
         }
@@ -357,36 +469,38 @@ async fn build_message_dtos<R: Runtime>(
     app: &AppHandle<R>,
     history: &[crate::vcp_modules::chat_manager::ChatMessage],
     owner_type: &str,
-) -> Vec<serde_json::Value> {
+) -> Result<Vec<serde_json::Value>, String> {
     let db = app.state::<DbState>();
     let mut results = Vec::new();
 
     for msg in history {
         let msg_value = if msg.role == "user" {
             let dto = UserMessageSyncDTO::from(msg);
-            serde_json::to_value(dto).ok()
+            serde_json::to_value(dto)
         } else if owner_type == "group" {
             let avatar_color =
                 query_avatar_color(&db.pool, &msg.agent_id.clone().unwrap_or_default())
                     .await
-                    .unwrap_or("#6B7280".to_string());
+                    .map_err(|error| format!("Failed to build message DTO {}: {error}", msg.id))?
+                    .unwrap_or_else(|| "#6B7280".to_string());
             let dto = GroupMessageSyncDTO::from_message(msg, avatar_color);
-            serde_json::to_value(dto).ok()
+            serde_json::to_value(dto)
         } else {
             let avatar_color =
                 query_avatar_color(&db.pool, &msg.agent_id.clone().unwrap_or_default())
                     .await
-                    .unwrap_or("#6B7280".to_string());
+                    .map_err(|error| format!("Failed to build message DTO {}: {error}", msg.id))?
+                    .unwrap_or_else(|| "#6B7280".to_string());
             let dto = AgentMessageSyncDTO::from_message(msg, avatar_color);
-            serde_json::to_value(dto).ok()
+            serde_json::to_value(dto)
         };
-
-        if let Some(v) = msg_value {
-            results.push(v);
-        }
+        results.push(
+            msg_value
+                .map_err(|error| format!("Failed to serialize message {}: {error}", msg.id))?,
+        );
     }
 
-    results
+    Ok(results)
 }
 
 async fn upload_attachment<R: Runtime>(
@@ -409,19 +523,33 @@ async fn upload_attachment<R: Runtime>(
         let internal_path: String = att_row.get("internal_path");
 
         let name_row =
-            sqlx::query("SELECT display_name FROM message_attachments WHERE hash = ? LIMIT 1")
+            sqlx::query("SELECT display_name FROM message_attachments WHERE hash = ? AND deleted_at IS NULL LIMIT 1")
                 .bind(hash)
                 .fetch_optional(&db.pool)
                 .await
-                .unwrap_or(None);
+                .map_err(|error| format!("Failed to query attachment name for {hash}: {error}"))?;
         let display_name = name_row
             .map(|r| r.get::<String, _>("display_name"))
             .unwrap_or_else(|| "unnamed".to_string());
 
         let file_path = internal_path.trim_start_matches("file://");
-        let file_data = tokio::fs::read(file_path)
+        let metadata = tokio::fs::metadata(file_path)
             .await
-            .map_err(|e| format!("读取附件失败: {}", e))?;
+            .map_err(|e| format!("读取附件元数据失败: {}", e))?;
+        if !metadata.is_file() {
+            return Err(format!("附件不是常规文件: {}", display_name));
+        }
+        if metadata.len() > MAX_SYNC_ATTACHMENT_BYTES {
+            return Err(format!(
+                "附件超过 100MB 同步上限: {} ({} bytes)",
+                display_name,
+                metadata.len()
+            ));
+        }
+        let file = tokio::fs::File::open(file_path)
+            .await
+            .map_err(|e| format!("打开附件失败: {}", e))?;
+        let file_stream = ReaderStream::new(file);
 
         let url = format!(
             "{}/api/mobile-sync/upload-attachment?hash={}&type={}&name={}",
@@ -436,15 +564,101 @@ async fn upload_attachment<R: Runtime>(
             .header("x-sync-token", sync_token)
             .header("Authorization", format!("Bearer {}", sync_token))
             .header("Content-Type", "application/octet-stream")
-            .body(file_data)
+            .header(reqwest::header::CONTENT_LENGTH, metadata.len())
+            .body(reqwest::Body::wrap_stream(file_stream))
             .send()
             .await
             .map_err(|e| format!("上传附件失败: {}", e))?;
 
-        if response.status().is_success() {
-            log::debug!("[PushExecutor] Attachment uploaded: {}", hash);
-        }
+        ensure_http_success(response, "Upload attachment").await?;
+        log::debug!("[PushExecutor] Attachment uploaded: {}", hash);
+    } else {
+        return Err(format!("Attachment {} not found", hash));
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn expected_topics() -> HashSet<String> {
+        ["topic-a", "topic-b"]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn batch_push_response_requires_one_valid_result_per_topic() {
+        let body = concat!(
+            r#"{"topicId":"topic-a","success":true,"neededAttachmentHashes":["hash-a"]}"#,
+            "\n",
+            r#"{"topicId":"topic-b","success":false,"error":"rejected"}"#,
+            "\n"
+        );
+
+        let (results, hashes) =
+            parse_push_messages_batch_response(body, &expected_topics()).unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert!(results[0].success);
+        assert!(!results[1].success);
+        assert_eq!(results[1].error.as_deref(), Some("rejected"));
+        assert_eq!(hashes, vec!["hash-a"]);
+    }
+
+    #[test]
+    fn batch_push_response_rejects_malformed_missing_duplicate_and_unexpected_topics() {
+        let expected = expected_topics();
+
+        assert!(parse_push_messages_batch_response("not-json", &expected).is_err());
+        assert!(parse_push_messages_batch_response(
+            r#"{"topicId":"topic-a","success":true}"#,
+            &expected,
+        )
+        .unwrap_err()
+        .contains("missing topics"));
+        assert!(parse_push_messages_batch_response(
+            concat!(
+                r#"{"topicId":"topic-a","success":true}"#,
+                "\n",
+                r#"{"topicId":"topic-a","success":true}"#,
+                "\n"
+            ),
+            &expected,
+        )
+        .unwrap_err()
+        .contains("duplicate"));
+        assert!(parse_push_messages_batch_response(
+            concat!(
+                r#"{"topicId":"topic-a","success":true}"#,
+                "\n",
+                r#"{"topicId":"topic-c","success":true}"#,
+                "\n"
+            ),
+            &expected,
+        )
+        .unwrap_err()
+        .contains("unexpected"));
+    }
+
+    #[test]
+    fn batch_push_response_rejects_stream_errors_and_invalid_attachment_hashes() {
+        let expected = ["topic-a".to_string()].into_iter().collect();
+
+        assert!(parse_push_messages_batch_response(
+            r#"{"_stream_error":"connection reset"}"#,
+            &expected,
+        )
+        .unwrap_err()
+        .contains("stream error"));
+        assert!(parse_push_messages_batch_response(
+            r#"{"topicId":"topic-a","success":true,"neededAttachmentHashes":[42]}"#,
+            &expected,
+        )
+        .unwrap_err()
+        .contains("invalid attachment hash"));
+    }
 }

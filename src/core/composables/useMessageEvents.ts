@@ -5,7 +5,7 @@ import { openRenderedImageViewer } from "./useRenderedImageViewer";
 import { findRenderedImagePayload } from "../utils/renderedImage";
 import {
   buildHtmlButtonAction,
-  isLocalHtmlButton,
+  findHtmlActionElement,
   wrapVcpButtonAction,
 } from "../utils/htmlActions";
 
@@ -37,22 +37,24 @@ export function useMessageEvents(containerRef: Ref<HTMLElement | null>) {
   };
 
   const sendButtonAction = async (
-    button: HTMLButtonElement,
+    button: HTMLElement,
     action: string,
   ) => {
     const payload = wrapVcpButtonAction(action);
     if (!payload || button.dataset.vcpActionPending === "true") return;
 
     button.dataset.vcpActionPending = "true";
-    button.disabled = true;
+    if (button instanceof HTMLButtonElement) button.disabled = true;
+    button.setAttribute("aria-disabled", "true");
     button.setAttribute("aria-busy", "true");
     try {
       const sent = await historyStore.sendMessage(payload);
       if (!sent) throw new Error("AI action did not start a generation request");
       button.dataset.vcpActionSent = "true";
     } catch (error) {
-      button.disabled = false;
+      if (button instanceof HTMLButtonElement) button.disabled = false;
       delete button.dataset.vcpActionPending;
+      button.removeAttribute("aria-disabled");
       console.error("[useMessageEvents] Failed to send AI action:", error);
     } finally {
       button.removeAttribute("aria-busy");
@@ -113,9 +115,9 @@ export function useMessageEvents(containerRef: Ref<HTMLElement | null>) {
       return;
     }
 
-    // 1.5 AI-generated command buttons send their local card context to AI.
-    const aiButton = target.closest('button') as HTMLButtonElement | null;
-    if (aiButton && !isLocalHtmlButton(aiButton)) {
+    // 1.5 Generated HTML can cross into chat only through an explicit VCP action.
+    const aiButton = findHtmlActionElement(target);
+    if (aiButton) {
       const action = buildHtmlButtonAction(aiButton);
       if (!action) return;
       e.preventDefault();

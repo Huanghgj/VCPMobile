@@ -16,10 +16,10 @@ lazy_static! {
     static ref THOUGHT_CHAIN_REGEX: Regex = Regex::new(r#"(?ims)[ \t]*\[--- VCP元思考链(?::\s*[^\]]*?)?\s*---\].*?[ \t]*\[--- 元思考链结束 ---\][ \t]*\r?\n?"#).unwrap();
     /// 清理未闭合 VCP 元思考链的正则表达式
     static ref INCOMPLETE_THOUGHT_CHAIN_REGEX: Regex = Regex::new(r#"(?ims)[ \t]*\[--- VCP元思考链(?::\s*[^\]]*?)?\s*---\].*\z"#).unwrap();
-    /// 清理常规 <think>/<thinking> 标签的正则表达式
-    static ref CONVENTIONAL_THOUGHT_REGEX: Regex = Regex::new(r"(?is)<think(?:ing)?>.*?</think(?:ing)?>").unwrap();
-    /// 清理未闭合 <think>/<thinking> 标签的正则表达式
-    static ref INCOMPLETE_CONVENTIONAL_THOUGHT_REGEX: Regex = Regex::new(r"(?is)<think(?:ing)?>.*\z").unwrap();
+    /// 清理常规 <think>/<thinking>/<antmlThinking> 标签的正则表达式
+    static ref CONVENTIONAL_THOUGHT_REGEX: Regex = Regex::new(r"(?is)<(?:think(?:ing)?|antmlthinking)>.*?</(?:think(?:ing)?|antmlthinking)>").unwrap();
+    /// 清理未闭合 <think>/<thinking>/<antmlThinking> 标签的正则表达式
+    static ref INCOMPLETE_CONVENTIONAL_THOUGHT_REGEX: Regex = Regex::new(r"(?is)<(?:think(?:ing)?|antmlthinking)>.*\z").unwrap();
     /// 仅匹配实际会参与富文本渲染的 HTML 标签，避免把 `a < b > c` 误判为 HTML。
     static ref HTML_CHECK_REGEX: Regex = Regex::new(r"(?is)</?(?:html|head|body|title|meta|link|style|script|div|span|p|br|strong|b|em|i|u|s|h[1-6]|ul|ol|li|a|img|audio|video|source|pre|code|blockquote|table|thead|tbody|tfoot|tr|th|td|details|summary|section|article|header|footer|main|nav|aside|form|input|button|label|select|option|textarea|svg|canvas|iframe|template|noscript|hr)\b[^>]*>").unwrap();
     /// 清理多余空行（保留最多2个连续空行）的正则表达式
@@ -52,7 +52,9 @@ impl ContextSanitizer {
             ttl_secs
         );
         Self {
-            cache: Mutex::new(LruCache::new(NonZeroUsize::new(capacity).unwrap())),
+            cache: Mutex::new(LruCache::new(
+                NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::MIN),
+            )),
             ttl: Duration::from_secs(ttl_secs),
         }
     }
@@ -61,7 +63,10 @@ impl ContextSanitizer {
     /// @param key 缓存键
     #[allow(dead_code)]
     pub fn get_cached(&self, key: &str) -> Option<String> {
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self.cache.lock().unwrap_or_else(|poisoned| {
+            log::warn!("[ContextSanitizer] Recovering from a poisoned cache lock");
+            poisoned.into_inner()
+        });
         if let Some(item) = cache.get(key) {
             // 检查是否过期
             if let Ok(elapsed) = item.timestamp.elapsed() {
@@ -81,7 +86,10 @@ impl ContextSanitizer {
     /// @param value 净化后的内容
     #[allow(dead_code)]
     pub fn set_cached(&self, key: String, value: String) {
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self.cache.lock().unwrap_or_else(|poisoned| {
+            log::warn!("[ContextSanitizer] Recovering from a poisoned cache lock");
+            poisoned.into_inner()
+        });
         cache.put(
             key,
             CacheItem {
@@ -223,7 +231,7 @@ fn process_node(node: NodeRef<Node>, out: &mut String, keep_thoughts: bool) {
                 // 纯渲染、资源或执行节点不进入历史上下文。
                 "style" | "script" | "svg" | "canvas" | "iframe" | "template" | "noscript"
                 | "link" | "meta" | "source" => {}
-                "think" | "thinking" => {
+                "think" | "thinking" | "antmlthinking" => {
                     if keep_thoughts {
                         for child in node.children() {
                             process_node(child, out, keep_thoughts);
@@ -292,7 +300,11 @@ fn process_node(node: NodeRef<Node>, out: &mut String, keep_thoughts: bool) {
                     out.push('*');
                 }
                 "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
-                    let level = tag.chars().last().unwrap().to_digit(10).unwrap_or(1);
+                    let level = tag
+                        .strip_prefix('h')
+                        .and_then(|value| value.parse::<u32>().ok())
+                        .filter(|value| (1..=6).contains(value))
+                        .unwrap_or(1);
                     out.push('\n');
                     for _ in 0..level {
                         out.push('#');
@@ -440,20 +452,25 @@ mod tests {
 
     #[test]
     fn test_strip_thought_variants() {
-        let input = "A\n[--- VCP元思考链: test ---]\nsecret\n[--- 元思考链结束 ---]\nB <thinking>hidden</thinking> C";
+        let input = "A\n[--- VCP元思考链: test ---]\nsecret\n[--- 元思考链结束 ---]\nB <thinking>hidden</thinking> C <antmlThinking>also hidden</antmlThinking> D";
         let stripped = strip_thought_chains(input);
         assert!(stripped.contains("A"));
         assert!(stripped.contains("B"));
         assert!(stripped.contains("C"));
+        assert!(stripped.contains("D"));
         assert!(!stripped.contains("secret"));
         assert!(!stripped.contains("hidden"));
         assert!(!stripped.contains("<thinking>"));
+        assert!(!stripped.contains("<antmlThinking>"));
     }
 
     #[test]
     fn test_strip_incomplete_thought_to_end() {
         let input = "Visible\n<think>unfinished internal text";
         assert_eq!(strip_thought_chains(input), "Visible\n");
+
+        let alias_input = "Visible\n<antmlThinking>unfinished internal text";
+        assert_eq!(strip_thought_chains(alias_input), "Visible\n");
     }
 
     #[test]
@@ -513,5 +530,14 @@ mod tests {
 
         assert!(!assistant_context_contains_html(content));
         assert_eq!(sanitize_assistant_context_content(content, false), content);
+    }
+
+    #[test]
+    fn zero_capacity_cache_degrades_to_one_entry() {
+        let sanitizer = ContextSanitizer::new(0, 60);
+
+        sanitizer.set_cached("key".to_string(), "value".to_string());
+
+        assert_eq!(sanitizer.get_cached("key").as_deref(), Some("value"));
     }
 }

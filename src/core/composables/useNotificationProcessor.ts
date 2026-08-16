@@ -291,11 +291,11 @@ export function useNotificationProcessor() {
     const meta: NonNullable<VcpNotification['meta']> = [];
     const details: NonNullable<VcpNotification['details']> = [];
     const tags = ['VCPInfo'];
-    let title = 'VCPInfo';
+    let title: string;
     let subtitle = infoType;
     let message = data.message || '';
     let type: VcpNotification['type'] = 'info';
-    let category = 'VCPInfo';
+    let category: string;
     let duration = 9000;
     let historyOnly = false;
     let structured: VcpNotification['structured'] | undefined;
@@ -765,10 +765,10 @@ export function useNotificationProcessor() {
       return { silent: true };
     }
 
-    let title = 'VCP 通知';
-    let message = '';
+    let title: string;
+    let message: string;
     let type: VcpNotification['type'] = 'info';
-    let isPreformatted = false;
+    let isPreformatted: boolean;
     let duration = 7000;
     let actions: VcpNotification['actions'] = [];
     let notificationId: string | undefined = undefined;

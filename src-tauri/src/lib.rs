@@ -1,7 +1,7 @@
 mod distributed;
 mod vcp_modules;
 
-use tauri::{Listener, Manager};
+use tauri::{Listener, Manager, WebviewWindowBuilder};
 use tauri_plugin_log::{Target, TargetKind};
 use vcp_modules::affect_engine::{
     get_affect_state, list_affect_events, reset_affect_state, update_affect_config,
@@ -35,8 +35,8 @@ use vcp_modules::emoticon_manager::{
     fix_emoticon_url, get_emoticon_library, regenerate_emoticon_library,
 };
 use vcp_modules::file_manager::{
-    get_attachment_real_path, open_file, read_image_preview_data_url, register_local_file,
-    store_file,
+    check_attachment_support, get_attachment_real_path, open_file, prepare_attachment_asset,
+    read_image_preview_data_url, register_local_file, store_file,
 };
 use vcp_modules::frontend_update_manager::{
     apply_frontend_update, check_for_frontend_update, clear_frontend_updates,
@@ -50,7 +50,8 @@ use vcp_modules::group_service::{
 use vcp_modules::high_speed_channel::prepare_vcp_upload;
 use vcp_modules::lifecycle_manager::{
     bootstrap, get_core_status, get_last_error, get_system_snapshot,
-    reconcile_distributed_node_cmd, reconcile_local_server_cmd, LifecycleState,
+    reconcile_distributed_node_cmd, reconcile_local_server_cmd, set_app_foreground_state,
+    LifecycleState,
 };
 use vcp_modules::lifecycle_scheduler::{
     cancel_lifecycle_job, claim_due_lifecycle_jobs, complete_lifecycle_job, create_lifecycle_job,
@@ -61,7 +62,9 @@ use vcp_modules::maintenance_manager::{
     init_automatic_maintenance, reconstruct_system_cache,
 };
 use vcp_modules::message_repository::{process_message_content, rebuild_all_pre_renders};
-use vcp_modules::message_service::{fetch_raw_message_content, re_render_message};
+use vcp_modules::message_service::{
+    delete_message_attachment, fetch_raw_message_content, re_render_message,
+};
 use vcp_modules::model_manager::{
     get_cached_models, get_favorite_models, get_hot_models, record_model_usage, refresh_models,
     start_batch_model_test, stop_all_model_tests, test_model_connectivity, toggle_favorite_model,
@@ -130,7 +133,7 @@ pub fn run() {
 
     let builder = tauri::Builder::default();
 
-    builder
+    let app = builder
         .setup(|app| {
             // 2. 初始化核心状态
             app.manage(app.handle().clone());
@@ -197,6 +200,55 @@ pub fn run() {
                     }
                 }
             });
+
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            {
+                let handle_lifecycle = app.handle().clone();
+                app.listen_any("vcp-mobile://lifecycle", move |event| {
+                    let Ok(payload) = serde_json::from_str::<serde_json::Value>(event.payload())
+                    else {
+                        log::warn!("[Lifecycle] Ignoring malformed native lifecycle payload");
+                        return;
+                    };
+                    let Some(native_state) = payload.get("state").and_then(|value| value.as_str())
+                    else {
+                        return;
+                    };
+                    let is_foreground = match native_state {
+                        "resume" => true,
+                        "pause" | "stop" => false,
+                        _ => return,
+                    };
+                    let handle = handle_lifecycle.clone();
+                    tauri::async_runtime::spawn(async move {
+                        vcp_modules::lifecycle_manager::set_app_foreground_state_internal(
+                            handle,
+                            is_foreground,
+                        )
+                        .await;
+                    });
+                });
+            }
+
+            // Tauri creates configured WebViews before running `setup`. The main window is
+            // therefore declared with `create: false` and opened here only after every command
+            // state, especially DbState, is available. This prevents early frontend invokes from
+            // reaching a `State<DbState>` extractor before `manage` and aborting the process.
+            if app.try_state::<DbState>().is_none() {
+                return Err(std::io::Error::other(
+                    "DbState must be managed before creating the main WebView",
+                )
+                .into());
+            }
+            let main_window_config = app
+                .config()
+                .app
+                .windows
+                .iter()
+                .find(|config| config.label == "main")
+                .cloned()
+                .ok_or_else(|| std::io::Error::other("main window config is missing"))?;
+            WebviewWindowBuilder::from_config(app, &main_window_config)?.build()?;
 
             Ok(())
         })
@@ -301,10 +353,13 @@ pub fn run() {
             store_file,
             register_local_file,
             read_image_preview_data_url,
+            prepare_attachment_asset,
             prepare_vcp_upload,
             fetch_raw_message_content,
             re_render_message,
+            delete_message_attachment,
             get_attachment_real_path,
+            check_attachment_support,
             open_file,
             clear_webview_cache,
             reconstruct_system_cache,
@@ -353,6 +408,7 @@ pub fn run() {
             archive_assistant_chat,
             reconcile_local_server_cmd,
             reconcile_distributed_node_cmd,
+            set_app_foreground_state,
             distributed::get_distributed_status,
             distributed::get_registered_tools_metadata,
             distributed::update_disabled_tools,
@@ -368,6 +424,21 @@ pub fn run() {
             clear_frontend_updates,
             confirm_frontend_boot,
         ])
-        .run(context)
-        .expect("error while running tauri application");
+        .build(context)
+        .expect("error while building tauri application");
+
+    app.run(|app_handle, event| match event {
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        tauri::RunEvent::WindowEvent {
+            event: tauri::WindowEvent::Focused(focused),
+            ..
+        } => {
+            let handle = app_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                vcp_modules::lifecycle_manager::set_app_foreground_state_internal(handle, focused)
+                    .await;
+            });
+        }
+        _ => {}
+    });
 }

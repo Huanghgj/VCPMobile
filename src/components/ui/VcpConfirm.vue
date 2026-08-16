@@ -2,10 +2,7 @@
 defineOptions({
   inheritAttrs: false
 });
-import { watch } from 'vue';
-import { useModalHistory } from '../../core/composables/useModalHistory';
-
-const props = defineProps<{
+defineProps<{
   title: string;
   message: string;
   isOpen: boolean;
@@ -18,24 +15,6 @@ const emit = defineEmits<{
   (e: 'confirm'): void;
   (e: 'cancel'): void;
 }>();
-
-const { registerModal, unregisterModal } = useModalHistory();
-const modalId = 'VcpConfirm';
-
-watch(() => props.isOpen, (newVal) => {
-  if (newVal) {
-    registerModal(modalId, () => {
-      if (props.onlyConfirm) {
-        emit('confirm');
-      } else {
-        emit('cancel');
-      }
-      emit('update:isOpen', false);
-    });
-  } else {
-    unregisterModal(modalId);
-  }
-});
 
 const handleConfirm = () => {
   emit('confirm');

@@ -1,146 +1,23 @@
 use log::info;
 use serde::Serialize;
-use std::sync::Arc;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::sync::RwLock;
 
 use crate::vcp_modules::db_manager::DbState;
 use crate::vcp_modules::emoticon_manager::{
     internal_load_library, refresh_emoticon_library_internal, EmoticonManagerState,
 };
-use crate::vcp_modules::infra::local_server::{self, ServerHandle};
 use crate::vcp_modules::model_manager::{init_model_manager, ModelManagerState};
 use crate::vcp_modules::settings_manager::{read_settings, SettingsState};
 use crate::vcp_modules::vcp_log_service::init_vcp_log_connection_internal;
 
-#[derive(Debug, Serialize, Clone, Copy, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum CoreStatus {
-    Initializing,
-    Ready,
-    // Syncing,
-    Error,
-}
-
-pub struct LifecycleState {
-    pub status: Arc<RwLock<CoreStatus>>,
-    pub last_error: Arc<RwLock<Option<String>>>,
-    /// 划词助手本地服务器句柄：用于根据设置动态启停
-    pub local_server_handle: Arc<tokio::sync::Mutex<Option<ServerHandle>>>,
-}
-
-impl LifecycleState {
-    pub fn new() -> Self {
-        Self {
-            status: Arc::new(RwLock::new(CoreStatus::Initializing)),
-            last_error: Arc::new(RwLock::new(None)),
-            local_server_handle: Arc::new(tokio::sync::Mutex::new(None)),
-        }
-    }
-}
-
-/// 根据设置决定启动或停止划词助手本地服务器
-pub async fn reconcile_local_server(
-    app_handle: &AppHandle,
-    lifecycle: &LifecycleState,
-    enable_assistant: bool,
-) {
-    let mut handle_lock = lifecycle.local_server_handle.lock().await;
-    let has_server = handle_lock.is_some();
-
-    match (enable_assistant, has_server) {
-        (true, false) => {
-            log::info!("[Lifecycle] enableAssistant=true, starting local server...");
-            *handle_lock = Some(local_server::start_server(app_handle.clone()));
-        }
-        (false, true) => {
-            log::info!("[Lifecycle] enableAssistant=false, stopping local server...");
-            if let Some(h) = handle_lock.take() {
-                h.shutdown().await;
-            }
-        }
-        _ => {
-            // 无需变更
-        }
-    }
-}
-
-/// 根据设置决定启动或停止分布式节点连接
-pub async fn reconcile_distributed_node(
-    app_handle: &AppHandle,
-    distributed_enabled: bool,
-    force_reconnect: bool,
-) {
-    let distributed_state = match app_handle.try_state::<crate::distributed::DistributedState>() {
-        Some(s) => s,
-        None => {
-            log::warn!("[Lifecycle] DistributedState not registered, skipping reconciliation");
-            return;
-        }
-    };
-    let client = distributed_state.client.read().await;
-
-    // 读取全局 settings，获取连接参数
-    let settings_state = app_handle.state::<SettingsState>();
-    let settings = match read_settings(app_handle.clone(), settings_state).await {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!(
-                "[Lifecycle] Failed to read settings for distributed reconnect: {}",
-                e
-            );
-            return;
-        }
-    };
-
-    let ws_url = settings.distributed_ws_url.clone();
-    let vcp_key = settings.distributed_vcp_key.clone();
-    let device_name = if settings.distributed_device_name.is_empty() {
-        "VCPMobile".to_string()
-    } else {
-        settings.distributed_device_name.clone()
-    };
-
-    let mut is_running = client.is_running().await;
-    if force_reconnect && is_running {
-        log::info!("[Lifecycle] Connection settings changed, stopping existing connection for reconnect...");
-        client.stop(app_handle).await;
-        is_running = false;
-    }
-
-    match (distributed_enabled, is_running) {
-        (true, false) => {
-            if ws_url.is_empty() || vcp_key.is_empty() {
-                log::warn!("[Lifecycle] distributedEnabled=true but ws_url/vcp_key is empty, skipping auto-connect");
-                return;
-            }
-            log::info!(
-                "[Lifecycle] distributedEnabled=true, starting distributed node connection..."
-            );
-            distributed_state.registry.load_disabled_config(app_handle);
-            if let Err(e) = client
-                .start(
-                    app_handle.clone(),
-                    ws_url,
-                    vcp_key,
-                    device_name,
-                    distributed_state.registry.clone(),
-                )
-                .await
-            {
-                log::error!("[Lifecycle] Auto-start distributed node failed: {}", e);
-            }
-        }
-        (false, true) => {
-            log::info!(
-                "[Lifecycle] distributedEnabled=false, stopping distributed node connection..."
-            );
-            client.stop(app_handle).await;
-        }
-        _ => {}
-    }
-}
+pub use crate::vcp_modules::infra::lifecycle_controller::{
+    is_app_in_foreground, set_app_foreground_state, set_app_foreground_state_internal,
+};
+pub use crate::vcp_modules::infra::lifecycle_reconciler::{
+    reconcile_distributed_node, reconcile_local_server,
+};
+pub use crate::vcp_modules::infra::lifecycle_state::{CoreStatus, LifecycleState};
 
 /// 核心启动逻辑：线性化管理所有服务的初始化顺序
 pub async fn bootstrap(app: &AppHandle) -> Result<(), String> {
@@ -217,7 +94,9 @@ pub async fn bootstrap(app: &AppHandle) -> Result<(), String> {
             "[Lifecycle] distributedEnabled={}, reconciling distributed node...",
             enable_dist
         );
-        reconcile_distributed_node(&handle, enable_dist, false).await;
+        if let Err(error) = reconcile_distributed_node(&handle, enable_dist, false).await {
+            log::error!("[Lifecycle] Initial distributed reconciliation failed: {error}");
+        }
     }
 
     // 同步服务状态已在 setup 阶段注册，便于前端冷启动读取状态。
@@ -439,7 +318,7 @@ pub async fn reconcile_distributed_node_cmd(
         "[Lifecycle] reconcile_distributed_node_cmd called: enable={}",
         enable
     );
-    reconcile_distributed_node(&app_handle, enable, enable).await;
+    reconcile_distributed_node(&app_handle, enable, enable).await?;
     Ok(enable)
 }
 

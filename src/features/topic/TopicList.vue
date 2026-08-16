@@ -63,9 +63,9 @@ const showTopicContextMenu = (topicId: string) => {
     topicListStore.currentAgentId ||
     sessionStore.currentSelectedItem?.id ||
     "default_agent";
-  const ownerType = assistantStore.agents.some((a) => a.id === itemId)
-    ? "agent"
-    : "group";
+  const ownerType =
+    topic.ownerType ||
+    (assistantStore.agents.some((a) => a.id === itemId) ? "agent" : "group");
 
   const menuItems: any[] = [
     {
@@ -171,21 +171,25 @@ const showTopicContextMenu = (topicId: string) => {
     label: "删除话题",
     icon: Trash2,
     danger: true,
+    disabled: topicListStore.deletingTopicIds.includes(topic.id),
     handler: async () => {
-      const confirm1 = await overlayStore.showConfirm({
+      const confirmed = await overlayStore.showConfirm({
         title: "删除话题",
-        message: `确定要删除话题 "${topic.name}" 吗？此操作不可逆转。`,
+        message: `确定要永久删除话题 "${topic.name}" 及其全部聊天记录吗？此操作不可撤销。`,
         isDanger: true
       });
-      if (confirm1) {
-        const confirm2 = await overlayStore.showConfirm({
-          title: "最终确认",
-          message: `【最终确认】真的要永久删除 "${topic.name}" 吗？`,
-          isDanger: true
+      if (!confirmed) return;
+
+      try {
+        await topicListStore.deleteTopic(itemId, ownerType, topic.id);
+      } catch (err: any) {
+        notificationStore.addNotification({
+          type: "error",
+          title: "话题删除失败",
+          message:
+            typeof err === "string" ? err : err?.message || "数据库操作失败",
+          duration: 5000,
         });
-        if (confirm2) {
-          topicListStore.deleteTopic(itemId, ownerType, topic.id);
-        }
       }
     },
   });

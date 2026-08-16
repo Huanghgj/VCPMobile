@@ -510,16 +510,26 @@ pub struct ActiveRequestControl {
     remote_interrupt_sent: AtomicBool,
     cancel_tx: watch::Sender<bool>,
     remote_context: Mutex<Option<RemoteInterruptContext>>,
+    scope: Option<ActiveRequestScope>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActiveRequestScope {
+    pub owner_id: String,
+    pub owner_type: String,
+    pub topic_id: String,
+    pub turn_id: Option<String>,
 }
 
 impl ActiveRequestControl {
-    fn new() -> Self {
+    fn new(scope: Option<ActiveRequestScope>) -> Self {
         let (cancel_tx, _) = watch::channel(false);
         Self {
             cancelled: AtomicBool::new(false),
             remote_interrupt_sent: AtomicBool::new(false),
             cancel_tx,
             remote_context: Mutex::new(None),
+            scope,
         }
     }
 
@@ -624,9 +634,110 @@ pub struct ActiveRequests(pub Arc<DashMap<String, Arc<ActiveRequestControl>>>);
 
 impl ActiveRequests {
     pub fn register(&self, message_id: &str) -> Arc<ActiveRequestControl> {
-        let control = Arc::new(ActiveRequestControl::new());
+        self.register_with_scope(message_id, None)
+    }
+
+    pub fn register_scoped(
+        &self,
+        message_id: &str,
+        owner_id: &str,
+        owner_type: &str,
+        topic_id: &str,
+        turn_id: Option<&str>,
+    ) -> Arc<ActiveRequestControl> {
+        self.register_with_scope(
+            message_id,
+            Some(ActiveRequestScope {
+                owner_id: owner_id.to_string(),
+                owner_type: owner_type.to_string(),
+                topic_id: topic_id.to_string(),
+                turn_id: turn_id.map(ToString::to_string),
+            }),
+        )
+    }
+
+    pub fn register_from_context(
+        &self,
+        message_id: &str,
+        context: Option<&Value>,
+    ) -> Arc<ActiveRequestControl> {
+        let scope = context.and_then(|context| {
+            let topic_id = context.get("topicId")?.as_str()?;
+            let (owner_type, owner_id) =
+                if let Some(group_id) = context.get("groupId").and_then(Value::as_str) {
+                    ("group", group_id)
+                } else {
+                    (
+                        "agent",
+                        context
+                            .get("agentId")
+                            .or_else(|| context.get("ownerId"))?
+                            .as_str()?,
+                    )
+                };
+            Some(ActiveRequestScope {
+                owner_id: owner_id.to_string(),
+                owner_type: owner_type.to_string(),
+                topic_id: topic_id.to_string(),
+                turn_id: context
+                    .get("turnId")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+            })
+        });
+        self.register_with_scope(message_id, scope)
+    }
+
+    fn register_with_scope(
+        &self,
+        message_id: &str,
+        scope: Option<ActiveRequestScope>,
+    ) -> Arc<ActiveRequestControl> {
+        let control = Arc::new(ActiveRequestControl::new(scope));
         self.0.insert(message_id.to_string(), control.clone());
         control
+    }
+
+    pub fn cancel_ids<'a>(&self, message_ids: impl IntoIterator<Item = &'a str>) -> usize {
+        let mut cancelled = 0;
+        for message_id in message_ids {
+            if let Some(control) = self.0.get(message_id) {
+                if control.cancel() {
+                    cancelled += 1;
+                }
+            }
+        }
+        cancelled
+    }
+
+    pub fn cancel_topic(&self, topic_id: &str) -> Vec<String> {
+        self.cancel_matching(|scope| scope.topic_id == topic_id)
+    }
+
+    pub fn cancel_owner(&self, owner_id: &str, owner_type: &str) -> Vec<String> {
+        self.cancel_matching(|scope| scope.owner_id == owner_id && scope.owner_type == owner_type)
+    }
+
+    fn cancel_matching(&self, predicate: impl Fn(&ActiveRequestScope) -> bool) -> Vec<String> {
+        let mut group_turn_ids = Vec::new();
+        for entry in self.0.iter() {
+            let control = entry.value();
+            let Some(scope) = control.scope.as_ref().filter(|scope| predicate(scope)) else {
+                continue;
+            };
+            control.cancel();
+            if scope.owner_type == "group" {
+                group_turn_ids.push(
+                    scope
+                        .turn_id
+                        .clone()
+                        .unwrap_or_else(|| scope.topic_id.clone()),
+                );
+            }
+        }
+        group_turn_ids.sort();
+        group_turn_ids.dedup();
+        group_turn_ids
     }
 }
 
@@ -715,7 +826,7 @@ pub async fn sendToVCP<R: Runtime>(
 ) -> Result<Value, String> {
     let message_id = payload.message_id.clone();
     let context = payload.context.clone();
-    let request_control = state.register(&message_id);
+    let request_control = state.register_from_context(&message_id, context.as_ref());
     let _request_guard =
         ActiveRequestGuard::new(state.0.clone(), message_id.clone(), request_control.clone());
 
@@ -2046,11 +2157,36 @@ mod completion_response_tests {
 
     #[test]
     fn cancellation_is_idempotent_and_visible_to_late_subscribers() {
-        let control = ActiveRequestControl::new();
+        let control = ActiveRequestControl::new(None);
         assert!(control.cancel());
         assert!(!control.cancel());
         assert!(control.is_cancelled());
         assert!(*control.subscribe().borrow());
+    }
+
+    #[test]
+    fn scoped_cancellation_targets_only_the_deleted_topic_and_group_turn() {
+        let requests = ActiveRequests::default();
+        let deleted = requests.register_scoped(
+            "deleted-message",
+            "group-1",
+            "group",
+            "topic-deleted",
+            Some("turn-deleted"),
+        );
+        let retained = requests.register_scoped(
+            "retained-message",
+            "group-1",
+            "group",
+            "topic-retained",
+            Some("turn-retained"),
+        );
+
+        let turns = requests.cancel_topic("topic-deleted");
+
+        assert!(deleted.is_cancelled());
+        assert!(!retained.is_cancelled());
+        assert_eq!(turns, vec!["turn-deleted"]);
     }
 
     #[test]

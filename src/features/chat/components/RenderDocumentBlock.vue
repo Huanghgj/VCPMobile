@@ -49,7 +49,9 @@ const compiled = computed(() => {
       signature: `${RENDER_DOCUMENT_VERSION}:markstream:${props.sourceId}`,
     };
   }
-  return compileRenderFragment(props.block, props.messageId);
+  return compileRenderFragment(props.block, props.messageId, {
+    final: !props.streaming,
+  });
 });
 const { injectScopedCss, removeScopedCss } = useMessageStyleInjector();
 let activeSourceId = props.sourceId;

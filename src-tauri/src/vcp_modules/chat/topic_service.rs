@@ -3,6 +3,7 @@
 
 use crate::vcp_modules::db_manager::DbState;
 use crate::vcp_modules::settings_manager::SettingsState;
+use crate::vcp_modules::sync_executor::DeleteExecutor;
 use crate::vcp_modules::sync_hash::HashAggregator;
 use crate::vcp_modules::sync_service::{SyncCommand, SyncState};
 use crate::vcp_modules::sync_types::SyncDataType;
@@ -11,6 +12,65 @@ use serde_json::Value;
 use sqlx::Row;
 use std::collections::HashMap;
 use tauri::{ipc::Channel, AppHandle, Emitter, Manager, State};
+use uuid::Uuid;
+
+async fn ensure_active_owner(
+    pool: &sqlx::SqlitePool,
+    owner_id: &str,
+    owner_type: &str,
+) -> Result<(), String> {
+    let active: bool = match owner_type {
+        "agent" => sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM agents WHERE agent_id = ? AND deleted_at IS NULL)",
+        )
+        .bind(owner_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| e.to_string())?,
+        "group" => sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM groups WHERE group_id = ? AND deleted_at IS NULL)",
+        )
+        .bind(owner_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| e.to_string())?,
+        _ => return Err(format!("不支持的话题归属类型: {}", owner_type)),
+    };
+
+    if active {
+        Ok(())
+    } else {
+        Err(format!("{} {} 不存在或已删除", owner_type, owner_id))
+    }
+}
+
+async fn ensure_topic_owner(
+    pool: &sqlx::SqlitePool,
+    topic_id: &str,
+    owner_id: &str,
+    owner_type: &str,
+) -> Result<(), String> {
+    let actual = sqlx::query_as::<_, (String, String)>(
+        "SELECT owner_id, owner_type FROM topics WHERE topic_id = ?",
+    )
+    .bind(topic_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    match actual {
+        Some((actual_owner_id, actual_owner_type))
+            if actual_owner_id == owner_id && actual_owner_type == owner_type =>
+        {
+            Ok(())
+        }
+        Some((actual_owner_id, actual_owner_type)) => Err(format!(
+            "话题 {} 属于 {} {}，拒绝按 {} {} 操作",
+            topic_id, actual_owner_type, actual_owner_id, owner_type, owner_id
+        )),
+        None => Err(format!("话题 {} 不存在", topic_id)),
+    }
+}
 
 /// 批量获取所有 owner 的未读计数，替代前端的 N+1 查询
 #[tauri::command]
@@ -147,23 +207,29 @@ pub async fn get_topics_streamed(
 
 #[tauri::command]
 pub async fn create_topic(
-    _app_handle: AppHandle,
+    app_handle: AppHandle,
     db_state: State<'_, DbState>,
     owner_id: String,
     owner_type: String,
     name: String,
 ) -> Result<Topic, String> {
+    ensure_active_owner(&db_state.pool, &owner_id, &owner_type).await?;
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("话题名称不能为空".to_string());
+    }
+
     let now = crate::vcp_modules::infra::utils::now_millis();
 
     let id = if owner_type == "group" {
-        format!("group_topic_{}", now)
+        format!("group_topic_{}", Uuid::new_v4().simple())
     } else {
-        format!("topic_{}", now)
+        format!("topic_{}", Uuid::new_v4().simple())
     };
 
     let topic = Topic {
         id: id.clone(),
-        name: name.clone(),
+        name: name.to_string(),
         created_at: now,
         locked: true,
         unread: false,
@@ -173,6 +239,7 @@ pub async fn create_topic(
         owner_type: owner_type.clone(),
     };
 
+    let mut tx = db_state.pool.begin().await.map_err(|e| e.to_string())?;
     sqlx::query(
         "INSERT INTO topics (topic_id, owner_id, owner_type, title, created_at, updated_at, msg_count, locked, unread, unread_count)
          VALUES (?, ?, ?, ?, ?, ?, 0, 1, 0, 0)",
@@ -180,23 +247,33 @@ pub async fn create_topic(
     .bind(&id)
     .bind(&owner_id)
     .bind(&owner_type)
-    .bind(&name)
+    .bind(name)
     .bind(now)
     .bind(now)
-    .execute(&db_state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| format!("[CreateTopic] DB initialization failed: {}", e))?;
 
     // 触发聚合哈希冒泡 (初始化 Topic Hash 并更新 Agent/Group 的 ContentHash)
-    let mut tx = db_state.pool.begin().await.map_err(|e| e.to_string())?;
-    if let Err(e) = HashAggregator::bubble_from_topic(&mut tx, &id).await {
-        log::error!(
-            "[CreateTopic] Failed to bubble hash for topic {}: {}",
-            id,
-            e
-        );
-    }
+    HashAggregator::bubble_from_topic(&mut tx, &id).await?;
     tx.commit().await.map_err(|e| e.to_string())?;
+
+    if let Some(sync_state) = app_handle.try_state::<SyncState>() {
+        let config_hash: String = sqlx::query_scalar(
+            "SELECT config_hash FROM topics WHERE topic_id = ? AND deleted_at IS NULL",
+        )
+        .bind(&id)
+        .fetch_one(&db_state.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        let _ = sync_state.ws_sender.send(SyncCommand::NotifyLocalChange {
+            data_type: SyncDataType::Topic,
+            id: id.clone(),
+            hash: config_hash,
+            ts: now,
+            owner_type: Some(owner_type.clone()),
+        });
+    }
 
     Ok(topic)
 }
@@ -209,29 +286,8 @@ pub async fn delete_topic(
     owner_type: String,
     topic_id: String,
 ) -> Result<(), String> {
-    let now = chrono::Utc::now().timestamp_millis();
-
-    sqlx::query("UPDATE topics SET deleted_at = ? WHERE topic_id = ?")
-        .bind(now)
-        .bind(&topic_id)
-        .execute(&db_state.pool)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // 级联将该话题下的所有消息标记为逻辑删除
-    sqlx::query("UPDATE messages SET deleted_at = ? WHERE topic_id = ? AND deleted_at IS NULL")
-        .bind(now)
-        .bind(&topic_id)
-        .execute(&db_state.pool)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // 级联清除活跃生成注册表，杜绝已删除消息复活
-    sqlx::query("DELETE FROM active_generations WHERE topic_id = ?")
-        .bind(&topic_id)
-        .execute(&db_state.pool)
-        .await
-        .map_err(|e| e.to_string())?;
+    ensure_topic_owner(&db_state.pool, &topic_id, &owner_id, &owner_type).await?;
+    DeleteExecutor::soft_delete_topic(&app_handle, &topic_id).await?;
 
     if let Some(sync_state) = app_handle.try_state::<SyncState>() {
         let _ = sync_state.ws_sender.send(SyncCommand::NotifyDelete {
@@ -239,14 +295,6 @@ pub async fn delete_topic(
             id: topic_id.clone(),
         });
     }
-
-    let mut tx = db_state.pool.begin().await.map_err(|e| e.to_string())?;
-    if owner_type == "agent" {
-        let _ = HashAggregator::bubble_agent_hash(&mut tx, &owner_id).await;
-    } else if owner_type == "group" {
-        let _ = HashAggregator::bubble_group_hash(&mut tx, &owner_id).await;
-    }
-    let _ = tx.commit().await;
 
     Ok(())
 }
@@ -261,38 +309,47 @@ pub async fn update_topic_title(
     title: String,
 ) -> Result<(), String> {
     let now = crate::vcp_modules::infra::utils::now_millis();
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("话题标题不能为空".to_string());
+    }
 
-    sqlx::query("UPDATE topics SET title = ?, updated_at = ? WHERE topic_id = ?")
-        .bind(&title)
-        .bind(now)
-        .bind(&topic_id)
-        .execute(&db_state.pool)
-        .await
-        .map_err(|e| e.to_string())?;
+    let mut tx = db_state.pool.begin().await.map_err(|e| e.to_string())?;
+    let updated = sqlx::query(
+        "UPDATE topics SET title = ?, updated_at = ? \
+         WHERE topic_id = ? AND owner_id = ? AND owner_type = ? AND deleted_at IS NULL",
+    )
+    .bind(title)
+    .bind(now)
+    .bind(&topic_id)
+    .bind(&owner_id)
+    .bind(&owner_type)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+    if updated.rows_affected() == 0 {
+        return Err(format!("话题 {} 不存在、已删除或归属不匹配", topic_id));
+    }
 
     // 1. 触发聚合哈希冒泡 (重算当前 topic 的哈希，并向上累加到 Agent/Group)
-    let mut tx = db_state.pool.begin().await.map_err(|e| e.to_string())?;
     HashAggregator::bubble_from_topic(&mut tx, &topic_id).await?;
+    let hash: String = sqlx::query_scalar(
+        "SELECT config_hash FROM topics WHERE topic_id = ? AND deleted_at IS NULL",
+    )
+    .bind(&topic_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
     tx.commit().await.map_err(|e| e.to_string())?;
 
     // 2. 发送同步通知给局域网同步网络
     if let Some(sync_state) = app_handle.try_state::<SyncState>() {
-        let row = sqlx::query(
-            "SELECT config_hash, owner_type FROM topics WHERE topic_id = ? AND deleted_at IS NULL",
-        )
-        .bind(&topic_id)
-        .fetch_one(&db_state.pool)
-        .await
-        .map_err(|e| e.to_string())?;
-
-        let hash: String = row.get("config_hash");
-        let owner_type: String = row.get("owner_type");
         let _ = sync_state.ws_sender.send(SyncCommand::NotifyLocalChange {
             data_type: SyncDataType::Topic,
             id: topic_id.clone(),
             hash,
             ts: now,
-            owner_type: Some(owner_type),
+            owner_type: Some(owner_type.clone()),
         });
     }
 
@@ -334,38 +391,43 @@ pub async fn summarize_topic(
 pub async fn toggle_topic_lock(
     app_handle: AppHandle,
     db_state: State<'_, DbState>,
-    _owner_id: String,
-    _owner_type: String,
+    owner_id: String,
+    owner_type: String,
     topic_id: String,
     locked: bool,
 ) -> Result<(), String> {
     let now = crate::vcp_modules::infra::utils::now_millis();
 
-    sqlx::query("UPDATE topics SET locked = ?, updated_at = ? WHERE topic_id = ?")
-        .bind(locked)
-        .bind(now)
-        .bind(&topic_id)
-        .execute(&db_state.pool)
-        .await
-        .map_err(|e| e.to_string())?;
+    let mut tx = db_state.pool.begin().await.map_err(|e| e.to_string())?;
+    let updated = sqlx::query(
+        "UPDATE topics SET locked = ?, updated_at = ? \
+         WHERE topic_id = ? AND owner_id = ? AND owner_type = ? AND deleted_at IS NULL",
+    )
+    .bind(locked)
+    .bind(now)
+    .bind(&topic_id)
+    .bind(&owner_id)
+    .bind(&owner_type)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+    if updated.rows_affected() == 0 {
+        return Err(format!("话题 {} 不存在、已删除或归属不匹配", topic_id));
+    }
 
     // 1. 触发聚合哈希冒泡
-    let mut tx = db_state.pool.begin().await.map_err(|e| e.to_string())?;
     HashAggregator::bubble_from_topic(&mut tx, &topic_id).await?;
+    let hash: String = sqlx::query_scalar(
+        "SELECT config_hash FROM topics WHERE topic_id = ? AND deleted_at IS NULL",
+    )
+    .bind(&topic_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
     tx.commit().await.map_err(|e| e.to_string())?;
 
     // 2. 发送同步通知
     if let Some(sync_state) = app_handle.try_state::<SyncState>() {
-        let row = sqlx::query(
-            "SELECT config_hash, owner_type FROM topics WHERE topic_id = ? AND deleted_at IS NULL",
-        )
-        .bind(&topic_id)
-        .fetch_one(&db_state.pool)
-        .await
-        .map_err(|e| e.to_string())?;
-
-        let hash: String = row.get("config_hash");
-        let owner_type: String = row.get("owner_type");
         let _ = sync_state.ws_sender.send(SyncCommand::NotifyLocalChange {
             data_type: SyncDataType::Topic,
             id: topic_id,
@@ -380,21 +442,51 @@ pub async fn toggle_topic_lock(
 
 #[tauri::command]
 pub async fn set_topic_unread(
-    _app_handle: AppHandle,
+    app_handle: AppHandle,
     db_state: State<'_, DbState>,
-    _owner_id: String,
-    _owner_type: String,
+    owner_id: String,
+    owner_type: String,
     topic_id: String,
     unread: bool,
 ) -> Result<(), String> {
     let unread_int = if unread { 1 } else { 0 };
-    sqlx::query("UPDATE topics SET unread = ?, updated_at = ? WHERE topic_id = ?")
-        .bind(unread_int)
-        .bind(crate::vcp_modules::infra::utils::now_millis())
-        .bind(&topic_id)
-        .execute(&db_state.pool)
-        .await
-        .map_err(|e| e.to_string())?;
+    let now = crate::vcp_modules::infra::utils::now_millis();
+    let mut tx = db_state.pool.begin().await.map_err(|e| e.to_string())?;
+    let updated = sqlx::query(
+        "UPDATE topics SET unread = ?, updated_at = ? \
+         WHERE topic_id = ? AND owner_id = ? AND owner_type = ? AND deleted_at IS NULL",
+    )
+    .bind(unread_int)
+    .bind(now)
+    .bind(&topic_id)
+    .bind(&owner_id)
+    .bind(&owner_type)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+    if updated.rows_affected() == 0 {
+        return Err(format!("话题 {} 不存在、已删除或归属不匹配", topic_id));
+    }
+
+    HashAggregator::bubble_from_topic(&mut tx, &topic_id).await?;
+    let hash: String = sqlx::query_scalar(
+        "SELECT config_hash FROM topics WHERE topic_id = ? AND deleted_at IS NULL",
+    )
+    .bind(&topic_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+    tx.commit().await.map_err(|e| e.to_string())?;
+
+    if let Some(sync_state) = app_handle.try_state::<SyncState>() {
+        let _ = sync_state.ws_sender.send(SyncCommand::NotifyLocalChange {
+            data_type: SyncDataType::Topic,
+            id: topic_id,
+            hash,
+            ts: now,
+            owner_type: Some(owner_type),
+        });
+    }
 
     Ok(())
 }
@@ -476,6 +568,8 @@ pub async fn archive_assistant_chat(
             blocks: None,
             shell: None,
             content_hash: None,
+            transient_context: None,
+            transient_system_prompt: None,
         };
 
         crate::vcp_modules::persistence::message_repository::MessageRepository::upsert_message(
@@ -577,12 +671,14 @@ pub async fn regenerate_topic_response(
     let user_msg = crate::vcp_modules::message_service::fetch_raw_message_content(
         app_handle.clone(),
         target_user_msg_id.clone(),
+        Some(topic_id.clone()),
     )
     .await?;
 
     // 2. 加载消息元数据（为了获取 timestamp 以后续截断）
     let pool = &db_state.pool;
-    let row = sqlx::query("SELECT timestamp, role, name, agent_id, group_id, is_group_message FROM messages WHERE msg_id = ?")
+    let row = sqlx::query("SELECT timestamp, role, name, agent_id, group_id, is_group_message FROM messages WHERE topic_id = ? AND msg_id = ? AND deleted_at IS NULL")
+        .bind(&topic_id)
         .bind(&target_user_msg_id)
         .fetch_one(pool)
         .await
@@ -619,6 +715,8 @@ pub async fn regenerate_topic_response(
         blocks: None,
         shell: None,
         content_hash: None,
+        transient_context: None,
+        transient_system_prompt: None,
     };
 
     // 5. 获取配置并发起生成

@@ -1,5 +1,6 @@
 package com.vcp.mobile
 
+import android.annotation.SuppressLint
 import android.animation.Animator
 import android.animation.AnimatorListenerAdapter
 import android.animation.ValueAnimator
@@ -10,7 +11,6 @@ import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
-import android.os.Build
 import android.provider.Settings
 import android.util.Log
 import android.view.Gravity
@@ -20,7 +20,9 @@ import android.view.WindowManager
 import android.view.animation.DecelerateInterpolator
 import android.webkit.JavascriptInterface
 import android.webkit.WebSettings
+import android.webkit.WebResourceRequest
 import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -43,26 +45,20 @@ class FloatingWindowManager(private val activity: Activity) {
     }
 
     fun hasOverlayPermission(): Boolean {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            Settings.canDrawOverlays(context)
-        } else {
-            true
-        }
+        return Settings.canDrawOverlays(context)
     }
 
     fun requestOverlayPermission() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            try {
-                val intent = Intent(
-                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                    Uri.parse("package:${activity.packageName}")
-                ).apply {
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                }
-                activity.startActivity(intent)
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to start ACTION_MANAGE_OVERLAY_PERMISSION", e)
+        try {
+            val intent = Intent(
+                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                Uri.parse("package:${activity.packageName}")
+            ).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
+            activity.startActivity(intent)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start ACTION_MANAGE_OVERLAY_PERMISSION", e)
         }
     }
 
@@ -86,7 +82,7 @@ class FloatingWindowManager(private val activity: Activity) {
             val dp48 = dpToPx(48)
             val params = WindowManager.LayoutParams(
                 dp48, dp48,
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
                 PixelFormat.TRANSLUCENT
             ).apply {
@@ -104,9 +100,10 @@ class FloatingWindowManager(private val activity: Activity) {
                     setColor(0xFFF9FAFB.toInt())
                     setStroke(dpToPx(1), 0x1F000000)
                 }
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) elevation = dpToPx(6).toFloat()
+                elevation = dpToPx(6).toFloat()
                 alpha = 0.85f
             }
+            imageView.setOnClickListener { onFloatingBallClick() }
             setupBallTouchListener(imageView)
             windowManager?.addView(imageView, params)
             floatingBallView = imageView
@@ -141,7 +138,7 @@ class FloatingWindowManager(private val activity: Activity) {
                 }
                 MotionEvent.ACTION_UP -> {
                     if (Math.hypot((event.rawX - startX).toDouble(), (event.rawY - startY).toDouble()) < dpToPx(6) && System.currentTimeMillis() - startTime < 300) {
-                        onFloatingBallClick()
+                        v.performClick()
                     }
                     animateBallToEdge(v, params)
                 }
@@ -181,6 +178,7 @@ class FloatingWindowManager(private val activity: Activity) {
         if (assistantContainer == null) showAssistantWindow() else hideAssistantWindow()
     }
 
+    @SuppressLint("SetJavaScriptEnabled")
     private fun showAssistantWindow() {
         if (assistantContainer != null) return
         try {
@@ -190,7 +188,7 @@ class FloatingWindowManager(private val activity: Activity) {
 
             val params = WindowManager.LayoutParams(
                 WindowManager.LayoutParams.MATCH_PARENT, height,
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                 WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
                 PixelFormat.TRANSLUCENT
             ).apply {
@@ -231,8 +229,24 @@ class FloatingWindowManager(private val activity: Activity) {
                 settings.apply {
                     javaScriptEnabled = true
                     domStorageEnabled = true
-                    databaseEnabled = true
-                    mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                    allowFileAccess = false
+                    allowContentAccess = false
+                    javaScriptCanOpenWindowsAutomatically = false
+                    setSupportMultipleWindows(false)
+                    mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
+                }
+                webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest): Boolean {
+                        if (!request.isForMainFrame) return false
+                        val uri = request.url
+                        val isTrusted = uri.scheme == "http" &&
+                            uri.host == "127.0.0.1" &&
+                            uri.port == LOCAL_SERVER_PORT
+                        if (!isTrusted) {
+                            Log.w(TAG, "Blocked floating WebView navigation to an untrusted origin.")
+                        }
+                        return !isTrusted
+                    }
                 }
                 addJavascriptInterface(object {
                     @JavascriptInterface fun closeWindow() { activity.runOnUiThread { hideAssistantWindow() } }

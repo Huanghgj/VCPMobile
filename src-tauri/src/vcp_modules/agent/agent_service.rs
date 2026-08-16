@@ -6,6 +6,7 @@ use crate::vcp_modules::db_manager::DbState;
 use crate::vcp_modules::group::group_service::GroupManagerState;
 use crate::vcp_modules::group::group_types::GroupListItem;
 use crate::vcp_modules::sync_dto::AgentSyncDTO;
+use crate::vcp_modules::sync_executor::DeleteExecutor;
 use crate::vcp_modules::sync_hash::HashAggregator;
 use crate::vcp_modules::sync_service::{SyncCommand, SyncState};
 use crate::vcp_modules::sync_types::SyncDataType;
@@ -94,7 +95,7 @@ pub async fn read_agent_config_internal<R: Runtime>(
     let agent_row = sqlx::query(
         "SELECT a.name, a.system_prompt, a.mobile_system_prompt, a.model, a.temperature, a.context_token_limit, a.max_output_tokens, a.stream_output, a.use_temperature, av.dominant_color
          FROM agents a
-         LEFT JOIN avatars av ON av.owner_id = a.agent_id AND av.owner_type = 'agent'
+         LEFT JOIN avatars av ON av.owner_id = a.agent_id AND av.owner_type = 'agent' AND av.deleted_at IS NULL
          WHERE a.agent_id = ? AND a.deleted_at IS NULL"
     )
     .bind(agent_id)
@@ -197,7 +198,7 @@ pub async fn get_agents(
     let agent_rows = sqlx::query(
         "SELECT a.agent_id, a.name, a.system_prompt, a.mobile_system_prompt, a.model, a.temperature, a.context_token_limit, a.max_output_tokens, a.stream_output, a.use_temperature, av.dominant_color
          FROM agents a
-         LEFT JOIN avatars av ON av.owner_id = a.agent_id AND av.owner_type = 'agent'
+         LEFT JOIN avatars av ON av.owner_id = a.agent_id AND av.owner_type = 'agent' AND av.deleted_at IS NULL
          WHERE a.deleted_at IS NULL"
     )
     .fetch_all(pool)
@@ -300,6 +301,18 @@ async fn internal_write_agent_config<R: Runtime>(
     let pool = &db_state.pool;
     let now = crate::vcp_modules::infra::utils::now_millis();
 
+    let agent_is_active: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM agents WHERE agent_id = ? AND deleted_at IS NULL)",
+    )
+    .bind(agent_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    if !agent_is_active {
+        state.caches.remove(agent_id);
+        return Err(format!("Agent {} 不存在或已删除", agent_id));
+    }
+
     // 🛡️ 防擦除防线：如果前端发回的对象提示词为空，从 caches 或 SQLite 数据库提取原有 system_prompt 兜底
     let mut final_config = new_config.clone();
     if final_config.system_prompt.is_empty() {
@@ -326,33 +339,21 @@ async fn internal_write_agent_config<R: Runtime>(
     let dto = AgentSyncDTO::from(&final_config);
     let config_hash = HashAggregator::compute_agent_config_hash(&dto);
 
-    // 只有非同步来源且哈希发生变化时，才通知同步中心
-    if !from_sync {
-        if let Some(sync_state) = app_handle.try_state::<SyncState>() {
-            let rows = sqlx::query("SELECT config_hash FROM agents WHERE agent_id = ?")
-                .bind(agent_id)
-                .fetch_optional(pool)
-                .await
-                .map_err(|e| e.to_string())?;
+    let should_notify_sync = if from_sync {
+        false
+    } else {
+        let old_hash = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT config_hash FROM agents WHERE agent_id = ? AND deleted_at IS NULL",
+        )
+        .bind(agent_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?
+        .flatten();
+        old_hash.as_ref() != Some(&config_hash)
+    };
 
-            let old_hash = rows.and_then(|r| {
-                use sqlx::Row;
-                r.get::<Option<String>, _>("config_hash")
-            });
-
-            if old_hash.as_ref() != Some(&config_hash) {
-                let _ = sync_state.ws_sender.send(SyncCommand::NotifyLocalChange {
-                    id: agent_id.to_string(),
-                    data_type: SyncDataType::Agent,
-                    hash: config_hash.clone(),
-                    ts: now,
-                    owner_type: None,
-                });
-            }
-        }
-    }
-
-    sqlx::query(
+    let agent_update = sqlx::query(
         "INSERT INTO agents (
             agent_id, name, system_prompt, mobile_system_prompt, model, temperature,
             context_token_limit, max_output_tokens,
@@ -369,7 +370,8 @@ async fn internal_write_agent_config<R: Runtime>(
             stream_output = excluded.stream_output,
             use_temperature = excluded.use_temperature,
             config_hash = excluded.config_hash,
-            updated_at = excluded.updated_at",
+            updated_at = excluded.updated_at
+         WHERE agents.deleted_at IS NULL",
     )
     .bind(agent_id)
     .bind(&final_config.name)
@@ -386,11 +388,14 @@ async fn internal_write_agent_config<R: Runtime>(
     .execute(&mut *tx)
     .await
     .map_err(|e| e.to_string())?;
+    if agent_update.rows_affected() == 0 {
+        return Err(format!("Agent {} 已删除，拒绝延迟保存", agent_id));
+    }
 
     // 更新话题 (Upsert)
     if !new_config.topics.is_empty() {
         for topic in &new_config.topics {
-            sqlx::query(
+            let topic_update = sqlx::query(
                 "INSERT INTO topics (
                     topic_id, owner_type, owner_id, title,
                     created_at, updated_at, locked, unread
@@ -399,7 +404,10 @@ async fn internal_write_agent_config<R: Runtime>(
                     title = excluded.title,
                     locked = excluded.locked,
                     unread = excluded.unread,
-                    updated_at = excluded.updated_at",
+                    updated_at = excluded.updated_at
+                 WHERE topics.deleted_at IS NULL
+                   AND topics.owner_id = excluded.owner_id
+                   AND topics.owner_type = excluded.owner_type",
             )
             .bind(&topic.id)
             .bind(agent_id)
@@ -413,7 +421,9 @@ async fn internal_write_agent_config<R: Runtime>(
             .map_err(|e| e.to_string())?;
 
             // 初始化/更新 Topic 自身哈希 (config_hash, content_hash)
-            HashAggregator::bubble_topic_hash(&mut tx, &topic.id).await?;
+            if topic_update.rows_affected() > 0 {
+                HashAggregator::bubble_topic_hash(&mut tx, &topic.id).await?;
+            }
         }
     }
 
@@ -431,6 +441,18 @@ async fn internal_write_agent_config<R: Runtime>(
         .caches
         .insert(agent_id.to_string(), final_config.clone());
 
+    if should_notify_sync {
+        if let Some(sync_state) = app_handle.try_state::<SyncState>() {
+            let _ = sync_state.ws_sender.send(SyncCommand::NotifyLocalChange {
+                id: agent_id.to_string(),
+                data_type: SyncDataType::Agent,
+                hash: config_hash,
+                ts: now,
+                owner_type: None,
+            });
+        }
+    }
+
     Ok(true)
 }
 
@@ -441,16 +463,10 @@ pub async fn delete_agent(
     state: State<'_, AgentConfigState>,
     agent_id: String,
 ) -> Result<bool, String> {
-    let db_state = app_handle.state::<DbState>();
-    let pool = &db_state.pool;
-    let now = crate::vcp_modules::infra::utils::now_millis();
+    let mutex = state.acquire_lock(&agent_id).await;
+    let _lock = mutex.lock().await;
 
-    sqlx::query("UPDATE agents SET deleted_at = ? WHERE agent_id = ?")
-        .bind(now)
-        .bind(&agent_id)
-        .execute(pool)
-        .await
-        .map_err(|e| e.to_string())?;
+    DeleteExecutor::soft_delete_agent(&app_handle, &agent_id).await?;
 
     state.caches.remove(&agent_id);
     state.locks.remove(&agent_id);
@@ -595,7 +611,7 @@ pub async fn get_assistants_snapshot(
     let agent_rows = sqlx::query(
         "SELECT a.agent_id, a.name, a.system_prompt, a.mobile_system_prompt, a.model, a.temperature, a.context_token_limit, a.max_output_tokens, a.stream_output, a.use_temperature, av.dominant_color
          FROM agents a
-         LEFT JOIN avatars av ON av.owner_id = a.agent_id AND av.owner_type = 'agent'
+         LEFT JOIN avatars av ON av.owner_id = a.agent_id AND av.owner_type = 'agent' AND av.deleted_at IS NULL
          WHERE a.deleted_at IS NULL"
     )
     .fetch_all(pool)
@@ -640,7 +656,7 @@ pub async fn get_assistants_snapshot(
     let group_rows = sqlx::query(
         "SELECT g.group_id, g.name, g.mode, g.group_prompt, g.invite_prompt, g.use_unified_model, g.unified_model, g.tag_match_mode, g.created_at, av.dominant_color
          FROM groups g
-         LEFT JOIN avatars av ON av.owner_id = g.group_id AND av.owner_type = 'group'
+         LEFT JOIN avatars av ON av.owner_id = g.group_id AND av.owner_type = 'group' AND av.deleted_at IS NULL
          WHERE g.deleted_at IS NULL"
     )
     .fetch_all(pool)

@@ -151,11 +151,12 @@ impl HashAggregator {
         let root_hash = Self::compute_topic_root_hash(tx, topic_id).await?;
 
         // 2. 计算并更新 config_hash (元数据)
-        let row = sqlx::query("SELECT owner_type FROM topics WHERE topic_id = ?")
-            .bind(topic_id)
-            .fetch_one(&mut **tx)
-            .await
-            .map_err(|e| e.to_string())?;
+        let row =
+            sqlx::query("SELECT owner_type FROM topics WHERE topic_id = ? AND deleted_at IS NULL")
+                .bind(topic_id)
+                .fetch_one(&mut **tx)
+                .await
+                .map_err(|e| e.to_string())?;
 
         let owner_type: String = row.get("owner_type");
         let config_hash = if owner_type == "agent" {
@@ -166,13 +167,16 @@ impl HashAggregator {
             Self::compute_group_topic_metadata_hash(&dto)
         };
 
-        sqlx::query("UPDATE topics SET content_hash = ?, config_hash = ? WHERE topic_id = ?")
-            .bind(root_hash)
-            .bind(config_hash)
-            .bind(topic_id)
-            .execute(&mut **tx)
-            .await
-            .map_err(|e| e.to_string())?;
+        sqlx::query(
+            "UPDATE topics SET content_hash = ?, config_hash = ? \
+             WHERE topic_id = ? AND deleted_at IS NULL",
+        )
+        .bind(root_hash)
+        .bind(config_hash)
+        .bind(topic_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -209,13 +213,16 @@ impl HashAggregator {
             Self::compute_group_topic_metadata_hash(&dto)
         };
 
-        sqlx::query("UPDATE topics SET content_hash = ?, config_hash = ? WHERE topic_id = ?")
-            .bind(root_hash)
-            .bind(config_hash)
-            .bind(topic_id)
-            .execute(&mut **tx)
-            .await
-            .map_err(|e| e.to_string())?;
+        sqlx::query(
+            "UPDATE topics SET content_hash = ?, config_hash = ? \
+             WHERE topic_id = ? AND deleted_at IS NULL",
+        )
+        .bind(root_hash)
+        .bind(config_hash)
+        .bind(topic_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -253,11 +260,14 @@ impl HashAggregator {
     ) -> Result<(), String> {
         Self::bubble_topic_hash(tx, topic_id).await?;
 
-        let topic_row = sqlx::query("SELECT owner_id, owner_type FROM topics WHERE topic_id = ?")
-            .bind(topic_id)
-            .fetch_one(&mut **tx)
-            .await
-            .map_err(|e| e.to_string())?;
+        let topic_row = sqlx::query(
+            "SELECT owner_id, owner_type FROM topics \
+             WHERE topic_id = ? AND deleted_at IS NULL",
+        )
+        .bind(topic_id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|e| e.to_string())?;
 
         let owner_id: String = topic_row.get("owner_id");
         let owner_type: String = topic_row.get("owner_type");
@@ -400,7 +410,8 @@ impl HashInitializer {
         topic_id: &str,
     ) -> Result<AgentTopicSyncDTO, String> {
         let row = sqlx::query(
-            "SELECT topic_id, title, created_at, locked, unread, owner_id FROM topics WHERE topic_id = ?",
+            "SELECT topic_id, title, created_at, locked, unread, owner_id FROM topics \
+             WHERE topic_id = ? AND deleted_at IS NULL",
         )
         .bind(topic_id)
         .fetch_one(&mut **tx)
@@ -422,7 +433,8 @@ impl HashInitializer {
         topic_id: &str,
     ) -> Result<GroupTopicSyncDTO, String> {
         let row = sqlx::query(
-            "SELECT topic_id, title, created_at, owner_id FROM topics WHERE topic_id = ?",
+            "SELECT topic_id, title, created_at, owner_id FROM topics \
+             WHERE topic_id = ? AND deleted_at IS NULL",
         )
         .bind(topic_id)
         .fetch_one(&mut **tx)

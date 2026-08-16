@@ -47,7 +47,9 @@ android {
     }
 
     defaultConfig {
-        manifestPlaceholders["usesCleartextTraffic"] = "false"
+        // User-configured VCPToolBox/ComfyUI endpoints commonly serve LAN HTTP
+        // resources, including images rendered inside rich messages.
+        manifestPlaceholders["usesCleartextTraffic"] = "true"
         manifestPlaceholders["appName"] = "VCPMobile"
         applicationId = "com.vcp.avatar"
         minSdk = 26
@@ -64,7 +66,8 @@ android {
             isDebuggable = true
             isJniDebuggable = true
             isMinifyEnabled = false
-            packaging {                jniLibs.keepDebugSymbols.add("*/arm64-v8a/*.so")
+            packaging {
+                jniLibs.keepDebugSymbols.add("*/arm64-v8a/*.so")
                 jniLibs.keepDebugSymbols.add("*/armeabi-v7a/*.so")
                 jniLibs.keepDebugSymbols.add("*/x86/*.so")
                 jniLibs.keepDebugSymbols.add("*/x86_64/*.so")

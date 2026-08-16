@@ -66,6 +66,7 @@ const groupConfig = ref<GroupConfig>({
 
 const allAgents = ref<Agent[]>([]);
 const isSaving = ref(false);
+const isDeleting = ref(false);
 const saveSuccess = ref(false);
 let saveTimeout: ReturnType<typeof setTimeout> | null = null;
 let saveSuccessTimer: ReturnType<typeof setTimeout> | null = null;
@@ -154,7 +155,7 @@ const fetchGroupConfig = async () => {
 };
 
 const saveOnClose = async () => {
-  if (!groupConfig.value.id) return;
+  if (isDeleting.value || !groupConfig.value.id) return;
 
   // 仅在配置真正被修改时才触发保存，避免无意义的后端调用
   if (originalConfig.value && JSON.stringify(groupConfig.value) !== JSON.stringify(originalConfig.value)) {
@@ -220,19 +221,24 @@ const onModelSelect = (modelId: string) => {
 };
 
 const handleDelete = async () => {
+  if (isDeleting.value) return;
   const confirmed = await overlayStore.showConfirm({
     title: "删除群组",
     message: "确定要删除这个群组吗？所有聊天记录将被标记为删除。",
     isDanger: true
   });
   if (confirmed) {
+    isDeleting.value = true;
     try {
       await assistantStore.deleteGroup(props.id);
       if (sessionStore.currentSelectedItem?.id === props.id) {
         sessionStore.currentSelectedItem = null;
+        sessionStore.currentTopicId = null;
       }
+      delete sessionStore.lastActiveTopicMap[props.id];
       emit("close");
     } catch (err: any) {
+      isDeleting.value = false;
       notificationStore.addNotification({
         type: 'error',
         message: "删除失败: " + (err?.message || err),
@@ -422,9 +428,9 @@ const tagModeOptions = [
 
         <!-- Actions -->
         <div class="pt-4 pb-8">
-          <button @click="handleDelete"
+          <button @click="handleDelete" :disabled="isDeleting"
             class="w-full py-3.5 bg-transparent border border-red-500/20 text-red-500/60 hover:bg-red-500/5 active:bg-red-500/10 active:scale-95 transition-all rounded-2xl font-black uppercase tracking-widest text-[11px]">
-            删除此群组
+            {{ isDeleting ? "正在删除…" : "删除此群组" }}
           </button>
         </div>
       </div>

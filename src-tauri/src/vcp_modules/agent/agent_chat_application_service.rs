@@ -49,29 +49,6 @@ pub struct AgentChatPayload {
     pub vcp_api_key: String,
 }
 
-fn history_tail_matches_user_message(history: &[ChatMessage], user_message: &ChatMessage) -> bool {
-    history
-        .last()
-        .filter(|last| last.role == "user")
-        .is_some_and(|last| {
-            (!user_message.id.is_empty() && last.id == user_message.id)
-                || (!user_message.content.is_empty() && last.content == user_message.content)
-        })
-}
-
-fn context_history_message_limit(context_token_limit: i32) -> usize {
-    const MIN_HISTORY_MESSAGES: usize = 24;
-    const MAX_HISTORY_MESSAGES: usize = 240;
-    const TOKENS_PER_MESSAGE_BUDGET: usize = 1_500;
-
-    if context_token_limit <= 0 {
-        return 96;
-    }
-
-    ((context_token_limit as usize) / TOKENS_PER_MESSAGE_BUDGET)
-        .clamp(MIN_HISTORY_MESSAGES, MAX_HISTORY_MESSAGES)
-}
-
 fn sanitize_outbound_context_content(
     role: &str,
     content: &str,
@@ -170,7 +147,8 @@ pub async fn internal_process_agent_chat_message(
         }
     }
 
-    let request_control = active_requests.register(&thinking_id);
+    let request_control =
+        active_requests.register_scoped(&thinking_id, &agent_id, "agent", &topic_id, None);
     let _request_guard = ActiveRequestGuard::new(
         active_requests.0.clone(),
         thinking_id.clone(),
@@ -211,32 +189,44 @@ pub async fn internal_process_agent_chat_message(
     }
 
     // 3. 加载轻量级纯文本和附件历史记录用于大模型上下文组装 (从底层隔离 UI 渲染反序列化和 Shell 计算)
-    let mut history = message_service::load_chat_text_history_for_context(
-        &app_handle,
-        &topic_id,
-        Some(context_history_message_limit(
-            agent_config.context_token_limit,
-        )),
-        None,
-        true, // include_extracted_text: 组装上下文发送给 VCP 时需要包含附件提取文本内容
-    )
-    .await?;
-
-    if !append_user_msg && !history_tail_matches_user_message(&history, &user_message) {
-        log::warn!(
-            "[AgentChatAppService] Latest user message missing from persisted history; injecting inline for request context. topic_id={}, user_msg_id={}",
-            topic_id,
-            user_message.id
-        );
-        history.push(user_message.clone());
-    }
-
-    // 4. 委派上下文级联装配外观中枢，完成微观编织与宏观 Tavern 规则流水线拦截
-    let mut effective_prompt = if !agent_config.mobile_system_prompt.is_empty() {
+    let configured_system_prompt = if !agent_config.mobile_system_prompt.is_empty() {
         agent_config.mobile_system_prompt.clone()
     } else {
         agent_config.system_prompt.clone()
     };
+    let history_token_budget = message_service::context_input_token_budget(
+        agent_config.context_token_limit,
+        agent_config.max_output_tokens,
+        &[&configured_system_prompt],
+    );
+    let mut history = message_service::load_chat_text_history_for_context_window(
+        &app_handle,
+        &topic_id,
+        history_token_budget,
+        true, // include_extracted_text: 组装上下文发送给 VCP 时需要包含附件提取文本内容
+    )
+    .await?;
+
+    if !append_user_msg {
+        if let Some(persisted_message) = history
+            .iter_mut()
+            .rev()
+            .find(|message| message.id == user_message.id)
+        {
+            // The frontend may add request-only media/context after persisting the visible message.
+            *persisted_message = user_message.clone();
+        } else {
+            log::warn!(
+                "[AgentChatAppService] Latest user message missing from persisted history; injecting inline for request context. topic_id={}, user_msg_id={}",
+                topic_id,
+                user_message.id
+            );
+            history.push(user_message.clone());
+        }
+    }
+
+    // 4. 委派上下文级联装配外观中枢，完成微观编织与宏观 Tavern 规则流水线拦截
+    let mut effective_prompt = configured_system_prompt;
 
     if turn_source == ChatTurnSource::User {
         let affect_input = crate::vcp_modules::affect_engine::RecordAffectEventInput {

@@ -22,7 +22,7 @@ const groupedNotifications = computed<GroupedNotifications[]>(() => {
 
   props.items.forEach((item) => {
     const date = new Date(item.timestamp);
-    let groupKey = "";
+    let groupKey: string;
 
     if (isToday(date)) {
       groupKey = "今天";

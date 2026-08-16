@@ -20,10 +20,9 @@ mod distributed;
 #[path = "../src/vcp_modules/mod.rs"]
 mod vcp_modules;
 
-use crate::vcp_modules::aurora_pipeline::{AuroraBuffer, TailFrame};
-use crate::vcp_modules::chat::ast_diff::diff_ast;
+use crate::vcp_modules::aurora_pipeline::{AuroraBuffer, AuroraUpdate};
 use crate::vcp_modules::pre_renderer::code_highlighter::highlight_code_block;
-use crate::vcp_modules::pre_renderer::{parse_markdown_to_ast_streaming, MarkdownNode};
+use crate::vcp_modules::pre_renderer::parse_markdown_to_ast;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
 /// 读取 40k 测试 HTML 源（827 行）。编译期内嵌，杜绝运行时路径依赖。
@@ -50,10 +49,9 @@ fn as_open_code_fence(content: &str) -> String {
     format!("```html\n{}", content)
 }
 
-/// 基准 1：单帧全链路开销 —— parse → hash → diff → serialize，外加 IPC 载荷字节数。
+/// 基准 1：最终块 parse + serialize 开销。
 ///
-/// 这是决定 8KB 上限的关键数据：一帧（一次 process_queue）在 tail 达到某尺寸时的总开销。
-/// 由于 CodeBlock 走整节点 Replace，每帧都会把整块重新 parse/hash/serialize。
+/// 活动 tail 已不再逐帧生成 AST；这个基准衡量块闭合时的一次性成本。
 fn bench_single_frame_pipeline(c: &mut Criterion) {
     let html = load_genesis_html();
     let mut group = c.benchmark_group("tail_single_frame_pipeline");
@@ -62,22 +60,10 @@ fn bench_single_frame_pipeline(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(tier), &tier, |b, &tier| {
             let content = truncate_on_char_boundary(html, tier);
             let fenced = as_open_code_fence(content);
-            let prev_content = truncate_on_char_boundary(content, content.len().saturating_sub(40));
-            let prev_fenced = as_open_code_fence(prev_content);
 
             b.iter(|| {
-                let parsed = parse_markdown_to_ast_streaming(&fenced);
-                let prev_ast = parse_markdown_to_ast_streaming(&prev_fenced);
-                let mutations = diff_ast(&prev_ast, &parsed, "t");
-                let frame = TailFrame {
-                    epoch: 1,
-                    revision: 1,
-                    frame_seq: 1,
-                    reset: false,
-                    snapshot: None,
-                    mutations,
-                };
-                let serialized = serde_json::to_string(&frame).unwrap();
+                let parsed = parse_markdown_to_ast(&fenced);
+                let serialized = serde_json::to_string(&parsed).unwrap();
                 black_box(serialized);
             });
         });
@@ -105,7 +91,7 @@ fn bench_syntect_highlight(c: &mut Criterion) {
 /// 基准 3：累计流式开销 —— 一个代码块从 0 增长到目标尺寸，逐帧 re-parse 的总和。
 ///
 /// 模拟真实 SSE：固定 chunk 字节（约模拟一次 SSE delta），每追加一块就跑一次
-/// 单帧全链路（parse+diff+serialize）。这是"30 帧缓冲累计开销"的直接量化。
+/// parse + serialize。它给出旧式逐帧 AST 路径的累计成本上界。
 fn bench_cumulative_stream(c: &mut Criterion) {
     let html = load_genesis_html();
     const CHUNK_BYTES: usize = 48;
@@ -129,22 +115,11 @@ fn bench_cumulative_stream(c: &mut Criterion) {
             bounds.push(full.len());
 
             b.iter(|| {
-                let mut prev_ast: Vec<MarkdownNode> = Vec::new();
                 for &end in &bounds {
                     let content = &full[..end];
                     let fenced = as_open_code_fence(content);
-                    let new_ast = parse_markdown_to_ast_streaming(&fenced);
-                    let mutations = diff_ast(&prev_ast, &new_ast, "t");
-                    let frame = TailFrame {
-                        epoch: 1,
-                        revision: 1,
-                        frame_seq: 1,
-                        reset: false,
-                        snapshot: None,
-                        mutations,
-                    };
-                    let _ = serde_json::to_string(&frame).unwrap();
-                    prev_ast = new_ast;
+                    let ast = parse_markdown_to_ast(&fenced);
+                    let _ = serde_json::to_string(&ast).unwrap();
                 }
                 black_box(());
             });
@@ -154,7 +129,7 @@ fn bench_cumulative_stream(c: &mut Criterion) {
 }
 
 /// 基准 4：端到端 AuroraBuffer —— 用真实管道喂入增长的代码块，验证整链路（含
-/// take_tail_frame 的 reset/snapshot 逻辑）的真实开销，而非孤立函数。
+/// compact `AuroraUpdate` 序列化）的真实开销，而非孤立函数。
 fn bench_end_to_end_aurora(c: &mut Criterion) {
     let html = load_genesis_html();
     const CHUNK_BYTES: usize = 48;
@@ -177,11 +152,17 @@ fn bench_end_to_end_aurora(c: &mut Criterion) {
                     let chunk = &fenced_full[sent..end];
                     sent = end;
                     buffer.append_chunk(chunk);
-                    let _ = buffer.process_queue();
-                    let frame = buffer.take_tail_frame();
-                    if let Some(f) = frame {
-                        let _ = serde_json::to_string(&f).unwrap();
-                    }
+                    let (stable_changed, tail_changed) = buffer.process_queue();
+                    let update = AuroraUpdate {
+                        sequence: 1,
+                        stable_blocks_delta: None,
+                        stable_changed,
+                        tail_block: buffer.tail_block.clone(),
+                        tail_changed,
+                        content_delta: Some(chunk.to_string()),
+                        content: None,
+                    };
+                    let _ = serde_json::to_string(&update).unwrap();
                 }
                 black_box(());
             });

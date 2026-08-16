@@ -13,7 +13,7 @@ interface PageStackItem {
 }
 
 export const useOverlayStore = defineStore('overlay', () => {
-  const { registerModal, unregisterModal } = useModalHistory();
+  const { registerModal, unregisterModal, replaceModal } = useModalHistory();
 
   const promptConfig = ref<PromptConfig | null>(null);
   const confirmConfig = ref<ConfirmConfig | null>(null);
@@ -217,8 +217,16 @@ export const useOverlayStore = defineStore('overlay', () => {
 
   // --- Modal API (unchanged) ---
   const openPrompt = (config: PromptConfig) => {
+    if (promptConfig.value) return;
+
     promptConfig.value = config;
-    registerModal('Prompt', () => { promptConfig.value = null; });
+    const closeFromHistory = () => { promptConfig.value = null; };
+    if (contextMenuConfig.value) {
+      contextMenuConfig.value = null;
+      replaceModal('ContextMenu', 'Prompt', closeFromHistory);
+    } else {
+      registerModal('Prompt', closeFromHistory);
+    }
   };
 
   const closePrompt = () => {
@@ -229,7 +237,15 @@ export const useOverlayStore = defineStore('overlay', () => {
   };
 
   const showConfirm = (options: { title: string; message: string; isDanger?: boolean; onlyConfirm?: boolean }) => {
+    if (confirmConfig.value) {
+      return Promise.resolve(false);
+    }
+
     return new Promise<boolean>((resolve) => {
+      const closeFromHistory = () => {
+        confirmConfig.value = null;
+        resolve(options.onlyConfirm ? true : false);
+      };
       confirmConfig.value = {
         title: options.title,
         message: options.message,
@@ -246,10 +262,12 @@ export const useOverlayStore = defineStore('overlay', () => {
           resolve(options.onlyConfirm ? true : false);
         }
       };
-      registerModal('Confirm', () => {
-        confirmConfig.value = null;
-        resolve(options.onlyConfirm ? true : false);
-      });
+      if (contextMenuConfig.value) {
+        contextMenuConfig.value = null;
+        replaceModal('ContextMenu', 'Confirm', closeFromHistory);
+      } else {
+        registerModal('Confirm', closeFromHistory);
+      }
     });
   };
 

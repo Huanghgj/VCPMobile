@@ -10,6 +10,8 @@ use crate::vcp_modules::content_parser::{
 use crate::vcp_modules::pre_renderer::MarkdownNode;
 use crate::vcp_modules::sync_hash::HashAggregator;
 
+const TOOL_REQUEST_MARKER: &str = "<<<[TOOL_REQUEST]>>>";
+
 /// 流式模式下轻量解析的块类型，前端增量渲染
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -331,6 +333,16 @@ impl StreamBlockParser {
             return None;
         }
 
+        if let Some(marker) = TOOL_START
+            .find(trimmed)
+            .filter(|marker| marker.start() == 0)
+        {
+            let content = trimmed[marker.end()..].trim().to_string();
+            let tool_name = extract_tool_name(&content);
+            let hash = HashAggregator::compute_content_hash(&format!("{}:{}", tool_name, content));
+            return Some(StreamBlock::tool(tool_name, content, false, hash));
+        }
+
         if let Some(caps) = THINK_START.captures(trimmed) {
             let marker = caps.get(0)?;
             let content = trimmed[marker.end()..].trim().to_string();
@@ -404,6 +416,16 @@ fn find_earliest_start_marker(text: &str) -> Option<(usize, usize, BlockType)> {
             }
         }
     }
+    if let Some((start, end)) =
+        crate::vcp_modules::render_repair::find_tool_request_boundary_in_html(text)
+    {
+        if earliest
+            .as_ref()
+            .is_none_or(|(current_start, _, _)| start < *current_start)
+        {
+            earliest = Some((start, end, BlockType::Tool));
+        }
+    }
     earliest
 }
 
@@ -431,6 +453,16 @@ fn find_end_marker(
                     content_start,
                     &tag_name,
                 );
+            if let Some((tool_start, _)) =
+                crate::vcp_modules::render_repair::find_tool_request_boundary_in_html(search_area)
+                    .filter(|(tool_start, _)| {
+                        close.is_none_or(|(close_start, _)| {
+                            *tool_start < close_start - content_start
+                        })
+                    })
+            {
+                return Some((tool_start, tool_start, false));
+            }
             if !allow_vcp_root_completion
                 && crate::vcp_modules::render_repair::is_vcp_root_open_tag(marker_text)
             {
@@ -505,17 +537,34 @@ fn find_end_marker(
 /// the protocol block must be parsed independently while the stream is active.
 fn starts_with_protocol_marker(text: &str) -> bool {
     let trimmed = text.trim_start();
-    [
-        &*TOOL_START,
-        &*THOUGHT_START,
-        &*THINK_START,
-        &*TOOL_RESULT_START,
-        &*DIARY_START,
-        &*ROLE_DIVIDER,
-        &*crate::vcp_modules::content_parser::TOOL_CALL_SUMMARY_START,
-    ]
-    .into_iter()
-    .any(|marker| marker.find(trimmed).is_some_and(|found| found.start() == 0))
+    is_incomplete_tool_request_marker(trimmed)
+        || [
+            &*TOOL_START,
+            &*THOUGHT_START,
+            &*THINK_START,
+            &*TOOL_RESULT_START,
+            &*DIARY_START,
+            &*ROLE_DIVIDER,
+            &*crate::vcp_modules::content_parser::TOOL_CALL_SUMMARY_START,
+        ]
+        .into_iter()
+        .any(|marker| marker.find(trimmed).is_some_and(|found| found.start() == 0))
+}
+
+pub(crate) fn is_incomplete_tool_request_marker(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.len() >= "<<<[".len()
+        && trimmed.len() < TOOL_REQUEST_MARKER.len()
+        && TOOL_REQUEST_MARKER.starts_with(trimmed)
+}
+
+pub(crate) fn strip_incomplete_tool_request_suffix(text: &str) -> &str {
+    for prefix_len in (1..TOOL_REQUEST_MARKER.len()).rev() {
+        if text.ends_with(&TOOL_REQUEST_MARKER[..prefix_len]) {
+            return &text[..text.len() - prefix_len];
+        }
+    }
+    text
 }
 
 /// 从匹配的标记构建 StreamBlock
@@ -607,6 +656,10 @@ fn build_stream_block(
         }
         BlockType::HtmlContainer => {
             let open_tag = &remaining[start_idx..end_idx];
+            let container_tag = crate::vcp_modules::content_parser::HTML_CONTAINER_OPEN_RE
+                .captures(open_tag)
+                .and_then(|caps| caps.get(1).map(|m| m.as_str().to_lowercase()))
+                .expect("HtmlContainer block must start with a supported container tag");
             let mut full_html = format!("{}{}", open_tag, inner_content);
             let close_tag = if end_end > 0 {
                 let search_area = &remaining[end_idx..];
@@ -622,6 +675,9 @@ fn build_stream_block(
             if let Some(close_tag) = close_tag {
                 full_html.push_str(close_tag);
             }
+            if !is_complete {
+                full_html = crate::vcp_modules::render_repair::repair_html_fragment(&full_html);
+            }
             let hash = HashAggregator::compute_content_hash(&full_html);
 
             if crate::vcp_modules::content_parser::requires_active_html_preview(&full_html) {
@@ -635,6 +691,7 @@ fn build_stream_block(
             let markdown_inner =
                 crate::vcp_modules::chat::pre_renderer::markdown_parser::strip_stuck_container_close_before_fence(
                     &deindented_inner,
+                    &container_tag,
                 );
             let mut nodes = vec![crate::vcp_modules::pre_renderer::MarkdownNode::raw_html(
                 open_tag.to_string(),
@@ -1206,6 +1263,65 @@ VCP Render Probe · Full Tool Result Shape
     }
 
     #[test]
+    fn test_incomplete_tool_tail_builds_tool_block() {
+        let block = StreamBlockParser::build_incomplete_tail_block(concat!(
+            "<<<[TOOL_REQUEST]>>>\n",
+            "maid:「始」Nova「末」,\n",
+            "tool_name:「始」ComfyUIGen「末」,\n",
+            "mode:「始」anima「末」,\n",
+            "prompt:「始」portrait prompt still streaming「末」"
+        ))
+        .expect("incomplete tool request should build a tool block");
+
+        assert!(matches!(
+            block,
+            StreamBlock::Tool {
+                ref tool_name,
+                ref content,
+                is_complete: false,
+                ..
+            } if tool_name == "ComfyUIGen"
+                && content.contains("prompt:「始」portrait prompt still streaming「末」")
+                && !content.contains("<<<[TOOL_REQUEST]>>>")
+        ));
+    }
+
+    #[test]
+    fn test_antml_thinking_alias_builds_thought_blocks() {
+        let incomplete =
+            StreamBlockParser::build_incomplete_tail_block("<antmlThinking>正在分析工具结果")
+                .expect("incomplete antmlThinking tail should build a thought block");
+        assert!(matches!(
+            incomplete,
+            StreamBlock::Thought {
+                ref theme,
+                ref content,
+                is_complete: false,
+                ..
+            } if theme == "思考过程" && content == "正在分析工具结果"
+        ));
+
+        let mut parser = StreamBlockParser::new();
+        let blocks =
+            parser.finalize("<antmlThinking>private reasoning</antmlThinking>Visible answer");
+        assert!(matches!(
+            blocks.first(),
+            Some(StreamBlock::Thought {
+                theme,
+                content,
+                is_complete: true,
+                ..
+            }) if theme == "思考过程" && content == "private reasoning"
+        ));
+        assert!(
+            blocks
+                .iter()
+                .any(|block| stream_block_contains_plain_text(block, "Visible answer")),
+            "visible answer after antmlThinking must remain independent: {blocks:#?}"
+        );
+    }
+
+    #[test]
     fn test_finalize_html_container_with_stuck_code_fence() {
         let raw = r#"<think>
 先分析。
@@ -1233,6 +1349,44 @@ VCP Render Probe · Full Tool Result Shape
             blocks.iter().any(stream_block_contains_yaml_code),
             "expected stream parser to keep stuck fence as yaml code block, got {blocks:#?}"
         );
+    }
+
+    #[test]
+    fn test_finalize_nested_root_close_before_code_fence_probe() {
+        let raw = r#"<think>analysis</think><div id="vcp-root" style="background:#111;color:#eee">
+<div data-probe="body"><div data-probe="row"><div data-probe="card">
+## Output format
+</div></div></div></div>```
+[YYYY-MM-DD HH:MM] Actor event
+```
+
+Same-day entries stay in chronological order.
+
+## Notes
+
+- Keep the first item.
+- Keep the second item.
+</div></div>
+<div data-probe="tail">Trailing rich card</div>
+<div data-probe="footer">Footer</div>
+</div>"#;
+
+        let mut parser = StreamBlockParser::new();
+        let blocks = parser.finalize(raw);
+        let nodes = blocks
+            .iter()
+            .find_map(|block| match block {
+                StreamBlock::Markdown {
+                    nodes: Some(nodes), ..
+                } if nodes.iter().any(|node| {
+                    matches!(node, MarkdownNode::CodeBlock { code, .. } if code.contains("Actor event"))
+                }) => Some(nodes),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected the fenced record in stream AST: {blocks:#?}"));
+
+        assert!(nodes_contain_raw_html(nodes, "data-probe=\"body\""));
+        assert!(nodes_contain_raw_html(nodes, "data-probe=\"tail\""));
     }
 
     #[test]
@@ -1428,13 +1582,16 @@ details body remains visible
     #[test]
     fn test_stream_settles_closed_vcp_root_before_daily_note() {
         let raw = concat!(
-            "<div id=\"vcp-root\"><p data-probe=\"final-body\">visible</p></div>",
+            "<think>render the final response</think>",
+            "<div id=\"vcp-root\" style=\"background:linear-gradient(180deg,#0f0f180%,#1a1525100%);color:#e6ddd4\">",
+            "<p data-probe=\"final-body\">visible</p></div>\n\n",
             "<<<[TOOL_REQUEST]>>>\n",
             "maid:「始」Mama「末」,\n",
             "tool_name:「始」DailyNote「末」,\n",
             "command:「始」create「末」,\n",
-            "Date:「始」2026-07-26「末」,\n",
-            "Content:「始ESCAPE」stream diary body「末ESCAPE」,\n",
+            "Date:「始」2026-07-29「末」,\n",
+            "folder:「始」Mama「末」,\n",
+            "Content:「始」[02:22] stream diary body\nTag: render regression「末」,\n",
             "archery:「始」no_reply「末」\n",
             "<<<[END_TOOL_REQUEST]>>>"
         );
@@ -1452,8 +1609,53 @@ details body remains visible
         assert!(blocks.iter().any(|block| matches!(
             block,
             StreamBlock::Diary { maid, date, content, .. }
-                if maid == "Mama" && date == "2026-07-26" && content == "stream diary body"
+                if maid == "Mama"
+                    && date == "2026-07-29"
+                    && content.contains("stream diary body")
         )));
+        assert!(
+            !blocks
+                .iter()
+                .any(|block| { stream_block_contains_plain_text(block, "<<<[TOOL_REQUEST]>>>") }),
+            "tool protocol markers must not leak into visible text: {blocks:#?}"
+        );
+    }
+
+    #[test]
+    fn test_stream_extracts_daily_note_before_outer_generated_root_closes() {
+        let raw = concat!(
+            "<think>render the final response</think>",
+            "<div id=\"vcp-root\"><div data-probe=\"story\">visible story</div>",
+            "<<<[TOOL_REQUEST]>>>\n",
+            "maid:「始」Nova「末」,\n",
+            "tool_name:「始」DailyNote「末」,\n",
+            "command:「始」create「末」,\n",
+            "Date:「始」2026-08-02「末」,\n",
+            "Content:「始ESCAPE」stream diary body「末ESCAPE」,\n",
+            "archery:「始」no_reply「末」\n",
+            "<<<[END_TOOL_REQUEST]>>>\n",
+            "<w2g><catsay>tail card</catsay></w2g></div>"
+        );
+
+        let mut parser = StreamBlockParser::new();
+        let blocks = parser.finalize(raw);
+
+        assert!(blocks
+            .iter()
+            .any(|block| stream_block_contains_raw_html(block, "data-probe=\"story\"")));
+        assert!(blocks.iter().any(|block| matches!(
+            block,
+            StreamBlock::Diary { maid, date, content, .. }
+                if maid == "Nova"
+                    && date == "2026-08-02"
+                    && content == "stream diary body"
+        )));
+        assert!(
+            !blocks
+                .iter()
+                .any(|block| { stream_block_contains_plain_text(block, "<<<[TOOL_REQUEST]>>>") }),
+            "nested tool protocol must not leak into stream HTML: {blocks:#?}"
+        );
     }
 
     #[test]
@@ -1628,5 +1830,59 @@ details body remains visible
             expected,
             "single-character chunking must match one-shot rendering"
         );
+    }
+
+    #[test]
+    fn every_reported_html_and_daily_note_chunk_boundary_matches_one_shot() {
+        let raw = concat!(
+            "<think>render the final response</think>",
+            "<div id=\"vcp-root\" style=\"background:linear-gradient(180deg,#0f0f180%,#1a1525100%);color:#e6ddd4\">",
+            "<p data-probe=\"reported-body\">visible</p>\n",
+            "<p data-vcp-multiblock-wrapper style=\"margin-top:20px;padding:16px;border-left:2px solid #5a4a6a\">\n\n",
+            "First wrapped paragraph.\n\n",
+            "Second wrapped paragraph.\n\n",
+            "</p>\n</div>\n\n",
+            "<<<[TOOL_REQUEST]>>>\n",
+            "maid:「始」Mama「末」,\n",
+            "tool_name:「始」DailyNote「末」,\n",
+            "command:「始」create「末」,\n",
+            "Date:「始」2026-07-29「末」,\n",
+            "Content:「始」[02:22] persisted diary body「末」,\n",
+            "archery:「始」no_reply「末」\n",
+            "<<<[END_TOOL_REQUEST]>>>"
+        );
+        let mut one_shot = StreamBlockParser::new();
+        let expected_blocks = one_shot.finalize(raw);
+        assert!(
+            expected_blocks.iter().any(|block| {
+                stream_block_contains_raw_html(block, "<div data-vcp-multiblock-wrapper")
+            }),
+            "styled paragraph wrapper was not promoted: {expected_blocks:#?}"
+        );
+        assert!(
+            !expected_blocks.iter().any(|block| {
+                stream_block_contains_raw_html(block, "<p data-vcp-multiblock-wrapper")
+            }),
+            "invalid paragraph wrapper survived the render AST: {expected_blocks:#?}"
+        );
+        let expected = serde_json::to_value(expected_blocks).unwrap();
+        let boundaries: Vec<usize> = raw
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain(std::iter::once(raw.len()))
+            .collect();
+
+        for split in boundaries.iter().copied() {
+            let mut parser = StreamBlockParser::new();
+            let (mut actual, _) = parser.process(&raw[..split]);
+            let (mut after_split, _) = parser.process(raw);
+            actual.append(&mut after_split);
+            actual.extend(parser.finalize(raw));
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                expected,
+                "reported response diverged at UTF-8 boundary {split}"
+            );
+        }
     }
 }

@@ -541,6 +541,18 @@
           "markdownDescription": "Denies the launch_root_manager command without any pre-configured scope."
         },
         {
+          "description": "Enables the mark_share_intent_ready command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-mark-share-intent-ready",
+          "markdownDescription": "Enables the mark_share_intent_ready command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the mark_share_intent_ready command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-mark-share-intent-ready",
+          "markdownDescription": "Denies the mark_share_intent_ready command without any pre-configured scope."
+        },
+        {
           "description": "Enables the move_task_to_back command without any pre-configured scope.",
           "type": "string",
           "const": "allow-move-task-to-back",
@@ -743,6 +755,18 @@
           "type": "string",
           "const": "deny-set-keep-screen-on",
           "markdownDescription": "Denies the set_keep_screen_on command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_keepalive_mode command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-keepalive-mode",
+          "markdownDescription": "Enables the set_keepalive_mode command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_keepalive_mode command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-keepalive-mode",
+          "markdownDescription": "Denies the set_keepalive_mode command without any pre-configured scope."
         },
         {
           "description": "Enables the set_lifecycle_keepalive command without any pre-configured scope.",

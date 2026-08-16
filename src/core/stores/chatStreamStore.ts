@@ -45,6 +45,8 @@ export const useChatStreamStore = defineStore("chatStream", () => {
   const auroraActiveMessageIds = new Set<string>();
   const sealedStreamMessageIds = new Set<string>();
   const terminalStreamMessageIds = new Set<string>();
+  const deletedSessionKeys = new Set<string>();
+  const deletedOwnerIds = new Set<string>();
   const lifecycleDirectiveHiddenMessageIds = new Set<string>();
   const streamBlockSignatures = new Map<string, string>();
   const streamTailSignatures = new Map<string, string>();
@@ -365,6 +367,59 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     cleanupTimers.add(cleanupTimer);
   };
 
+  const discardTopicSession = (ownerId: string, topicId: string) => {
+    const key = `${ownerId}:${topicId}`;
+    deletedSessionKeys.add(key);
+    delete pendingGenerations[key];
+
+    const messageIds = [...(sessionActiveStreams.value[key] || [])];
+    for (const messageId of messageIds) {
+      sealStreamInputs(messageId);
+      markStreamTerminal(messageId);
+      clearRAFUpdate(messageId, false);
+      removeSessionStream(ownerId, topicId, messageId);
+    }
+    delete sessionActiveStreams.value[key];
+  };
+
+  const discardOwnerSessions = (ownerId: string) => {
+    deletedOwnerIds.add(ownerId);
+    const prefix = `${ownerId}:`;
+    const sessionKeys = new Set([
+      ...Object.keys(sessionActiveStreams.value),
+      ...Object.keys(pendingGenerations),
+    ]);
+    for (const context of Object.values(activeStreamContexts)) {
+      if (context.itemId === ownerId) {
+        sessionKeys.add(`${ownerId}:${context.topicId}`);
+      }
+    }
+    for (const key of sessionKeys) {
+      if (key.startsWith(prefix)) {
+        discardTopicSession(ownerId, key.slice(prefix.length));
+      }
+    }
+  };
+
+  const handleTopicDeleted = (event: Event) => {
+    const detail = (
+      event as CustomEvent<{ ownerId?: string; topicId?: string }>
+    ).detail;
+    if (detail?.ownerId && detail?.topicId) {
+      discardTopicSession(detail.ownerId, detail.topicId);
+    }
+  };
+
+  const handleOwnerDeleted = (event: Event) => {
+    const detail = (event as CustomEvent<{ ownerId?: string }>).detail;
+    if (detail?.ownerId) discardOwnerSessions(detail.ownerId);
+  };
+
+  if (typeof window !== "undefined") {
+    window.addEventListener("vcp-topic-deleted", handleTopicDeleted);
+    window.addEventListener("vcp-owner-deleted", handleOwnerDeleted);
+  }
+
   const blocksSignature = (
     blocks: Array<{ hash?: string; type?: string }> = [],
   ) => blocks.map((block) => block.hash || block.type || "").join("|");
@@ -552,6 +607,15 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     const itemId = isGroup ? ctx.groupId : ctx.agentId || ctx.ownerId;
 
     if (!actualMessageId || !topicId || !itemId) return;
+    if (
+      deletedOwnerIds.has(itemId) ||
+      deletedSessionKeys.has(`${itemId}:${topicId}`)
+    ) {
+      sealStreamInputs(actualMessageId);
+      markStreamTerminal(actualMessageId);
+      clearRAFUpdate(actualMessageId, false);
+      return;
+    }
 
     const isTerminalEvent = type === "end" || type === "error";
     if (!isTerminalEvent && sealedStreamMessageIds.has(actualMessageId)) {
@@ -952,6 +1016,8 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     }
     if (typeof window !== "undefined") {
       window.removeEventListener("vcp-lifecycle", handleVcpLifecycle);
+      window.removeEventListener("vcp-topic-deleted", handleTopicDeleted);
+      window.removeEventListener("vcp-owner-deleted", handleOwnerDeleted);
     }
     cleanupTimers.forEach(clearTimeout);
     cleanupTimers.clear();
@@ -963,6 +1029,8 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     auroraActiveMessageIds.clear();
     sealedStreamMessageIds.clear();
     terminalStreamMessageIds.clear();
+    deletedSessionKeys.clear();
+    deletedOwnerIds.clear();
     streamBlockSignatures.clear();
     streamTailSignatures.clear();
     lastAuroraSequences.clear();
@@ -988,6 +1056,8 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     computeShell,
     addSessionStream,
     removeSessionStream,
+    discardTopicSession,
+    discardOwnerSessions,
     beginGeneration,
     endGeneration,
     processStreamEvent,

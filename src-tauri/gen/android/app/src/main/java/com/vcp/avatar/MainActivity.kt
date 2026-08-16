@@ -14,11 +14,14 @@ import androidx.activity.enableEdgeToEdge
 class MainActivity : TauriActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // Keep release WebViews private while allowing CDP assertions in debug APKs.
+        WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
     }
 
     override fun onWebViewCreate(webView: WebView) {
+        WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
         // TauriActivity 强制 handleBackNavigation = false，Wry 不注册任何返回键回调。
         // 在此处（WebView 已初始化后）注册 OnBackPressedDispatcher，
         // 有历史时 goBack() 触发前端 popstate 拦截链，无历史时 finish Activity。

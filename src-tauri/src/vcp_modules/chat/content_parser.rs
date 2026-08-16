@@ -262,8 +262,10 @@ lazy_static! {
     pub(crate) static ref THOUGHT_START: Regex = Regex::new(r"(?im)^[ \t]*\[--- VCP元思考链(?::\s*([^\]]*?))?\s*---\]").unwrap();
     pub(crate) static ref THOUGHT_END: Regex = Regex::new(r"(?im)^[ \t]*\[--- 元思考链结束 ---\]").unwrap();
 
-    pub(crate) static ref THINK_START: Regex = Regex::new(r"(?i)<think(?:ing)?>").unwrap();
-    pub(crate) static ref THINK_END: Regex = Regex::new(r"(?i)</think(?:ing)?>").unwrap();
+    pub(crate) static ref THINK_START: Regex =
+        Regex::new(r"(?i)<(?:think(?:ing)?|antmlthinking)>").unwrap();
+    pub(crate) static ref THINK_END: Regex =
+        Regex::new(r"(?i)</(?:think(?:ing)?|antmlthinking)>").unwrap();
 
     pub(crate) static ref TOOL_RESULT_START: Regex = Regex::new(r"(?im)^[ \t]*\[\[VCP调用结果信息汇总:").unwrap();
     pub(crate) static ref TOOL_RESULT_END: Regex = Regex::new(r"(?im)^[ \t]*VCP调用结果结束\]\]").unwrap();
@@ -327,7 +329,7 @@ pub(crate) fn find_protocol_bounded_end(
 ) -> Option<ProtocolBlockEnd> {
     lazy_static! {
         static ref TOP_LEVEL_THINK_START: Regex =
-            Regex::new(r"(?im)^[ \t]*<think(?:ing)?>").unwrap();
+            Regex::new(r"(?im)^[ \t]*<(?:think(?:ing)?|antmlthinking)>").unwrap();
     }
 
     let explicit_end = end_marker.find(text);
@@ -398,6 +400,12 @@ fn is_vcp_marker(s: &str) -> bool {
         || (s.len() >= 5 && s.is_char_boundary(5) && s[..5].eq_ignore_ascii_case("[[vcp"))
         || (s.len() >= 6 && s.is_char_boundary(6) && s[..6].eq_ignore_ascii_case("<think"))
         || (s.len() >= 7 && s.is_char_boundary(7) && s[..7].eq_ignore_ascii_case("</think"))
+        || (s.len() >= 14
+            && s.is_char_boundary(14)
+            && s[..14].eq_ignore_ascii_case("<antmlthinking"))
+        || (s.len() >= 15
+            && s.is_char_boundary(15)
+            && s[..15].eq_ignore_ascii_case("</antmlthinking"))
 }
 
 pub fn de_indent_misinterpreted_code_blocks(text: &str) -> String {
@@ -473,7 +481,7 @@ pub fn parse_content(raw_text: &str) -> Vec<ContentBlock> {
             r"(?im)",
             r"(^[ \t]*<<<\[TOOL_REQUEST\]>>>)|",                       // 1
             r"(^[ \t]*\[--- VCP元思考链(?::\s*[^\]]*?)?\s*---\])|",    // 2
-            r"(<think(?:ing)?>)|",                                     // 3
+            r"(<(?:think(?:ing)?|antmlthinking)>)|",                  // 3
             r"(^[ \t]*\[\[VCP调用结果信息汇总:)|",                     // 4
             r"(^[ \t]*<<<DailyNoteStart>>>)|",                         // 5
             r"(^[ \t]*```html[ \t]*$)|",                               // 6
@@ -563,13 +571,12 @@ pub fn parse_content(raw_text: &str) -> Vec<ContentBlock> {
                     .map_or((None, None, false), |end| {
                         (Some(end.content_end), Some(end.marker_end), end.complete)
                     }),
-                BlockType::ToolCallSummary => find_protocol_bounded_end(
-                    search_area,
-                    &TOOL_CALL_SUMMARY_END,
-                )
-                    .map_or((None, None, false), |end| {
-                        (Some(end.content_end), Some(end.marker_end), end.complete)
-                    }),
+                BlockType::ToolCallSummary => {
+                    find_protocol_bounded_end(search_area, &TOOL_CALL_SUMMARY_END)
+                        .map_or((None, None, false), |end| {
+                            (Some(end.content_end), Some(end.marker_end), end.complete)
+                        })
+                }
                 BlockType::HtmlFence => HTML_FENCE_END
                     .find(search_area)
                     .map_or((None, None, false), |m| {
@@ -580,10 +587,28 @@ pub fn parse_content(raw_text: &str) -> Vec<ContentBlock> {
                     .map_or((None, None, false), |m| {
                         (Some(m.start()), Some(m.end()), true)
                     }),
-                BlockType::HtmlContainer => crate::vcp_modules::chat::pre_renderer::markdown_parser::find_matching_close_tag(remaining, content_start, &container_tag)
-                    .map_or((None, None, false), |(s, e)| {
-                        (Some(s - content_start), Some(e - content_start), true)
-                    }),
+                BlockType::HtmlContainer => {
+                    let matching_close = crate::vcp_modules::chat::pre_renderer::markdown_parser::find_matching_close_tag(
+                        remaining,
+                        content_start,
+                        &container_tag,
+                    );
+                    let stuck_tool =
+                        crate::vcp_modules::render_repair::find_tool_request_boundary_in_html(
+                            search_area,
+                        );
+                    if let Some((tool_start, _)) = stuck_tool.filter(|(tool_start, _)| {
+                        matching_close.is_none_or(|(close_start, _)| {
+                            *tool_start < close_start - content_start
+                        })
+                    }) {
+                        (Some(tool_start), Some(tool_start), false)
+                    } else {
+                        matching_close.map_or((None, None, false), |(s, e)| {
+                            (Some(s - content_start), Some(e - content_start), true)
+                        })
+                    }
+                }
                 BlockType::RoleDivider => (Some(0), Some(0), true),
                 BlockType::Style => STYLE_TAG_END
                     .find(search_area)
@@ -602,7 +627,8 @@ pub fn parse_content(raw_text: &str) -> Vec<ContentBlock> {
                 && !is_complete
                 && !matches!(
                     block_type,
-                    BlockType::HtmlFence
+                    BlockType::Tool
+                        | BlockType::HtmlFence
                         | BlockType::HtmlDoc
                         | BlockType::HtmlContainer
                         | BlockType::CodeFence
@@ -704,12 +730,21 @@ pub fn parse_content(raw_text: &str) -> Vec<ContentBlock> {
                     if let Some(close_tag) = close_tag {
                         full_html.push_str(close_tag);
                     }
+                    if !is_complete {
+                        full_html =
+                            crate::vcp_modules::render_repair::repair_html_fragment(&full_html);
+                    }
 
                     if requires_active_html_preview(&full_html) {
                         ContentBlock::html_preview(full_html)
                     } else {
-                        let deindented_inner = crate::vcp_modules::chat::pre_renderer::markdown_parser::trim_common_leading_indent(inner_content);
-                        let markdown_inner = crate::vcp_modules::chat::pre_renderer::markdown_parser::strip_stuck_container_close_before_fence(&deindented_inner);
+                        let markdown_source = if is_complete {
+                            inner_content
+                        } else {
+                            full_html.strip_prefix(open_tag).unwrap_or(inner_content)
+                        };
+                        let deindented_inner = crate::vcp_modules::chat::pre_renderer::markdown_parser::trim_common_leading_indent(markdown_source);
+                        let markdown_inner = crate::vcp_modules::chat::pre_renderer::markdown_parser::strip_stuck_container_close_before_fence(&deindented_inner, &container_tag);
                         let mut nodes =
                             vec![crate::vcp_modules::pre_renderer::MarkdownNode::raw_html(
                                 open_tag.to_string(),
@@ -1580,6 +1615,195 @@ details body remains visible
     }
 
     #[test]
+    fn test_parse_content_folds_antml_thinking_alias() {
+        let raw = "<antmlThinking>private reasoning</antmlThinking>Visible answer";
+        let blocks = parse_content(raw);
+
+        assert!(matches!(
+            blocks.first(),
+            Some(ContentBlock::Thought {
+                theme,
+                content,
+                is_complete: true,
+                ..
+            }) if theme == "思考过程" && content == "private reasoning"
+        ));
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block_contains_plain_text(block, "Visible answer")),
+            "visible answer after antmlThinking must remain independent: {blocks:#?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_content_keeps_daily_note_after_generated_root_out_of_visible_text() {
+        let raw = concat!(
+            "<think>render the final response</think>",
+            "<div id=\"vcp-root\" style=\"background:linear-gradient(180deg,#0f0f180%,#1a1525100%);color:#e6ddd4\">",
+            "<p data-probe=\"reported-body\">visible</p>\n",
+            "<p data-vcp-multiblock-wrapper style=\"margin-top:20px;padding:16px;border-left:2px solid #5a4a6a\">\n\n",
+            "First wrapped paragraph.\n\n",
+            "Second wrapped paragraph.\n\n",
+            "</p>\n</div>\n\n",
+            "<<<[TOOL_REQUEST]>>>\n",
+            "maid:「始」Mama「末」,\n",
+            "tool_name:「始」DailyNote「末」,\n",
+            "command:「始」create「末」,\n",
+            "Date:「始」2026-07-29「末」,\n",
+            "folder:「始」Mama「末」,\n",
+            "Content:「始」[02:22] persisted diary body\nTag: render regression「末」,\n",
+            "archery:「始」no_reply「末」\n",
+            "<<<[END_TOOL_REQUEST]>>>"
+        );
+
+        let blocks = parse_content(raw);
+
+        assert!(blocks
+            .iter()
+            .any(|block| block_contains_raw_html(block, "data-probe=\"reported-body\"")));
+        assert!(blocks
+            .iter()
+            .any(|block| block_contains_raw_html(block, "<div data-vcp-multiblock-wrapper")));
+        assert!(!blocks
+            .iter()
+            .any(|block| block_contains_raw_html(block, "<p data-vcp-multiblock-wrapper")));
+        assert!(blocks
+            .iter()
+            .any(|block| block_contains_plain_text(block, "First wrapped paragraph.")));
+        assert!(blocks
+            .iter()
+            .any(|block| block_contains_plain_text(block, "Second wrapped paragraph.")));
+        assert!(blocks.iter().any(|block| matches!(
+            block,
+            ContentBlock::Diary { maid, date, content, .. }
+                if maid == "Mama"
+                    && date == "2026-07-29"
+                    && content.contains("persisted diary body")
+        )));
+        assert!(
+            !blocks
+                .iter()
+                .any(|block| block_contains_plain_text(block, "<<<[TOOL_REQUEST]>>>")),
+            "tool protocol markers must not leak into persisted visible text: {blocks:#?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_content_extracts_daily_note_wrapped_by_generated_html() {
+        let raw = concat!(
+            "<think>render the final response</think>",
+            "<div id=\"vcp-root\"><div data-probe=\"story\">visible story</div>",
+            "<<<[TOOL_REQUEST]>>>\n",
+            "maid:「始」Nova「末」,\n",
+            "tool_name:「始」DailyNote「末」,\n",
+            "command:「始」create「末」,\n",
+            "Date:「始」2026-08-02「末」,\n",
+            "folder:「始」Nova「末」,\n",
+            "Content:「始ESCAPE」[20:45] independent diary body「末ESCAPE」,\n",
+            "archery:「始」no_reply「末」\n",
+            "<<<[END_TOOL_REQUEST]>>>\n",
+            "<w2g><catsay>tail card</catsay></w2g></div>"
+        );
+
+        let blocks = parse_content(raw);
+
+        assert!(blocks
+            .iter()
+            .any(|block| block_contains_raw_html(block, "data-probe=\"story\"")));
+        assert!(blocks.iter().any(|block| matches!(
+            block,
+            ContentBlock::Diary { maid, date, content, .. }
+                if maid == "Nova"
+                    && date == "2026-08-02"
+                    && content == "[20:45] independent diary body"
+        )));
+        assert!(
+            !blocks
+                .iter()
+                .any(|block| block_contains_plain_text(block, "<<<[TOOL_REQUEST]>>>")),
+            "nested tool protocol must not leak into rendered HTML: {blocks:#?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_content_keeps_unclosed_comfy_request_out_of_visible_markdown() {
+        let raw = concat!(
+            "<div id=\"vcp-root\"><p data-probe=\"story\">visible story</p></div>",
+            "<<<[TOOL_REQUEST]>>>\n",
+            "maid:「始」Nova「末」,\n",
+            "tool_name:「始」ComfyUIGen「末」,\n",
+            "mode:「始」anima「末」,\n",
+            "prompt:「始」portrait prompt still streaming「末」"
+        );
+
+        let blocks = parse_content(raw);
+
+        assert!(blocks
+            .iter()
+            .any(|block| block_contains_raw_html(block, "data-probe=\"story\"")));
+        assert!(blocks.iter().any(|block| matches!(
+            block,
+            ContentBlock::ToolUse {
+                tool_name,
+                content,
+                is_complete: false,
+                ..
+            } if tool_name == "ComfyUIGen"
+                && content.contains("prompt:「始」portrait prompt still streaming「末」")
+        )));
+        assert!(
+            !blocks.iter().any(|block| {
+                block_contains_plain_text(block, "<<<[TOOL_REQUEST]>>>")
+                    || block_contains_plain_text(block, "tool_name:「始」ComfyUIGen「末」")
+            }),
+            "unfinished tool protocol must not become visible markdown: {blocks:#?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_content_extracts_unclosed_comfy_request_from_unclosed_generated_html() {
+        let raw = concat!(
+            "<div id=\"vcp-root\"><p data-probe=\"story\">visible story</p>",
+            "<w2g><catsay>咪咪点评\n",
+            "<<<[TOOL_REQUEST]>>>\n",
+            "maid:「始」Nova「末」,\n",
+            "tool_name:「始」ComfyUIGen「末」,\n",
+            "mode:「始」anima「末」,\n",
+            "prompt:「始」screenshot prompt still streaming「末」"
+        );
+
+        let blocks = parse_content(raw);
+
+        assert!(
+            blocks.iter().any(|block| {
+                block_contains_raw_html(block, "data-probe=\"story\"")
+                    && block_contains_raw_html(block, "</catsay></w2g></div>")
+            }),
+            "generated HTML should be repaired before the tool block: {blocks:#?}"
+        );
+        assert!(blocks.iter().any(|block| matches!(
+            block,
+            ContentBlock::ToolUse {
+                tool_name,
+                content,
+                is_complete: false,
+                ..
+            } if tool_name == "ComfyUIGen"
+                && content.contains("prompt:「始」screenshot prompt still streaming「末」")
+        )));
+        assert!(
+            !blocks.iter().any(|block| {
+                block_contains_plain_text(block, "<<<[TOOL_REQUEST]>>>")
+                    || block_contains_raw_html(block, "<<<[TOOL_REQUEST]>>>")
+                    || block_contains_plain_text(block, "tool_name:「始」ComfyUIGen「末」")
+                    || block_contains_raw_html(block, "tool_name:「始」ComfyUIGen「末」")
+            }),
+            "unfinished tool protocol must stay outside rendered HTML/Markdown: {blocks:#?}"
+        );
+    }
+
+    #[test]
     fn test_active_html_container_becomes_executable_preview() {
         let raw = r#"<div id="web-app">
 <canvas id="scene"></canvas>
@@ -1665,5 +1889,67 @@ window.scene = new THREE.Scene();
         assert!(root_html.contains("data-probe=\"second\""), "{blocks:#?}");
         assert!(root_html.contains("@keyframes fadeIn"), "{blocks:#?}");
         assert!(root_html.ends_with("</div>"), "{blocks:#?}");
+    }
+
+    #[test]
+    fn test_parse_content_nested_root_close_before_code_fence_probe() {
+        let raw = r#"<think>analysis</think><div id="vcp-root" style="background:#111;color:#eee">
+<div data-probe="body"><div data-probe="row"><div data-probe="card">
+## Output format
+</div></div></div></div>```
+[YYYY-MM-DD HH:MM] Actor event
+```
+
+Same-day entries stay in chronological order.
+
+## Notes
+
+- Keep the first item.
+- Keep the second item.
+</div></div>
+<div data-probe="tail">Trailing rich card</div>
+<div data-probe="footer">Footer</div>
+</div>"#;
+
+        let blocks = parse_content(raw);
+        let nodes = blocks
+            .iter()
+            .find_map(|block| match block {
+                ContentBlock::Markdown {
+                    nodes: Some(nodes), ..
+                } if nodes.iter().any(|node| {
+                    matches!(node, MarkdownNode::CodeBlock { code, .. } if code.contains("Actor event"))
+                }) => Some(nodes),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!("expected the fenced record to remain in the rich markdown block: {blocks:#?}")
+            });
+        let code_index = nodes
+            .iter()
+            .position(|node| {
+                matches!(node, MarkdownNode::CodeBlock { code, .. } if code.contains("Actor event"))
+            })
+            .expect("expected the fenced record code node");
+        let raw_prefix = nodes[..code_index]
+            .iter()
+            .filter_map(|node| match node {
+                MarkdownNode::RawHtml { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+
+        assert!(raw_prefix.contains("data-probe=\"body\""), "{blocks:#?}");
+        assert_eq!(
+            raw_prefix.matches("<div").count(),
+            raw_prefix.matches("</div>").count() + 1,
+            "only vcp-root should still be open when the code block begins: {blocks:#?}"
+        );
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block_contains_raw_html(block, "data-probe=\"tail\"")),
+            "the trailing rich card must remain in the generated root: {blocks:#?}"
+        );
     }
 }

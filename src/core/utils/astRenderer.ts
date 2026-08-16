@@ -65,9 +65,10 @@ function renderNode(node: MarkdownNode, messageId: string): string {
     case "paragraph":
       return `<p>${(node.children || []).map(renderInline).join("")}</p>`;
 
-    case "heading":
+    case "heading": {
       const level = node.level || 1;
       return `<h${level}>${(node.children || []).map(renderInline).join("")}</h${level}>`;
+    }
 
     case "code_block": {
       if (node.lang === "mermaid") {
@@ -101,7 +102,7 @@ function renderNode(node: MarkdownNode, messageId: string): string {
     case "blockquote":
       return `<blockquote>${(node.children || []).map((n: any) => renderNode(n, messageId)).join("")}</blockquote>`;
 
-    case "list":
+    case "list": {
       const tag = node.ordered ? "ol" : "ul";
       const itemsHtml = (node.items || [])
         .map(
@@ -110,6 +111,7 @@ function renderNode(node: MarkdownNode, messageId: string): string {
         )
         .join("");
       return `<${tag}>${itemsHtml}</${tag}>`;
+    }
 
     case "table": {
       const headerHtml = `<tr>${(node.header || []).map((cell) => `<th>${(cell as any).map(renderInline).join("")}</th>`).join("")}</tr>`;
@@ -234,10 +236,41 @@ export function renderMarkdownNodesToHtml(
 }
 
 function renderCodeShell(preHtml: string, code: string, lang: string): string {
-  const langLabel = lang
-    ? `<span class="vcp-code-lang">${escapeHtml(lang)}</span>`
-    : "";
-  return `<div class="vcp-code-shell"><div class="vcp-code-toolbar" data-vcp-ui-control="code-toolbar">${langLabel}<button type="button" class="vcp-code-copy-btn" data-vcp-ui-control="code-copy" data-vcp-copy-code="${escapeHtml(encodeURIComponent(code))}" data-vcp-copy-encoded="uri" title="复制代码" aria-label="复制代码"><span class="i-ph:copy-bold vcp-code-copy-icon" aria-hidden="true"></span></button></div>${preHtml}</div>`;
+  const template = document.createElement("template");
+  template.innerHTML = preHtml;
+  const pre = template.content.querySelector("pre");
+  if (!pre) return preHtml;
+
+  pre.classList.add("vcp-code-shell");
+
+  const toolbar = document.createElement("span");
+  toolbar.className = "vcp-code-toolbar";
+  toolbar.dataset.vcpUiControl = "code-toolbar";
+
+  if (lang) {
+    const langLabel = document.createElement("span");
+    langLabel.className = "vcp-code-lang";
+    langLabel.textContent = lang;
+    toolbar.append(langLabel);
+  }
+
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "vcp-code-copy-btn";
+  button.dataset.vcpUiControl = "code-copy";
+  button.dataset.vcpCopyCode = encodeURIComponent(code);
+  button.dataset.vcpCopyEncoded = "uri";
+  button.title = "复制代码";
+  button.setAttribute("aria-label", "复制代码");
+
+  const icon = document.createElement("span");
+  icon.className = "i-ph:copy-bold vcp-code-copy-icon";
+  icon.setAttribute("aria-hidden", "true");
+  button.append(icon);
+  toolbar.append(button);
+  pre.prepend(toolbar);
+
+  return pre.outerHTML;
 }
 
 function sanitizeMarkdownHtml(html: string): string {

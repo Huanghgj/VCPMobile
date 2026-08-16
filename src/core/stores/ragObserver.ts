@@ -94,7 +94,7 @@ export const useRagObserverStore = defineStore('ragObserver', () => {
       return;
     }
 
-    unlistenFn = await listen<any>('vcp-info-event', (event) => {
+    const registeredUnlisten = await listen<any>('vcp-info-event', (event) => {
       const payload = event.payload;
       if (!payload || typeof payload !== 'object') return;
 
@@ -117,9 +117,15 @@ export const useRagObserverStore = defineStore('ragObserver', () => {
         metadataList.value = [];
       }
     });
+    if (currentSessionId !== listenerSessionId) {
+      registeredUnlisten();
+      return;
+    }
+    unlistenFn = registeredUnlisten;
   };
 
   const destroyListener = () => {
+    listenerSessionId += 1;
     if (unlistenFn) {
       unlistenFn();
       unlistenFn = null;

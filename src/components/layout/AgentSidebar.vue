@@ -1,5 +1,7 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue';
+import { computed, ref, watch } from 'vue';
+import { useRouter } from 'vue-router';
+import { Clapperboard } from 'lucide-vue-next';
 import { useSidebarSwipe } from '../../core/composables/useSidebarSwipe';
 import { useLayoutStore } from '../../core/stores/layout';
 import { useOverlayStore } from '../../core/stores/overlay';
@@ -11,12 +13,18 @@ import TopicList from '../../features/topic/TopicList.vue';
 import AgentsCreator from '../../features/agent/AgentsCreator.vue';
 import TopicCreator from '../../features/topic/TopicCreator.vue';
 
+defineProps<{
+  overlayMode?: boolean;
+}>();
+
 const layoutStore = useLayoutStore();
 const overlayStore = useOverlayStore();
 const sessionStore = useChatSessionStore();
+const router = useRouter();
 
 const activeTab = ref<'agents' | 'topics'>('agents');
 const searchQuery = ref('');
+const isWatchActive = computed(() => router.currentRoute.value.path === '/watch');
 
 // 切换 Tab 时清空搜索框
 watch(activeTab, () => {
@@ -51,10 +59,22 @@ const handleSelectTopic = () => {
 const openSettings = () => {
   overlayStore.openSettings();
 };
+
+const openWatchTogether = async () => {
+  await router.push(isWatchActive.value ? '/chat' : '/watch');
+  layoutStore.setLeftDrawer(false);
+};
 </script>
 
 <template>
-  <aside ref="sidebarRef" class="vcp-drawer vcp-drawer-left flex flex-col" :class="{ 'is-open': layoutStore.leftDrawerOpen }">
+  <aside
+    ref="sidebarRef"
+    class="vcp-drawer vcp-drawer-left flex flex-col"
+    :class="{
+      'is-open': layoutStore.leftDrawerOpen,
+      'is-overlay-mode': overlayMode,
+    }"
+  >
 
     <!-- 顶部 Tabs -->
     <div class="sidebar-header-safe px-4 pb-2 shrink-0 border-b border-black/5 dark:border-white/5">
@@ -90,6 +110,18 @@ const openSettings = () => {
 
       <button
         class="w-full flex items-center justify-between p-3 bg-black/5 dark:bg-white/5 hover:bg-black/10 dark:hover:bg-white/10 active:scale-95 rounded-xl transition-all border border-black/5 dark:border-white/5 text-primary-text"
+        :class="{ 'watch-entry-active': isWatchActive }"
+        @click="openWatchTogether"
+      >
+        <div class="flex items-center gap-3">
+          <Clapperboard :size="18" />
+          <span class="font-bold text-sm">{{ isWatchActive ? '退出一起看' : '一起看' }}</span>
+        </div>
+        <span class="watch-entry-dot" aria-hidden="true"></span>
+      </button>
+
+      <button
+        class="w-full flex items-center justify-between p-3 bg-black/5 dark:bg-white/5 hover:bg-black/10 dark:hover:bg-white/10 active:scale-95 rounded-xl transition-all border border-black/5 dark:border-white/5 text-primary-text"
         @click="openSettings">
         <div class="flex items-center gap-3">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
@@ -114,6 +146,20 @@ const openSettings = () => {
 <style scoped>
 .sidebar-header-safe {
   padding-top: calc(var(--vcp-safe-top, 24px) + 24px);
+}
+
+.watch-entry-active {
+  color: #ef4444;
+  border-color: rgba(239, 68, 68, 0.28);
+  background: rgba(239, 68, 68, 0.09);
+}
+
+.watch-entry-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #ef4444;
+  opacity: 0.8;
 }
 
 .vcp-drawer {
@@ -149,6 +195,19 @@ const openSettings = () => {
 
   .vcp-drawer-left {
     transition: none;
+  }
+
+  .vcp-drawer.is-overlay-mode {
+    position: absolute;
+    width: 280px;
+    max-width: 280px;
+    transform: translateX(-100%) !important;
+    transition: transform 0.28s cubic-bezier(0.16, 1, 0.3, 1);
+    z-index: var(--layer-drawer);
+  }
+
+  .vcp-drawer-left.is-overlay-mode.is-open {
+    transform: translateX(0) !important;
   }
 }
 

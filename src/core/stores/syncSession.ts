@@ -24,6 +24,7 @@ export const useSyncSessionStore = defineStore('syncSession', () => {
 
   // --- 监听器引用 ---
   let unlistenFns: UnlistenFn[] = [];
+  let listenerGeneration = 0;
 
   const open = () => {
     isOpen.value = true;
@@ -87,7 +88,9 @@ export const useSyncSessionStore = defineStore('syncSession', () => {
     activeTab.value = 'live';
     cleanupListeners();
     releaseScreenKeep();
-    invoke('stop_sync').catch(() => {});
+    invoke('stop_sync').catch((error) => {
+      console.warn('[SyncSession] Failed to stop sync while closing:', error);
+    });
   };
 
   const copyLogs = async () => {
@@ -109,16 +112,34 @@ export const useSyncSessionStore = defineStore('syncSession', () => {
 
   const registerListeners = () => {
     cleanupListeners();
-    listen('vcp-log', (event: any) => {
+    const generation = listenerGeneration;
+
+    const register = <T>(eventName: string, handler: (event: { payload: T }) => void) => {
+      listen<T>(eventName, handler)
+        .then((unlisten) => {
+          if (generation !== listenerGeneration || !isOpen.value) {
+            unlisten();
+            return;
+          }
+          unlistenFns.push(unlisten);
+        })
+        .catch((error) => {
+          if (generation === listenerGeneration) {
+            console.error(`[SyncSession] Failed to listen for ${eventName}:`, error);
+          }
+        });
+    };
+
+    register<any>('vcp-log', (event) => {
       const { level, category, message } = event.payload;
       if (category === 'sync') pushLog(level || 'info', message);
-    }).then(fn => unlistenFns.push(fn));
+    });
 
-    listen('vcp-sync-progress', (event: any) => {
+    register<any>('vcp-sync-progress', (event) => {
       progressData.value = event.payload;
-    }).then(fn => unlistenFns.push(fn));
+    });
 
-    listen('vcp-sync-status', (event: any) => {
+    register<any>('vcp-sync-status', (event) => {
       const s = event.payload.status;
       if (s === 'open') { status.value = 'connected'; canDismiss.value = false; }
       if (s === 'error') {
@@ -126,18 +147,19 @@ export const useSyncSessionStore = defineStore('syncSession', () => {
         canDismiss.value = true;
         releaseScreenKeep();
       }
-    }).then(fn => unlistenFns.push(fn));
+    });
 
-    listen('vcp-sync-completed', () => {
+    register('vcp-sync-completed', () => {
       status.value = 'completed';
       canDismiss.value = true;
       needsReload.value = true;
       releaseScreenKeep();
       pushLog('success', '同步已全部完成，点击关闭以刷新数据');
-    }).then(fn => unlistenFns.push(fn));
+    });
   };
 
   const cleanupListeners = () => {
+    listenerGeneration += 1;
     unlistenFns.forEach(fn => fn());
     unlistenFns = [];
   };

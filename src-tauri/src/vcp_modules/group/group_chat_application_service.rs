@@ -44,19 +44,6 @@ pub struct GroupChatParams {
     pub stream_channel: Option<Channel<crate::vcp_modules::vcp_client::StreamEvent>>,
 }
 
-fn context_history_message_limit(context_token_limit: i32) -> usize {
-    const MIN_HISTORY_MESSAGES: usize = 24;
-    const MAX_HISTORY_MESSAGES: usize = 240;
-    const TOKENS_PER_MESSAGE_BUDGET: usize = 1_500;
-
-    if context_token_limit <= 0 {
-        return 96;
-    }
-
-    ((context_token_limit as usize) / TOKENS_PER_MESSAGE_BUDGET)
-        .clamp(MIN_HISTORY_MESSAGES, MAX_HISTORY_MESSAGES)
-}
-
 fn history_tail_matches_user_message(history: &[ChatMessage], user_message: &ChatMessage) -> bool {
     history
         .last()
@@ -235,31 +222,39 @@ pub async fn internal_process_group_chat_message(
         return Ok(json!({"status": "no_ai_response"}));
     }
 
-    let context_limit = speakers
+    let history_token_budget = speakers
         .iter()
-        .map(|speaker| context_history_message_limit(speaker.context_token_limit))
+        .map(|speaker| {
+            message_service::context_input_token_budget(speaker.context_token_limit, 0, &[])
+        })
         .max()
-        .unwrap_or(96);
+        .unwrap_or(128_000);
 
     // 提前加载轻量级全量纯文本和附件历史记录作为接力上下文的基础 (从底层隔离 UI 渲染反序列化和 Shell 计算)
-    let mut full_history_for_context = message_service::load_chat_text_history_for_context(
+    let mut full_history_for_context = message_service::load_chat_text_history_for_context_window(
         &app_handle,
         &topic_id,
-        Some(context_limit),
-        None,
+        history_token_budget,
         true, // include_extracted_text: 组装群聊上下文发送给 VCP 时需要包含附件提取文本内容
     )
     .await?;
 
-    if !append_user_msg
-        && !history_tail_matches_user_message(&full_history_for_context, &user_message)
-    {
-        log::warn!(
-            "[GroupChatAppService] Latest user message missing from persisted history; injecting inline for request context. topic_id={}, user_msg_id={}",
-            topic_id,
-            user_message.id
-        );
-        full_history_for_context.push(user_message.clone());
+    if !append_user_msg {
+        if let Some(persisted_message) = full_history_for_context
+            .iter_mut()
+            .rev()
+            .find(|message| message.id == user_message.id)
+        {
+            // Preserve request-only watch media without writing it into chat history.
+            *persisted_message = user_message.clone();
+        } else {
+            log::warn!(
+                "[GroupChatAppService] Latest user message missing from persisted history; injecting inline for request context. topic_id={}, user_msg_id={}",
+                topic_id,
+                user_message.id
+            );
+            full_history_for_context.push(user_message.clone());
+        }
     }
 
     // 5. 串行异步调度 (约束：群聊内部必须串行)
@@ -316,7 +311,13 @@ pub async fn internal_process_group_chat_message(
         }
         response_message_ids.push(message_id.clone());
 
-        let request_control = ActiveRequests(active_requests_map.clone()).register(&message_id);
+        let request_control = ActiveRequests(active_requests_map.clone()).register_scoped(
+            &message_id,
+            &group_id,
+            "group",
+            &topic_id,
+            Some(&cancellation_key),
+        );
         let _request_guard = ActiveRequestGuard::new(
             active_requests_map.clone(),
             message_id.clone(),
@@ -399,9 +400,23 @@ pub async fn internal_process_group_chat_message(
             .as_ref()
             .map(|ip| ip.replace("{{VCPChatAgentName}}", &agent_name));
 
+        let mut context_overhead = vec![base_system_prompt.as_str()];
+        if let Some(invite_prompt) = invite_prompt_processed.as_deref() {
+            context_overhead.push(invite_prompt);
+        }
+        let speaker_history_budget = message_service::context_input_token_budget(
+            speaker.context_token_limit,
+            speaker.max_output_tokens,
+            &context_overhead,
+        );
+        let speaker_history = message_service::select_recent_history_within_token_budget(
+            &full_history_for_context,
+            speaker_history_budget,
+        );
+
         let messages = crate::vcp_modules::context_assembler::orchestrate_chat_context(
             &db_pool,
-            &full_history_for_context,
+            &speaker_history,
             &topic_id,
             &agent_name,
             "group",
@@ -484,6 +499,8 @@ pub async fn internal_process_group_chat_message(
                     blocks: None,
                     shell: None,
                     content_hash: None,
+                    transient_context: None,
+                    transient_system_prompt: None,
                 };
                 full_history_for_context.push(ai_msg.clone());
                 final_new_msgs.push(ai_msg);

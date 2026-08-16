@@ -3,6 +3,7 @@ import { ref, onMounted, watch, onUnmounted } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { useSettingsStore, type AppSettings } from "../../../core/stores/settings";
 import { useAssistantStore } from "../../../core/stores/assistant";
+import { useNotificationStore } from "../../../core/stores/notification";
 import SettingsSwitch from "../../../components/settings/SettingsSwitch.vue";
 import SettingsRow from "../../../components/settings/SettingsRow.vue";
 
@@ -16,7 +17,23 @@ const emit = defineEmits<{
 
 const settingsStore = useSettingsStore();
 const assistantStore = useAssistantStore();
+const notificationStore = useNotificationStore();
 const hasOverlayPermission = ref(false);
+
+const applyAssistantRuntimeState = async (enabled: boolean) => {
+  await invoke("plugin:vcp-mobile|toggle_floating_ball", { show: enabled });
+  await invoke("reconcile_local_server_cmd", { enable: enabled });
+};
+
+const reportRuntimeError = (title: string, error: unknown) => {
+  const message = error instanceof Error ? error.message : String(error);
+  notificationStore.addNotification({
+    type: "error",
+    title,
+    message,
+    toastOnly: true,
+  });
+};
 
 const checkPermission = async () => {
   try {
@@ -26,9 +43,19 @@ const checkPermission = async () => {
     // 如果没有系统权限，但设置里是开启的，则重置设置状态并隐藏悬浮球
     if (!status.overlay && props.settings.enableAssistant) {
       props.settings.enableAssistant = false;
-      await invoke("plugin:vcp-mobile|toggle_floating_ball", { show: false });
+      const cleanupResults = await Promise.allSettled([
+        invoke("plugin:vcp-mobile|toggle_floating_ball", { show: false }),
+        invoke("reconcile_local_server_cmd", { enable: false }),
+      ]);
+      cleanupResults.forEach((result) => {
+        if (result.status === "rejected") {
+          console.warn("[AssistantSettings] Failed to stop revoked assistant runtime:", result.reason);
+        }
+      });
+      emit("save-request");
     }
   } catch (e) {
+    hasOverlayPermission.value = false;
     console.error("[AssistantSettings] Failed to check overlay permission:", e);
   }
 };
@@ -50,21 +77,25 @@ const handleToggle = async (val: boolean) => {
     // 开启时懒加载 Agent 列表
     try {
       await assistantStore.fetchAgents();
-    } catch (_) {}
+    } catch (error) {
+      console.warn("[AssistantSettings] Failed to refresh agents before enabling:", error);
+    }
   }
 
-  props.settings.enableAssistant = val;
-
+  const previousValue = props.settings.enableAssistant;
   try {
-    // 启停悬浮球（Android 原生层）
-    await invoke("plugin:vcp-mobile|toggle_floating_ball", { show: val });
-    // 启停本地 HTTP 服务器（即时生效）
-    await invoke("reconcile_local_server_cmd", { enable: val });
+    await applyAssistantRuntimeState(val);
+    props.settings.enableAssistant = val;
+    emit("save-request");
   } catch (e) {
     console.error("[AssistantSettings] Failed to toggle assistant:", e);
+    props.settings.enableAssistant = previousValue;
+    await Promise.allSettled([
+      invoke("plugin:vcp-mobile|toggle_floating_ball", { show: previousValue }),
+      invoke("reconcile_local_server_cmd", { enable: previousValue }),
+    ]);
+    reportRuntimeError("悬浮助手切换失败", e);
   }
-
-  emit("save-request");
 };
 
 watch(
@@ -80,11 +111,15 @@ const handleLifecycleEvent = async (e: any) => {
     if (props.settings.enableAssistant && hasOverlayPermission.value) {
       try {
         await assistantStore.fetchAgents();
-      } catch (_) {}
+      } catch (error) {
+        console.warn("[AssistantSettings] Failed to refresh agents on resume:", error);
+      }
       try {
-        await invoke("plugin:vcp-mobile|toggle_floating_ball", { show: true });
-        await invoke("reconcile_local_server_cmd", { enable: true });
-      } catch (_) {}
+        await applyAssistantRuntimeState(true);
+      } catch (error) {
+        console.error("[AssistantSettings] Failed to restore assistant runtime:", error);
+        reportRuntimeError("悬浮助手恢复失败", error);
+      }
     }
   }
 };
@@ -96,11 +131,15 @@ onMounted(async () => {
   if (props.settings.enableAssistant && hasOverlayPermission.value) {
     try {
       await assistantStore.fetchAgents();
-    } catch (_) {}
+    } catch (error) {
+      console.warn("[AssistantSettings] Failed to refresh agents on mount:", error);
+    }
     try {
-      await invoke("plugin:vcp-mobile|toggle_floating_ball", { show: true });
-      await invoke("reconcile_local_server_cmd", { enable: true });
-    } catch (_) {}
+      await applyAssistantRuntimeState(true);
+    } catch (error) {
+      console.error("[AssistantSettings] Failed to restore assistant runtime on mount:", error);
+      reportRuntimeError("悬浮助手启动失败", error);
+    }
   }
 
   // 监听生命周期 resume 事件以刷新权限状态

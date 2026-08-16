@@ -14,6 +14,7 @@ import SlidePage from "../../components/ui/SlidePage.vue";
 import SettingsSwitch from "../../components/settings/SettingsSwitch.vue";
 import { useAffectStore } from "../../core/stores/affect";
 import { useNotificationStore } from "../../core/stores/notification";
+import { useOverlayStore } from "../../core/stores/overlay";
 import type { AffectConfig, AffectPersonaBaseline } from "../../core/types/affect";
 import type { AffectEvent } from "../../core/types/affect";
 
@@ -36,6 +37,7 @@ const emit = defineEmits<{
 
 const affect = useAffectStore();
 const notifications = useNotificationStore();
+const overlayStore = useOverlayStore();
 const draft = ref<AffectConfig>({ ...affect.state.config });
 const draftPersona = ref<AffectPersonaBaseline>({
   ...affect.state.personaBaseline,
@@ -169,7 +171,13 @@ const save = async () => {
 };
 
 const reset = async () => {
-  if (!props.agentId || !confirm("确定重置这个角色的情绪、关系和事件记录吗？人格与行为配置会保留。")) return;
+  if (!props.agentId || isResetting.value) return;
+  const confirmed = await overlayStore.showConfirm({
+    title: "重置角色情感状态",
+    message: "确定重置这个角色的情绪、关系和事件记录吗？人格与行为配置会保留。",
+    isDanger: true,
+  });
+  if (!confirmed) return;
   isResetting.value = true;
   try {
     await affect.reset(props.agentId);

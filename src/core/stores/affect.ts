@@ -148,11 +148,13 @@ const normalizeEvent = (raw: any, index: number, agentId: string): AffectEvent =
     ? raw.signals.map((item: unknown) => String(item))
     : [];
   const userAffectSignalNames = new Set(["用户低落", "共享喜悦", "用户愤怒"]);
-  const relationshipSignals: string[] = Array.isArray(raw?.relationshipSignals || raw?.relationship_signals)
-    ? (raw?.relationshipSignals || raw?.relationship_signals).map((item: unknown) => String(item))
+  const relationshipSignalSource = raw?.relationshipSignals ?? raw?.relationship_signals;
+  const userAffectSignalSource = raw?.userAffectSignals ?? raw?.user_affect_signals;
+  const relationshipSignals: string[] = Array.isArray(relationshipSignalSource)
+    ? relationshipSignalSource.map((item: unknown) => String(item))
     : signals.filter((signal) => !userAffectSignalNames.has(signal));
-  const userAffectSignals: string[] = Array.isArray(raw?.userAffectSignals || raw?.user_affect_signals)
-    ? (raw?.userAffectSignals || raw?.user_affect_signals).map((item: unknown) => String(item))
+  const userAffectSignals: string[] = Array.isArray(userAffectSignalSource)
+    ? userAffectSignalSource.map((item: unknown) => String(item))
     : signals.filter((signal) => userAffectSignalNames.has(signal));
 
   return {

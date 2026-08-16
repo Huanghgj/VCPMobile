@@ -4,6 +4,7 @@
 use crate::vcp_modules::db_manager::DbState;
 use crate::vcp_modules::group_types::GroupConfig;
 use crate::vcp_modules::sync_dto::GroupSyncDTO;
+use crate::vcp_modules::sync_executor::DeleteExecutor;
 use crate::vcp_modules::sync_hash::HashAggregator;
 use crate::vcp_modules::sync_service::{SyncCommand, SyncState};
 use crate::vcp_modules::sync_types::SyncDataType;
@@ -62,7 +63,7 @@ pub async fn read_group_config_internal<R: Runtime>(
     let group_row: Option<sqlx::sqlite::SqliteRow> = sqlx::query(
         "SELECT g.name, g.mode, g.group_prompt, g.invite_prompt, g.use_unified_model, g.unified_model, g.tag_match_mode, g.created_at, av.dominant_color
          FROM groups g
-         LEFT JOIN avatars av ON av.owner_id = g.group_id AND av.owner_type = 'group'
+         LEFT JOIN avatars av ON av.owner_id = g.group_id AND av.owner_type = 'group' AND av.deleted_at IS NULL
          WHERE g.group_id = ? AND g.deleted_at IS NULL"
     )
     .bind(group_id)
@@ -172,7 +173,7 @@ pub async fn get_groups(
     let group_rows = sqlx::query(
         "SELECT g.group_id, g.name, g.mode, g.group_prompt, g.invite_prompt, g.use_unified_model, g.unified_model, g.tag_match_mode, g.created_at, av.dominant_color
          FROM groups g
-         LEFT JOIN avatars av ON av.owner_id = g.group_id AND av.owner_type = 'group'
+         LEFT JOIN avatars av ON av.owner_id = g.group_id AND av.owner_type = 'group' AND av.deleted_at IS NULL
          WHERE g.deleted_at IS NULL"
     )
     .fetch_all(pool)
@@ -405,38 +406,38 @@ async fn internal_write_group_config<R: Runtime>(
 
     let now = crate::vcp_modules::infra::utils::now_millis();
 
+    let group_is_active: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM groups WHERE group_id = ? AND deleted_at IS NULL)",
+    )
+    .bind(group_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    if !group_is_active {
+        state.caches.remove(group_id);
+        return Err(format!("群组 {} 不存在或已删除", group_id));
+    }
+
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
 
     let dto = GroupSyncDTO::from(config);
     let config_hash = HashAggregator::compute_group_config_hash(&dto);
 
-    // 只有非同步来源且哈希发生变化时，才通知同步中心
-    if !from_sync {
-        if let Some(sync_state) = app_handle.try_state::<SyncState>() {
-            let rows = sqlx::query("SELECT config_hash FROM groups WHERE group_id = ?")
-                .bind(group_id)
-                .fetch_optional(pool)
-                .await
-                .map_err(|e| e.to_string())?;
+    let should_notify_sync = if from_sync {
+        false
+    } else {
+        let old_hash = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT config_hash FROM groups WHERE group_id = ? AND deleted_at IS NULL",
+        )
+        .bind(group_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?
+        .flatten();
+        old_hash.as_ref() != Some(&config_hash)
+    };
 
-            let old_hash = rows.and_then(|r| {
-                use sqlx::Row;
-                r.get::<Option<String>, _>("config_hash")
-            });
-
-            if old_hash.as_ref() != Some(&config_hash) {
-                let _ = sync_state.ws_sender.send(SyncCommand::NotifyLocalChange {
-                    id: group_id.to_string(),
-                    data_type: SyncDataType::Group,
-                    hash: config_hash.clone(),
-                    ts: now,
-                    owner_type: None,
-                });
-            }
-        }
-    }
-
-    sqlx::query(
+    let group_update = sqlx::query(
         "INSERT INTO groups (
             group_id, name, mode,
             group_prompt, invite_prompt, use_unified_model, unified_model,
@@ -451,7 +452,8 @@ async fn internal_write_group_config<R: Runtime>(
             unified_model = excluded.unified_model,
             tag_match_mode = excluded.tag_match_mode,
             config_hash = excluded.config_hash,
-            updated_at = excluded.updated_at",
+            updated_at = excluded.updated_at
+         WHERE groups.deleted_at IS NULL",
     )
     .bind(group_id)
     .bind(&config.name)
@@ -467,6 +469,9 @@ async fn internal_write_group_config<R: Runtime>(
     .execute(&mut *tx)
     .await
     .map_err(|e| e.to_string())?;
+    if group_update.rows_affected() == 0 {
+        return Err(format!("群组 {} 已删除，拒绝延迟保存", group_id));
+    }
 
     sqlx::query("DELETE FROM group_members WHERE group_id = ?")
         .bind(group_id)
@@ -497,7 +502,7 @@ async fn internal_write_group_config<R: Runtime>(
 
     if !config.topics.is_empty() {
         for topic in &config.topics {
-            sqlx::query(
+            let topic_update = sqlx::query(
                 "INSERT INTO topics (
                     topic_id, owner_type, owner_id, title,
                     created_at, updated_at, locked, unread
@@ -506,7 +511,10 @@ async fn internal_write_group_config<R: Runtime>(
                     title = excluded.title,
                     locked = excluded.locked,
                     unread = excluded.unread,
-                    updated_at = excluded.updated_at",
+                    updated_at = excluded.updated_at
+                 WHERE topics.deleted_at IS NULL
+                   AND topics.owner_id = excluded.owner_id
+                   AND topics.owner_type = excluded.owner_type",
             )
             .bind(&topic.id)
             .bind(group_id)
@@ -520,7 +528,9 @@ async fn internal_write_group_config<R: Runtime>(
             .map_err(|e| e.to_string())?;
 
             // 初始化/更新 Topic 自身哈希
-            HashAggregator::bubble_topic_hash(&mut tx, &topic.id).await?;
+            if topic_update.rows_affected() > 0 {
+                HashAggregator::bubble_topic_hash(&mut tx, &topic.id).await?;
+            }
         }
     }
 
@@ -533,9 +543,19 @@ async fn internal_write_group_config<R: Runtime>(
         bubble_tx.commit().await.map_err(|e| e.to_string())?;
     }
 
-    // 通知同步中心：本地数据已变动 (已由上面的 config_hash 比对逻辑处理)
-
     state.caches.insert(group_id.to_string(), config.clone());
+
+    if should_notify_sync {
+        if let Some(sync_state) = app_handle.try_state::<SyncState>() {
+            let _ = sync_state.ws_sender.send(SyncCommand::NotifyLocalChange {
+                id: group_id.to_string(),
+                data_type: SyncDataType::Group,
+                hash: config_hash,
+                ts: now,
+                owner_type: None,
+            });
+        }
+    }
 
     Ok(true)
 }
@@ -546,39 +566,10 @@ pub async fn delete_group(
     state: State<'_, GroupManagerState>,
     group_id: String,
 ) -> Result<bool, String> {
-    let db_state = app_handle.state::<DbState>();
-    let pool = &db_state.pool;
-    let now = crate::vcp_modules::infra::utils::now_millis();
+    let mutex = state.acquire_lock(&group_id).await;
+    let _lock = mutex.lock().await;
 
-    sqlx::query("UPDATE groups SET deleted_at = ? WHERE group_id = ?")
-        .bind(now)
-        .bind(&group_id)
-        .execute(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // 级联将该 Group 下的所有话题标记为逻辑删除
-    sqlx::query("UPDATE topics SET deleted_at = ? WHERE owner_id = ? AND owner_type = 'group' AND deleted_at IS NULL")
-        .bind(now)
-        .bind(&group_id)
-        .execute(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // 级联将该 Group 下所有话题的所有消息标记为逻辑删除
-    sqlx::query("UPDATE messages SET deleted_at = ? WHERE topic_id IN (SELECT topic_id FROM topics WHERE owner_id = ? AND owner_type = 'group') AND deleted_at IS NULL")
-        .bind(now)
-        .bind(&group_id)
-        .execute(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // 级联清除该 Group 下的所有活跃生成，杜绝已删除消息复活
-    sqlx::query("DELETE FROM active_generations WHERE owner_id = ? AND owner_type = 'group'")
-        .bind(&group_id)
-        .execute(pool)
-        .await
-        .map_err(|e| e.to_string())?;
+    DeleteExecutor::soft_delete_group(&app_handle, &group_id).await?;
 
     state.caches.remove(&group_id);
     state.locks.remove(&group_id);

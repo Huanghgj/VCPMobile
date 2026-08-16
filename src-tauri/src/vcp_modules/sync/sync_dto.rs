@@ -339,6 +339,8 @@ impl From<MessagePullSyncDTO> for crate::vcp_modules::chat_manager::ChatMessage 
             blocks: None, // ⚡ 同步下载阶段不再执行耗时预渲染，直接设为 None，由 Lazy Render 闭环接管！
             content_hash: dto.content_hash,
             shell: None,
+            transient_context: None,
+            transient_system_prompt: None,
         }
     }
 }

@@ -15,6 +15,7 @@ import {
 } from "../../core/utils/renderLibraryPreloader";
 import {
   blockContainsRichHtml,
+  blockUsesFramelessLayout,
   compileRenderFragment,
   createRenderDocument,
   isRenderDocumentBlock,
@@ -184,7 +185,7 @@ function splitMarkdownNodes(nodes: any[]): any[][] {
 interface BubbleGroup {
   id: string;
   blocks: RenderedContentBlock[];
-  hasRichHtml: boolean;
+  usesFramelessLayout: boolean;
   isTail?: boolean;
 }
 
@@ -215,7 +216,7 @@ const messageBubbles = computed(() => {
       list.push({
         id: `${props.message.id}-bubble-${bubbleIndex++}`,
         blocks,
-        hasRichHtml: blocks.some(blockContainsRichHtml),
+        usesFramelessLayout: blocks.some(blockUsesFramelessLayout),
       });
       currentBlocks = [];
     }
@@ -280,7 +281,7 @@ const messageBubbles = computed(() => {
     list.push({
       id: `${props.message.id}-bubble-${bubbleIndex++}`,
       blocks: [],
-      hasRichHtml: false,
+      usesFramelessLayout: false,
     });
   }
 
@@ -289,7 +290,7 @@ const messageBubbles = computed(() => {
     list.push({
       id: `${props.message.id}-bubble-0`,
       blocks: [],
-      hasRichHtml: false,
+      usesFramelessLayout: false,
     });
   }
 
@@ -323,7 +324,7 @@ function getBubbleStyle(bubble: BubbleGroup): Record<string, string> {
   const style: Record<string, string> = {
     "--dynamic-color": shell.value?.avatarColor || "transparent",
   };
-  if (!shell.value?.isUser && bubble.hasRichHtml) {
+  if (!shell.value?.isUser && bubble.usesFramelessLayout) {
     style["--assistant-bubble-bg"] = "transparent";
     style["--agent-text"] = "inherit";
     style["border-color"] = "transparent";
@@ -898,16 +899,33 @@ const showMessageContextMenu = async () => {
     }
   }
 
-  actions.push({
-    label: "删除消息",
-    icon: Trash2,
-    danger: true,
-    handler: () => {
-      if (confirm("确定要删除这条消息吗？")) {
-        historyStore.deleteMessage(props.message.id);
-      }
-    },
-  });
+  if (!isStreaming.value) {
+    actions.push({
+      label: "删除消息",
+      icon: Trash2,
+      danger: true,
+      handler: async () => {
+        const confirmed = await overlayStore.showConfirm({
+          title: "删除消息",
+          message: "确定要删除这条消息吗？此操作不可撤销。",
+          isDanger: true,
+        });
+        if (!confirmed) return;
+
+        try {
+          await historyStore.deleteMessage(props.message.id);
+        } catch (error) {
+          console.error("[MessageRenderer] Failed to delete message:", error);
+          notificationStore.addNotification({
+            type: "error",
+            title: "消息删除失败",
+            message: error instanceof Error ? error.message : String(error),
+            toastOnly: true,
+          });
+        }
+      },
+    });
+  }
 
   overlayStore.openContextMenu(
     actions,
@@ -1081,6 +1099,10 @@ function formatTime(ts: number) {
               message.attachments.length > 0
             "
             :attachments="message.attachments"
+            :message-id="message.id"
+            :topic-id="
+              message.topicId || sessionStore.currentTopicId || undefined
+            "
             class="pt-3 border-t border-black/5 dark:border-white/5"
           />
 

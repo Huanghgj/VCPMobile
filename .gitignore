@@ -43,6 +43,7 @@ scripts/
 !scripts/
 scripts/*
 !scripts/build_android_arm64_release.cjs
+!scripts/upload_android_release_asset.cjs
 plans/Archive_Assets/
 .codex-remote-attachments/
 *.err.log
@@ -52,6 +53,10 @@ plans/Archive_Assets/
 releases/
 vector/
 /*.apk
+release-artifacts/
+test-artifacts/
+src-tauri/target-codex-confirm/
+src-tauri/target-codex-tests/
 
 # Cargo registry cache
 /.cargo

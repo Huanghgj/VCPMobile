@@ -1,5 +1,5 @@
 use serde::Serialize;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -44,6 +44,8 @@ pub struct LifecycleState {
     pub local_server_handle: Arc<tokio::sync::Mutex<Option<ServerHandle>>>,
     /// 应用前台状态，统一替代原裸静态全局变量
     pub is_foreground: Arc<AtomicBool>,
+    /// 每次真实前后台切换递增，用于拒绝过期异步任务的副作用。
+    pub transition_epoch: AtomicU64,
     /// 统一后台 Linger 延时断连任务状态与控制器
     pub linger: Arc<LingerController>,
 }
@@ -56,6 +58,7 @@ impl LifecycleState {
             last_error: Arc::new(RwLock::new(None)),
             local_server_handle: Arc::new(tokio::sync::Mutex::new(None)),
             is_foreground: Arc::new(AtomicBool::new(true)),
+            transition_epoch: AtomicU64::new(0),
             linger: Arc::new(LingerController::new()),
         }
     }

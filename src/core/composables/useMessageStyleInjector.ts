@@ -37,6 +37,15 @@ function stableCssIdentifier(value: string): string {
   return (hash >>> 0).toString(36);
 }
 
+function normalizeGeneratedRootSelector(selector: string): string {
+  return selector
+    .replace(/#vcp-root\b/gi, "[data-vcp-generated-root]")
+    .replace(
+      /\[\s*id\s*=\s*(?:"vcp-root"|'vcp-root'|vcp-root)\s*(?:[is]\s*)?\]/gi,
+      "[data-vcp-generated-root]",
+    );
+}
+
 function isKeyframesRule(node: any): boolean {
   return (
     node?.type === "Atrule" && /^(?:-[a-z]+-)?keyframes$/i.test(node.name || "")
@@ -56,7 +65,7 @@ function firstIdentifier(node: any): any | null {
 }
 
 function scopeSingleSelector(selector: string, scopeSelector: string): string {
-  const trimmed = selector.trim();
+  const trimmed = normalizeGeneratedRootSelector(selector.trim());
   if (!trimmed || trimmed.includes(scopeSelector)) return trimmed;
 
   if (/^(?::root|html|body)(?=$|[\s.#:[>+~])/i.test(trimmed)) {

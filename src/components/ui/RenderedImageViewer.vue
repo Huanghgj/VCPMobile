@@ -356,6 +356,8 @@ function handleTouchEnd(event: TouchEvent): void {
 }
 
 function normalizeFileName(raw: string): string {
+  // Control characters are invalid in filenames on every supported platform.
+  // eslint-disable-next-line no-control-regex
   const name = raw.trim().replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_");
   return name || "vcp-image";
 }

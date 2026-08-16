@@ -359,6 +359,7 @@ async fn legacy_backup_tables(pool: &Pool<Sqlite>, table: &str) -> Result<Vec<St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vcp_modules::sync_hash::HashAggregator;
     use sqlx::sqlite::SqlitePoolOptions;
 
     #[tokio::test]
@@ -538,6 +539,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(attachment_count, 1);
+        assert!(table_columns(&pool, "message_attachments")
+            .await
+            .unwrap()
+            .contains("deleted_at"));
     }
 
     #[tokio::test]
@@ -610,6 +615,279 @@ mod tests {
         assert_eq!(row.get::<String, _>("config_hash"), "");
         assert_eq!(row.get::<String, _>("content_hash"), "");
         assert_eq!(row.try_get::<Option<i64>, _>("deleted_at").unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn setup_tables_upgrades_legacy_group_topic_schema_without_data_loss() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite");
+
+        for statement in [
+            "CREATE TABLE agents (
+                agent_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                system_prompt TEXT NOT NULL DEFAULT '',
+                model TEXT NOT NULL,
+                updated_at BIGINT NOT NULL
+            )",
+            "CREATE TABLE groups (
+                group_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL
+            )",
+            "CREATE TABLE group_members (
+                group_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                PRIMARY KEY (group_id, agent_id)
+            )",
+            "CREATE TABLE topics (
+                topic_id TEXT PRIMARY KEY,
+                owner_type TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                created_at BIGINT NOT NULL
+            )",
+            "INSERT INTO agents (agent_id, name, system_prompt, model, updated_at)
+             VALUES ('agent_alpha', 'Alpha', 'legacy prompt', 'gpt-test', 10)",
+            "INSERT INTO groups (group_id, name) VALUES ('group_alpha', 'Legacy Group')",
+            "INSERT INTO group_members (group_id, agent_id)
+             VALUES ('group_alpha', 'agent_alpha')",
+            "INSERT INTO topics (topic_id, owner_type, owner_id, title, created_at)
+             VALUES ('topic_legacy', 'agent', 'agent_alpha', 'Legacy Topic', 20)",
+        ] {
+            sqlx::query(statement).execute(&pool).await.unwrap();
+        }
+
+        setup_tables(&pool).await.unwrap();
+
+        let groups = table_columns(&pool, "groups").await.unwrap();
+        for column in [
+            "mode",
+            "group_prompt",
+            "invite_prompt",
+            "use_unified_model",
+            "unified_model",
+            "tag_match_mode",
+            "config_hash",
+            "content_hash",
+            "created_at",
+            "updated_at",
+            "deleted_at",
+        ] {
+            assert!(groups.contains(column), "missing groups.{column}");
+        }
+
+        let topics = table_columns(&pool, "topics").await.unwrap();
+        for column in [
+            "updated_at",
+            "locked",
+            "unread",
+            "unread_count",
+            "msg_count",
+            "config_hash",
+            "content_hash",
+            "deleted_at",
+        ] {
+            assert!(topics.contains(column), "missing topics.{column}");
+        }
+
+        let members = table_columns(&pool, "group_members").await.unwrap();
+        for column in ["member_tag", "sort_order", "updated_at"] {
+            assert!(members.contains(column), "missing group_members.{column}");
+        }
+
+        let group = sqlx::query(
+            "SELECT name, mode, group_prompt, invite_prompt, use_unified_model,
+                    unified_model, tag_match_mode, config_hash, content_hash,
+                    created_at, updated_at, deleted_at
+             FROM groups WHERE group_id = 'group_alpha'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(group.get::<String, _>("name"), "Legacy Group");
+        assert_eq!(group.get::<String, _>("mode"), "sequential");
+        assert_eq!(
+            group.try_get::<Option<String>, _>("group_prompt").unwrap(),
+            None
+        );
+        assert_eq!(
+            group.try_get::<Option<String>, _>("invite_prompt").unwrap(),
+            None
+        );
+        assert_eq!(group.get::<i64, _>("use_unified_model"), 0);
+        assert_eq!(
+            group.try_get::<Option<String>, _>("unified_model").unwrap(),
+            None
+        );
+        assert_eq!(
+            group
+                .try_get::<Option<String>, _>("tag_match_mode")
+                .unwrap(),
+            None
+        );
+        assert_eq!(group.get::<String, _>("config_hash"), "");
+        assert_eq!(group.get::<String, _>("content_hash"), "");
+        assert_eq!(group.get::<i64, _>("created_at"), 0);
+        assert_eq!(group.get::<i64, _>("updated_at"), 0);
+        assert_eq!(group.try_get::<Option<i64>, _>("deleted_at").unwrap(), None);
+
+        let member = sqlx::query(
+            "SELECT member_tag, sort_order, updated_at
+             FROM group_members WHERE group_id = 'group_alpha' AND agent_id = 'agent_alpha'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            member.try_get::<Option<String>, _>("member_tag").unwrap(),
+            None
+        );
+        assert_eq!(member.get::<i64, _>("sort_order"), 0);
+        assert_eq!(member.get::<i64, _>("updated_at"), 0);
+
+        let topic = sqlx::query(
+            "SELECT title, created_at, updated_at, locked, unread, unread_count,
+                    msg_count, config_hash, content_hash, deleted_at
+             FROM topics WHERE topic_id = 'topic_legacy'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(topic.get::<String, _>("title"), "Legacy Topic");
+        assert_eq!(topic.get::<i64, _>("created_at"), 20);
+        assert_eq!(topic.get::<i64, _>("updated_at"), 0);
+        assert_eq!(topic.get::<i64, _>("locked"), 1);
+        assert_eq!(topic.get::<i64, _>("unread"), 0);
+        assert_eq!(topic.get::<i64, _>("unread_count"), 0);
+        assert_eq!(topic.get::<i64, _>("msg_count"), 0);
+        assert_eq!(topic.get::<String, _>("config_hash"), "");
+        assert_eq!(topic.get::<String, _>("content_hash"), "");
+        assert_eq!(topic.try_get::<Option<i64>, _>("deleted_at").unwrap(), None);
+
+        sqlx::query(
+            "INSERT INTO messages (
+                msg_id, topic_id, role, content, timestamp, content_hash, created_at, updated_at
+             ) VALUES ('message_legacy', 'topic_legacy', 'user', X'00', 25,
+                       'legacy-message-hash', 25, 25)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        HashAggregator::bubble_from_topic(&mut tx, "topic_legacy")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let topic_hashes: (String, String) = sqlx::query_as(
+            "SELECT config_hash, content_hash FROM topics WHERE topic_id = 'topic_legacy'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!topic_hashes.0.is_empty());
+        assert!(!topic_hashes.1.is_empty());
+        let agent_content_hash: String =
+            sqlx::query_scalar("SELECT content_hash FROM agents WHERE agent_id = 'agent_alpha'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(!agent_content_hash.is_empty());
+
+        sqlx::query(
+            "INSERT INTO topics (
+                topic_id, owner_type, owner_id, title, created_at, updated_at
+             ) VALUES ('topic_new', 'agent', 'agent_alpha', 'New Topic', 30, 30)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        HashAggregator::bubble_from_topic(&mut tx, "topic_new")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        sqlx::query("UPDATE topics SET deleted_at = 40 WHERE topic_id = 'topic_new'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let deleted_at: Option<i64> =
+            sqlx::query_scalar("SELECT deleted_at FROM topics WHERE topic_id = 'topic_new'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(deleted_at, Some(40));
+    }
+
+    #[tokio::test]
+    async fn setup_tables_backfills_legacy_avatar_tombstone_column() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite");
+
+        sqlx::query(
+            "CREATE TABLE avatars (
+                owner_type TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                avatar_hash TEXT NOT NULL,
+                mime_type TEXT NOT NULL,
+                image_data BLOB NOT NULL,
+                dominant_color TEXT,
+                updated_at BIGINT NOT NULL,
+                PRIMARY KEY (owner_type, owner_id)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO avatars
+                (owner_type, owner_id, avatar_hash, mime_type, image_data, updated_at)
+             VALUES ('agent', 'agent_alpha', 'hash', 'image/png', X'0102', 10)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        setup_tables(&pool).await.unwrap();
+
+        let columns = table_columns(&pool, "avatars").await.unwrap();
+        assert!(columns.contains("deleted_at"));
+        let row = sqlx::query(
+            "SELECT avatar_hash, image_data, deleted_at
+             FROM avatars WHERE owner_type = 'agent' AND owner_id = 'agent_alpha'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<String, _>("avatar_hash"), "hash");
+        assert_eq!(row.get::<Vec<u8>, _>("image_data"), vec![1, 2]);
+        assert_eq!(row.try_get::<Option<i64>, _>("deleted_at").unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn setup_tables_creates_active_generation_registry() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite");
+
+        setup_tables(&pool).await.unwrap();
+
+        assert!(table_exists(&pool, "active_generations").await.unwrap());
+        let columns = table_columns(&pool, "active_generations").await.unwrap();
+        for column in ["msg_id", "topic_id", "owner_id", "owner_type", "created_at"] {
+            assert!(
+                columns.contains(column),
+                "missing active_generations.{column}"
+            );
+        }
     }
 }
 
@@ -788,12 +1066,13 @@ async fn copy_legacy_message_attachments(pool: &Pool<Sqlite>, backup: &str) -> R
     let src_expr = aliased_col_expr(&columns, "legacy", "src", "NULL");
     let status_expr = aliased_col_expr(&columns, "legacy", "status", "NULL");
     let created_expr = aliased_col_expr(&columns, "legacy", "created_at", &now.to_string());
+    let deleted_expr = aliased_col_expr(&columns, "legacy", "deleted_at", "NULL");
     let copy_sql = format!(
         "INSERT OR IGNORE INTO message_attachments (
-            topic_id, msg_id, hash, attachment_order, display_name, src, status, created_at
+            topic_id, msg_id, hash, attachment_order, display_name, src, status, created_at, deleted_at
         )
         SELECT messages.topic_id, legacy.msg_id, legacy.hash, {order_expr},
-               {display_expr}, {src_expr}, {status_expr}, {created_expr}
+               {display_expr}, {src_expr}, {status_expr}, {created_expr}, {deleted_expr}
         FROM {backup_table} legacy
         INNER JOIN messages ON messages.msg_id = legacy.msg_id",
         backup_table = quote_ident(backup)
@@ -817,12 +1096,14 @@ async fn setup_tables(pool: &Pool<Sqlite>) -> Result<(), String> {
             image_data BLOB NOT NULL,     -- 物理二进制数据
             dominant_color TEXT,          -- 预计算的主色调 (rgb/hex)
             updated_at BIGINT NOT NULL,   -- 逻辑时钟/时间戳
+            deleted_at BIGINT,
             PRIMARY KEY (owner_type, owner_id)
         )",
     )
     .execute(pool)
     .await
     .map_err(|e| e.to_string())?;
+    add_column_if_missing(pool, "avatars", "deleted_at", "BIGINT").await?;
 
     // 2. agents 表 (智能体配置 - 物理删除了 current_topic_id)
     sqlx::query(
@@ -881,6 +1162,21 @@ async fn setup_tables(pool: &Pool<Sqlite>) -> Result<(), String> {
     .execute(pool)
     .await
     .map_err(|e| e.to_string())?;
+    for (column, definition) in [
+        ("mode", "TEXT NOT NULL DEFAULT 'sequential'"),
+        ("group_prompt", "TEXT"),
+        ("invite_prompt", "TEXT"),
+        ("use_unified_model", "INTEGER NOT NULL DEFAULT 0"),
+        ("unified_model", "TEXT"),
+        ("tag_match_mode", "TEXT"),
+        ("config_hash", "TEXT NOT NULL DEFAULT ''"),
+        ("content_hash", "TEXT NOT NULL DEFAULT ''"),
+        ("created_at", "BIGINT NOT NULL DEFAULT 0"),
+        ("updated_at", "BIGINT NOT NULL DEFAULT 0"),
+        ("deleted_at", "BIGINT"),
+    ] {
+        add_column_if_missing(pool, "groups", column, definition).await?;
+    }
 
     // 4. group_members 表
     sqlx::query(
@@ -896,6 +1192,13 @@ async fn setup_tables(pool: &Pool<Sqlite>) -> Result<(), String> {
     .execute(pool)
     .await
     .map_err(|e| e.to_string())?;
+    for (column, definition) in [
+        ("member_tag", "TEXT"),
+        ("sort_order", "INTEGER NOT NULL DEFAULT 0"),
+        ("updated_at", "BIGINT NOT NULL DEFAULT 0"),
+    ] {
+        add_column_if_missing(pool, "group_members", column, definition).await?;
+    }
 
     // 5. topics 表 (主题管理)
     sqlx::query(
@@ -918,6 +1221,18 @@ async fn setup_tables(pool: &Pool<Sqlite>) -> Result<(), String> {
     .execute(pool)
     .await
     .map_err(|e| e.to_string())?;
+    for (column, definition) in [
+        ("updated_at", "BIGINT NOT NULL DEFAULT 0"),
+        ("locked", "INTEGER NOT NULL DEFAULT 1"),
+        ("unread", "INTEGER NOT NULL DEFAULT 0"),
+        ("unread_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("msg_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("config_hash", "TEXT NOT NULL DEFAULT ''"),
+        ("content_hash", "TEXT NOT NULL DEFAULT ''"),
+        ("deleted_at", "BIGINT"),
+    ] {
+        add_column_if_missing(pool, "topics", column, definition).await?;
+    }
 
     // 6. messages 表 (消息历史 - 已物理删除 is_thinking 列)
     let legacy_message_migration = migrate_legacy_messages_table(pool).await?;
@@ -990,6 +1305,7 @@ async fn setup_tables(pool: &Pool<Sqlite>) -> Result<(), String> {
             src TEXT,
             status TEXT,
             created_at BIGINT NOT NULL,
+            deleted_at BIGINT,
             PRIMARY KEY (topic_id, msg_id, attachment_order),
             FOREIGN KEY (topic_id, msg_id) REFERENCES messages(topic_id, msg_id) ON DELETE CASCADE
         )",
@@ -997,6 +1313,7 @@ async fn setup_tables(pool: &Pool<Sqlite>) -> Result<(), String> {
     .execute(pool)
     .await
     .map_err(|e| e.to_string())?;
+    add_column_if_missing(pool, "message_attachments", "deleted_at", "BIGINT").await?;
     if let Some(backup) = legacy_message_migration.message_attachments_backup {
         copy_legacy_message_attachments(pool, &backup).await?;
     }
@@ -1090,6 +1407,21 @@ async fn setup_tables(pool: &Pool<Sqlite>) -> Result<(), String> {
             sort_order INTEGER NOT NULL DEFAULT 0,
             created_at BIGINT NOT NULL,
             updated_at BIGINT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // 15. active_generations 活跃生成注册表
+    // 删除与断点恢复链路都会访问这张表；当前手写建表流程不能依赖未执行的 migration。
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS active_generations (
+            msg_id TEXT PRIMARY KEY,
+            topic_id TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            owner_type TEXT NOT NULL,
+            created_at BIGINT NOT NULL
         )",
     )
     .execute(pool)

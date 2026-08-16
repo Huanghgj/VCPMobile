@@ -34,12 +34,16 @@ export const useTopicStore = defineStore("topic", () => {
   const loading = ref(false);
   const searchTerm = ref("");
   const currentAgentId = ref<string | null>(null);
+  const deletingTopicIds = ref<string[]>([]);
+  const deletedTopicIds = new Set<string>();
+  let topicLoadSequence = 0;
 
   // --- 事件监听 (Event Listeners) ---
   // 注意：topic-index-updated 事件当前在 Rust 侧未被 emit，已移除死代码
   let topicTitleUpdatedUnlisten: UnlistenFn | null = null;
   let topicTitleListenerInit: Promise<void> | null = null;
   let topicTitleListenerRetry: ReturnType<typeof window.setTimeout> | null = null;
+  let topicTitleListenerDisposed = false;
 
   const applyTopicTitleUpdate = (topicId: string, title: string) => {
     const index = topics.value.findIndex((t) => t.id === topicId);
@@ -62,7 +66,12 @@ export const useTopicStore = defineStore("topic", () => {
   };
 
   const ensureTopicTitleListener = () => {
-    if (!isTauriRuntime() || topicTitleUpdatedUnlisten || topicTitleListenerInit) return;
+    if (
+      topicTitleListenerDisposed ||
+      !isTauriRuntime() ||
+      topicTitleUpdatedUnlisten ||
+      topicTitleListenerInit
+    ) return;
 
     topicTitleListenerInit = listen<{
       topicId?: string;
@@ -72,11 +81,16 @@ export const useTopicStore = defineStore("topic", () => {
       if (topicId && title) {
         applyTopicTitleUpdate(topicId, title);
       }
-    })
+      })
       .then((unlisten) => {
+        if (topicTitleListenerDisposed) {
+          unlisten();
+          return;
+        }
         topicTitleUpdatedUnlisten = unlisten;
       })
       .catch((err) => {
+        if (topicTitleListenerDisposed) return;
         console.warn("[TopicStore] topic-title-updated listener init failed:", err);
         topicTitleUpdatedUnlisten = null;
         topicTitleListenerRetry = window.setTimeout(() => {
@@ -92,6 +106,7 @@ export const useTopicStore = defineStore("topic", () => {
   ensureTopicTitleListener();
 
   onScopeDispose(() => {
+    topicTitleListenerDisposed = true;
     if (topicTitleListenerRetry) {
       window.clearTimeout(topicTitleListenerRetry);
       topicTitleListenerRetry = null;
@@ -107,7 +122,9 @@ export const useTopicStore = defineStore("topic", () => {
    * 同步完成后调用，确保下次切到任意 Agent/Group 时重新加载最新话题
    */
   const invalidateAllTopicCaches = () => {
+    topicLoadSequence += 1;
     topics.value = [];
+    loading.value = false;
     // currentAgentId 保持不动，这样当前选中的话题列表会在 watch 中重新加载
     console.log("[TopicStore] All topic caches invalidated");
   };
@@ -142,6 +159,16 @@ export const useTopicStore = defineStore("topic", () => {
     });
   });
 
+  const isOwnerVisible = (ownerId: string, topicId?: string) => {
+    const visibleOwnerId =
+      sessionStore.currentSelectedItem?.id ?? currentAgentId.value;
+    if (visibleOwnerId) return visibleOwnerId === ownerId;
+    if (!topicId) return true;
+    return topics.value.some(
+      (topic) => topic.id === topicId && topic.ownerId === ownerId,
+    );
+  };
+
   // --- 核心 Action (Actions) ---
 
   /**
@@ -152,6 +179,7 @@ export const useTopicStore = defineStore("topic", () => {
   const loadTopicList = async (ownerId: string, owner_type: string) => {
     if (!ownerId) return;
 
+    const loadSequence = ++topicLoadSequence;
     currentAgentId.value = ownerId;
     console.log(`[TopicStore] Loading topics for ${owner_type}: ${ownerId}`);
     loading.value = true;
@@ -165,21 +193,26 @@ export const useTopicStore = defineStore("topic", () => {
 
       channel.onmessage = (chunk) => {
         // 竞态检查：如果请求返回时，当前选中的 Agent 已经改变，则丢弃该结果
-        if (currentAgentId.value !== ownerId) return;
+        if (
+          currentAgentId.value !== ownerId ||
+          loadSequence !== topicLoadSequence
+        ) return;
 
-        const mappedChunk = chunk.map((t) => ({
-          ...t,
-          ownerId: ownerId,
-          ownerType: owner_type,
-          name: t.name || (t as any).title || t.id,
-          unreadCount: (t as any).unreadCount || 0,
-          msgCount: (t as any).msgCount || 0,
-        }));
+        const mappedChunk = chunk
+          .filter((topic) => !deletedTopicIds.has(topic.id))
+          .map((t) => ({
+            ...t,
+            ownerId: ownerId,
+            ownerType: owner_type,
+            name: t.name || (t as any).title || t.id,
+            unreadCount: (t as any).unreadCount || 0,
+            msgCount: (t as any).msgCount || 0,
+          }));
 
-        // 增量推入
-        topics.value.push(...mappedChunk);
-        // 强制触发虚拟列表重绘 (因为是 push，Vue 数组变动本身能响应，但为了保险对齐方案 A)
-        topics.value = [...topics.value];
+        // 增量推入并按 ID 去重，防止同一 Owner 的重入加载产生重复项。
+        const merged = new Map(topics.value.map((topic) => [topic.id, topic]));
+        mappedChunk.forEach((topic) => merged.set(topic.id, topic));
+        topics.value = Array.from(merged.values());
       };
 
       // 调用 Rust 命令开始流式获取
@@ -195,7 +228,9 @@ export const useTopicStore = defineStore("topic", () => {
     } catch (e) {
       console.error("[TopicStore] Failed to load topics:", e);
     } finally {
-      loading.value = false;
+      if (loadSequence === topicLoadSequence) {
+        loading.value = false;
+      }
     }
   };
 
@@ -228,9 +263,12 @@ export const useTopicStore = defineStore("topic", () => {
         locked: true,
       };
 
-      topics.value.unshift(topicWithState);
-      // 强制触发虚拟列表重绘
-      topics.value = [...topics.value];
+      deletedTopicIds.delete(topicWithState.id);
+      if (isOwnerVisible(ownerId)) {
+        topics.value.unshift(topicWithState);
+        // 强制触发虚拟列表重绘
+        topics.value = [...topics.value];
+      }
       notificationStore.addNotification({
         type: "success",
         title: "话题创建成功",
@@ -262,12 +300,28 @@ export const useTopicStore = defineStore("topic", () => {
     ownerType: string,
     topicId: string,
   ) => {
+    if (deletingTopicIds.value.includes(topicId)) return;
+    deletingTopicIds.value = [...deletingTopicIds.value, topicId];
+
     try {
       console.log(`[TopicStore] Deleting topic ${topicId}`);
       // 注意：确保 Rust 端已实现 delete_topic 命令
       await invoke("delete_topic", { ownerId, ownerType, topicId });
 
-      topics.value = topics.value.filter((t) => t.id !== topicId);
+      deletedTopicIds.add(topicId);
+      if (isOwnerVisible(ownerId, topicId)) {
+        topics.value = topics.value.filter((t) => t.id !== topicId);
+      }
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(
+          new CustomEvent("vcp-topic-deleted", {
+            detail: { ownerId, ownerType, topicId },
+          }),
+        );
+      }
+      if (sessionStore.lastActiveTopicMap[ownerId] === topicId) {
+        delete sessionStore.lastActiveTopicMap[ownerId];
+      }
 
       notificationStore.addNotification({
         type: "success",
@@ -277,18 +331,26 @@ export const useTopicStore = defineStore("topic", () => {
       });
 
       // 如果删除的是当前选中的话题，自动载入最新的一个
-      if (sessionStore.currentTopicId === topicId) {
+      if (
+        (!sessionStore.currentSelectedItem?.id ||
+          sessionStore.currentSelectedItem.id === ownerId) &&
+        sessionStore.currentTopicId === topicId
+      ) {
         const nextTopic = topics.value[0];
         if (nextTopic) {
           await sessionStore.selectTopicById(ownerId, nextTopic.id);
         } else {
           sessionStore.currentTopicId = null;
-          // chatHistoryStore 监听 currentTopicId 变化，会自动清空历史
+          // ChatView 监听 currentTopicId 变化并清空历史。
         }
       }
     } catch (e) {
       console.error("[TopicStore] Failed to delete topic:", e);
       throw e;
+    } finally {
+      deletingTopicIds.value = deletingTopicIds.value.filter(
+        (id) => id !== topicId,
+      );
     }
   };
 
@@ -376,7 +438,17 @@ export const useTopicStore = defineStore("topic", () => {
         topicId,
         locked: targetLockState,
       });
-      topics.value[index] = { ...topics.value[index], locked: targetLockState };
+      const currentIndex = topics.value.findIndex(
+        (topic) =>
+          topic.id === topicId &&
+          topic.ownerId === ownerId &&
+          topic.ownerType === ownerType,
+      );
+      if (currentIndex === -1) return;
+      topics.value[currentIndex] = {
+        ...topics.value[currentIndex],
+        locked: targetLockState,
+      };
       // 强制触发虚拟列表重绘
       topics.value = [...topics.value];
     } catch (e) {
@@ -481,7 +553,12 @@ export const useTopicStore = defineStore("topic", () => {
           ownerType: topic.ownerType, 
           topicId, 
           unread: false 
-        }).catch(() => {});
+        }).catch((error) => {
+          console.warn(
+            `[TopicStore] Failed to persist read state for ${topicId}:`,
+            error,
+          );
+        });
       }
     }
   };
@@ -497,6 +574,7 @@ export const useTopicStore = defineStore("topic", () => {
     updateTopicTitle,
     summarizeTopicTitle,
     currentAgentId,
+    deletingTopicIds,
     toggleTopicLock,
     setTopicUnread,
     invalidateAllTopicCaches,

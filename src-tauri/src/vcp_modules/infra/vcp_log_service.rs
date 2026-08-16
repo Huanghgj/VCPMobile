@@ -1,5 +1,6 @@
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
@@ -25,6 +26,84 @@ lazy_static::lazy_static! {
     static ref WS_URL_CHANNEL: (watch::Sender<Option<Url>>, watch::Receiver<Option<Url>>) = watch::channel(None);
     static ref CURRENT_LOG_STATUS: Arc<tokio::sync::RwLock<String>> = Arc::new(tokio::sync::RwLock::new("closed".to_string()));
     static ref HEARTBEAT_RESET_TX: Arc<tokio::sync::Mutex<Option<mpsc::Sender<()>>>> = Arc::new(tokio::sync::Mutex::new(None));
+    static ref BACKGROUND_LOG_CACHE: std::sync::Mutex<VecDeque<Value>> = std::sync::Mutex::new(VecDeque::new());
+}
+
+const MAX_BACKGROUND_LOG_EVENTS: usize = 500;
+
+pub async fn handle_foreground_state_change<R: tauri::Runtime>(
+    _app: &AppHandle<R>,
+    is_foreground: bool,
+) {
+    let heartbeat_ms = if is_foreground { 15_000 } else { 120_000 };
+    let _ = set_vcp_log_heartbeat(heartbeat_ms).await;
+}
+
+pub async fn disconnect_log_connections<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+) -> Result<(), String> {
+    let log_result =
+        init_vcp_log_connection_internal(app.clone(), String::new(), String::new()).await;
+    let info_result = super::vcp_info_service::init_vcp_info_connection_internal(
+        app.clone(),
+        String::new(),
+        String::new(),
+    )
+    .await;
+
+    combine_connection_results("disconnect", log_result, info_result)
+}
+
+pub async fn reconnect_log_connections<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    log_url: String,
+    log_key: String,
+) -> Result<(), String> {
+    let log_result =
+        init_vcp_log_connection_internal(app.clone(), log_url.clone(), log_key.clone()).await;
+    let info_result =
+        super::vcp_info_service::init_vcp_info_connection_internal(app.clone(), log_url, log_key)
+            .await;
+
+    combine_connection_results("reconnect", log_result, info_result)
+}
+
+fn combine_connection_results(
+    action: &str,
+    log_result: Result<(), String>,
+    info_result: Result<(), String>,
+) -> Result<(), String> {
+    match (log_result, info_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(log_error), Ok(())) => Err(format!("Failed to {action} VCPLog: {log_error}")),
+        (Ok(()), Err(info_error)) => Err(format!("Failed to {action} VCPInfo: {info_error}")),
+        (Err(log_error), Err(info_error)) => Err(format!(
+            "Failed to {action} VCPLog ({log_error}) and VCPInfo ({info_error})"
+        )),
+    }
+}
+
+fn emit_log_event<R: tauri::Runtime>(app: &AppHandle<R>, payload: Value) {
+    if !crate::vcp_modules::infra::lifecycle_manager::is_app_in_foreground(app) {
+        if let Ok(mut cache) = BACKGROUND_LOG_CACHE.lock() {
+            if cache.len() >= MAX_BACKGROUND_LOG_EVENTS {
+                cache.pop_front();
+            }
+            cache.push_back(payload);
+        }
+        return;
+    }
+    let _ = app.emit("vcp-system-event", payload);
+}
+
+pub fn flush_background_logs<R: tauri::Runtime>(app: &AppHandle<R>) {
+    let events = BACKGROUND_LOG_CACHE
+        .lock()
+        .map(|mut cache| cache.drain(..).collect::<Vec<_>>())
+        .unwrap_or_default();
+    for payload in events {
+        let _ = app.emit("vcp-system-event", payload);
+    }
 }
 
 #[tauri::command]
@@ -136,7 +215,10 @@ pub async fn init_vcp_log_connection_internal<R: tauri::Runtime>(
 ) -> Result<(), String> {
     // 如果 URL 或 Key 为空，发送 None 以停止现有连接并进入静默等待
     if url.trim().is_empty() || key.trim().is_empty() {
-        let _ = WS_URL_CHANNEL.0.send(None);
+        WS_URL_CHANNEL
+            .0
+            .send(None)
+            .map_err(|_| "VCPLog control channel is unavailable".to_string())?;
         {
             let mut sender_lock = LOG_SENDER.lock().await;
             *sender_lock = None;
@@ -147,7 +229,10 @@ pub async fn init_vcp_log_connection_internal<R: tauri::Runtime>(
     let ws_url = parse_log_url(&url, &key)?;
 
     // Always send the new URL to the watch channel
-    let _ = WS_URL_CHANNEL.0.send(Some(ws_url.clone()));
+    WS_URL_CHANNEL
+        .0
+        .send(Some(ws_url.clone()))
+        .map_err(|_| "VCPLog control channel is unavailable".to_string())?;
 
     if LOG_CONNECTION_ACTIVE.swap(true, Ordering::SeqCst) {
         return Ok(());
@@ -329,12 +414,10 @@ async fn start_vcp_log_listener<R: tauri::Runtime>(app_handle: AppHandle<R>) {
                                             let text = msg.to_text().unwrap_or_default();
                                             match serde_json::from_str::<Value>(text) {
                                                 Ok(payload) => {
-                                                    if let Err(e) = app_handle.emit("vcp-system-event", payload) {
-                                                        log::error!("[VCPLog] Failed to emit event to frontend: {}", e);
-                                                    }
+                                                    emit_log_event(&app_handle, payload);
                                                 }
                                                 Err(_) => {
-                                                    let _ = app_handle.emit("vcp-system-event", serde_json::json!({
+                                                    emit_log_event(&app_handle, serde_json::json!({
                                                         "type": "raw_text",
                                                         "data": text
                                                     }));

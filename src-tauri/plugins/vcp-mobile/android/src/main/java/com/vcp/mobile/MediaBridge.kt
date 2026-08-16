@@ -19,6 +19,7 @@ import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.ArrayDeque
+import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.Executors
 import kotlin.math.abs
@@ -81,13 +82,13 @@ object MediaBridge {
                 rawBitmap = decodedBitmap
 
                 // 4. 精确缩放 (filter = true 提供高保真插值)
-                scaledBitmap = if (decodedBitmap.width != targetW || decodedBitmap.height != targetH) {
+                val scaled = if (decodedBitmap.width != targetW || decodedBitmap.height != targetH) {
                     Bitmap.createScaledBitmap(decodedBitmap, targetW, targetH, true)
                 } else {
                     decodedBitmap
                 }
-                val scaled = scaledBitmap ?: throw Exception("Failed to scale image bitmap")
-                outputBitmap = if (scaled.hasAlpha()) {
+                scaledBitmap = scaled
+                val preparedBitmap = if (scaled.hasAlpha()) {
                     Bitmap.createBitmap(scaled.width, scaled.height, Bitmap.Config.ARGB_8888).also { flattened ->
                         val canvas = Canvas(flattened)
                         canvas.drawColor(Color.WHITE)
@@ -96,13 +97,13 @@ object MediaBridge {
                 } else {
                     scaled
                 }
+                outputBitmap = preparedBitmap
 
                 // 5. 写入 JPEG，避免部分 OpenAI 兼容上游拒绝 image/webp data URL。
                 val uploadsDir = File(context.cacheDir, "uploads").apply { mkdirs() }
                 val outFile = File(uploadsDir, "img_" + UUID.randomUUID().toString() + ".jpg")
-                val bitmapForOutput = outputBitmap ?: throw Exception("Failed to prepare output bitmap")
                 FileOutputStream(outFile).use { out ->
-                    bitmapForOutput.compress(Bitmap.CompressFormat.JPEG, 90, out)
+                    preparedBitmap.compress(Bitmap.CompressFormat.JPEG, 90, out)
                 }
 
                 Log.d(TAG, "Image scale success: ${outFile.absolutePath} (${targetW}x${targetH})")
@@ -238,14 +239,14 @@ object MediaBridge {
                             }
                             val outputBitmap = scaledBmp
 
-                            val frameFile = File(tempFolder, String.format("frame_%04d.jpg", idx + 1))
+                            val frameFile = File(tempFolder, String.format(Locale.US, "frame_%04d.jpg", idx + 1))
                             FileOutputStream(frameFile).use { out ->
                                 outputBitmap.compress(Bitmap.CompressFormat.JPEG, 90, out)
                             }
                             outputPaths.add(frameFile.absolutePath)
                         }
                     } finally {
-                        // 每帧都要用完就释放，别让 300 张 Bitmap 在内存里开无遮大会喵♡
+                        // 每帧处理完成后立即释放，避免批量抽帧时堆积 native 内存。
                         if (scaledBmp != null && scaledBmp !== frameBmp) {
                             scaledBmp.recycle()
                         }
@@ -259,7 +260,7 @@ object MediaBridge {
                 Log.e(TAG, "Video processing error", e)
                 callback(Result.failure(e))
             } finally {
-                // Retriever 抓着解码器句柄，异常路径也得拔出来，不然后台耗电会偷偷顶上去喵♡
+                // 异常路径也必须释放 Retriever 持有的解码器资源。
                 try {
                     retriever?.release()
                 } catch (ignored: Exception) {}
@@ -338,11 +339,6 @@ object MediaBridge {
                 var isEncoderInputEOS = false
                 var isEncoderOutputEOS = false
 
-                val decoderInputBuffers = decoder.inputBuffers
-                val decoderOutputBuffers = decoder.outputBuffers
-                val encoderInputBuffers = encoder.inputBuffers
-                val encoderOutputBuffers = encoder.outputBuffers
-
                 val decoderBufferInfo = MediaCodec.BufferInfo()
                 val encoderBufferInfo = MediaCodec.BufferInfo()
                 var encodedPcmBytes = 0L
@@ -376,11 +372,13 @@ object MediaBridge {
                         if (encInputBufIndex < 0) break
 
                         val sizeToFeed = Math.min(encoderChunkBytes, pendingPcmBytes)
-                        val encBuffer = encoderInputBuffers[encInputBufIndex]
+                        val encBuffer = encoder.getInputBuffer(encInputBufIndex)
+                            ?: throw IllegalStateException("Encoder returned a null input buffer")
                         encBuffer.clear()
                         var bytesCopied = 0
                         while (bytesCopied < sizeToFeed && pendingPcm.isNotEmpty()) {
-                            val pendingChunk = pendingPcm.peek()
+                            val pendingChunk = pendingPcm.peekFirst()
+                                ?: throw IllegalStateException("PCM byte count is inconsistent with the pending queue")
                             val bytesFromChunk = Math.min(sizeToFeed - bytesCopied, pendingChunk.size - pendingChunkOffset)
                             encBuffer.put(pendingChunk, pendingChunkOffset, bytesFromChunk)
                             bytesCopied += bytesFromChunk
@@ -404,7 +402,7 @@ object MediaBridge {
                         )
                         encodedPcmBytes += sizeToFeed.toLong()
                         if ((flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
-                            // EOS 也要温柔射进编码器，避免空尾巴音频把循环吊死喵♡
+                            // 即使没有剩余 PCM，也要发送 EOS，避免编码循环无法结束。
                             isEncoderInputEOS = true
                             break
                         }
@@ -416,7 +414,8 @@ object MediaBridge {
                     if (!isDecoderInputEOS) {
                         val inputBufIndex = decoder.dequeueInputBuffer(10000)
                         if (inputBufIndex >= 0) {
-                            val dstBuffer = decoderInputBuffers[inputBufIndex]
+                            val dstBuffer = decoder.getInputBuffer(inputBufIndex)
+                                ?: throw IllegalStateException("Decoder returned a null input buffer")
                             dstBuffer.clear()
                             val sampleSize = extractor.readSampleData(dstBuffer, 0)
                             val presentationTimeUs = extractor.sampleTime
@@ -440,7 +439,8 @@ object MediaBridge {
                     if (!isDecoderOutputEOS) {
                         val res = decoder.dequeueOutputBuffer(decoderBufferInfo, 10000)
                         if (res >= 0) {
-                            val pcmBuffer = decoderOutputBuffers[res]
+                            val pcmBuffer = decoder.getOutputBuffer(res)
+                                ?: throw IllegalStateException("Decoder returned a null output buffer")
                             pcmBuffer.position(decoderBufferInfo.offset)
                             pcmBuffer.limit(decoderBufferInfo.offset + decoderBufferInfo.size)
 
@@ -459,7 +459,7 @@ object MediaBridge {
                                 isDecoderOutputEOS = true
                             }
 
-                            // Feed 编码器：输入缓冲可用就立刻推进，别让 PCM 尾巴湿漉漉地堆在内存里喵♡
+                            // Feed 编码器：输入缓冲可用时立刻推进，避免 PCM 尾部堆积在内存中。
                             feedEncoderPending()
                         } else if (res == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                             Log.d(TAG, "Decoder output format changed")
@@ -469,7 +469,8 @@ object MediaBridge {
                     // 从编码器拿 AAC 帧，加上 ADTS 头写入文件
                     val encOutBufIndex = encoder.dequeueOutputBuffer(encoderBufferInfo, 10000)
                     if (encOutBufIndex >= 0) {
-                        val encodedBuffer = encoderOutputBuffers[encOutBufIndex]
+                        val encodedBuffer = encoder.getOutputBuffer(encOutBufIndex)
+                            ?: throw IllegalStateException("Encoder returned a null output buffer")
                         encodedBuffer.position(encoderBufferInfo.offset)
                         encodedBuffer.limit(encoderBufferInfo.offset + encoderBufferInfo.size)
 

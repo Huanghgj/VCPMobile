@@ -10,6 +10,7 @@ const GITHUB_API_LIST_URL: &str =
     "https://api.github.com/repos/MRiecy/VCPMobile/releases?per_page=1";
 const APK_ASSET_SUFFIX: &str = "arm64-v8a.apk";
 const APK_FILENAME: &str = "update.apk";
+const MAX_APK_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -190,6 +191,9 @@ pub async fn download_update(
     }
 
     let total = res.content_length();
+    if total.is_some_and(|size| size > MAX_APK_BYTES) {
+        return Err("更新安装包超过 512MB 安全限制".to_string());
+    }
     let mut downloaded: u64 = 0;
     let mut stream = res.bytes_stream();
     let mut file = tokio::fs::File::create(&apk_path)
@@ -198,10 +202,24 @@ pub async fn download_update(
 
     use futures_util::StreamExt;
     while let Some(chunk_result) = stream.next().await {
-        let chunk = chunk_result.map_err(|e| format!("下载流错误: {}", e))?;
-        file.write_all(&chunk)
-            .await
-            .map_err(|e| format!("写入文件失败: {}", e))?;
+        let chunk = match chunk_result {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                drop(file);
+                let _ = tokio::fs::remove_file(&apk_path).await;
+                return Err(format!("下载流错误: {}", error));
+            }
+        };
+        if downloaded.saturating_add(chunk.len() as u64) > MAX_APK_BYTES {
+            drop(file);
+            let _ = tokio::fs::remove_file(&apk_path).await;
+            return Err("更新安装包超过 512MB 安全限制".to_string());
+        }
+        if let Err(error) = file.write_all(&chunk).await {
+            drop(file);
+            let _ = tokio::fs::remove_file(&apk_path).await;
+            return Err(format!("写入文件失败: {}", error));
+        }
         downloaded += chunk.len() as u64;
 
         let _ = on_progress.send(DownloadProgress { downloaded, total });
@@ -271,5 +289,30 @@ pub async fn install_update(app: AppHandle, apk_path: String) -> Result<(), Stri
                 ))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apk_download_url_is_limited_to_the_expected_github_release_path() {
+        assert!(validate_github_download_url(
+            "https://github.com/MRiecy/VCPMobile/releases/download/v1.2.3/VCPMobile_v1.2.3_arm64-v8a.apk"
+        )
+        .is_ok());
+        assert!(validate_github_download_url(
+            "http://github.com/MRiecy/VCPMobile/releases/download/v1.2.3/VCPMobile_v1.2.3_arm64-v8a.apk"
+        )
+        .is_err());
+        assert!(validate_github_download_url(
+            "https://github.com.evil.invalid/MRiecy/VCPMobile/releases/download/v1.2.3/VCPMobile_v1.2.3_arm64-v8a.apk"
+        )
+        .is_err());
+        assert!(validate_github_download_url(
+            "https://github.com/other/VCPMobile/releases/download/v1.2.3/VCPMobile_v1.2.3_arm64-v8a.apk"
+        )
+        .is_err());
     }
 }

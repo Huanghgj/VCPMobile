@@ -9,6 +9,7 @@ import AvatarCropper from "../../components/ui/AvatarCropper.vue";
 import VcpAvatar from "../../components/ui/VcpAvatar.vue";
 import { BrainCircuit, ChevronRight } from "lucide-vue-next";
 import { useOverlayStore } from "../../core/stores/overlay";
+import { useNotificationStore } from "../../core/stores/notification";
 
 interface AgentConfig {
   id: string;
@@ -40,6 +41,7 @@ const emit = defineEmits(["close", "delete"]);
 const assistantStore = useAssistantStore();
 const sessionStore = useChatSessionStore();
 const overlayStore = useOverlayStore();
+const notificationStore = useNotificationStore();
 
 const agentConfig = ref<AgentConfig>({
   id: props.id || "",
@@ -113,6 +115,7 @@ const onModelSelect = (modelId: string) => {
 };
 
 const isSaving = ref(false);
+const isDeleting = ref(false);
 const saveSuccess = ref(false);
 let saveTimeout: ReturnType<typeof setTimeout> | null = null;
 let saveSuccessTimer: ReturnType<typeof setTimeout> | null = null;
@@ -154,7 +157,7 @@ const configsMatch = (left: AgentConfig | null, right: AgentConfig) =>
   Boolean(left && JSON.stringify(left) === JSON.stringify(right));
 
 const autoSave = async (force = false) => {
-  if (!agentConfig.value.id || (!props.isOpen && !force)) return;
+  if (isDeleting.value || !agentConfig.value.id || (!props.isOpen && !force)) return;
   if (saveLoop) return saveLoop;
 
   saveLoop = (async () => {
@@ -185,6 +188,7 @@ const autoSave = async (force = false) => {
 };
 
 const flushPendingSave = async () => {
+  if (isDeleting.value) return;
   if (saveTimeout) {
     clearTimeout(saveTimeout);
     saveTimeout = null;
@@ -229,16 +233,38 @@ watch(() => props.isOpen, (val) => {
 });
 
 const handleDelete = async () => {
-  if (confirm("确定要删除这个 Agent 吗？此操作不可撤销。")) {
-    try {
-      await assistantStore.deleteAgent(agentConfig.value.id);
-      if (sessionStore.currentSelectedItem?.id === agentConfig.value.id) {
-        sessionStore.currentSelectedItem = null;
-      }
-      emit("close");
-    } catch (err) {
-      console.error("Failed to delete agent:", err);
+  if (isDeleting.value) return;
+  const confirmed = await overlayStore.showConfirm({
+    title: "删除 Agent",
+    message: "确定要删除这个 Agent 吗？所有相关话题和聊天记录都将被标记为删除。",
+    isDanger: true,
+  });
+  if (!confirmed) return;
+
+  isDeleting.value = true;
+  if (saveTimeout) {
+    clearTimeout(saveTimeout);
+    saveTimeout = null;
+  }
+
+  try {
+    await saveLoop;
+    await assistantStore.deleteAgent(agentConfig.value.id);
+    if (sessionStore.currentSelectedItem?.id === agentConfig.value.id) {
+      sessionStore.currentSelectedItem = null;
+      sessionStore.currentTopicId = null;
     }
+    delete sessionStore.lastActiveTopicMap[agentConfig.value.id];
+    emit("close");
+  } catch (err) {
+    isDeleting.value = false;
+    console.error("Failed to delete agent:", err);
+    notificationStore.addNotification({
+      type: "error",
+      title: "Agent 删除失败",
+      message: err instanceof Error ? err.message : String(err),
+      toastOnly: true,
+    });
   }
 };
 
@@ -419,9 +445,9 @@ onMounted(async () => {
 
         <!-- Actions -->
         <div class="pt-4 pb-8">
-          <button @click="handleDelete"
+          <button @click="handleDelete" :disabled="isDeleting"
             class="w-full py-3 bg-transparent border border-red-500/20 text-red-500/60 hover:bg-red-500/5 active:bg-red-500/10 active:scale-95 transition-all rounded-xl font-bold uppercase tracking-widest text-[11px]">
-            删除此 Agent
+            {{ isDeleting ? "正在删除…" : "删除此 Agent" }}
           </button>
         </div>
       </div>

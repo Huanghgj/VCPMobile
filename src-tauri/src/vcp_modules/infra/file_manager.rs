@@ -623,61 +623,62 @@ pub async fn register_local_file(
         .await
         .map_err(|e| format!("无法读取源文件元数据: {}", e))?;
     let size = meta.len();
+    if size > 100 * 1024 * 1024 {
+        return Err("文件过大，单个附件不能超过 100MB".to_string());
+    }
 
-    // 3. 流式异步读取并计算 SHA-256 (若传入 expected_hash 则直接使用，免除二次哈希)
-    let hash = match expected_hash {
-        Some(h) => {
-            log::info!(
-                "[FileManager] Reusing expected hash from native side: {}",
-                h
-            );
-            h
+    // 3. 始终基于实际文件流计算 SHA-256。expected_hash 只能作为完整性断言，
+    // 不能直接成为 CAS 键，否则被篡改的 IPC 参数会污染内容寻址与去重语义。
+    let mut file = tokio::fs::File::open(&source_path)
+        .await
+        .map_err(|e| format!("无法打开源文件: {}", e))?;
+
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 65536]; // 64KB 缓冲
+    let mut hashed_bytes = 0u64;
+    let mut last_emit_time = std::time::Instant::now();
+    loop {
+        let n = file
+            .read(&mut buffer)
+            .await
+            .map_err(|e| format!("读取源文件失败: {}", e))?;
+        if n == 0 {
+            break;
         }
-        None => {
-            let mut file = tokio::fs::File::open(&source_path)
-                .await
-                .map_err(|e| format!("无法打开源文件: {}", e))?;
+        hasher.update(&buffer[..n]);
+        hashed_bytes += n as u64;
 
-            let mut hasher = Sha256::new();
-            let mut buffer = [0u8; 65536]; // 64KB 缓冲
-            let mut hashed_bytes = 0u64;
-            let mut last_emit_time = std::time::Instant::now();
-            loop {
-                let n = file
-                    .read(&mut buffer)
-                    .await
-                    .map_err(|e| format!("读取源文件失败: {}", e))?;
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buffer[..n]);
-                hashed_bytes += n as u64;
-
-                if let Some(ref sid) = stable_id {
-                    let now = std::time::Instant::now();
-                    if now.duration_since(last_emit_time).as_millis() > 200 {
-                        last_emit_time = now;
-                        let pct = if size > 0 {
-                            (hashed_bytes as f64 / size as f64 * 100.0) as u32
-                        } else {
-                            0
-                        };
-                        let scaled_pct = 50 + (pct * 40 / 100); // 50% 到 90%
-                        app_handle
-                            .emit(
-                                "vcp-file-register-progress",
-                                serde_json::json!({
-                                    "progress": scaled_pct,
-                                    "stableId": sid,
-                                }),
-                            )
-                            .ok();
-                    }
-                }
+        if let Some(ref sid) = stable_id {
+            let now = std::time::Instant::now();
+            if now.duration_since(last_emit_time).as_millis() > 200 {
+                last_emit_time = now;
+                let pct = if size > 0 {
+                    (hashed_bytes as f64 / size as f64 * 100.0) as u32
+                } else {
+                    0
+                };
+                let scaled_pct = 50 + (pct * 40 / 100); // 50% 到 90%
+                app_handle
+                    .emit(
+                        "vcp-file-register-progress",
+                        serde_json::json!({
+                            "progress": scaled_pct,
+                            "stableId": sid,
+                        }),
+                    )
+                    .ok();
             }
-            hex::encode(hasher.finalize())
         }
-    };
+    }
+    let hash = hex::encode(hasher.finalize());
+    if let Some(expected) = expected_hash.as_deref() {
+        if expected != hash {
+            return Err(format!(
+                "文件完整性校验失败：原生哈希 {} 与实际哈希 {} 不一致",
+                expected, hash
+            ));
+        }
+    }
 
     // 4. 计算目标路径
     let file_extension = std::path::Path::new(&original_name)
@@ -858,6 +859,34 @@ pub async fn open_file(app_handle: AppHandle, path: String) -> Result<(), String
     }
 }
 
+/// Grants the asset protocol access to one registered attachment file.
+/// The scope stays file-specific so generated HTML cannot browse app storage.
+#[tauri::command]
+pub fn prepare_attachment_asset<R: tauri::Runtime>(
+    app_handle: AppHandle<R>,
+    path: String,
+) -> Result<String, String> {
+    let clean_path = path.trim_start_matches("file://");
+    let candidate =
+        std::fs::canonicalize(clean_path).map_err(|error| format!("附件文件不可访问: {error}"))?;
+    if !candidate.is_file() {
+        return Err("附件资源不是文件".to_string());
+    }
+
+    let attachments_root = get_attachments_root_dir(&app_handle)?;
+    let canonical_root = std::fs::canonicalize(&attachments_root)
+        .map_err(|error| format!("附件目录不可访问: {error}"))?;
+    if !candidate.starts_with(&canonical_root) {
+        return Err("拒绝为附件目录之外的文件开放资源访问".to_string());
+    }
+
+    app_handle
+        .asset_protocol_scope()
+        .allow_file(&candidate)
+        .map_err(|error| format!("附件资源授权失败: {error}"))?;
+    Ok(candidate.to_string_lossy().into_owned())
+}
+
 /// 清理上传缓存目录以及多媒体缓存碎片 (通常在启动时执行，清除上次闪退/强杀留下的僵尸文件)
 pub fn clear_upload_cache(app_handle: &AppHandle) {
     if let Ok(cache_dir) = app_handle.path().app_cache_dir() {
@@ -989,4 +1018,24 @@ pub async fn delete_attachment_physical<R: tauri::Runtime>(
         let _ = tokio::fs::remove_file(thumb_path).await;
     }
     Ok(())
+}
+
+#[tauri::command]
+pub fn check_attachment_support(original_name: String) -> Result<bool, String> {
+    let extension = std::path::Path::new(&original_name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_lowercase();
+
+    if super::file_extractor::is_supported_attachment_extension(&extension) {
+        Ok(true)
+    } else {
+        let display_extension = if extension.is_empty() {
+            "未知".to_string()
+        } else {
+            format!(".{extension}")
+        };
+        Err(format!("系统不支持 {display_extension} 格式附件"))
+    }
 }

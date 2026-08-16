@@ -33,10 +33,14 @@ import {
 // directly, replacing the static 48px floor defined in themes.css.
 const handleSafeAreaInset = (e: Event) => {
   const detail = (e as CustomEvent<{ safeAreaBottom?: number }>).detail;
-  if (detail && typeof detail.safeAreaBottom === 'number' && detail.safeAreaBottom > 0) {
+  if (
+    detail &&
+    typeof detail.safeAreaBottom === "number" &&
+    detail.safeAreaBottom > 0
+  ) {
     const dpr = window.devicePixelRatio || 1;
     document.documentElement.style.setProperty(
-      '--vcp-safe-bottom',
+      "--vcp-safe-bottom",
       `${Math.round(detail.safeAreaBottom / dpr)}px`,
     );
   }
@@ -88,8 +92,16 @@ const { initGlobalFixer } = useEmoticonFixer();
 const { isPromptOpen, updateInfo, handleConfirm, handleDismiss } =
   useAutoUpdate();
 const router = useRouter();
-const isRendererProbe =
-  import.meta.env.DEV && window.location.hash.startsWith("#/renderer-v2-probe");
+const isWatchRoute = computed(
+  () => router.currentRoute.value.path === "/watch",
+);
+const rendererProbeEnabled =
+  import.meta.env.DEV || import.meta.env.VITE_RENDERER_PROBE === "1";
+const isRendererProbe = computed(
+  () =>
+    rendererProbeEnabled &&
+    router.currentRoute.value.path === "/renderer-v2-probe",
+);
 
 const { initRootHistory } = useModalHistory();
 
@@ -99,6 +111,35 @@ const isAssistant = ref(false);
 const sharedContent = ref<SharedContentData>({ text: "", files: [] });
 const showShareSelector = ref(false);
 const pendingSharedFiles = ref<PickedFileInfo[]>([]);
+let shareIntentSequence = 0;
+let preparedShareSequence = 0;
+let shareSelectionInProgress = false;
+
+const cleanupPreparedSharedFiles = (files: PickedFileInfo[]) => {
+  const hashes = new Set(files.map((file) => file.hash).filter(Boolean));
+  hashes.forEach((hash) => {
+    invoke("cleanup_single_orphaned_attachment", { hash }).catch((error) => {
+      console.warn(
+        `[App] Failed to clean unused shared attachment ${hash}:`,
+        error,
+      );
+    });
+  });
+};
+
+const cleanupNativeSharedTempFiles = (file: PickedFileInfo) => {
+  const paths = new Set([file.path, file.thumbnailPath].filter(Boolean));
+  paths.forEach((filePath) => {
+    invoke("plugin:vcp-mobile|delete_temp_file", { filePath }).catch(
+      (error) => {
+        console.warn(
+          `[App] Failed to clean shared temp file ${filePath}:`,
+          error,
+        );
+      },
+    );
+  });
+};
 
 const handleShareIntent = (e: Event) => {
   processSharedIntent((e as CustomEvent).detail);
@@ -107,17 +148,48 @@ const handleShareIntent = (e: Event) => {
 const processSharedIntent = async (detail: any) => {
   console.log("[App] Share intent received:", detail);
 
+  const sequence = ++shareIntentSequence;
   const text = typeof detail?.text === "string" ? detail.text : "";
   const files: SharedFileEntry[] = Array.isArray(detail?.files)
     ? detail.files
     : [];
+  const nativeErrors = Array.isArray(detail?.errors)
+    ? detail.errors.filter(
+        (item: unknown): item is string => typeof item === "string",
+      )
+    : [];
+  const snapshot = { text, files };
 
-  sharedContent.value = { text, files };
+  if (nativeErrors.length > 0) {
+    notificationStore.addNotification({
+      type: "warning",
+      title: "部分分享文件未能读取",
+      message: nativeErrors.join("\n"),
+      toastOnly: true,
+    });
+  }
+  if (!text.trim() && files.length === 0) {
+    notificationStore.addNotification({
+      type: "warning",
+      title: "没有可分享的内容",
+      message: nativeErrors[0] || "来源应用没有提供可读取的文本或文件。",
+      toastOnly: true,
+    });
+    return;
+  }
+
+  showShareSelector.value = false;
+  preparedShareSequence = 0;
+  if (!shareSelectionInProgress && pendingSharedFiles.value.length > 0) {
+    cleanupPreparedSharedFiles(pendingSharedFiles.value);
+  }
+  pendingSharedFiles.value = [];
+  sharedContent.value = snapshot;
 
   // Wait for core to be ready, then process files
   if (lifecycleStore.state !== "READY") {
     console.log(
-      "[App] Core not ready yet, deferring share intent processing..."
+      "[App] Core not ready yet, deferring share intent processing...",
     );
     if (stopPendingShareReadyWatch) {
       stopPendingShareReadyWatch();
@@ -131,18 +203,23 @@ const processSharedIntent = async (detail: any) => {
             stopPendingShareReadyWatch();
             stopPendingShareReadyWatch = null;
           }
-          await prepareShareFiles();
+          await prepareShareFiles(sequence, snapshot);
         }
-      }
+      },
     );
     return;
   }
 
-  await prepareShareFiles();
+  await prepareShareFiles(sequence, snapshot);
 };
 
-const prepareShareFiles = async () => {
-  const files = sharedContent.value.files;
+const prepareShareFiles = async (
+  sequence: number,
+  content: SharedContentData,
+) => {
+  const files = content.files;
+  const results: PickedFileInfo[] = [];
+  const registrationErrors: string[] = [];
   if (files.length > 0) {
     try {
       console.log(`[App] Registering ${files.length} shared file(s)...`);
@@ -154,10 +231,15 @@ const prepareShareFiles = async () => {
             mimeType: f.mimeType,
             fileName: f.fileName,
           })),
-        }
+        },
       );
-      const results = await Promise.all(
-        pickedFiles.map(async (file) => {
+      if (pickedFiles.length < files.length) {
+        registrationErrors.push(
+          `${files.length - pickedFiles.length} 个分享文件在原生预处理阶段失败`,
+        );
+      }
+      for (const file of pickedFiles) {
+        try {
           const registered = await invoke<any>("register_local_file", {
             localPath: file.path,
             originalName: file.name,
@@ -167,7 +249,7 @@ const prepareShareFiles = async () => {
             expectedHash: file.hash || null,
           });
 
-          return {
+          results.push({
             path: registered.internalPath || file.path,
             internalPath: registered.internalPath || file.path,
             name: registered.name || file.name,
@@ -175,17 +257,36 @@ const prepareShareFiles = async () => {
             size: registered.size ?? file.size,
             hash: registered.hash || file.hash,
             thumbnailPath: registered.thumbnailPath || file.thumbnailPath,
-          } satisfies PickedFileInfo;
-        })
-      );
-      pendingSharedFiles.value = results;
+          } satisfies PickedFileInfo);
+        } catch (error) {
+          cleanupNativeSharedTempFiles(file);
+          registrationErrors.push(
+            `${file.name}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
       console.log("[App] Shared files registered:", results);
     } catch (err) {
       console.error("[App] Failed to register shared files:", err);
-      pendingSharedFiles.value = [];
+      registrationErrors.push(err instanceof Error ? err.message : String(err));
     }
-  } else {
-    pendingSharedFiles.value = [];
+  }
+
+  if (sequence !== shareIntentSequence) {
+    cleanupPreparedSharedFiles(results);
+    return;
+  }
+
+  pendingSharedFiles.value = results;
+  sharedContent.value = content;
+  preparedShareSequence = sequence;
+  if (registrationErrors.length > 0) {
+    notificationStore.addNotification({
+      type: "warning",
+      title: "部分分享文件处理失败",
+      message: `${registrationErrors.length} 个文件未能添加，其余文件已保留。`,
+      toastOnly: true,
+    });
   }
 
   // Ensure agents are loaded
@@ -197,29 +298,43 @@ const prepareShareFiles = async () => {
     }
   }
 
+  if (sequence !== shareIntentSequence) {
+    cleanupPreparedSharedFiles(results);
+    return;
+  }
   showShareSelector.value = true;
 };
 
 const handleShareAgentSelected = async (agent: any) => {
+  const sequence = preparedShareSequence;
+  const text = sharedContent.value.text;
+  const files = [...pendingSharedFiles.value];
   showShareSelector.value = false;
+  shareSelectionInProgress = true;
+  let started = false;
 
   try {
-    await sessionStore.startShareSession(
-      agent.id,
-      sharedContent.value.text,
-      pendingSharedFiles.value
-    );
+    await sessionStore.startShareSession(agent.id, text, files);
+    started = true;
   } catch (err) {
     console.error("[App] Failed to start share session:", err);
+  } finally {
+    shareSelectionInProgress = false;
+    if (!started) cleanupPreparedSharedFiles(files);
   }
 
   // Clear share state
-  sharedContent.value = { text: "", files: [] };
-  pendingSharedFiles.value = [];
+  if (preparedShareSequence === sequence) {
+    sharedContent.value = { text: "", files: [] };
+    pendingSharedFiles.value = [];
+  }
 };
 
 const handleShareSelectorClose = () => {
   showShareSelector.value = false;
+  cleanupPreparedSharedFiles(pendingSharedFiles.value);
+  pendingSharedFiles.value = [];
+  sharedContent.value = { text: "", files: [] };
 };
 
 // --- Global Swipe Logic for Sidebar ---
@@ -247,7 +362,7 @@ const backgroundStyle = computed(() => {
   const themeInfo =
     themeStore.currentThemeInfo ||
     themeStore.availableThemes.find(
-      (t) => t.fileName === themeStore.currentTheme
+      (t) => t.fileName === themeStore.currentTheme,
     );
   if (!themeInfo) return {};
 
@@ -270,7 +385,7 @@ const backgroundStyle = computed(() => {
   let filename = match ? match[1] : rawValue;
 
   // 1. Strip path
-  filename = filename.replace(/^.*[\\\/]/, "").replace(/['"]/g, "");
+  filename = filename.replace(/^.*[\\/]/, "").replace(/['"]/g, "");
   // 2. Strip ANY existing extension and force .webp (matching optimized public/wallpaper)
   filename = filename.split(".")[0] + ".webp";
 
@@ -296,7 +411,7 @@ const handleExitRequest = async () => {
         : "NULL"
     }, Topic: ${
       sessionStore.currentTopicId
-    }, Modals: ${useModalHistory().modalStackLength()}`
+    }, Modals: ${useModalHistory().modalStackLength()}`,
   );
 
   // 1. 优先让 Modal Stack 消费返回事件 (支持 Sidebar、Page、Dialog 等 LIFO 退出)
@@ -311,7 +426,7 @@ const handleExitRequest = async () => {
     sessionStore.currentSelectedItem !== null
   ) {
     console.log(
-      "[ExitRequest] Resetting active session to welcome boot screen."
+      "[ExitRequest] Resetting active session to welcome boot screen.",
     );
     sessionStore.$patch((state) => {
       state.currentSelectedItem = null;
@@ -333,7 +448,7 @@ const handleExitRequest = async () => {
     } catch (err) {
       console.warn(
         "[Exit] Failed to move task to back, calling window close fallback:",
-        err
+        err,
       );
       getCurrentWebviewWindow().close();
     }
@@ -379,7 +494,7 @@ const handleVcpLifecycle = (e: Event) => {
     if (isAppBackground) return;
     isAppBackground = true;
     console.log(
-      "[Lifecycle] App moved to background, tuning heartbeat to 120s..."
+      "[Lifecycle] App moved to background, tuning heartbeat to 120s...",
     );
     suspendPhysicalScreenKeep(); // 休眠物理亮屏，达到省电效果
     aiLifecycleStore.suspendTimer();
@@ -396,7 +511,7 @@ const handleVcpLifecycle = (e: Event) => {
     if (!isAppBackground) return;
     isAppBackground = false;
     console.log(
-      "[Lifecycle] App moved to foreground, restoring heartbeat to 15s..."
+      "[Lifecycle] App moved to foreground, restoring heartbeat to 15s...",
     );
     reapplyScreenKeepIfActive(); // 唤醒时自动校准和恢复可能丢失的物理亮屏 FLAG
     invoke("set_vcp_log_heartbeat", { intervalMs: 15000 }).catch((err) => {
@@ -412,9 +527,10 @@ const handleVcpLifecycle = (e: Event) => {
 };
 
 const processLifecycleWakeup = async () => {
-  const companionWasDue = aiLifecycleStore.config.enabled
-    && aiLifecycleStore.nextHeartbeatAt !== null
-    && aiLifecycleStore.nextHeartbeatAt <= Date.now() + 1_000;
+  const companionWasDue =
+    aiLifecycleStore.config.enabled &&
+    aiLifecycleStore.nextHeartbeatAt !== null &&
+    aiLifecycleStore.nextHeartbeatAt <= Date.now() + 1_000;
   if (companionWasDue) {
     try {
       await aiLifecycleStore.runDueHeartbeat();
@@ -459,7 +575,7 @@ const handleFloatingBallClick = async () => {
     let win = await WebviewWindow.getByLabel("assistant");
     if (win) {
       console.log(
-        "[App] Assistant window already exists, showing and focusing..."
+        "[App] Assistant window already exists, showing and focusing...",
       );
       await win.show();
       await win.setFocus();
@@ -513,31 +629,53 @@ onMounted(async () => {
   window.addEventListener("vcp-floating-ball-click", handleFloatingBallClick);
   window.addEventListener("vcp-share-intent", handleShareIntent);
   window.addEventListener("vcp-keyboard-inset", handleSafeAreaInset);
+  if (isTauriRuntime() && !isAssistant.value) {
+    await invoke("plugin:vcp-mobile|mark_share_intent_ready").catch((error) => {
+      console.error("[App] Failed to mark share intent listener ready:", error);
+    });
+  }
 
   // 初始化全局表情包修复器
   initGlobalFixer();
 
   // 1.5. 启动 VCP Log IPC 监听 (必须在 bootstrapApp 前挂载，防止 bootstrap 期间的 ready 事件丢失)
   if (isTauriRuntime()) {
-    unlistenLog = await listen("vcp-system-event", (event: any) => {
-      const payload = event.payload;
-      const processed = processPayload(payload);
+    try {
+      unlistenLog = await listen("vcp-system-event", (event: any) => {
+        const payload = event.payload;
+        const processed = processPayload(payload);
 
-      if (processed && !processed.silent) {
-        notificationStore.addNotification(processed);
-      }
-    });
-    unlistenLifecycleJobs = await listen("vcp-lifecycle-jobs-changed", () => {
-      Promise.all([
-        lifecycleSchedulerStore.refreshJobs(),
-        lifecycleSchedulerStore.refreshJobHistory(),
-      ])
-        .then(() => lifecycleSchedulerStore.syncNativeWakeup())
-        .catch((err) => console.error("[Lifecycle] Failed to refresh scheduled jobs:", err));
-    });
+        if (processed && !processed.silent) {
+          notificationStore.addNotification(processed);
+        }
+      });
+    } catch (error) {
+      console.error(
+        "[App] Failed to register vcp-system-event listener:",
+        error,
+      );
+    }
+
+    try {
+      unlistenLifecycleJobs = await listen("vcp-lifecycle-jobs-changed", () => {
+        Promise.all([
+          lifecycleSchedulerStore.refreshJobs(),
+          lifecycleSchedulerStore.refreshJobHistory(),
+        ])
+          .then(() => lifecycleSchedulerStore.syncNativeWakeup())
+          .catch((err) =>
+            console.error("[Lifecycle] Failed to refresh scheduled jobs:", err),
+          );
+      });
+    } catch (error) {
+      console.error(
+        "[Lifecycle] Failed to register scheduled-job listener:",
+        error,
+      );
+    }
   } else {
     console.info(
-      "[App] Web preview runtime detected, skipping Tauri event listeners."
+      "[App] Web preview runtime detected, skipping Tauri event listeners.",
     );
   }
 
@@ -546,7 +684,10 @@ onMounted(async () => {
 
   if (!isAssistant.value) {
     stopLifecycleDeadlineWatch = watch(
-      () => aiLifecycleStore.config.enabled ? aiLifecycleStore.nextHeartbeatAt : null,
+      () =>
+        aiLifecycleStore.config.enabled
+          ? aiLifecycleStore.nextHeartbeatAt
+          : null,
       (triggerAt) => lifecycleSchedulerStore.setCompanionWakeupAt(triggerAt),
       { immediate: true },
     );
@@ -556,8 +697,9 @@ onMounted(async () => {
       aiLifecycleStore.startTimer();
     }
     const keepalivePreference = localStorage.getItem("vcp-lifecycle-keepalive");
-    const shouldRestoreKeepalive = keepalivePreference === "true"
-      || (keepalivePreference === null && aiLifecycleStore.config.enabled);
+    const shouldRestoreKeepalive =
+      keepalivePreference === "true" ||
+      (keepalivePreference === null && aiLifecycleStore.config.enabled);
     if (isTauriRuntime() && shouldRestoreKeepalive) {
       invoke("plugin:vcp-mobile|set_lifecycle_keepalive", { enabled: true })
         .then(() => {
@@ -566,7 +708,10 @@ onMounted(async () => {
           }
         })
         .catch((err) => {
-          console.error("[Lifecycle] Failed to restore lifecycle keepalive:", err);
+          console.error(
+            "[Lifecycle] Failed to restore lifecycle keepalive:",
+            err,
+          );
         });
     }
   }
@@ -603,7 +748,7 @@ onUnmounted(() => {
   window.removeEventListener("vcp-lifecycle-wakeup", handleLifecycleWakeup);
   window.removeEventListener(
     "vcp-floating-ball-click",
-    handleFloatingBallClick
+    handleFloatingBallClick,
   );
   window.removeEventListener("vcp-share-intent", handleShareIntent);
   window.removeEventListener("vcp-keyboard-inset", handleSafeAreaInset);
@@ -619,7 +764,9 @@ onUnmounted(() => {
     :class="{ 'is-notification-open': layoutStore.rightDrawerOpen }"
   >
     <!-- 0. 权限门禁 (仅在 PERMISSIONS 状态显示) -->
-    <PermissionGate v-if="lifecycleStore.state === 'PERMISSIONS'" />
+    <PermissionGate
+      v-if="lifecycleStore.state === 'PERMISSIONS' && !isRendererProbe"
+    />
 
     <!-- 0.5. 全局初始化加载层 & 错误看板 -->
     <BootScreen v-else-if="!isRendererProbe" />
@@ -649,13 +796,17 @@ onUnmounted(() => {
     <Transition name="fade">
       <div
         v-if="layoutStore.leftDrawerOpen"
-        class="vcp-overlay fixed inset-0 z-drawer bg-black/12 md:hidden"
+        class="vcp-overlay fixed inset-0 z-drawer bg-black/12"
+        :class="{ 'md:hidden': !isWatchRoute }"
         @click.self="layoutStore.setLeftDrawer(false)"
       ></div>
     </Transition>
 
     <!-- 4. 左侧抽屉在遮罩之后声明；通知中心恢复为全屏页面体验 -->
-    <AgentSidebar v-if="lifecycleStore.state === 'READY'" />
+    <AgentSidebar
+      v-if="lifecycleStore.state === 'READY'"
+      :overlay-mode="isWatchRoute"
+    />
     <NotificationCenterPage
       v-if="lifecycleStore.state === 'READY'"
       :is-open="layoutStore.rightDrawerOpen"

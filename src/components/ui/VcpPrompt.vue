@@ -2,8 +2,7 @@
 defineOptions({
   inheritAttrs: false
 });
-import { ref, onMounted, nextTick, watch } from 'vue';
-import { useModalHistory } from '../../core/composables/useModalHistory';
+import { ref, onMounted, nextTick } from 'vue';
 
 const props = defineProps<{
   title: string;
@@ -17,20 +16,6 @@ const emit = defineEmits<{
   (e: 'confirm', value: string): void;
   (e: 'cancel'): void;
 }>();
-
-const { registerModal, unregisterModal } = useModalHistory();
-const modalId = 'VcpPrompt';
-
-watch(() => props.isOpen, (newVal) => {
-  if (newVal) {
-    registerModal(modalId, () => {
-      emit('cancel');
-      emit('update:isOpen', false);
-    });
-  } else {
-    unregisterModal(modalId);
-  }
-});
 
 const inputValue = ref(props.initialValue || '');
 const inputRef = ref<HTMLInputElement | null>(null);

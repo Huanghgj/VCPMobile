@@ -2,62 +2,41 @@ const VCP_BUTTON_PREFIX = "[[点击按钮:";
 const VCP_BUTTON_SUFFIX = "]]";
 const MAX_VCP_BUTTON_PAYLOAD = 500;
 
+// Crossing from generated HTML into chat is opt-in. Ordinary HTML controls
+// must keep their native/local behavior inside the rendered document.
+export const HTML_ACTION_SELECTOR = "[data-vcp-send]";
+
 function compactText(value: string | null | undefined): string {
   return (value || "").replace(/\s+/g, " ").trim();
 }
 
-function readInlineHandler(button: HTMLButtonElement): string {
-  return compactText(button.getAttribute("onclick")).toLowerCase();
+export function findHtmlActionElement(target: Element): HTMLElement | null {
+  const candidate = target.closest(HTML_ACTION_SELECTOR);
+  return candidate instanceof HTMLElement ? candidate : null;
 }
 
-export function isLocalHtmlButton(button: HTMLButtonElement): boolean {
-  if (button.hasAttribute("data-vcp-send") || button.hasAttribute("data-send")) {
-    return false;
-  }
-  if (
-    button.closest(
-      "[data-vcp-local], [data-vcp-ui-control], [data-vcp-copy-code]",
-    )
-  ) {
-    return true;
-  }
-  if (button.closest("form") && ["submit", "reset"].includes(button.type)) {
-    return true;
-  }
-
-  const handler = readInlineHandler(button);
-  if (
-    /navigator\.clipboard|\.play\s*\(|\.pause\s*\(|requestfullscreen\s*\(|showmodal\s*\(/i.test(
-      handler,
-    )
-  ) {
-    return true;
-  }
-
-  const label = compactText(button.textContent);
-  return /^(?:复制|点击复制|收听|点击收听|播放|暂停|刷新|关闭|展开|收起|预览|源码)$/i.test(
-    label,
-  );
+export function isHtmlAiActionElement(element: HTMLElement): boolean {
+  return element.matches(HTML_ACTION_SELECTOR);
 }
 
-function closestActionScope(button: HTMLButtonElement): Element | null {
-  return button.closest(
+function closestActionScope(element: HTMLElement): Element | null {
+  return element.closest(
     "[data-vcp-action-context], article, section, li, [role='group'], [class*='card'], [class*='panel'], [class*='item'], [class*='row']",
   );
 }
 
-export function buildHtmlButtonAction(button: HTMLButtonElement): string {
-  const explicit = compactText(
-    button.getAttribute("data-vcp-send") || button.getAttribute("data-send"),
-  );
+export function buildHtmlButtonAction(element: HTMLElement): string {
+  if (!isHtmlAiActionElement(element)) return "";
+
+  const explicit = compactText(element.getAttribute("data-vcp-send"));
   if (explicit) return explicit;
 
   const label = compactText(
-    button.getAttribute("aria-label") || button.textContent || button.title,
+    element.getAttribute("aria-label") || element.textContent || element.title,
   );
   if (!label) return "";
 
-  const scope = closestActionScope(button);
+  const scope = closestActionScope(element);
   const explicitContext = compactText(
     scope?.getAttribute("data-vcp-action-context"),
   );

@@ -4,12 +4,34 @@ use crate::vcp_modules::sync_hash::HashAggregator;
 use serde::Serialize;
 
 use sqlx::Row;
+use std::collections::HashSet;
+use std::io::Read;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc;
 
 type CachedMessageContent = (String, String, String, Vec<u8>);
 type CachedMessageBatch = Vec<CachedMessageContent>;
-const RENDER_CACHE_VERSION: &str = "render-v2";
+const RENDER_CACHE_VERSION: &str = "render-v5";
+const MAX_DECOMPRESSED_MESSAGE_BYTES: usize = 128 * 1024 * 1024;
+
+fn decompress_zstd_bounded(bytes: &[u8], data_kind: &str) -> Result<Vec<u8>, String> {
+    let decoder = zstd::stream::read::Decoder::new(bytes)
+        .map_err(|e| format!("zstd {data_kind} decoder initialization failed: {e}"))?;
+    let mut decompressed = Vec::new();
+    decoder
+        .take((MAX_DECOMPRESSED_MESSAGE_BYTES + 1) as u64)
+        .read_to_end(&mut decompressed)
+        .map_err(|e| format!("zstd {data_kind} decompression failed: {e}"))?;
+
+    if decompressed.len() > MAX_DECOMPRESSED_MESSAGE_BYTES {
+        return Err(format!(
+            "zstd {data_kind} exceeds the {} MiB decompressed safety limit",
+            MAX_DECOMPRESSED_MESSAGE_BYTES / (1024 * 1024)
+        ));
+    }
+
+    Ok(decompressed)
+}
 
 pub struct MessageRenderCompiler;
 
@@ -39,9 +61,7 @@ impl MessageRenderCompiler {
 
     /// Deserializes compressed binary back to AST blocks (JSON + zstd)
     pub fn deserialize(bytes: &[u8]) -> Result<Vec<ContentBlock>, String> {
-        // Use a generous upper bound for decompression; zstd will return exact size
-        let decompressed = zstd::bulk::decompress(bytes, 16 * 1024 * 1024)
-            .map_err(|e| format!("zstd decompress failed: {}", e))?;
+        let decompressed = decompress_zstd_bounded(bytes, "render cache")?;
         serde_json::from_slice(&decompressed).map_err(|e| format!("json deserialize failed: {}", e))
     }
 }
@@ -57,8 +77,7 @@ impl ContentCompressor {
     }
 
     pub fn decompress(bytes: &[u8]) -> Result<String, String> {
-        let decompressed = zstd::bulk::decompress(bytes, 16 * 1024 * 1024)
-            .map_err(|e| format!("zstd decompress content failed: {}", e))?;
+        let decompressed = decompress_zstd_bounded(bytes, "message content")?;
         String::from_utf8(decompressed)
             .map_err(|e| format!("content decompression not valid utf-8: {}", e))
     }
@@ -107,7 +126,8 @@ async fn stream_cached_message_contents(
             "SELECT m.rowid, m.topic_id, m.msg_id, m.content_hash, m.content \
              FROM messages m \
              INNER JOIN render_cache r ON m.topic_id = r.topic_id AND m.msg_id = r.msg_id \
-             WHERE m.rowid > ? \
+             INNER JOIN topics t ON t.topic_id = m.topic_id \
+             WHERE m.rowid > ? AND m.deleted_at IS NULL AND t.deleted_at IS NULL \
              ORDER BY m.rowid \
              LIMIT ?",
         )
@@ -211,10 +231,15 @@ pub async fn rebuild_all_pre_renders(app_handle: AppHandle) -> Result<(), String
     let pool = db_state.pool.clone();
     let db_path = db_state.path.clone();
 
-    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM render_cache")
-        .fetch_one(&pool)
-        .await
-        .map_err(|e| e.to_string())?;
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM render_cache r \
+         JOIN messages m ON m.topic_id = r.topic_id AND m.msg_id = r.msg_id \
+         JOIN topics t ON t.topic_id = m.topic_id \
+         WHERE m.deleted_at IS NULL AND t.deleted_at IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
 
     if total == 0 {
         return Ok(());
@@ -354,14 +379,17 @@ impl MessageRepository {
         render_content: &[u8],
         skip_bubble: bool,
     ) -> Result<(), String> {
+        let (tombstoned_attachment_hashes, reserved_attachment_orders) =
+            Self::attachment_tombstones(tx, topic_id, &message.id).await?;
+
         // 1. 计算核心内容指纹 (通过 HashAggregator)
         let attachment_hashes: Vec<String> = message
             .attachments
             .as_ref()
             .map(|atts| {
                 atts.iter()
-                    .map(|a| a.hash.clone().unwrap_or_default())
-                    .filter(|h| !h.is_empty())
+                    .map(Self::attachment_hash)
+                    .filter(|hash| !tombstoned_attachment_hashes.contains(hash))
                     .collect()
             })
             .unwrap_or_default();
@@ -370,13 +398,16 @@ impl MessageRepository {
             HashAggregator::compute_message_fingerprint(&message.content, &attachment_hashes);
 
         // 2. 插入或更新消息 (不含 render_content)
-        sqlx::query(
+        let upsert_result = sqlx::query(
             "INSERT INTO messages (
                 msg_id, topic_id, role, name, agent_id, content, timestamp,
                 is_group_message, group_id, finish_reason,
                 content_hash,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+              WHERE EXISTS (
+                SELECT 1 FROM topics WHERE topic_id = ? AND deleted_at IS NULL
+              )
              ON CONFLICT(topic_id, msg_id) DO UPDATE SET
                 content = excluded.content,
                 role = excluded.role,
@@ -387,8 +418,8 @@ impl MessageRepository {
                 group_id = excluded.group_id,
                 finish_reason = excluded.finish_reason,
                 content_hash = excluded.content_hash,
-                updated_at = excluded.updated_at,
-                deleted_at = NULL",
+                updated_at = excluded.updated_at
+              WHERE messages.deleted_at IS NULL",
         )
         .bind(&message.id)
         .bind(topic_id)
@@ -403,9 +434,18 @@ impl MessageRepository {
         .bind(&content_hash)
         .bind(message.timestamp as i64) // created_at
         .bind(message.timestamp as i64) // updated_at
+        .bind(topic_id)
         .execute(&mut **tx)
         .await
         .map_err(|e| e.to_string())?;
+
+        // A late stream finalizer must not recreate a deleted message or write into a deleted topic.
+        if upsert_result.rows_affected() == 0 {
+            return Err(format!(
+                "Message {} was deleted or topic {} is no longer active",
+                message.id, topic_id
+            ));
+        }
 
         // 2.1 插入或更新渲染缓存 (独立表)
         sqlx::query(
@@ -433,15 +473,20 @@ impl MessageRepository {
                 &message.id,
                 message.timestamp as i64,
                 attachments,
+                &tombstoned_attachment_hashes,
+                &reserved_attachment_orders,
             )
             .await?;
         } else {
-            sqlx::query("DELETE FROM message_attachments WHERE topic_id = ? AND msg_id = ?")
-                .bind(topic_id)
-                .bind(&message.id)
-                .execute(&mut **tx)
-                .await
-                .map_err(|e| e.to_string())?;
+            sqlx::query(
+                "DELETE FROM message_attachments \
+                 WHERE topic_id = ? AND msg_id = ? AND deleted_at IS NULL",
+            )
+            .bind(topic_id)
+            .bind(&message.id)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| e.to_string())?;
         }
 
         // 3. 触发聚合哈希冒泡 (通过 HashAggregator 统一处理)
@@ -452,24 +497,71 @@ impl MessageRepository {
         Ok(())
     }
 
+    fn attachment_hash(attachment: &crate::vcp_modules::chat_manager::Attachment) -> String {
+        attachment
+            .hash
+            .as_ref()
+            .filter(|hash| !hash.is_empty())
+            .cloned()
+            .unwrap_or_else(|| {
+                crate::vcp_modules::infra::utils::calculate_sha256(attachment.src.as_bytes())
+            })
+    }
+
+    async fn attachment_tombstones(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        topic_id: &str,
+        msg_id: &str,
+    ) -> Result<(HashSet<String>, HashSet<i32>), String> {
+        let rows = sqlx::query(
+            "SELECT hash, attachment_order FROM message_attachments \
+             WHERE topic_id = ? AND msg_id = ? AND deleted_at IS NOT NULL",
+        )
+        .bind(topic_id)
+        .bind(msg_id)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        let hashes = rows
+            .iter()
+            .map(|row| row.get::<String, _>("hash"))
+            .collect();
+        let orders = rows
+            .iter()
+            .map(|row| row.get::<i32, _>("attachment_order"))
+            .collect();
+        Ok((hashes, orders))
+    }
+
     async fn upsert_attachments_for_message(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         topic_id: &str,
         msg_id: &str,
         timestamp: i64,
         attachments: &[crate::vcp_modules::chat_manager::Attachment],
+        tombstoned_hashes: &HashSet<String>,
+        reserved_orders: &HashSet<i32>,
     ) -> Result<(), String> {
-        sqlx::query("DELETE FROM message_attachments WHERE topic_id = ? AND msg_id = ?")
-            .bind(topic_id)
-            .bind(msg_id)
-            .execute(&mut **tx)
-            .await
-            .map_err(|e| e.to_string())?;
+        sqlx::query(
+            "DELETE FROM message_attachments \
+             WHERE topic_id = ? AND msg_id = ? AND deleted_at IS NULL",
+        )
+        .bind(topic_id)
+        .bind(msg_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| e.to_string())?;
 
-        for (i, att) in attachments.iter().enumerate() {
-            let hash = att.hash.clone().unwrap_or_else(|| {
-                crate::vcp_modules::infra::utils::calculate_sha256(att.src.as_bytes())
-            });
+        let mut attachment_order = 0i32;
+        for att in attachments {
+            let hash = Self::attachment_hash(att);
+            if tombstoned_hashes.contains(&hash) {
+                continue;
+            }
+            while reserved_orders.contains(&attachment_order) {
+                attachment_order += 1;
+            }
 
             let image_frames = att
                 .image_frames
@@ -511,7 +603,7 @@ impl MessageRepository {
             .bind(topic_id)
             .bind(msg_id)
             .bind(&hash)
-            .bind(i as i32)
+            .bind(attachment_order)
             .bind(&att.name)
             .bind(&att.src)
             .bind(&att.status)
@@ -519,6 +611,8 @@ impl MessageRepository {
             .execute(&mut **tx)
             .await
             .map_err(|e| e.to_string())?;
+
+            attachment_order += 1;
         }
 
         Ok(())
@@ -527,7 +621,111 @@ impl MessageRepository {
 
 #[cfg(test)]
 mod tests {
-    use super::MessageRenderCompiler;
+    use super::{ContentCompressor, MessageRenderCompiler, MessageRepository};
+    use crate::vcp_modules::chat_manager::{Attachment, ChatMessage};
+    use crate::vcp_modules::sync_hash::HashAggregator;
+    use sqlx::{sqlite::SqlitePoolOptions, Row};
+
+    async fn repository_test_pool() -> sqlx::SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        for statement in [
+            "CREATE TABLE topics (
+                topic_id TEXT PRIMARY KEY,
+                content_hash TEXT NOT NULL DEFAULT '',
+                deleted_at BIGINT
+            )",
+            "CREATE TABLE messages (
+                msg_id TEXT NOT NULL,
+                topic_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                name TEXT,
+                agent_id TEXT,
+                content BLOB NOT NULL,
+                timestamp BIGINT NOT NULL,
+                is_group_message INTEGER NOT NULL DEFAULT 0,
+                group_id TEXT,
+                finish_reason TEXT,
+                content_hash TEXT NOT NULL DEFAULT '',
+                created_at BIGINT NOT NULL,
+                updated_at BIGINT NOT NULL,
+                deleted_at BIGINT,
+                PRIMARY KEY (topic_id, msg_id)
+            )",
+            "CREATE TABLE render_cache (
+                topic_id TEXT NOT NULL,
+                msg_id TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                render_content BLOB NOT NULL,
+                updated_at BIGINT NOT NULL,
+                PRIMARY KEY (topic_id, msg_id)
+            )",
+            "CREATE TABLE message_attachments (
+                topic_id TEXT NOT NULL,
+                msg_id TEXT NOT NULL,
+                hash TEXT NOT NULL,
+                attachment_order INTEGER NOT NULL,
+                display_name TEXT NOT NULL,
+                src TEXT,
+                status TEXT,
+                created_at BIGINT NOT NULL,
+                deleted_at BIGINT,
+                PRIMARY KEY (topic_id, msg_id, attachment_order)
+            )",
+            "CREATE TABLE attachments (
+                hash TEXT PRIMARY KEY,
+                mime_type TEXT NOT NULL,
+                size BIGINT NOT NULL,
+                internal_path TEXT NOT NULL,
+                extracted_text TEXT,
+                image_frames TEXT,
+                thumbnail_path TEXT,
+                created_at BIGINT NOT NULL,
+                updated_at BIGINT NOT NULL
+            )",
+        ] {
+            sqlx::query(statement).execute(&pool).await.unwrap();
+        }
+        pool
+    }
+
+    fn test_message(content: &str, timestamp: u64) -> ChatMessage {
+        ChatMessage {
+            id: "message-1".to_string(),
+            role: "assistant".to_string(),
+            name: Some("Agent".to_string()),
+            agent_id: Some("agent-1".to_string()),
+            content: content.to_string(),
+            timestamp,
+            is_thinking: Some(false),
+            group_id: None,
+            topic_id: Some("topic-1".to_string()),
+            is_group_message: Some(false),
+            finish_reason: Some("completed".to_string()),
+            attachments: None,
+            blocks: None,
+            shell: None,
+            content_hash: None,
+            transient_context: None,
+            transient_system_prompt: None,
+        }
+    }
+
+    fn test_attachment(hash: &str) -> Attachment {
+        Attachment {
+            r#type: "image/png".to_string(),
+            src: format!("file://{hash}.png"),
+            name: format!("{hash}.png"),
+            size: 10,
+            hash: Some(hash.to_string()),
+            status: Some("ready".to_string()),
+            internal_path: format!("{hash}.png"),
+            ..Attachment::default()
+        }
+    }
 
     #[test]
     fn render_cache_key_requires_current_compiler_version() {
@@ -543,5 +741,200 @@ mod tests {
             "render-v1:message-fingerprint",
             content_hash
         ));
+        assert!(!MessageRenderCompiler::cache_matches(
+            "render-v2:message-fingerprint",
+            content_hash
+        ));
+        assert!(!MessageRenderCompiler::cache_matches(
+            "render-v3:message-fingerprint",
+            content_hash
+        ));
+        assert!(!MessageRenderCompiler::cache_matches(
+            "render-v4:message-fingerprint",
+            content_hash
+        ));
+    }
+
+    #[test]
+    fn compressed_content_round_trips_past_the_legacy_16_mib_limit() {
+        let marker = "VCP_LARGE_MESSAGE_TAIL";
+        let content = format!("{}{}", "x".repeat(17 * 1024 * 1024), marker);
+
+        let compressed = ContentCompressor::compress(&content).unwrap();
+        let restored = ContentCompressor::decompress(&compressed).unwrap();
+
+        assert_eq!(restored.len(), content.len());
+        assert!(restored.ends_with(marker));
+    }
+
+    #[test]
+    fn render_cache_round_trips_large_vcp_document_tail() {
+        let marker = "VCP_LARGE_RENDER_TAIL";
+        let content = format!(
+            "<div id=\"vcp-root\"><p>{}{}</p></div>",
+            "x".repeat(17 * 1024 * 1024),
+            marker
+        );
+        let blocks = MessageRenderCompiler::compile(&content);
+
+        let compressed = MessageRenderCompiler::serialize(&blocks).unwrap();
+        let restored = MessageRenderCompiler::deserialize(&compressed).unwrap();
+        let restored_json = serde_json::to_string(&restored).unwrap();
+
+        assert!(restored_json.contains(marker));
+    }
+
+    #[tokio::test]
+    async fn upsert_writes_into_an_active_topic() {
+        let pool = repository_test_pool().await;
+        sqlx::query("INSERT INTO topics (topic_id) VALUES ('topic-1')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        MessageRepository::upsert_message(
+            &mut tx,
+            &test_message("hello", 20),
+            "topic-1",
+            b"[]",
+            true,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn late_upsert_does_not_revive_a_tombstoned_message() {
+        let pool = repository_test_pool().await;
+        sqlx::query("INSERT INTO topics (topic_id) VALUES ('topic-1')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO messages (
+                msg_id, topic_id, role, content, timestamp, created_at, updated_at, deleted_at
+             ) VALUES ('message-1', 'topic-1', 'assistant', X'00', 10, 10, 10, 99)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let result = MessageRepository::upsert_message(
+            &mut tx,
+            &test_message("late final", 20),
+            "topic-1",
+            b"[]",
+            true,
+        )
+        .await;
+        assert!(result.is_err());
+        tx.rollback().await.unwrap();
+
+        let row = sqlx::query("SELECT timestamp, deleted_at FROM messages WHERE topic_id = 'topic-1' AND msg_id = 'message-1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<i64, _>("timestamp"), 10);
+        assert_eq!(row.get::<i64, _>("deleted_at"), 99);
+        let cache_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM render_cache")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(cache_count, 0);
+    }
+
+    #[tokio::test]
+    async fn late_upsert_does_not_insert_into_a_deleted_topic() {
+        let pool = repository_test_pool().await;
+        sqlx::query("INSERT INTO topics (topic_id, deleted_at) VALUES ('topic-1', 99)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let result = MessageRepository::upsert_message(
+            &mut tx,
+            &test_message("late final", 20),
+            "topic-1",
+            b"[]",
+            true,
+        )
+        .await;
+        assert!(result.is_err());
+        tx.rollback().await.unwrap();
+
+        let message_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(message_count, 0);
+    }
+
+    #[tokio::test]
+    async fn upsert_preserves_attachment_tombstones_and_uses_filtered_fingerprint() {
+        let pool = repository_test_pool().await;
+        sqlx::query("INSERT INTO topics (topic_id) VALUES ('topic-1')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO message_attachments (
+                topic_id, msg_id, hash, attachment_order, display_name, src, status,
+                created_at, deleted_at
+             ) VALUES ('topic-1', 'message-1', 'hash-a', 0, 'a.png', '', 'ready', 1, 99)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut message = test_message("hello", 20);
+        message.attachments = Some(vec![test_attachment("hash-a"), test_attachment("hash-b")]);
+        let mut tx = pool.begin().await.unwrap();
+        MessageRepository::upsert_message(&mut tx, &message, "topic-1", b"[]", true)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let relations = sqlx::query(
+            "SELECT hash, attachment_order, deleted_at FROM message_attachments \
+             WHERE topic_id = 'topic-1' AND msg_id = 'message-1' ORDER BY attachment_order",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(relations.len(), 2);
+        assert_eq!(relations[0].get::<String, _>("hash"), "hash-a");
+        assert_eq!(relations[0].get::<Option<i64>, _>("deleted_at"), Some(99));
+        assert_eq!(relations[1].get::<String, _>("hash"), "hash-b");
+        assert_eq!(relations[1].get::<i32, _>("attachment_order"), 1);
+        assert_eq!(relations[1].get::<Option<i64>, _>("deleted_at"), None);
+
+        let expected_hash =
+            HashAggregator::compute_message_fingerprint("hello", &["hash-b".to_string()]);
+        let message_hash: String = sqlx::query_scalar(
+            "SELECT content_hash FROM messages WHERE topic_id = 'topic-1' AND msg_id = 'message-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let render_hash: String = sqlx::query_scalar(
+            "SELECT content_hash FROM render_cache WHERE topic_id = 'topic-1' AND msg_id = 'message-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(message_hash, expected_hash);
+        assert_eq!(
+            render_hash,
+            MessageRenderCompiler::cache_key(&expected_hash)
+        );
     }
 }

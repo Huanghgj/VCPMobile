@@ -70,8 +70,6 @@ export const useAssistantStore = defineStore("assistant", () => {
     }
   };
 
-
-
   const combinedItems = computed(() => [
     ...agents.value.map((agent) => ({ ...agent, type: "agent" as const })),
     ...groups.value.map((group) => ({ ...group, type: "group" as const })),
@@ -90,7 +88,9 @@ export const useAssistantStore = defineStore("assistant", () => {
       }>("get_assistants_snapshot");
       agents.value = snapshot.agents;
       unreadCounts.value = snapshot.unreadCounts;
-      console.log(`[Profile] fetchAgents finished in ${Date.now() - startTime}ms`);
+      console.log(
+        `[Profile] fetchAgents finished in ${Date.now() - startTime}ms`,
+      );
     } catch (e: any) {
       error.value = e.toString();
       console.error("[AssistantStore] fetchAgents failed:", e);
@@ -113,7 +113,9 @@ export const useAssistantStore = defineStore("assistant", () => {
       }>("get_assistants_snapshot");
       groups.value = snapshot.groups;
       unreadCounts.value = snapshot.unreadCounts;
-      console.log(`[Profile] fetchGroups finished in ${Date.now() - startTime}ms`);
+      console.log(
+        `[Profile] fetchGroups finished in ${Date.now() - startTime}ms`,
+      );
     } catch (e: any) {
       error.value = e.toString();
       console.error("[AssistantStore] fetchGroups failed:", e);
@@ -134,14 +136,18 @@ export const useAssistantStore = defineStore("assistant", () => {
         groups: GroupConfig[];
         unreadCounts: Record<string, number>;
       }>("get_assistants_snapshot");
-      console.log(`[Profile] invoke('get_assistants_snapshot') resolved in ${Date.now() - startTime}ms`);
+      console.log(
+        `[Profile] invoke('get_assistants_snapshot') resolved in ${Date.now() - startTime}ms`,
+      );
 
       // 在同一次 tick 中合并赋值，触发 Vue 3 渲染的批处理更新
       agents.value = snapshot.agents;
       groups.value = snapshot.groups;
       unreadCounts.value = snapshot.unreadCounts;
 
-      console.log(`[Profile] fetchAgentsAndGroups finished in ${Date.now() - startTime}ms`);
+      console.log(
+        `[Profile] fetchAgentsAndGroups finished in ${Date.now() - startTime}ms`,
+      );
     } catch (e: any) {
       error.value = e.toString();
       console.error("[AssistantStore] fetchAgentsAndGroups failed:", e);
@@ -175,6 +181,13 @@ export const useAssistantStore = defineStore("assistant", () => {
     try {
       await invoke("delete_agent", { agentId: id });
       agents.value = agents.value.filter((a) => a.id !== id);
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(
+          new CustomEvent("vcp-owner-deleted", {
+            detail: { ownerId: id, ownerType: "agent" },
+          }),
+        );
+      }
       notificationStore.addNotification({
         type: "success",
         title: "Agent 删除成功",
@@ -211,6 +224,13 @@ export const useAssistantStore = defineStore("assistant", () => {
     try {
       await invoke("delete_group", { groupId: id });
       groups.value = groups.value.filter((g) => g.id !== id);
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(
+          new CustomEvent("vcp-owner-deleted", {
+            detail: { ownerId: id, ownerType: "group" },
+          }),
+        );
+      }
       notificationStore.addNotification({
         type: "success",
         title: "Group 删除成功",
@@ -235,7 +255,8 @@ export const useAssistantStore = defineStore("assistant", () => {
           ...updated[index],
           name: agent.name,
           model: agent.model,
-          avatarCalculatedColor: agent.avatarCalculatedColor || updated[index].avatarCalculatedColor,
+          avatarCalculatedColor:
+            agent.avatarCalculatedColor || updated[index].avatarCalculatedColor,
         };
         agents.value = updated;
       }
@@ -264,7 +285,8 @@ export const useAssistantStore = defineStore("assistant", () => {
           ...updated[index],
           name: group.name,
           members: group.members,
-          avatarCalculatedColor: group.avatarCalculatedColor || updated[index].avatarCalculatedColor,
+          avatarCalculatedColor:
+            group.avatarCalculatedColor || updated[index].avatarCalculatedColor,
         };
         groups.value = updated;
       }
@@ -281,7 +303,12 @@ export const useAssistantStore = defineStore("assistant", () => {
     }
   };
 
-  const saveAvatar = async (ownerType: 'agent' | 'group' | 'user', ownerId: string, mimeType: string, imageData: number[]) => {
+  const saveAvatar = async (
+    ownerType: "agent" | "group" | "user",
+    ownerId: string,
+    mimeType: string,
+    imageData: number[],
+  ) => {
     try {
       const hash = await invoke<string>("save_avatar_data", {
         ownerType,
@@ -290,7 +317,12 @@ export const useAssistantStore = defineStore("assistant", () => {
         imageData,
       });
 
-      const label = ownerType === 'agent' ? 'Agent' : ownerType === 'group' ? 'Group' : '用户';
+      const label =
+        ownerType === "agent"
+          ? "Agent"
+          : ownerType === "group"
+            ? "Group"
+            : "用户";
       notificationStore.addNotification({
         type: "success",
         title: `${label} 头像更新成功`,
@@ -300,7 +332,10 @@ export const useAssistantStore = defineStore("assistant", () => {
 
       return hash;
     } catch (e: any) {
-      console.error(`[AssistantStore] Failed to save avatar for ${ownerType}:`, e);
+      console.error(
+        `[AssistantStore] Failed to save avatar for ${ownerType}:`,
+        e,
+      );
       throw e;
     }
   };

@@ -7,6 +7,7 @@ import { useThemeStore } from './theme';
 import { useNotificationStore } from './notification';
 import { isTauriRuntime } from '../utils/runtime';
 import { useAvatarStore } from './avatar';
+import { useChatSessionStore } from './chatSessionStore';
 import { updateDistributedState } from '../../features/distributed/composables/useDistributed';
 
 export type AppState = 'PERMISSIONS' | 'BOOTING' | 'CONNECTING' | 'PRELOADING' | 'READY' | 'ERROR';
@@ -19,6 +20,24 @@ export interface CoreStatus {
 const CONNECT_TIMEOUT_MS = 15000;
 const PRELOAD_TIMEOUT_MS = 20000;
 
+async function withTimeout<T>(
+  operation: Promise<T>,
+  timeoutMs: number,
+  timeoutMessage: string,
+): Promise<T> {
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
+}
+
 export const useAppLifecycleStore = defineStore('appLifecycle', () => {
   const state = ref<AppState>('BOOTING');
   const errorMsg = ref<string | null>(null);
@@ -28,6 +47,7 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
   const lastTransitionAt = ref<number | null>(null);
 
   const assistantStore = useAssistantStore();
+  const sessionStore = useChatSessionStore();
   const settingsStore = useSettingsStore();
   const themeStore = useThemeStore();
   const avatarStore = useAvatarStore();
@@ -102,8 +122,13 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
     async (newStatus, oldStatus) => {
       if (newStatus === 'connected' && oldStatus !== 'connected' && state.value === 'READY') {
         // 仅在连接成功时重新拉取数据快照，但不触发耗时的 Manifest 全量同步
-        await assistantStore.fetchAgents();
-        await assistantStore.fetchGroups();
+        try {
+          await assistantStore.fetchAgents();
+          await assistantStore.fetchGroups();
+          await sessionStore.reconcilePersistedSelection();
+        } catch (error) {
+          console.error('[Lifecycle] Failed to refresh data after reconnect:', error);
+        }
       }
     }
   );
@@ -126,29 +151,28 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
       updatePhaseLabel('正在并发预加载配置与助手数据...');
       console.log('[Lifecycle] [Concurrent] START Preloading Settings and AgentsAndGroups');
 
-      await Promise.race([
+      await withTimeout(
         Promise.all([
           settingsStore.fetchSettings(),
           assistantStore.fetchAgentsAndGroups()
         ]),
-        new Promise((_, reject) => {
-          setTimeout(() => reject(new Error('核心数据预加载超时')), PRELOAD_TIMEOUT_MS);
-        })
-      ]);
+        PRELOAD_TIMEOUT_MS,
+        '核心数据预加载超时',
+      );
 
       console.log(`[Lifecycle] [Concurrent] DONE Preloading in ${Date.now() - startTime}ms`);
+      await sessionStore.reconcilePersistedSelection();
 
       updatePhaseLabel('正在预加载头像资源...');
-      await Promise.race([
+      await withTimeout(
         avatarStore.preloadAvatars([
           { ownerType: 'user', ownerId: 'user_avatar' },
           ...assistantStore.agents.map((agent) => ({ ownerType: 'agent' as const, ownerId: agent.id })),
           ...assistantStore.groups.map((group) => ({ ownerType: 'group' as const, ownerId: group.id })),
         ]),
-        new Promise((_, reject) => {
-          setTimeout(() => reject(new Error('头像资源预加载超时')), PRELOAD_TIMEOUT_MS);
-        })
-      ]);
+        PRELOAD_TIMEOUT_MS,
+        '头像资源预加载超时',
+      );
 
       updatePhaseLabel('核心数据预加载完成');
 

@@ -56,6 +56,7 @@ import kotlin.math.roundToInt
 import com.topjohnwu.superuser.Shell
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
+import androidx.media3.common.util.UnstableApi
 import androidx.media3.transformer.Transformer
 import androidx.media3.transformer.TransformationRequest
 import androidx.media3.transformer.ExportException
@@ -65,7 +66,6 @@ import androidx.media3.transformer.Composition
 
 @TauriPlugin(permissions = [
     Permission(strings = ["android.permission.POST_NOTIFICATIONS"], alias = "notification"),
-    Permission(strings = ["android.permission.READ_MEDIA_IMAGES"], alias = "storage"),
     Permission(strings = ["android.permission.READ_EXTERNAL_STORAGE", "android.permission.WRITE_EXTERNAL_STORAGE"], alias = "storageLegacy"),
     Permission(strings = ["android.permission.RECORD_AUDIO"], alias = "microphone"),
     Permission(strings = ["android.permission.CAMERA"], alias = "camera"),
@@ -105,6 +105,13 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
 
     companion object {
         const val TAG = "VcpMobilePlugin"
+        private const val MAX_PICKED_FILE_BYTES = 100L * 1024L * 1024L
+        private const val MAX_PICKED_BATCH_BYTES = 500L * 1024L * 1024L
+        private const val MAX_PICKED_FILES = 20
+        private const val MAX_GALLERY_IMAGE_BYTES = 50 * 1024 * 1024
+        private const val MAX_DATA_URL_CHARS = 70 * 1024 * 1024
+        private const val PICKER_PREFS = "vcp_mobile_picker"
+        private const val CAMERA_TEMP_PATH = "camera_temp_path"
         private var instanceRef: java.lang.ref.WeakReference<VcpMobilePlugin>? = null
 
         fun getInstance(): VcpMobilePlugin? {
@@ -174,6 +181,7 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
     private val affectClassifierGuard = Any()
     @Volatile private var affectClassifier: AffectClassifier? = null
     private val fileIoExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+    private val oomScoreExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
     private var cameraTempFile: java.io.File? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: android.net.wifi.WifiManager.WifiLock? = null
@@ -182,6 +190,72 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
     private var networkCallback: android.net.ConnectivityManager.NetworkCallback? = null
     private var lastConnected: Boolean? = null
     private var isNetworkMonitoringStarted = false
+
+    internal fun executeFileIo(task: () -> Unit): Boolean = try {
+        fileIoExecutor.execute(task)
+        true
+    } catch (error: java.util.concurrent.RejectedExecutionException) {
+        Log.w(TAG, "File I/O executor is no longer available", error)
+        false
+    }
+
+    private fun sanitizePickedDisplayName(rawName: String): String {
+        val baseName = java.io.File(rawName.replace('\\', '/')).name
+        return baseName
+            .replace(Regex("[\\u0000-\\u001f\\u007f/\\\\]"), "_")
+            .trim()
+            .ifEmpty { "shared_file" }
+            .take(180)
+    }
+
+    private fun requireSupportedPickedFileSize(size: Long, name: String) {
+        if (size > MAX_PICKED_FILE_BYTES) {
+            throw IllegalArgumentException("$name exceeds the 100MB attachment limit")
+        }
+    }
+
+    private fun commitPickedTempFile(source: java.io.File, target: java.io.File) {
+        if (target.exists()) {
+            if (!source.delete()) {
+                Log.w(TAG, "Failed to remove duplicate temp file: ${source.absolutePath}")
+            }
+            return
+        }
+
+        if (!source.renameTo(target)) {
+            try {
+                source.copyTo(target, overwrite = false)
+            } catch (error: Throwable) {
+                target.delete()
+                throw error
+            }
+            if (!source.delete()) {
+                Log.w(TAG, "Failed to remove copied temp file: ${source.absolutePath}")
+            }
+        }
+
+        if (!target.exists()) {
+            throw java.io.IOException("Failed to commit picked file to ${target.absolutePath}")
+        }
+    }
+
+    private fun rememberCameraTempFile(file: java.io.File) {
+        cameraTempFile = file
+        activity
+            .getSharedPreferences(PICKER_PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putString(CAMERA_TEMP_PATH, file.absolutePath)
+            .apply()
+    }
+
+    private fun takeCameraTempFile(): java.io.File? {
+        val preferences = activity.getSharedPreferences(PICKER_PREFS, Context.MODE_PRIVATE)
+        val persistedPath = preferences.getString(CAMERA_TEMP_PATH, null)
+        preferences.edit().remove(CAMERA_TEMP_PATH).apply()
+        val file = cameraTempFile ?: persistedPath?.let { java.io.File(it) }
+        cameraTempFile = null
+        return file
+    }
 
     // ==================================================================
     // SSE Proxy Service Binder & IPC (Messenger)
@@ -207,7 +281,6 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
         instanceRef = java.lang.ref.WeakReference(this)
         activity.application.registerActivityLifecycleCallbacks(activityLifecycleCallbacks)
         startOomScoreGuard()
-        startHelperServiceInternal()
     }
 
 
@@ -224,14 +297,9 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
             true
         }
 
-        val storageGranted = if (Build.VERSION.SDK_INT >= 34) {
-            val hasAll = ContextCompat.checkSelfPermission(activity, android.Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED
-            val hasVisualSelected = ContextCompat.checkSelfPermission(activity, "android.permission.READ_MEDIA_VISUAL_USER_SELECTED") == PackageManager.PERMISSION_GRANTED
-            hasAll || hasVisualSelected
-        } else if (Build.VERSION.SDK_INT >= 33) {
-            ContextCompat.checkSelfPermission(activity, android.Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED
-        } else if (Build.VERSION.SDK_INT >= 29) {
-            ContextCompat.checkSelfPermission(activity, android.Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+        val storageGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            // ACTION_OPEN_DOCUMENT and MediaStore do not require broad media access.
+            true
         } else {
             ContextCompat.checkSelfPermission(activity, android.Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED &&
                 ContextCompat.checkSelfPermission(activity, android.Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
@@ -276,8 +344,9 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
                 }
             }
             "storage" -> {
-                if (Build.VERSION.SDK_INT >= 33) {
-                    requestPermissionForAlias("storage", invoke, "onPermissionResult")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    emitPermissionsToWebView()
+                    invoke.resolve()
                 } else {
                     requestPermissionForAlias("storageLegacy", invoke, "onPermissionResult")
                 }
@@ -293,12 +362,12 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
             }
             "battery" -> {
                 try {
-                    val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                        data = Uri.parse("package:${activity.packageName}")
-                    }
+                    val intent = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
                     startActivityForResult(invoke, intent, "onBatteryOptimizationResult")
                 } catch (e: Exception) {
-                    val intent = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                    val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                        data = Uri.parse("package:${activity.packageName}")
+                    }
                     startActivityForResult(invoke, intent, "onBatteryOptimizationResult")
                 }
             }
@@ -309,6 +378,14 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
     fun moveTaskToBack(invoke: Invoke) {
         activity.moveTaskToBack(true)
         invoke.resolve()
+    }
+
+    @Command
+    fun markShareIntentReady(invoke: Invoke) {
+        activity.runOnUiThread {
+            shareIntentHandler.markFrontendReady(webViewRef)
+            invoke.resolve()
+        }
     }
 
     @Command
@@ -346,7 +423,7 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     private fun startOomScoreGuard() {
-        fileIoExecutor.execute {
+        oomScoreExecutor.execute {
             try {
                 // 利用 topjohnwu 的 superuser 库检查 root 状态
                 if (Shell.getShell().isRoot) {
@@ -597,14 +674,8 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
             true
         }
 
-        val storageGranted = if (Build.VERSION.SDK_INT >= 34) {
-            val hasAll = ContextCompat.checkSelfPermission(activity, android.Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED
-            val hasVisualSelected = ContextCompat.checkSelfPermission(activity, "android.permission.READ_MEDIA_VISUAL_USER_SELECTED") == PackageManager.PERMISSION_GRANTED
-            hasAll || hasVisualSelected
-        } else if (Build.VERSION.SDK_INT >= 33) {
-            ContextCompat.checkSelfPermission(activity, android.Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED
-        } else if (Build.VERSION.SDK_INT >= 29) {
-            ContextCompat.checkSelfPermission(activity, android.Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+        val storageGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            true
         } else {
             ContextCompat.checkSelfPermission(activity, android.Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED &&
                 ContextCompat.checkSelfPermission(activity, android.Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
@@ -1322,18 +1393,19 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
     override fun load(webView: WebView) {
         super.load(webView)
         webViewRef = webView
+        shareIntentHandler.onWebViewLoaded()
 
         keyboardInsetsManager.attach(webView)
         lifecycleBridge.attach(activity, this)
 
         // 冷启动：处理传递给 Activity 的初始 intent
         shareIntentHandler.handleShareIntent(activity.intent)
-        shareIntentHandler.injectShareData(webView)
         handleNotificationIntent(activity.intent)
     }
 
     override fun onDestroy(activity: AppCompatActivity) {
         activity.application.unregisterActivityLifecycleCallbacks(activityLifecycleCallbacks)
+        shareIntentHandler.onWebViewDestroyed()
         webViewRef = null
         lifecycleBridge.detach()
         try {
@@ -1403,7 +1475,7 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
         try {
             val uploadsDir = java.io.File(activity.cacheDir, "uploads").apply { mkdirs() }
             val tempFile = java.io.File(uploadsDir, "camera_${System.currentTimeMillis()}.jpg")
-            cameraTempFile = tempFile
+            rememberCameraTempFile(tempFile)
 
             val authority = "${activity.packageName}.fileprovider"
             val uri = try {
@@ -1419,8 +1491,78 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
             startActivityForResult(invoke, intent, "onCameraResult")
         } catch (e: Throwable) {
             Log.e(TAG, "[launchCameraIntent] Failed to launch camera intent", e)
+            takeCameraTempFile()?.delete()
             invoke.reject("Failed to launch camera: ${e.message}")
         }
+    }
+
+    private fun pickerRequestId(invoke: Invoke): String = try {
+        invoke.parseArgs(PickFileArgs::class.java).requestId
+    } catch (_: Throwable) {
+        ""
+    }
+
+    private fun openDocumentIntent(mimeType: String): Intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+        type = mimeType
+        addCategory(Intent.CATEGORY_OPENABLE)
+        putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+
+    private fun getContentIntent(mimeType: String): Intent = Intent(Intent.ACTION_GET_CONTENT).apply {
+        type = mimeType
+        addCategory(Intent.CATEGORY_OPENABLE)
+        putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+
+    private fun firstAvailablePickerIntent(vararg candidates: Intent): Intent {
+        return candidates.firstOrNull { intent ->
+            intent.resolveActivity(activity.packageManager) != null
+        } ?: candidates.first()
+    }
+
+    private fun galleryPickerIntent(): Intent {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            return firstAvailablePickerIntent(
+                openDocumentIntent("image/*"),
+                getContentIntent("image/*")
+            )
+        }
+
+        return Intent(MediaStore.ACTION_PICK_IMAGES).apply {
+            type = "image/*"
+            putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+            putExtra(
+                MediaStore.EXTRA_PICK_IMAGES_MAX,
+                minOf(MAX_PICKED_FILES, MediaStore.getPickImagesMaxLimit())
+            )
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+    }
+
+    private fun dispatchPickerTerminalEvent(eventName: String, detail: JSObject) {
+        val safeDetail = escapeJsonForJsString(detail.toString())
+        val script = "window.dispatchEvent(new CustomEvent('$eventName', { detail: JSON.parse(\"$safeDetail\") }))"
+        activity.runOnUiThread {
+            webViewRef?.evaluateJavascript(script, null)
+        }
+    }
+
+    private fun resolveCancelledPicker(invoke: Invoke, requestId: String, reason: String) {
+        val batch = JSObject().apply {
+            put("requestId", requestId)
+            put("files", JSArray())
+            put("errors", JSArray())
+        }
+        dispatchPickerTerminalEvent(
+            "vcp-mobile-file-picker-dismissed",
+            JSObject().apply {
+                put("requestId", requestId)
+                put("reason", reason)
+            }
+        )
+        invoke.resolve(batch)
     }
 
     @Command
@@ -1428,7 +1570,7 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
         try {
             val args = invoke.parseArgs(PickFileArgs::class.java)
             val mode = args.mode
-            Log.i(TAG, "[pickFile] Invoked with mode: $mode")
+            Log.i(TAG, "[pickFile] Invoked with mode: $mode, requestId=${args.requestId}")
 
             when (mode) {
                 "camera" -> {
@@ -1439,17 +1581,13 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
                     launchCameraIntent(invoke)
                 }
                 "gallery" -> {
-                    val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
-                        type = "image/*"
-                        addCategory(Intent.CATEGORY_OPENABLE)
-                    }
-                    startActivityForResult(invoke, intent, "onPickFileResult")
+                    startActivityForResult(invoke, galleryPickerIntent(), "onPickFileResult")
                 }
                 else -> {
-                    val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
-                        type = "*/*"
-                        addCategory(Intent.CATEGORY_OPENABLE)
-                    }
+                    val intent = firstAvailablePickerIntent(
+                        openDocumentIntent("*/*"),
+                        getContentIntent("*/*")
+                    )
                     startActivityForResult(invoke, intent, "onPickFileResult")
                 }
             }
@@ -1461,34 +1599,36 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
 
     @ActivityCallback
     fun onCameraResult(invoke: Invoke, result: ActivityResult) {
+        val requestId = pickerRequestId(invoke)
         if (result.resultCode != Activity.RESULT_OK) {
             Log.w(TAG, "[onCameraResult] Camera capture cancelled or failed")
-            cameraTempFile?.delete()
-            cameraTempFile = null
-            invoke.reject("Cancelled")
+            takeCameraTempFile()?.delete()
+            resolveCancelledPicker(invoke, requestId, "camera_cancelled")
             return
         }
 
-        val photoFile = cameraTempFile
+        val photoFile = takeCameraTempFile()
         if (photoFile == null || !photoFile.exists()) {
             Log.e(TAG, "[onCameraResult] Temporary photo file is null or does not exist")
             invoke.reject("Capture failed: temp file not found")
             return
         }
 
-        cameraTempFile = null // reset
-
         fileIoExecutor.execute {
             try {
                 val context = activity
                 val originalName = "Camera_${System.currentTimeMillis()}.jpg"
+                val nativeId = "camera_${System.currentTimeMillis()}"
                 val mimeType = "image/jpeg"
                 val size = photoFile.length()
+                requireSupportedPickedFileSize(size, originalName)
 
                 Log.i(TAG, "[onCameraResult] Processing captured photo: $originalName (size=$size)")
 
                 // 发送预准备事件给前端，让前端立即创建进度卡片
                 val startDetail = JSObject().apply {
+                    put("requestId", requestId)
+                    put("nativeId", nativeId)
                     put("name", originalName)
                     put("size", size)
                     put("mime", mimeType)
@@ -1516,7 +1656,7 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
                 if (finalTempFile.exists()) {
                     photoFile.delete() // 缓存去重，复用已有文件
                 } else {
-                    photoFile.renameTo(finalTempFile)
+                    commitPickedTempFile(photoFile, finalTempFile)
                 }
 
                 // 生成缩略图
@@ -1524,6 +1664,7 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
 
                 // 组装结果物理路径并回传给 Rust 桥接
                 val resultObject = JSObject()
+                resultObject.put("nativeId", nativeId)
                 resultObject.put("path", finalTempFile.absolutePath)
                 resultObject.put("name", originalName)
                 resultObject.put("mime", mimeType)
@@ -1535,6 +1676,8 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
 
                 // 双轨通信：推送最终结果给前端，穿透 JNI 断裂层
                 val pickedDetail = JSObject().apply {
+                    put("requestId", requestId)
+                    put("nativeId", nativeId)
                     put("path", finalTempFile.absolutePath)
                     put("name", originalName)
                     put("mime", mimeType)
@@ -1555,29 +1698,52 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
                 invoke.resolve(resultObject)
             } catch (e: Throwable) {
                 Log.e(TAG, "[onCameraResult] Photo processing failed", e)
+                try { photoFile.delete() } catch (_: Exception) {}
                 invoke.reject("Handling captured photo failed: ${e.message}")
             }
         }
     }
 
     @ActivityCallback
+    @UnstableApi
     fun onPickFileResult(invoke: Invoke, result: ActivityResult) {
+        val requestId = pickerRequestId(invoke)
         if (result.resultCode != Activity.RESULT_OK) {
             Log.w(TAG, "[onPickFileResult] Pick cancelled or failed")
-            invoke.reject("Cancelled")
+            resolveCancelledPicker(invoke, requestId, "picker_cancelled")
             return
         }
 
-        val uri = result.data?.data
-        if (uri == null) {
+        val selectedUris = buildList {
+            val data = result.data
+            val clipData = data?.clipData
+            if (clipData != null) {
+                for (index in 0 until clipData.itemCount) {
+                    clipData.getItemAt(index).uri?.let(::add)
+                }
+            }
+            data?.data?.let(::add)
+        }.distinct()
+        if (selectedUris.isEmpty()) {
             Log.w(TAG, "[onPickFileResult] Selected URI is null")
-            invoke.reject("No file selected")
+            resolveCancelledPicker(invoke, requestId, "empty_selection")
+            return
+        }
+        if (selectedUris.size > MAX_PICKED_FILES) {
+            invoke.reject("一次最多选择 $MAX_PICKED_FILES 个文件")
             return
         }
 
         fileIoExecutor.execute {
-            var currentTempFile: java.io.File? = null
-            try {
+            val files = JSArray()
+            val errors = JSArray()
+            var totalBatchBytes = 0L
+
+            selectedUris.forEachIndexed { selectionIndex, uri ->
+                val nativeId = "pick_${java.util.UUID.randomUUID()}_$selectionIndex"
+                val temporaryFiles = linkedSetOf<java.io.File>()
+                var accountedBatchBytes = 0L
+                try {
                 val context = activity
                 val contentResolver = context.contentResolver
 
@@ -1588,10 +1754,11 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
                     val nameIndex = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
                     val sizeIndex = cursor.getColumnIndex(android.provider.OpenableColumns.SIZE)
                     if (cursor.moveToFirst()) {
-                        if (nameIndex != -1) originalName = cursor.getString(nameIndex)
-                        if (sizeIndex != -1) size = cursor.getLong(sizeIndex)
+                        if (nameIndex != -1) originalName = cursor.getString(nameIndex) ?: "unknown"
+                        if (sizeIndex != -1 && !cursor.isNull(sizeIndex)) size = cursor.getLong(sizeIndex)
                     }
                 }
+                requireSupportedPickedFileSize(size, originalName)
 
                 // 2. 获取 MIME 类型
                 var mimeType = contentResolver.getType(uri) ?: "application/octet-stream"
@@ -1599,6 +1766,8 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
 
                 // 3. 发送预准备事件给前端，让前端立即创建进度卡片
                 val startDetail = JSObject().apply {
+                    put("requestId", requestId)
+                    put("nativeId", nativeId)
                     put("name", originalName)
                     put("size", size)
                     put("mime", mimeType)
@@ -1610,33 +1779,40 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
 
                 // 4. 流式安全拷贝至 cacheDir 并同步计算 SHA-256 (64KB buffer)
                 val uploadsDir = java.io.File(context.cacheDir, "uploads").apply { mkdirs() }
-                var tempFile = java.io.File(uploadsDir, "pick_${System.currentTimeMillis()}_temp")
-                currentTempFile = tempFile
+                var tempFile = java.io.File(uploadsDir, "${nativeId}_temp")
+                temporaryFiles.add(tempFile)
                 val digest = java.security.MessageDigest.getInstance("SHA-256")
 
                 contentResolver.openInputStream(uri).use { inputStream ->
                     if (inputStream == null) {
                         Log.e(TAG, "[onPickFileResult] openInputStream returned null")
-                        invoke.reject("Could not open input stream")
-                        return@execute
+                        throw IllegalStateException("Could not open input stream")
                     }
+                    var copiedBytes = 0L
                     java.io.FileOutputStream(tempFile).use { outputStream ->
                         val buffer = ByteArray(65536)
                         var bytesRead: Int
-                        var totalRead = 0L
                         var lastReportTime = System.currentTimeMillis()
 
                         while (inputStream.read(buffer).also { bytesRead = it } != -1) {
+                            if (copiedBytes + bytesRead > MAX_PICKED_FILE_BYTES) {
+                                throw IllegalArgumentException("$originalName exceeds the 100MB attachment limit")
+                            }
+                            if (totalBatchBytes + copiedBytes + bytesRead > MAX_PICKED_BATCH_BYTES) {
+                                throw IllegalArgumentException("整批选择文件超过 500MB 限制")
+                            }
                             outputStream.write(buffer, 0, bytesRead)
                             digest.update(buffer, 0, bytesRead)
-                            totalRead += bytesRead
+                            copiedBytes += bytesRead
 
                             val now = System.currentTimeMillis()
                             if (now - lastReportTime > 200) {
                                 lastReportTime = now
-                                val progress = if (size > 0) ((totalRead.toDouble() / size) * 100).toInt() else 0
+                                val progress = if (size > 0) ((copiedBytes.toDouble() / size) * 100).toInt() else 0
                                 val progressDetail = JSObject().apply {
-                                    put("loaded", totalRead)
+                                    put("requestId", requestId)
+                                    put("nativeId", nativeId)
+                                    put("loaded", copiedBytes)
                                     put("total", size)
                                     put("progress", progress)
                                     put("name", originalName)
@@ -1650,6 +1826,8 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
                             }
                         }
                     }
+                    totalBatchBytes += copiedBytes
+                    accountedBatchBytes = copiedBytes
                 }
 
                 val hashBytes = digest.digest()
@@ -1675,8 +1853,8 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
                     val isAudioOnly = isUnsupportedAudio || isUnsupportedOpus || (ext == "ogg" && sdkInt < 29)
                     val isImageOnly = isUnsupportedHeic || isUnsupportedAvif
                     val outputSuffix = if (isAudioOnly) "m4a" else if (isImageOnly) "jpg" else "mp4"
-                    val transcodedFile = java.io.File(uploadsDir, "transcoded_${System.currentTimeMillis()}.$outputSuffix")
-                    currentTempFile = transcodedFile
+                    val transcodedFile = java.io.File(uploadsDir, "transcoded_$nativeId.$outputSuffix")
+                    temporaryFiles.add(transcodedFile)
 
                     val latch = CountDownLatch(1)
                     var transcodeError: Throwable? = null
@@ -1721,6 +1899,7 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
 
                     if (transcodeError != null) {
                         try { transcodedFile.delete() } catch (_: Exception) {}
+                        try { tempFile.delete() } catch (_: Exception) {}
                         throw transcodeError!!
                     }
 
@@ -1744,17 +1923,31 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
                     mimeType = if (isAudioOnly) "audio/mp4" else if (isImageOnly) "image/jpeg" else "video/mp4"
                     originalName = originalName.substringBeforeLast(".") + "." + outputSuffix
                     tempFile = transcodedFile
+                    requireSupportedPickedFileSize(tempFile.length(), originalName)
+                    val transcodedBytes = tempFile.length()
+                    if (totalBatchBytes - accountedBatchBytes + transcodedBytes > MAX_PICKED_BATCH_BYTES) {
+                        throw IllegalArgumentException("整批选择文件超过 500MB 限制")
+                    }
+                    totalBatchBytes = totalBatchBytes - accountedBatchBytes + transcodedBytes
+                    accountedBatchBytes = transcodedBytes
                 }
 
-                val finalTempFile = java.io.File(uploadsDir, "$hash$fileExtension")
+                // Rust moves the source during registration, so every selected item needs
+                // its own path even when multiple items have identical content.
+                val finalTempFile = java.io.File(uploadsDir, "${nativeId}_$hash$fileExtension")
+                if (finalTempFile.exists() && !finalTempFile.delete()) {
+                    throw java.io.IOException("Could not replace stale picker temp file")
+                }
 
                 if (finalTempFile.exists()) {
                     tempFile.delete() // 缓存去重，复用已有文件
                 } else {
-                    tempFile.renameTo(finalTempFile)
+                    commitPickedTempFile(tempFile, finalTempFile)
                 }
 
-                val finalSize = if (size > 0) size else finalTempFile.length()
+                temporaryFiles.remove(tempFile)
+                temporaryFiles.add(finalTempFile)
+                val finalSize = finalTempFile.length()
 
                 // 4. 图片资源触发 Native 硬件加速缩略图硬解
                 var thumbnailPath: String? = null
@@ -1764,6 +1957,7 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
 
                 // 5. 组装结果物理路径并回传给 Rust 桥接
                 val resultObject = JSObject()
+                resultObject.put("nativeId", nativeId)
                 resultObject.put("path", finalTempFile.absolutePath)
                 resultObject.put("name", originalName)
                 resultObject.put("mime", mimeType)
@@ -1776,32 +1970,34 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
                 Log.i(TAG, "[onPickFileResult] File copy & process complete: path=${finalTempFile.absolutePath}, hash=$hash")
 
                 // 双轨通信：主动推送最终结果给前端，穿透 JNI 断裂层
-                val pickedDetail = JSObject().apply {
-                    put("path", finalTempFile.absolutePath)
-                    put("name", originalName)
-                    put("mime", mimeType)
-                    put("size", finalSize)
-                    put("hash", hash)
-                    if (thumbnailPath != null) {
-                        put("thumbnailPath", thumbnailPath)
-                    } else {
-                        put("thumbnailPath", org.json.JSONObject.NULL)
+                files.put(resultObject)
+                temporaryFiles.clear()
+                } catch (e: Throwable) {
+                    totalBatchBytes = (totalBatchBytes - accountedBatchBytes).coerceAtLeast(0L)
+                    Log.e(TAG, "[onPickFileResult] File pick handling failed for $uri", e)
+                    temporaryFiles.forEach { file ->
+                        try {
+                            file.delete()
+                        } catch (_: Exception) {}
                     }
+                    errors.put(JSObject().apply {
+                        put("nativeId", nativeId)
+                        put("message", e.message ?: "Unknown file processing error")
+                    })
                 }
-                val safePickedDetail = escapeJsonForJsString(pickedDetail.toString())
-                val pickedScript = "window.dispatchEvent(new CustomEvent('vcp-mobile-file-picked', { detail: JSON.parse(\"$safePickedDetail\") }))"
-                activity.runOnUiThread {
-                    webViewRef?.evaluateJavascript(pickedScript, null)
-                }
-
-                invoke.resolve(resultObject)
-            } catch (e: Throwable) {
-                Log.e(TAG, "[onPickFileResult] File pick handling failed", e)
-                try {
-                    currentTempFile?.delete()
-                } catch (_: Exception) {}
-                invoke.reject("Handling picked file failed: ${e.message}")
             }
+
+            val batch = JSObject().apply {
+                put("requestId", requestId)
+                put("files", files)
+                put("errors", errors)
+            }
+            val safeBatch = escapeJsonForJsString(batch.toString())
+            val batchScript = "window.dispatchEvent(new CustomEvent('vcp-mobile-files-picked', { detail: JSON.parse(\"$safeBatch\") }))"
+            activity.runOnUiThread {
+                webViewRef?.evaluateJavascript(batchScript, null)
+            }
+            invoke.resolve(batch)
         }
     }
 
@@ -1886,7 +2082,7 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
         val args = invoke.parseArgs(ProcessSharedFileArgs::class.java)
         val cachePath = args.cachePath
         val rawMimeType = args.mimeType
-        val originalName = args.fileName
+        val originalName = sanitizePickedDisplayName(args.fileName)
 
         if (cachePath.isEmpty()) {
             invoke.reject("cachePath is empty")
@@ -1895,15 +2091,23 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
 
         fileIoExecutor.execute {
             var currentTempFile: java.io.File? = null
+            var sharedSourceFile: java.io.File? = null
             try {
                 val context = activity
-                val sourceFile = java.io.File(cachePath)
-                if (!sourceFile.exists()) {
+                val sharedRoot = java.io.File(context.cacheDir, "shared").canonicalFile
+                val sourceFile = java.io.File(cachePath).canonicalFile
+                if (!sourceFile.isFile) {
                     invoke.reject("Shared file not found at cache path: $cachePath")
                     return@execute
                 }
+                if (!sourceFile.toPath().startsWith(sharedRoot.toPath())) {
+                    invoke.reject("Shared file path is outside the app share cache")
+                    return@execute
+                }
+                sharedSourceFile = sourceFile
 
                 val size = sourceFile.length()
+                requireSupportedPickedFileSize(size, originalName)
                 var mimeType = rawMimeType
                 if (mimeType.isNullOrBlank()) {
                     val ext = sourceFile.extension.lowercase()
@@ -1925,7 +2129,8 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
 
                 // 计算 SHA-256 哈希 (复用现有 pickFile 的流式拷贝+哈希模式)
                 val uploadsDir = java.io.File(context.cacheDir, "uploads").apply { mkdirs() }
-                val tempFile = java.io.File(uploadsDir, "shared_${System.currentTimeMillis()}_temp")
+                val nativeId = java.util.UUID.randomUUID().toString()
+                val tempFile = java.io.File(uploadsDir, "shared_${nativeId}_temp")
                 currentTempFile = tempFile
                 val digest = java.security.MessageDigest.getInstance("SHA-256")
 
@@ -1948,12 +2153,13 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
                 val fileExtension = java.io.File(originalName).extension.let {
                     if (it.isEmpty()) "" else ".$it"
                 }
-                val finalTempFile = java.io.File(uploadsDir, "$hash$fileExtension")
-
-                if (finalTempFile.exists()) {
-                    tempFile.delete()
-                } else {
-                    tempFile.renameTo(finalTempFile)
+                // Keep one movable source path per shared item. Multiple selected
+                // files may have identical bytes and therefore the same CAS hash.
+                val finalTempFile = java.io.File(uploadsDir, "shared_${nativeId}_${hash}$fileExtension")
+                commitPickedTempFile(tempFile, finalTempFile)
+                currentTempFile = finalTempFile
+                if (!sourceFile.delete()) {
+                    Log.w(TAG, "[processSharedFile] Failed to remove consumed share cache: ${sourceFile.absolutePath}")
                 }
 
                 // 缩略图生成（仅图片）
@@ -1999,6 +2205,9 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
                 Log.e(TAG, "[processSharedFile] Failed", e)
                 try {
                     currentTempFile?.delete()
+                } catch (_: Exception) {}
+                try {
+                    sharedSourceFile?.delete()
                 } catch (_: Exception) {}
                 invoke.reject("Processing shared file failed: ${e.message}")
             }
@@ -2165,7 +2374,7 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
                 }
 
                 // 2. 读取图片二进制流
-                val bytes = file.readBytes()
+                val bytes = file.inputStream().use { readBytesLimited(it) }
 
                 // 3. 安全魔数嗅探：强制检测图片格式，坚决拒收假冒图片绕过的攻击
                 val mimeType = sniffImageMime(bytes, file.name, true)
@@ -2248,6 +2457,9 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
             if (status !in 200..299) {
                 throw IllegalStateException("HTTP $status")
             }
+            if (connection.contentLengthLong > MAX_GALLERY_IMAGE_BYTES) {
+                throw IllegalArgumentException("图片过大，超过 50MB")
+            }
             val contentType = connection.contentType?.substringBefore(";")?.lowercase(Locale.US)
             val bytes = connection.inputStream.use { readBytesLimited(it) }
             return LoadedImage(bytes, sniffImageMime(bytes, contentType ?: mimeFromSource(sourceUrl), isLocal = false))
@@ -2263,15 +2475,21 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
         val header = dataUrl.substring(5, commaIndex)
         val mime = header.substringBefore(";").ifBlank { "application/octet-stream" }.lowercase(Locale.US)
         val payload = dataUrl.substring(commaIndex + 1)
+        if (payload.length > MAX_DATA_URL_CHARS) {
+            throw IllegalArgumentException("图片过大，超过 50MB")
+        }
         val bytes = if (header.contains(";base64", ignoreCase = true)) {
             Base64.decode(payload, Base64.DEFAULT)
         } else {
             URLDecoder.decode(payload, "UTF-8").toByteArray(Charsets.UTF_8)
         }
+        if (bytes.size > MAX_GALLERY_IMAGE_BYTES) {
+            throw IllegalArgumentException("图片过大，超过 50MB")
+        }
         return LoadedImage(bytes, sniffImageMime(bytes, mime, isLocal = false))
     }
 
-    private fun readBytesLimited(input: InputStream, maxBytes: Int = 50 * 1024 * 1024): ByteArray {
+    private fun readBytesLimited(input: InputStream, maxBytes: Int = MAX_GALLERY_IMAGE_BYTES): ByteArray {
         val output = ByteArrayOutputStream()
         val buffer = ByteArray(64 * 1024)
         var total = 0
@@ -2641,6 +2859,7 @@ class OpenFileArgs {
 @InvokeArg
 class PickFileArgs {
     var mode: String = "file"
+    var requestId: String = ""
 }
 
 @InvokeArg

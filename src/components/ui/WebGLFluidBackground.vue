@@ -350,8 +350,8 @@ const trackInteraction = (e: Event) => {
 
   const rect = canvas.getBoundingClientRect();
   if (rect.width <= 0 || rect.height <= 0) return;
-  let clientX = 0;
-  let clientY = 0;
+  let clientX: number;
+  let clientY: number;
 
   if (window.TouchEvent && e instanceof TouchEvent) {
     if (e.touches.length === 0) return;

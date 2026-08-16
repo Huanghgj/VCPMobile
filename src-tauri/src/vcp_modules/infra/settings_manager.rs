@@ -266,12 +266,16 @@ async fn internal_write_settings<R: Runtime>(
     if should_reconcile_dist {
         let concrete_app = app_handle.state::<tauri::AppHandle>().inner().clone();
         let enabled = settings.distributed_enabled;
-        crate::vcp_modules::infra::lifecycle_manager::reconcile_distributed_node(
-            &concrete_app,
-            enabled,
-            force_reconnect_dist,
-        )
-        .await;
+        if let Err(error) =
+            crate::vcp_modules::infra::lifecycle_manager::reconcile_distributed_node(
+                &concrete_app,
+                enabled,
+                force_reconnect_dist,
+            )
+            .await
+        {
+            log::error!("[Settings] Distributed reconciliation after save failed: {error}");
+        }
     }
 
     Ok(true)

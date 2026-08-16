@@ -118,7 +118,7 @@ impl Phase1Metadata {
 
     pub async fn build_avatar_manifest(pool: &SqlitePool) -> Result<SyncManifest, String> {
         let rows = sqlx::query(
-            "SELECT owner_id, owner_type, avatar_hash, updated_at 
+            "SELECT owner_id, owner_type, avatar_hash, updated_at, deleted_at
              FROM avatars",
         )
         .fetch_all(pool)
@@ -135,7 +135,7 @@ impl Phase1Metadata {
                 config_hash: None,
                 content_hash: None,
                 ts: r.get("updated_at"),
-                deleted_at: None,
+                deleted_at: r.get("deleted_at"),
                 owner_type: None,
             });
         }

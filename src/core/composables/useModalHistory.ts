@@ -80,28 +80,30 @@ const handlePopState = (event: PopStateEvent) => {
 };
 
 let popstateHandler: ((e: PopStateEvent) => void) | null = null;
-let listenerRegistered = false;
 
-// Initialize the popstate listener only once
-if (typeof window !== 'undefined' && !listenerRegistered) {
-  listenerRegistered = true;
+const ensureModalHistoryListener = () => {
+  if (typeof window === 'undefined' || popstateHandler) return;
+
   popstateHandler = handlePopState;
   window.addEventListener('popstate', popstateHandler);
 
   // Initial check: if we are at root, push the dummy state
   // Note: App.vue will call this again after router is ready to be 100% sure
   initRootHistory();
-}
+};
+
+// Initialize the popstate listener once when the module is loaded.
+ensureModalHistoryListener();
 
 export function cleanupModalHistory() {
   if (popstateHandler && typeof window !== 'undefined') {
     window.removeEventListener('popstate', popstateHandler);
     popstateHandler = null;
-    listenerRegistered = false;
   }
 }
 
 export function useModalHistory() {
+  ensureModalHistoryListener();
   /**
    * Registers a modal as "open" and pushes a state to the history stack.
    * @param id Unique identifier for the modal
@@ -140,6 +142,21 @@ export function useModalHistory() {
     modalStack.value.splice(index, 1);
   };
 
+  /**
+   * Replaces an open modal without adding another browser-history entry.
+   * This is used when a context-menu action immediately opens a confirmation.
+   */
+  const replaceModal = (fromId: string, toId: string, closeHandler: () => void) => {
+    const index = modalStack.value.findIndex(m => m.id === fromId);
+    if (index === -1) {
+      registerModal(toId, closeHandler);
+      return;
+    }
+
+    modalStack.value[index] = { id: toId, close: closeHandler };
+    window.history.replaceState({ vcpRoot: true, vcpModalId: toId }, '');
+  };
+
   const closeTopModal = (): boolean => {
     if (modalStack.value.length > 0) {
       const topIdx = modalStack.value.length - 1;
@@ -164,6 +181,7 @@ export function useModalHistory() {
   return {
     registerModal,
     unregisterModal,
+    replaceModal,
     modalStackLength: () => modalStack.value.length,
     initRootHistory,
     closeTopModal

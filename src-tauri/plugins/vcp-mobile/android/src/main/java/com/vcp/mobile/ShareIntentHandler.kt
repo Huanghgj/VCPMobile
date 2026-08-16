@@ -9,15 +9,27 @@ import app.tauri.plugin.JSArray
 import app.tauri.plugin.JSObject
 import java.io.File
 import androidx.core.content.IntentCompat
+import java.util.concurrent.atomic.AtomicLong
 
 class ShareIntentHandler(private val plugin: VcpMobilePlugin) {
 
     companion object {
         private const val TAG = "ShareIntentHandler"
+        private const val MAX_SHARED_FILE_BYTES = 100L * 1024L * 1024L
+        private const val MAX_SHARED_BATCH_BYTES = 500L * 1024L * 1024L
+        private const val MAX_SHARED_FILES = 20
     }
 
     // WebView 未就绪时缓存待注入数据
     private var pendingShareData: JSObject? = null
+    private var pendingShareCacheFiles: List<File> = emptyList()
+    private val shareGeneration = AtomicLong(0)
+    @Volatile private var frontendReady = false
+
+    private data class ExtractedShare(
+        val payload: JSObject,
+        val cacheFiles: List<File>,
+    )
 
     /**
      * 入口：由 VcpMobilePlugin.onNewIntent 调用
@@ -33,24 +45,43 @@ class ShareIntentHandler(private val plugin: VcpMobilePlugin) {
 
         Log.i(TAG, "[handleShareIntent] Processing share intent: type=${intent.type}, action=$action")
 
+        val generation = shareGeneration.incrementAndGet()
         val context = plugin.pluginActivity
-        val shareData = extractSharedContent(intent, context)
+        val accepted = plugin.executeFileIo {
+            val extracted = extractSharedContent(intent, context)
+            context.runOnUiThread {
+                if (generation != shareGeneration.get()) {
+                    extracted.cacheFiles.forEach { file ->
+                        try {
+                            file.delete()
+                        } catch (_: Exception) {}
+                    }
+                    return@runOnUiThread
+                }
 
-        // 尝试立即注入 WebView
-        val webView = plugin.webViewRef
-        pendingShareData = shareData
-        if (webView != null) {
-            injectShareData(webView)
-        } else {
-            Log.w(TAG, "[handleShareIntent] WebView not ready, caching share data")
+                pendingShareCacheFiles.forEach(::deleteQuietly)
+                pendingShareData = extracted.payload
+                pendingShareCacheFiles = extracted.cacheFiles
+                consumeShareIntent(intent)
+                val webView = plugin.webViewRef
+                if (webView != null && frontendReady) {
+                    injectShareData(webView)
+                } else {
+                    Log.i(TAG, "[handleShareIntent] Frontend not ready, caching share data")
+                }
+            }
+        }
+        if (!accepted) {
+            Log.w(TAG, "[handleShareIntent] Ignoring share intent after plugin shutdown")
         }
     }
 
     /**
      * 内部：提取文本和文件 URI
      */
-    private fun extractSharedContent(intent: Intent, context: Context): JSObject {
+    private fun extractSharedContent(intent: Intent, context: Context): ExtractedShare {
         val root = JSObject()
+        val cacheFiles = mutableListOf<File>()
 
         // ACTION_PROCESS_TEXT: 浏览器/阅读器选中文字菜单
         val processText = if (intent.action == Intent.ACTION_PROCESS_TEXT) {
@@ -79,49 +110,80 @@ class ShareIntentHandler(private val plugin: VcpMobilePlugin) {
 
         root.put("text", combinedText.ifBlank { "" })
 
-        // 提取文件 URIs
+        // 提取文件 URIs。部分提供方只填 ClipData，另一些只填 EXTRA_STREAM。
         val files = JSArray()
-
-        if (intent.action == Intent.ACTION_SEND_MULTIPLE) {
-            val uris = IntentCompat.getParcelableArrayListExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
-            if (uris != null) {
-                for (uri in uris) {
-                    val fileInfo = copyStreamToCache(uri, context)
-                    if (fileInfo != null) {
-                        files.put(fileInfo)
-                    }
+        val errors = JSArray()
+        val uris = collectSharedUris(intent)
+        if (uris.size > MAX_SHARED_FILES) {
+            errors.put("一次最多分享 $MAX_SHARED_FILES 个文件，其余文件已跳过")
+        }
+        var totalBytes = 0L
+        for (uri in uris.take(MAX_SHARED_FILES)) {
+            try {
+                val remainingBytes = MAX_SHARED_BATCH_BYTES - totalBytes
+                if (remainingBytes <= 0L) {
+                    errors.put("整批文件超过 500MB 限制，其余文件已跳过")
+                    break
                 }
-            }
-        } else {
-            val uri = IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
-            if (uri != null) {
-                val fileInfo = copyStreamToCache(uri, context)
-                if (fileInfo != null) {
-                    files.put(fileInfo)
-                }
+                val copied = copyStreamToCache(uri, context, remainingBytes)
+                files.put(copied.first)
+                cacheFiles.add(copied.second)
+                totalBytes += copied.second.length()
+            } catch (error: Exception) {
+                Log.e(TAG, "[extractSharedContent] Failed to copy shared URI: $uri", error)
+                errors.put(error.message ?: "无法读取分享文件")
             }
         }
 
         root.put("files", files)
+        root.put("errors", errors)
         val isDebug = (context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
         if (isDebug) {
             Log.i(TAG, "[extractSharedContent] text=${combinedText.take(120)}, fileCount=${files.length()}")
         } else {
             Log.i(TAG, "[extractSharedContent] textLength=${combinedText.length}, fileCount=${files.length()}")
         }
-        return root
+        return ExtractedShare(root, cacheFiles)
     }
 
     /**
      * 内部：将 content:// URI 复制到 app cache 目录
      */
-    private fun copyStreamToCache(uri: Uri, context: Context): JSObject? {
+    private fun collectSharedUris(intent: Intent): List<Uri> {
+        val uris = mutableListOf<Uri>()
+        if (intent.action == Intent.ACTION_SEND_MULTIPLE) {
+            IntentCompat.getParcelableArrayListExtra(
+                intent,
+                Intent.EXTRA_STREAM,
+                Uri::class.java,
+            )?.let(uris::addAll)
+        } else {
+            IntentCompat.getParcelableExtra(
+                intent,
+                Intent.EXTRA_STREAM,
+                Uri::class.java,
+            )?.let(uris::add)
+        }
+        intent.clipData?.let { clipData ->
+            for (index in 0 until clipData.itemCount) {
+                clipData.getItemAt(index).uri?.let(uris::add)
+            }
+        }
+        return uris.distinct()
+    }
+
+    private fun copyStreamToCache(
+        uri: Uri,
+        context: Context,
+        remainingBatchBytes: Long,
+    ): Pair<JSObject, File> {
+        var targetFile: File? = null
         try {
             val contentResolver = context.contentResolver
 
             // 获取文件名和 MIME
             var fileName = "shared_file"
-            var mimeType = contentResolver.getType(uri) ?: "application/octet-stream"
+            val mimeType = contentResolver.getType(uri) ?: "application/octet-stream"
 
             contentResolver.query(uri, null, null, null, null)?.use { cursor ->
                 val nameIndex = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
@@ -131,31 +193,88 @@ class ShareIntentHandler(private val plugin: VcpMobilePlugin) {
                 }
             }
 
-            // 写入 cacheDir/shared_{timestamp}_{filename}
+            fileName = sanitizeFileName(fileName)
             val sharedDir = File(context.cacheDir, "shared").apply { mkdirs() }
-            val timestamp = System.currentTimeMillis()
-            val targetFile = File(sharedDir, "shared_${timestamp}_$fileName")
+            val outputFile = File(sharedDir, "shared_${java.util.UUID.randomUUID()}_$fileName")
+            targetFile = outputFile
 
             contentResolver.openInputStream(uri)?.use { input ->
-                targetFile.outputStream().use { output ->
-                    input.copyTo(output, bufferSize = 65536)
+                outputFile.outputStream().use { output ->
+                    val buffer = ByteArray(65536)
+                    var total = 0L
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read < 0) break
+                        total += read
+                        if (total > MAX_SHARED_FILE_BYTES) {
+                            throw IllegalArgumentException("$fileName exceeds the 100MB attachment limit")
+                        }
+                        if (total > remainingBatchBytes) {
+                            throw IllegalArgumentException("整批分享文件超过 500MB 限制")
+                        }
+                        output.write(buffer, 0, read)
+                    }
                 }
             } ?: run {
-                Log.w(TAG, "[copyStreamToCache] Failed to open input stream for: $uri")
-                return null
+                throw IllegalArgumentException("无法读取分享文件: $fileName")
             }
 
             val fileInfo = JSObject()
-            fileInfo.put("cachePath", targetFile.absolutePath)
+            fileInfo.put("cachePath", outputFile.absolutePath)
             fileInfo.put("mimeType", mimeType)
             fileInfo.put("fileName", fileName)
-            fileInfo.put("size", targetFile.length())
+            fileInfo.put("size", outputFile.length())
 
-            Log.i(TAG, "[copyStreamToCache] Copied: $fileName -> ${targetFile.absolutePath} (size=${targetFile.length()})")
-            return fileInfo
+            Log.i(TAG, "[copyStreamToCache] Copied: $fileName -> ${outputFile.absolutePath} (size=${outputFile.length()})")
+            return fileInfo to outputFile
         } catch (e: Exception) {
+            try {
+                targetFile?.delete()
+            } catch (_: Exception) {}
             Log.e(TAG, "[copyStreamToCache] Failed to copy stream", e)
-            return null
+            throw e
+        }
+    }
+
+    fun onWebViewLoaded() {
+        frontendReady = false
+    }
+
+    fun markFrontendReady(webView: WebView?) {
+        frontendReady = true
+        injectShareData(webView)
+    }
+
+    fun onWebViewDestroyed() {
+        frontendReady = false
+    }
+
+    private fun consumeShareIntent(intent: Intent) {
+        intent.action = null
+        intent.type = null
+        intent.clipData = null
+        intent.removeExtra(Intent.EXTRA_TEXT)
+        intent.removeExtra(Intent.EXTRA_SUBJECT)
+        intent.removeExtra(Intent.EXTRA_STREAM)
+        intent.removeExtra(Intent.EXTRA_PROCESS_TEXT)
+    }
+
+    private fun sanitizeFileName(rawName: String): String {
+        val baseName = File(rawName.replace('\\', '/')).name
+        return baseName
+            .replace(Regex("[\\u0000-\\u001f\\u007f/\\\\]"), "_")
+            .trim()
+            .ifEmpty { "shared_file" }
+            .take(180)
+    }
+
+    private fun deleteQuietly(file: File) {
+        try {
+            if (file.exists() && !file.delete()) {
+                Log.w(TAG, "[deleteQuietly] Failed to remove stale share cache: ${file.absolutePath}")
+            }
+        } catch (error: Exception) {
+            Log.w(TAG, "[deleteQuietly] Failed to remove stale share cache: ${file.absolutePath}", error)
         }
     }
 
@@ -180,6 +299,8 @@ class ShareIntentHandler(private val plugin: VcpMobilePlugin) {
 
             Log.i(TAG, "[injectShareData] Share data injected into WebView successfully")
             pendingShareData = null
+            // The frontend owns these cache paths after the event is dispatched.
+            pendingShareCacheFiles = emptyList()
         } catch (e: Exception) {
             Log.e(TAG, "[injectShareData] Failed to inject share data", e)
         }

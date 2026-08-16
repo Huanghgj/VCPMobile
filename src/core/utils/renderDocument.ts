@@ -7,7 +7,7 @@ import {
   sanitizeMarkdownHtml,
 } from "./safeMarkdown";
 
-export const RENDER_DOCUMENT_VERSION = 2 as const;
+export const RENDER_DOCUMENT_VERSION = 3 as const;
 
 export interface RenderFragmentV2 {
   version: typeof RENDER_DOCUMENT_VERSION;
@@ -21,6 +21,10 @@ export interface RenderDocumentV2 {
   version: typeof RENDER_DOCUMENT_VERSION;
   blocks: ContentBlock[];
   tail: ContentBlock | null;
+}
+
+export interface CompileRenderFragmentOptions {
+  final?: boolean;
 }
 
 export function createRenderDocument(
@@ -55,10 +59,20 @@ export function blockContainsRichHtml(block: ContentBlock): boolean {
   if (block.type !== "markdown" && block.type !== "diary") return false;
   const content = block.content || collectRawHtml(block.nodes);
   return (
-    /id\s*=\s*["']vcp-root["']/i.test(content) ||
+    /id\s*=\s*(?:["']vcp-root["']|vcp-root(?=\s|\/?>))/i.test(content) ||
     /data-vcp-[\w-]+\s*=/i.test(content) ||
     /style\s*=/i.test(content) ||
     /<(?:div|section|article|main|table|img|svg|canvas)\b/i.test(content)
+  );
+}
+
+export function blockUsesFramelessLayout(block: ContentBlock): boolean {
+  if (block.type === "html-preview") return true;
+  if (block.type !== "markdown" && block.type !== "diary") return false;
+  const content = block.content || collectRawHtml(block.nodes);
+  return (
+    /id\s*=\s*(?:["']vcp-root["']|vcp-root(?=\s|\/?>))/i.test(content) ||
+    /data-vcp-generated-root(?:\s|=|>)/i.test(content)
   );
 }
 
@@ -149,6 +163,57 @@ function isHiddenGeneratedRoot(root: HTMLElement): boolean {
   );
 }
 
+function parseCssColorChannels(value: string): [number, number, number] | null {
+  const normalized = value.trim().toLowerCase();
+  const hex = normalized.match(/^#([0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i);
+  if (hex) {
+    const body = hex[1];
+    const channels =
+      body.length <= 4
+        ? [body[0], body[1], body[2]].map((channel) =>
+            parseInt(channel + channel, 16),
+          )
+        : [body.slice(0, 2), body.slice(2, 4), body.slice(4, 6)].map(
+            (channel) => parseInt(channel, 16),
+          );
+    return channels as [number, number, number];
+  }
+
+  const rgb = normalized.match(
+    /^rgba?\(\s*(\d+(?:\.\d+)?)\s*[, ]\s*(\d+(?:\.\d+)?)\s*[, ]\s*(\d+(?:\.\d+)?)/,
+  );
+  if (!rgb) return null;
+  return [Number(rgb[1]), Number(rgb[2]), Number(rgb[3])].map((channel) =>
+    Math.max(0, Math.min(255, channel)),
+  ) as [number, number, number];
+}
+
+function usesLightForeground(value: string): boolean {
+  let channels = parseCssColorChannels(value);
+  if (!channels && value.trim()) {
+    const probe = document.createElement("span");
+    probe.style.color = value;
+    if (probe.style.color && probe.style.color !== value) {
+      channels = parseCssColorChannels(probe.style.color);
+    }
+  }
+  if (!channels) return false;
+  const [red, green, blue] = channels;
+  return (red * 0.2126 + green * 0.7152 + blue * 0.0722) / 255 >= 0.62;
+}
+
+function markFallbackSurface(root: HTMLElement): void {
+  const hasInlineBackground = Boolean(
+    root.style.background ||
+    root.style.backgroundColor ||
+    root.style.backgroundImage,
+  );
+  if (hasInlineBackground) return;
+  root.dataset.vcpFallbackSurface = usesLightForeground(root.style.color)
+    ? "dark"
+    : "light";
+}
+
 /**
  * `vcp-root` belongs to the generated document, not to the application DOM.
  * Normalize every occurrence so duplicate IDs and an early hidden placeholder
@@ -178,6 +243,7 @@ function normalizeGeneratedRichRoots(fragment: DocumentFragment): void {
     root.removeAttribute("id");
     root.dataset.vcpGeneratedRoot = "";
     root.dataset.vcpRenderVersion = String(RENDER_DOCUMENT_VERSION);
+    markFallbackSurface(root);
   }
 }
 
@@ -261,17 +327,29 @@ function restoreHexStopBoundary(match: string, body: string): string {
   // missing boundary, so leave that ambiguous case untouched.
   if (VALID_HEX_LENGTHS.includes(body.length as 3 | 4 | 6 | 8)) return match;
 
-  for (const colorLength of VALID_HEX_LENGTHS) {
+  const candidates = VALID_HEX_LENGTHS.flatMap((colorLength) => {
     const stop = body.slice(colorLength);
-    if (
-      colorLength < body.length &&
+    return colorLength < body.length &&
       /^\d{1,3}$/.test(stop) &&
       Number(stop) <= 100
-    ) {
-      return `#${body.slice(0, colorLength)} ${stop}%`;
-    }
-  }
-  return match;
+      ? [{ colorLength, stop }]
+      : [];
+  });
+  if (candidates.length === 0) return match;
+
+  // Prefer the longest valid stop. This resolves generated values such as
+  // `#1a1525100%` to the common six-digit color plus `100%`, not an eight-digit
+  // color plus `0%`.
+  candidates.sort((left, right) => {
+    const stopLengthDelta = right.stop.length - left.stop.length;
+    if (stopLengthDelta !== 0) return stopLengthDelta;
+    return (
+      VALID_HEX_LENGTHS.indexOf(left.colorLength) -
+      VALID_HEX_LENGTHS.indexOf(right.colorLength)
+    );
+  });
+  const best = candidates[0];
+  return `#${body.slice(0, best.colorLength)} ${best.stop}%`;
 }
 
 function restoreCssTokenBoundaries(value: string): string {
@@ -342,6 +420,156 @@ function repairMalformedGeneratedInlineStyles(
   });
 }
 
+const HTML_TAG_RE = /<\/?([a-z][\w-]*)\b[^>]*>/gi;
+const PARAGRAPH_TAG_RE = /<(\/?)p(?=[\s>])/gi;
+const HTML_COMMENT_RE = /<!--[\s\S]*?(?:-->|$)/g;
+const HTML_RAW_TEXT_RE =
+  /<(style|script|textarea)\b[^>]*>[\s\S]*?(?:<\/\1\s*>|$)/gi;
+const PARAGRAPH_BLOCK_TAGS = new Set([
+  "address",
+  "article",
+  "aside",
+  "blockquote",
+  "details",
+  "dialog",
+  "div",
+  "dl",
+  "fieldset",
+  "figcaption",
+  "figure",
+  "footer",
+  "form",
+  "h1",
+  "h2",
+  "h3",
+  "h4",
+  "h5",
+  "h6",
+  "header",
+  "hgroup",
+  "hr",
+  "main",
+  "menu",
+  "nav",
+  "ol",
+  "p",
+  "pre",
+  "section",
+  "summary",
+  "table",
+  "ul",
+]);
+
+interface SourceRange {
+  start: number;
+  end: number;
+}
+
+function collectProtectedHtmlRanges(sourceHtml: string): SourceRange[] {
+  const ranges: SourceRange[] = [];
+  for (const regex of [HTML_COMMENT_RE, HTML_RAW_TEXT_RE]) {
+    regex.lastIndex = 0;
+    for (const match of sourceHtml.matchAll(regex)) {
+      const start = match.index;
+      ranges.push({ start, end: start + match[0].length });
+    }
+  }
+  return ranges.sort((left, right) => left.start - right.start);
+}
+
+function rangeContains(ranges: SourceRange[], offset: number): boolean {
+  return ranges.some((range) => offset >= range.start && offset < range.end);
+}
+
+function hasClosedMultiblockParagraph(
+  sourceHtml: string,
+  protectedRanges: SourceRange[],
+): boolean {
+  const paragraphStack: Array<{ hasBlockChild: boolean }> = [];
+  HTML_TAG_RE.lastIndex = 0;
+
+  for (const match of sourceHtml.matchAll(HTML_TAG_RE)) {
+    if (rangeContains(protectedRanges, match.index)) continue;
+    const token = match[0];
+    const tag = match[1].toLowerCase();
+    const closing = token.startsWith("</");
+    const selfClosing = token.endsWith("/>");
+
+    if (tag === "p") {
+      if (closing) {
+        const paragraph = paragraphStack.pop();
+        if (paragraph?.hasBlockChild) return true;
+      } else if (!selfClosing) {
+        if (paragraphStack.length > 0) {
+          paragraphStack[paragraphStack.length - 1].hasBlockChild = true;
+        }
+        paragraphStack.push({ hasBlockChild: false });
+      }
+      continue;
+    }
+
+    if (
+      !closing &&
+      PARAGRAPH_BLOCK_TAGS.has(tag) &&
+      paragraphStack.length > 0
+    ) {
+      paragraphStack[paragraphStack.length - 1].hasBlockChild = true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Recover legacy AST output that serialized a styled paragraph around block
+ * children. Custom elements preserve the intended nesting long enough for the
+ * browser to identify which paragraph is acting as a flow container.
+ */
+function promoteLegacyMultiblockParagraphs(sourceHtml: string): string {
+  const protectedRanges = collectProtectedHtmlRanges(sourceHtml);
+  if (!hasClosedMultiblockParagraph(sourceHtml, protectedRanges)) {
+    return sourceHtml;
+  }
+
+  const probe = document.createElement("template");
+  probe.innerHTML = sourceHtml.replace(
+    PARAGRAPH_TAG_RE,
+    (match, closing: string, offset: number) =>
+      rangeContains(protectedRanges, offset)
+        ? match
+        : `<${closing}vcp-paragraph-sentinel`,
+  );
+  const paragraphs = Array.from(
+    probe.content.querySelectorAll<HTMLElement>("vcp-paragraph-sentinel"),
+  );
+  const promoted = new Set(
+    paragraphs.filter((paragraph) =>
+      paragraph.querySelector(
+        `vcp-paragraph-sentinel,${Array.from(PARAGRAPH_BLOCK_TAGS)
+          .filter((tag) => tag !== "p")
+          .join(",")}`,
+      ),
+    ),
+  );
+  if (promoted.size === 0) return sourceHtml;
+
+  for (const paragraph of paragraphs.reverse()) {
+    const replacement = document.createElement(
+      promoted.has(paragraph) ? "div" : "p",
+    );
+    for (const attribute of Array.from(paragraph.attributes)) {
+      replacement.setAttribute(attribute.name, attribute.value);
+    }
+    if (promoted.has(paragraph)) {
+      replacement.dataset.vcpParagraphPromoted = "";
+    }
+    replacement.append(...Array.from(paragraph.childNodes));
+    paragraph.replaceWith(replacement);
+  }
+
+  return probe.innerHTML;
+}
+
 function assignStableRenderKeys(
   parent: DocumentFragment | Element,
   messageId: string,
@@ -353,7 +581,7 @@ function assignStableRenderKeys(
     if (!child.id && !child.hasAttribute("data-vcp-key")) {
       child.setAttribute(
         "data-vcp-render-key",
-        `v2-${hashString(messageId)}-${childPath.join("-")}`,
+        `v${RENDER_DOCUMENT_VERSION}-${hashString(messageId)}-${childPath.join("-")}`,
       );
     }
     assignStableRenderKeys(child, messageId, childPath);
@@ -364,12 +592,15 @@ function assignStableRenderKeys(
 function html5NormalizeAndSanitize(
   sourceHtml: string,
   messageId: string,
+  repairLegacyParagraphs: boolean,
 ): {
   html: string;
   css: string;
 } {
   const template = document.createElement("template");
-  template.innerHTML = sourceHtml;
+  template.innerHTML = repairLegacyParagraphs
+    ? promoteLegacyMultiblockParagraphs(sourceHtml)
+    : sourceHtml;
   repairMalformedGeneratedInlineStyles(template.content);
   const css = extractStyles(template.content);
   normalizeGeneratedRichRoots(template.content);
@@ -400,11 +631,14 @@ function hashString(value: string): string {
 export function compileRenderFragment(
   block: ContentBlock,
   messageId: string,
+  options: CompileRenderFragmentOptions = {},
 ): RenderFragmentV2 {
+  const final = options.final !== false;
+  const renderMode = final ? "final" : "stream";
   try {
     const sourceHtml = renderBlockSource(block, messageId);
-    const normalized = html5NormalizeAndSanitize(sourceHtml, messageId);
-    const signature = `${RENDER_DOCUMENT_VERSION}:${String(block.hash || "")}:${hashString(sourceHtml)}:${hashString(normalized.css)}`;
+    const normalized = html5NormalizeAndSanitize(sourceHtml, messageId, final);
+    const signature = `${RENDER_DOCUMENT_VERSION}:${renderMode}:${String(block.hash || "")}:${hashString(sourceHtml)}:${hashString(normalized.css)}`;
     return {
       version: RENDER_DOCUMENT_VERSION,
       html: normalized.html,
@@ -420,7 +654,7 @@ export function compileRenderFragment(
       html: fallback,
       css: "",
       rich: false,
-      signature: `${RENDER_DOCUMENT_VERSION}:fallback:${hashString(fallback)}`,
+      signature: `${RENDER_DOCUMENT_VERSION}:${renderMode}:fallback:${hashString(fallback)}`,
     };
   }
 }

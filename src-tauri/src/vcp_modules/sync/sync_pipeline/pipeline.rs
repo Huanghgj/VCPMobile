@@ -72,15 +72,17 @@ impl SyncPipeline {
                 progress: PhaseProgress::new(),
             };
         }
-        let _ = self.command_tx.send(PipelineCommand::StartTopicMetadata);
-        Ok(())
+        self.command_tx
+            .send(PipelineCommand::StartTopicMetadata)
+            .map_err(|error| format!("Failed to start topic metadata phase: {error}"))
     }
 
     /// 进入 Phase 2.5: Topic 哈希比对
     pub async fn on_topic_metadata_pull_done(&self) -> Result<(), String> {
         // 哈希比对在 Phase2 逻辑内，不改变底层 PipelinePhase 枚举
-        let _ = self.command_tx.send(PipelineCommand::StartTopicValidation);
-        Ok(())
+        self.command_tx
+            .send(PipelineCommand::StartTopicValidation)
+            .map_err(|error| format!("Failed to start topic validation phase: {error}"))
     }
 
     /// 进入 Phase 3: 消息同步
@@ -91,8 +93,9 @@ impl SyncPipeline {
                 progress: PhaseProgress::new(),
             };
         }
-        let _ = self.command_tx.send(PipelineCommand::StartMessages);
-        Ok(())
+        self.command_tx
+            .send(PipelineCommand::StartMessages)
+            .map_err(|error| format!("Failed to start messages phase: {error}"))
     }
 
     /// 同步结束
@@ -101,7 +104,8 @@ impl SyncPipeline {
             let mut state = self.state.write().await;
             *state = PipelinePhase::Completed;
         }
-        let _ = self.command_tx.send(PipelineCommand::Finalize);
-        Ok(())
+        self.command_tx
+            .send(PipelineCommand::Finalize)
+            .map_err(|error| format!("Failed to finalize sync pipeline: {error}"))
     }
 }

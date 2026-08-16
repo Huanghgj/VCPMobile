@@ -57,20 +57,22 @@ const isListenerReady = computed(() => {
 const step2Ready = computed(() => isAutoStartReady.value && isPowerReady.value && isListenerReady.value);
 
 // Step 3 存储检测是否合格 (要求 >= 5.0 GB)
-const isStorageSpaceOk = computed(() => freeDiskSpaceGB.value >= 5.0);
+const isStorageSpaceOk = computed(() => isDiskCheckError.value || freeDiskSpaceGB.value >= 5.0);
 
 const check = async () => {
   try {
     const res = await invoke<PermissionStatus>('plugin:vcp-mobile|check_all_permissions');
     status.value = res;
 
-    // 检测通知栏监听服务
-    const listenerRes = await invoke<{ enabled: boolean }>('plugin:vcp-mobile|check_notification_listener_permission');
-    isNotificationListenerReady.value = listenerRes.enabled;
+    // 附加保活能力是独立检查项，任一 OEM 接口失败都不能阻断后续检查。
+    try {
+      const listenerRes = await invoke<{ enabled: boolean }>('plugin:vcp-mobile|check_notification_listener_permission');
+      isNotificationListenerReady.value = listenerRes.enabled;
+    } catch (e) {
+      console.error('[PermissionGate] Failed to check notification listener:', e);
+    }
 
-    // 如果已经授予存储权限，检测内部存储空间和自启动状态
-    await checkDiskSpace();
-    await checkAutoStart();
+    await Promise.all([checkDiskSpace(), checkAutoStart()]);
   } catch (e) {
     console.error('[PermissionGate] Failed to check permissions:', e);
   }
@@ -444,7 +446,10 @@ onUnmounted(() => {
                 </p>
 
                 <!-- Disk Space Status Bar -->
-                <div class="space-y-1" v-if="freeDiskSpaceGB > 0">
+                <div v-if="isDiskCheckError" class="text-xs text-amber-600 font-semibold leading-relaxed">
+                  无法读取系统可用存储空间。本项将按警告处理，不阻断进入应用。
+                </div>
+                <div class="space-y-1" v-else-if="freeDiskSpaceGB > 0">
                   <div class="flex justify-between text-xs font-semibold">
                     <span :class="isStorageSpaceOk ? 'text-green-600' : 'text-red-500'">
                       {{ isStorageSpaceOk ? '✅ 系统可用存储充足' : '⚠️ 可用存储空间不足 5.0 GB' }}
@@ -475,7 +480,7 @@ onUnmounted(() => {
                 class="w-full py-4 bg-gray-900 text-white text-[15px] font-bold rounded-2xl active:scale-95 transition-all shadow-lg shadow-gray-900/10 flex items-center justify-center gap-2"
               >
                 <span>激活并进入应用</span>
-                <div class="i-heroicons-rocket text-lg"></div>
+                <div class="i-heroicons-rocket-launch text-lg"></div>
               </button>
               <button v-else class="w-full py-4 bg-red-100 text-red-400 text-[15px] font-bold rounded-2xl cursor-not-allowed flex items-center justify-center gap-2" disabled>
                 <span>存储空间不足，已阻断进入</span>

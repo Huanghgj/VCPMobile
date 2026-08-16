@@ -4,6 +4,63 @@ use crate::vcp_modules::sync_types::SyncDataType;
 
 use tauri::{AppHandle, Manager, Runtime};
 
+const MAX_AVATAR_BYTES: usize = 10 * 1024 * 1024;
+
+async fn ensure_avatar_owner_active(
+    pool: &sqlx::SqlitePool,
+    owner_type: &str,
+    owner_id: &str,
+) -> Result<(), String> {
+    let active = match owner_type {
+        "agent" => sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM agents WHERE agent_id = ? AND deleted_at IS NULL)",
+        )
+        .bind(owner_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|error| error.to_string())?,
+        "group" => sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM groups WHERE group_id = ? AND deleted_at IS NULL)",
+        )
+        .bind(owner_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|error| error.to_string())?,
+        "user" => owner_id == "user_avatar",
+        _ => false,
+    };
+
+    if active {
+        Ok(())
+    } else {
+        Err(format!(
+            "Avatar owner {owner_type}:{owner_id} does not exist or was deleted"
+        ))
+    }
+}
+
+fn validate_avatar_payload(mime_type: &str, image_data: &[u8]) -> Result<(), String> {
+    if image_data.is_empty() {
+        return Err("Avatar image is empty".to_string());
+    }
+    if image_data.len() > MAX_AVATAR_BYTES {
+        return Err(format!(
+            "Avatar image exceeds the {} MiB limit",
+            MAX_AVATAR_BYTES / 1024 / 1024
+        ));
+    }
+    if !mime_type.starts_with("image/") || mime_type.len() > 100 {
+        return Err("Avatar MIME type must be an image".to_string());
+    }
+    Ok(())
+}
+
+fn valid_dominant_color(color: &str) -> bool {
+    color.len() == 7
+        && color.starts_with('#')
+        && color.as_bytes()[1..].iter().all(u8::is_ascii_hexdigit)
+}
+
 /// Tauri IPC Command: 保存头像二进制数据到数据库
 /// 前端裁剪后将 Blob/ArrayBuffer 传给 Rust
 #[tauri::command]
@@ -16,6 +73,8 @@ pub async fn save_avatar_data<R: Runtime>(
 ) -> Result<String, String> {
     let db_state = app_handle.state::<DbState>();
     let pool = &db_state.pool;
+    validate_avatar_payload(&mime_type, &image_data)?;
+    ensure_avatar_owner_active(pool, &owner_type, &owner_id).await?;
 
     // 1. 计算 SHA-256 哈希作为唯一标识
     let avatar_hash = crate::vcp_modules::infra::utils::calculate_sha256(&image_data);
@@ -35,7 +94,8 @@ pub async fn save_avatar_data<R: Runtime>(
             mime_type = excluded.mime_type,
             image_data = excluded.image_data,
             dominant_color = excluded.dominant_color,
-            updated_at = excluded.updated_at"
+            updated_at = excluded.updated_at,
+            deleted_at = NULL"
     )
     .bind(&owner_type)
     .bind(&owner_id)
@@ -89,7 +149,7 @@ pub async fn get_avatar<R: Runtime>(
     let pool = &db_state.pool;
 
     let row_res = sqlx::query(
-        "SELECT mime_type, image_data, dominant_color, updated_at FROM avatars WHERE owner_type = ? AND owner_id = ?"
+        "SELECT mime_type, image_data, dominant_color, updated_at FROM avatars WHERE owner_type = ? AND owner_id = ? AND deleted_at IS NULL"
     )
     .bind(&owner_type)
     .bind(&owner_id)
@@ -132,7 +192,7 @@ pub async fn batch_get_avatars<R: Runtime>(
     let rows = sqlx::query(
         "SELECT owner_type, owner_id, mime_type, image_data, dominant_color, updated_at
          FROM avatars
-         WHERE owner_type IN ('agent', 'group', 'user')",
+         WHERE owner_type IN ('agent', 'group', 'user') AND deleted_at IS NULL",
     )
     .fetch_all(pool)
     .await
@@ -164,7 +224,11 @@ pub async fn store_dominant_color(
 ) -> Result<(), String> {
     let pool = &db_state.pool;
 
-    sqlx::query("UPDATE avatars SET dominant_color = ? WHERE owner_type = ? AND owner_id = ?")
+    if !valid_dominant_color(&color) {
+        return Err("dominant_color must use #RRGGBB format".to_string());
+    }
+
+    sqlx::query("UPDATE avatars SET dominant_color = ? WHERE owner_type = ? AND owner_id = ? AND deleted_at IS NULL")
         .bind(&color)
         .bind(&owner_type)
         .bind(&owner_id)
@@ -187,4 +251,57 @@ pub async fn store_dominant_color(
 #[allow(dead_code)]
 pub fn extract_dominant_color_from_bytes(_data: &[u8]) -> Result<String, String> {
     Ok("#808080".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ensure_avatar_owner_active, valid_dominant_color, validate_avatar_payload};
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    #[tokio::test]
+    async fn avatar_owner_validation_rejects_deleted_and_unknown_owners() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE agents (agent_id TEXT PRIMARY KEY, deleted_at BIGINT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE groups (group_id TEXT PRIMARY KEY, deleted_at BIGINT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO agents VALUES ('active-agent', NULL), ('deleted-agent', 99)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(ensure_avatar_owner_active(&pool, "agent", "active-agent")
+            .await
+            .is_ok());
+        assert!(ensure_avatar_owner_active(&pool, "agent", "deleted-agent")
+            .await
+            .is_err());
+        assert!(ensure_avatar_owner_active(&pool, "group", "missing-group")
+            .await
+            .is_err());
+        assert!(ensure_avatar_owner_active(&pool, "user", "user_avatar")
+            .await
+            .is_ok());
+        assert!(ensure_avatar_owner_active(&pool, "user", "other")
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn avatar_values_are_bounded_and_css_color_is_strict() {
+        assert!(validate_avatar_payload("image/png", &[1]).is_ok());
+        assert!(validate_avatar_payload("text/html", &[1]).is_err());
+        assert!(validate_avatar_payload("image/png", &[]).is_err());
+        assert!(valid_dominant_color("#a0B1c2"));
+        assert!(!valid_dominant_color("red"));
+        assert!(!valid_dominant_color("#fff;url(x)"));
+    }
 }

@@ -34,12 +34,11 @@ pub async fn reconcile_distributed_node(
     app_handle: &AppHandle,
     distributed_enabled: bool,
     force_reconnect: bool,
-) {
+) -> Result<(), String> {
     let distributed_state = match app_handle.try_state::<crate::distributed::DistributedState>() {
         Some(s) => s,
         None => {
-            log::warn!("[Lifecycle] DistributedState not registered, skipping reconciliation");
-            return;
+            return Err("DistributedState is not registered".to_string());
         }
     };
     let client = distributed_state.client.read().await;
@@ -49,11 +48,9 @@ pub async fn reconcile_distributed_node(
     let settings = match read_settings(app_handle.clone(), settings_state).await {
         Ok(s) => s,
         Err(e) => {
-            log::error!(
-                "[Lifecycle] Failed to read settings for distributed reconnect: {}",
-                e
-            );
-            return;
+            return Err(format!(
+                "Failed to read settings for distributed reconnect: {e}"
+            ));
         }
     };
 
@@ -75,8 +72,7 @@ pub async fn reconcile_distributed_node(
     match (distributed_enabled, is_running) {
         (true, false) => {
             if ws_url.is_empty() || vcp_key.is_empty() {
-                log::warn!("[Lifecycle] distributedEnabled=true but ws_url/vcp_key is empty, skipping auto-connect");
-                return;
+                return Err("distributedEnabled=true but ws_url/vcp_key is empty".to_string());
             }
             log::info!(
                 "[Lifecycle] distributedEnabled=true, starting distributed node connection..."
@@ -92,7 +88,7 @@ pub async fn reconcile_distributed_node(
                 )
                 .await
             {
-                log::error!("[Lifecycle] Auto-start distributed node failed: {}", e);
+                return Err(format!("Auto-start distributed node failed: {e}"));
             }
         }
         (false, true) => {
@@ -103,4 +99,6 @@ pub async fn reconcile_distributed_node(
         }
         _ => {}
     }
+
+    Ok(())
 }

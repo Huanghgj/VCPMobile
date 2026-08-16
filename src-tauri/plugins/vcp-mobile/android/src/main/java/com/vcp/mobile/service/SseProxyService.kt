@@ -10,11 +10,11 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
 import android.util.Log
-import android.media.AudioAttributes
-import android.media.MediaPlayer
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -56,12 +56,12 @@ class SseProxyService : Service() {
         private const val TAG = "VcpSseProxy"
         const val CHANNEL_ID = "vcp_sse_proxy_helper"
         const val NOTIFICATION_ID_SERVICE = 0x53545202
+        private const val WAKE_LOCK_LEASE_MS = 10 * 60 * 1000L
+        private const val WAKE_LOCK_RENEWAL_MS = 9 * 60 * 1000L
 
         @Volatile
         var isServiceRunning = false
     }
-
-    private var mediaPlayer: MediaPlayer? = null
 
     class StreamSession(
         val requestId: String,
@@ -86,6 +86,16 @@ class SseProxyService : Service() {
     private var serverSocket: ServerSocket? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
+    private val lockHandler = Handler(Looper.getMainLooper())
+    private val wakeLockRenewal = object : Runnable {
+        override fun run() {
+            synchronized(this@SseProxyService) {
+                if (activeSessions.values.none { !it.isCompleted }) return
+                renewWakeLock()
+                lockHandler.postDelayed(this, WAKE_LOCK_RENEWAL_MS)
+            }
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -145,8 +155,6 @@ class SseProxyService : Service() {
         try {
             serverSocket?.close()
         } catch (ignored: Exception) {}
-
-        stopSilentPlayback()
 
         for (session in activeSessions.values) {
             session.eventSource?.cancel()
@@ -549,10 +557,8 @@ class SseProxyService : Service() {
         val hasRunning = activeSessions.values.any { !it.isCompleted }
         if (hasRunning) {
             acquireLocks()
-            startSilentPlayback()
         } else {
             releaseLocks()
-            stopSilentPlayback()
         }
         checkSelfTermination()
     }
@@ -562,15 +568,14 @@ class SseProxyService : Service() {
         if (wakeLock == null) {
             val powerManager = appContext.getSystemService(Context.POWER_SERVICE) as? PowerManager
             if (powerManager != null) {
-                wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "VCP:SseProxyWakeLock")
+                wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "VCP:SseProxyWakeLock").apply {
+                    setReferenceCounted(false)
+                }
             }
         }
-        wakeLock?.let {
-            if (!it.isHeld) {
-                it.acquire()
-                Log.i(TAG, "SseProxy WakeLock ACQUIRED.")
-            }
-        }
+        renewWakeLock()
+        lockHandler.removeCallbacks(wakeLockRenewal)
+        lockHandler.postDelayed(wakeLockRenewal, WAKE_LOCK_RENEWAL_MS)
 
         if (wifiLock == null) {
             val wifiManager = appContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
@@ -592,6 +597,7 @@ class SseProxyService : Service() {
     }
 
     private fun releaseLocks() {
+        lockHandler.removeCallbacks(wakeLockRenewal)
         wakeLock?.let {
             if (it.isHeld) {
                 it.release()
@@ -607,6 +613,16 @@ class SseProxyService : Service() {
             }
         }
         wifiLock = null
+    }
+
+    private fun renewWakeLock() {
+        wakeLock?.let {
+            if (it.isHeld) {
+                it.release()
+            }
+            it.acquire(WAKE_LOCK_LEASE_MS)
+            Log.i(TAG, "SseProxy WakeLock lease renewed for $WAKE_LOCK_LEASE_MS ms.")
+        }
     }
 
     private fun createNotificationChannel() {
@@ -677,83 +693,6 @@ class SseProxyService : Service() {
         }
 
         return builder.build()
-    }
-
-    @Synchronized
-    private fun ensureSilentAudioFile(): File {
-        val file = File(cacheDir, "silent.wav")
-        if (file.exists() && file.length() > 0) {
-            return file
-        }
-        try {
-            file.outputStream().use { out ->
-                // RIFF Header
-                out.write(byteArrayOf(0x52, 0x49, 0x46, 0x46)) // "RIFF"
-                out.write(byteArrayOf(0x64, 0x06, 0x00, 0x00)) // Size: 1636
-                out.write(byteArrayOf(0x57, 0x41, 0x56, 0x45)) // "WAVE"
-
-                // fmt Chunk
-                out.write(byteArrayOf(0x66, 0x6d, 0x74, 0x20)) // "fmt "
-                out.write(byteArrayOf(0x10, 0x00, 0x00, 0x00)) // Chunk size: 16
-                out.write(byteArrayOf(0x01, 0x00))             // Format: 1 (PCM)
-                out.write(byteArrayOf(0x01, 0x00))             // Channels: 1 (Mono)
-                out.write(byteArrayOf(0x40, 0x1F, 0x00, 0x00)) // Sample rate: 8000
-                out.write(byteArrayOf(0x40, 0x1F, 0x00, 0x00)) // Byte rate: 8000
-                out.write(byteArrayOf(0x01, 0x00))             // Block align: 1
-                out.write(byteArrayOf(0x08, 0x00))             // Bits per sample: 8
-
-                // data Chunk
-                out.write(byteArrayOf(0x64, 0x61, 0x74, 0x61)) // "data"
-                out.write(byteArrayOf(0x40, 0x06, 0x00, 0x00)) // Data size: 1600
-
-                // 1600 bytes of silence (0x80 for 8-bit PCM)
-                val silence = ByteArray(1600) { 0x80.toByte() }
-                out.write(silence)
-            }
-            Log.i(TAG, "Created silent.wav in cache directory.")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to create silent.wav", e)
-        }
-        return file
-    }
-
-    private fun startSilentPlayback() {
-        if (mediaPlayer != null) return
-        try {
-            val silentFile = ensureSilentAudioFile()
-            mediaPlayer = MediaPlayer().apply {
-                setDataSource(silentFile.absolutePath)
-                isLooping = true
-
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                    setAudioAttributes(
-                        AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
-                            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                            .build()
-                    )
-                }
-
-                prepare()
-                start()
-            }
-            Log.i(TAG, "Silent playback started.")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to start silent playback", e)
-        }
-    }
-
-    private fun stopSilentPlayback() {
-        mediaPlayer?.let {
-            try {
-                if (it.isPlaying) {
-                    it.stop()
-                }
-                it.release()
-            } catch (ignored: Exception) {}
-        }
-        mediaPlayer = null
-        Log.i(TAG, "Silent playback stopped.")
     }
 
     private fun sha256(input: String): String {

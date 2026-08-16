@@ -18,6 +18,8 @@ import java.util.concurrent.ConcurrentHashMap
  */
 object ForegroundGuardian {
     private const val TAG = "ForegroundGuardian"
+    private const val WAKE_LOCK_LEASE_MS = 10 * 60 * 1000L
+    private const val WAKE_LOCK_RENEWAL_MS = 9 * 60 * 1000L
 
     // 优先级常量定义
     const val PRIORITY_SYNC = 40
@@ -35,6 +37,15 @@ object ForegroundGuardian {
     // 超时自动释放任务调度器
     private val handler = Handler(Looper.getMainLooper())
     private val timeoutRunnables = ConcurrentHashMap<String, Runnable>()
+    private val wakeLockRenewal = object : Runnable {
+        override fun run() {
+            synchronized(this@ForegroundGuardian) {
+                if (consumers.isEmpty()) return
+                renewWakeLock()
+                handler.postDelayed(this, WAKE_LOCK_RENEWAL_MS)
+            }
+        }
+    }
 
     data class ConsumerEntry(
         val priority: Int,
@@ -78,9 +89,9 @@ object ForegroundGuardian {
         // 更新/插入消费者
         consumers[tag] = ConsumerEntry(priority, label, screenKeepOn)
 
+        acquireLocks(context)
         if (wasEmpty) {
-            // 首次消费者进入：物理获取系统双锁，并拉起前台服务
-            acquireLocks(context)
+            // 首次消费者进入：拉起前台服务
             startFgs(context)
         } else {
             // 已有消费者在运行：仅触发 Service 更新通知文案与屏幕状态
@@ -166,15 +177,14 @@ object ForegroundGuardian {
         if (wakeLock == null) {
             val powerManager = appContext.getSystemService(Context.POWER_SERVICE) as? PowerManager
             if (powerManager != null) {
-                wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "VCP:ForegroundGuardian")
+                wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "VCP:ForegroundGuardian").apply {
+                    setReferenceCounted(false)
+                }
             }
         }
-        wakeLock?.let {
-            if (!it.isHeld) {
-                it.acquire()
-                Log.d(TAG, "acquireLocks: WakeLock acquired.")
-            }
-        }
+        renewWakeLock()
+        handler.removeCallbacks(wakeLockRenewal)
+        handler.postDelayed(wakeLockRenewal, WAKE_LOCK_RENEWAL_MS)
 
         if (wifiLock == null) {
             val wifiManager = appContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
@@ -199,6 +209,7 @@ object ForegroundGuardian {
      * 物理释放 WakeLock 和 WifiLock
      */
     private fun releaseLocks() {
+        handler.removeCallbacks(wakeLockRenewal)
         wakeLock?.let {
             if (it.isHeld) {
                 it.release()
@@ -214,6 +225,16 @@ object ForegroundGuardian {
             }
         }
         wifiLock = null
+    }
+
+    private fun renewWakeLock() {
+        wakeLock?.let {
+            if (it.isHeld) {
+                it.release()
+            }
+            it.acquire(WAKE_LOCK_LEASE_MS)
+            Log.d(TAG, "WakeLock lease renewed for $WAKE_LOCK_LEASE_MS ms.")
+        }
     }
 
     private fun startFgs(context: Context) {

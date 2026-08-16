@@ -99,7 +99,7 @@ async fn inject_base_environment(pool: &Pool<Sqlite>, topic_id: &str, system_pro
     let now = Local::now().format("%Y-%m-%d %H:%M:%S %Z").to_string();
     let mut created_at_str = None;
 
-    match sqlx::query("SELECT created_at FROM topics WHERE topic_id = ?")
+    match sqlx::query("SELECT created_at FROM topics WHERE topic_id = ? AND deleted_at IS NULL")
         .bind(topic_id)
         .fetch_optional(pool)
         .await

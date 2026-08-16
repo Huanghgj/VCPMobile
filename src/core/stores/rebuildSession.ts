@@ -28,6 +28,7 @@ export const useRebuildSessionStore = defineStore('rebuildSession', () => {
 
   // --- 监听器引用 ---
   let unlistenFn: UnlistenFn | null = null;
+  let listenerGeneration = 0;
 
   const open = (type: RebuildTaskType = 'preRender') => {
     taskType.value = type;
@@ -73,14 +74,24 @@ export const useRebuildSessionStore = defineStore('rebuildSession', () => {
 
   const registerListener = () => {
     cleanupListener();
+    const generation = listenerGeneration;
     listen<{ current: number; total: number }>('render_rebuild_progress', (event) => {
       progress.value = event.payload;
     }).then((fn) => {
+      if (generation !== listenerGeneration || !isOpen.value) {
+        fn();
+        return;
+      }
       unlistenFn = fn;
+    }).catch((error) => {
+      if (generation === listenerGeneration) {
+        console.error('[RebuildSession] Failed to register progress listener:', error);
+      }
     });
   };
 
   const cleanupListener = () => {
+    listenerGeneration += 1;
     if (unlistenFn) {
       unlistenFn();
       unlistenFn = null;

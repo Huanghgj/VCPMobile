@@ -202,7 +202,9 @@ async fn load_topic_messages_for_summary(
             continue;
         }
         let content_bytes: Vec<u8> = row.get("content");
-        let content = ContentCompressor::decompress(&content_bytes).unwrap_or_default();
+        let content = ContentCompressor::decompress(&content_bytes).map_err(|error| {
+            format!("Failed to decompress a message in topic {topic_id}: {error}")
+        })?;
         let content = content.trim();
         if !content.is_empty() {
             messages.push((role, content.to_string()));

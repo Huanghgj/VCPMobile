@@ -81,21 +81,33 @@ impl AuroraBuffer {
         // 活动 tail 只携带原文和语义类型。Markdown AST 在块闭合后生成，
         // 避免逐帧 parse + hash + diff + JSON AST 放大 IPC 和 WebView 工作量。
         if !self.tail_content.is_empty() {
-            let semantic_tail_block =
-                StreamBlockParser::build_incomplete_semantic_tail_block_lightweight(
+            let render_tail =
+                crate::vcp_modules::stream_block_parser::strip_incomplete_tool_request_suffix(
                     &self.tail_content,
                 );
-            self.tail_block = semantic_tail_block.or_else(|| {
-                let content =
-                    if crate::vcp_modules::content_parser::is_html_tag_block(&self.tail_content) {
-                        crate::vcp_modules::render_repair::repair_html_fragment(&self.tail_content)
-                    } else {
-                        self.tail_content.clone()
-                    };
-                let hash =
-                    crate::vcp_modules::sync_hash::HashAggregator::compute_content_hash(&content);
-                Some(StreamBlock::markdown(content, None, hash))
-            });
+            if crate::vcp_modules::stream_block_parser::is_incomplete_tool_request_marker(
+                &self.tail_content,
+            ) || render_tail.trim().is_empty()
+            {
+                self.tail_block = None;
+            } else {
+                let semantic_tail_block =
+                    StreamBlockParser::build_incomplete_semantic_tail_block_lightweight(
+                        render_tail,
+                    );
+                self.tail_block = semantic_tail_block.or_else(|| {
+                    let content =
+                        if crate::vcp_modules::content_parser::is_html_tag_block(render_tail) {
+                            crate::vcp_modules::render_repair::repair_html_fragment(render_tail)
+                        } else {
+                            render_tail.to_string()
+                        };
+                    let hash = crate::vcp_modules::sync_hash::HashAggregator::compute_content_hash(
+                        &content,
+                    );
+                    Some(StreamBlock::markdown(content, None, hash))
+                });
+            }
         } else {
             self.tail_block = None;
         }
@@ -214,6 +226,116 @@ mod tests {
             StreamBlock::Diary { maid, date, content, .. }
                 if maid == "Mama" && date == "2026-07-26" && content == "stream diary body"
         )));
+    }
+
+    #[test]
+    fn chunked_tool_request_after_html_never_becomes_markdown_tail() {
+        let html = "<div id=\"vcp-root\"><p data-probe=\"story\">visible story</p></div>";
+        let request = concat!(
+            "<<<[TOOL_REQUEST]>>>\n",
+            "maid:「始」Nova「末」,\n",
+            "tool_name:「始」ComfyUIGen「末」,\n",
+            "mode:「始」anima「末」,\n",
+            "prompt:「始」portrait prompt still streaming「末」"
+        );
+        let mut buffer = AuroraBuffer::new();
+        buffer.append_chunk(html);
+        buffer.process_queue();
+
+        for character in request.chars() {
+            let mut encoded = [0; 4];
+            buffer.append_chunk(character.encode_utf8(&mut encoded));
+            buffer.process_queue();
+
+            if let Some(StreamBlock::Markdown { content, .. }) = buffer.tail_block.as_ref() {
+                assert!(
+                    !content.contains("<<<")
+                        && !content.contains("maid:「始」Nova「末」")
+                        && !content.contains("tool_name:「始」ComfyUIGen「末」"),
+                    "protocol text leaked through a markdown tail: {content}"
+                );
+            }
+        }
+
+        assert!(buffer.stable_blocks.iter().any(|block| matches!(
+            block,
+            StreamBlock::Markdown { content, .. } if content.contains("data-probe=\"story\"")
+        )));
+        assert!(matches!(
+            buffer.tail_block.as_ref(),
+            Some(StreamBlock::Tool {
+                tool_name,
+                content,
+                is_complete: false,
+                ..
+            }) if tool_name == "ComfyUIGen"
+                && content.contains("prompt:「始」portrait prompt still streaming「末」")
+        ));
+
+        buffer.append_chunk("\n<<<[END_TOOL_REQUEST]>>>");
+        buffer.process_queue();
+        assert!(buffer.tail_block.is_none());
+        assert!(buffer.stable_blocks.iter().any(|block| matches!(
+            block,
+            StreamBlock::Tool {
+                tool_name,
+                is_complete: true,
+                ..
+            } if tool_name == "ComfyUIGen"
+        )));
+    }
+
+    #[test]
+    fn chunked_tool_request_inside_unclosed_html_never_becomes_visible_html() {
+        let html = concat!(
+            "<div id=\"vcp-root\"><p data-probe=\"story\">visible story</p>",
+            "<w2g><catsay>咪咪点评"
+        );
+        let request = concat!(
+            "\n<<<[TOOL_REQUEST]>>>\n",
+            "maid:「始」Nova「末」,\n",
+            "tool_name:「始」ComfyUIGen「末」,\n",
+            "mode:「始」anima「末」,\n",
+            "prompt:「始」screenshot prompt still streaming「末」"
+        );
+        let mut buffer = AuroraBuffer::new();
+        buffer.append_chunk(html);
+        buffer.process_queue();
+
+        for character in request.chars() {
+            let mut encoded = [0; 4];
+            buffer.append_chunk(character.encode_utf8(&mut encoded));
+            buffer.process_queue();
+
+            for block in buffer.stable_blocks.iter().chain(buffer.tail_block.iter()) {
+                if let StreamBlock::Markdown { content, .. }
+                | StreamBlock::HtmlPreview { content, .. } = block
+                {
+                    assert!(
+                        !content.contains("<<<[TOOL_REQUEST]>>>")
+                            && !content.contains("tool_name:「始」ComfyUIGen「末」"),
+                        "protocol text leaked through rendered HTML/Markdown: {content}"
+                    );
+                }
+            }
+        }
+
+        assert!(buffer.stable_blocks.iter().any(|block| matches!(
+            block,
+            StreamBlock::Markdown { content, .. }
+                if content.contains("data-probe=\"story\"")
+                    && content.ends_with("</catsay></w2g></div>")
+        )));
+        assert!(matches!(
+            buffer.tail_block.as_ref(),
+            Some(StreamBlock::Tool {
+                tool_name,
+                content,
+                is_complete: false,
+                ..
+            }) if tool_name == "ComfyUIGen"
+                && content.contains("prompt:「始」screenshot prompt still streaming「末」")
+        ));
     }
 
     #[test]

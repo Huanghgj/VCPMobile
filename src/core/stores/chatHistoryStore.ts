@@ -8,9 +8,16 @@ import { useAssistantStore } from "./assistant";
 import { useSettingsStore } from "./settings";
 import { useTopicStore } from "./topicListManager";
 import { useNotificationStore } from "./notification";
+import { useWatchTogetherStore } from "./watchTogether";
 import { clearMessageCache } from "../utils/astRenderer";
 import { preloadMessageImages } from "../utils/messageAssetPreloader";
 import type { ChatMessage, HistoryChunk, ContentBlock } from "../types/chat";
+
+type ChatTarget = Readonly<{
+  ownerId: string;
+  ownerType: "agent" | "group";
+  topicId: string;
+}>;
 
 const DEBUG_ASSISTANT_RENDER_PROBE = [
   "<think>",
@@ -66,7 +73,7 @@ const DEBUG_ASSISTANT_RENDER_PROBE = [
   "Date:「始」2026-07-20「末」,",
   "Content:「始ESCAPE」Boundary recovery diary body.「末ESCAPE」,",
   "archery:「始」no_reply「末」",
-  "<<<[END_TOOL_REQUEST]>>><details data-probe=\"details-body\">",
+  '<<<[END_TOOL_REQUEST]>>><details data-probe="details-body">',
   "<summary><b>Boundary recovery details</b></summary>",
   "",
   "Boundary recovery final details body remains visible.",
@@ -78,8 +85,8 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
   const loading = ref(false);
 
   // 分页加载状态
-  const historyOffset = ref(0);        // 当前已加载的消息总数（= 下次请求的 offset 起点）
-  const hasMoreHistory = ref(true);    // 是否还有更多旧消息
+  const historyOffset = ref(0); // 当前已加载的消息总数（= 下次请求的 offset 起点）
+  const hasMoreHistory = ref(true); // 是否还有更多旧消息
   const isLoadingHistory = ref(false); // 防止并发重复触发
   let historyLoadSequence = 0;
 
@@ -98,23 +105,48 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
   const settingsStore = useSettingsStore();
   const topicStore = useTopicStore();
   const notificationStore = useNotificationStore();
+  const watchTogetherStore = useWatchTogetherStore();
 
-  const summarizeTopic = async () => {
-    if (!sessionStore.currentTopicId || !sessionStore.currentSelectedItem?.id) return;
-
+  const getCurrentTarget = (): ChatTarget | null => {
+    const selectedItem = sessionStore.currentSelectedItem;
     const topicId = sessionStore.currentTopicId;
-    const ownerId = sessionStore.currentSelectedItem.id;
-    const ownerType = sessionStore.currentSelectedItem.type;
+    if (!selectedItem?.id || !topicId) return null;
+    return {
+      ownerId: selectedItem.id,
+      ownerType: selectedItem.type === "group" ? "group" : "agent",
+      topicId,
+    };
+  };
+
+  const isTargetActive = (target: ChatTarget) => {
+    const current = getCurrentTarget();
+    return (
+      current?.ownerId === target.ownerId &&
+      current.ownerType === target.ownerType &&
+      current.topicId === target.topicId
+    );
+  };
+
+  const summarizeTopic = async (
+    target: ChatTarget | null = getCurrentTarget(),
+  ) => {
+    if (!target || !isTargetActive(target)) return;
+
+    const { topicId, ownerId, ownerType } = target;
 
     const topic = topicStore.topics.find((t) => t.id === topicId);
-    const isDefaultName = topic && /^(新话题|新会话) \d{2}:\d{2}:\d{2}$/.test(topic.name);
-    const messageCount = currentChatHistory.value.filter((m) => m.role !== "system").length;
+    const isDefaultName =
+      topic && /^(新话题|新会话) \d{2}:\d{2}:\d{2}$/.test(topic.name);
+    const messageCount = currentChatHistory.value.filter(
+      (m) => m.role !== "system",
+    ).length;
 
     if (!isDefaultName || messageCount < 4) return;
 
     try {
       const agentName =
-        assistantStore.agents.find((agent: any) => agent.id === ownerId)?.name || "AI";
+        assistantStore.agents.find((agent: any) => agent.id === ownerId)
+          ?.name || "AI";
       const newTitle = await invoke<string>("summarize_topic", {
         ownerId,
         ownerType,
@@ -123,7 +155,12 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
       });
 
       if (newTitle) {
-        await topicStore.updateTopicTitle(ownerId, ownerType, topicId, newTitle);
+        await topicStore.updateTopicTitle(
+          ownerId,
+          ownerType,
+          topicId,
+          newTitle,
+        );
       }
     } catch (e) {
       console.error("[ChatHistoryStore] AI Summary failed:", e);
@@ -138,7 +175,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     ownerType: string,
     topicId: string,
     limit: number = 15,
-    offset: number = 0
+    offset: number = 0,
   ) => {
     const loadType = offset === 0 ? "initial" : "pagination";
     console.log(
@@ -172,7 +209,9 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
       let resolveComplete: (() => void) | null = null;
       let isLoadCompleted = false;
       let cancelledByTopicChange = false;
-      const completePromise = new Promise<void>((resolve) => { resolveComplete = resolve; });
+      const completePromise = new Promise<void>((resolve) => {
+        resolveComplete = resolve;
+      });
       const completeLoad = () => {
         if (isLoadCompleted) return;
         isLoadCompleted = true;
@@ -194,7 +233,10 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
         }
         const now = performance.now();
         if (force || now - lastFlushTime >= FLUSH_INTERVAL) {
-          currentChatHistory.value = [...currentChatHistory.value, ...pendingHistory];
+          currentChatHistory.value = [
+            ...currentChatHistory.value,
+            ...pendingHistory,
+          ];
           pendingHistory = [];
           lastFlushTime = now;
         }
@@ -234,7 +276,9 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
         // 2. [关键修复] 消息对象劫持 (Object Hydration)
         // 如果该消息正在活跃生成中，则从全局流池中取出“活的”响应式对象
         // 这确保了即使是刚从 DB 拉回来的骨架，也能瞬间恢复流式动画与渲染状态
-        const activeMsg = streamStore.activeStreamMessages.get(chunk.message.id);
+        const activeMsg = streamStore.activeStreamMessages.get(
+          chunk.message.id,
+        );
         const msgToUse = activeMsg || chunk.message;
 
         if (offset === 0) {
@@ -277,7 +321,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
         }
       };
 
-      const total = await invoke<number>('load_chat_history_streamed', {
+      const total = await invoke<number>("load_chat_history_streamed", {
         ownerId,
         ownerType,
         topicId,
@@ -321,7 +365,6 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
       await Promise.race([completePromise, completeWatchdog]);
       if (completeWatchdogId !== null) {
         clearTimeout(completeWatchdogId);
-        completeWatchdogId = null;
       }
 
       const loadedCount = offset === 0 ? total : buffer.length;
@@ -330,11 +373,14 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
       );
 
       if (!canApplyLoad()) {
-        console.warn(`[ChatHistoryStore] Topic changed or request aborted during load, discarding results.`);
+        console.warn(
+          `[ChatHistoryStore] Topic changed or request aborted during load, discarding results.`,
+        );
         return;
       }
 
-      const messagesToResolve = offset === 0 ? currentChatHistory.value : buffer;
+      const messagesToResolve =
+        offset === 0 ? currentChatHistory.value : buffer;
       await Promise.all(
         messagesToResolve.map(async (msg) => {
           await attachmentStore.resolveMessageAssets(msg);
@@ -349,7 +395,6 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
       }
       if (completeWatchdogId !== null) {
         clearTimeout(completeWatchdogId);
-        completeWatchdogId = null;
       }
       if (flushRafId !== null) {
         cancelAnimationFrame(flushRafId);
@@ -376,7 +421,8 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
 
   const loadMoreHistory = async () => {
     if (!hasMoreHistory.value || isLoadingHistory.value) return;
-    if (!sessionStore.currentSelectedItem?.id || !sessionStore.currentTopicId) return;
+    if (!sessionStore.currentSelectedItem?.id || !sessionStore.currentTopicId)
+      return;
     await loadHistory(
       sessionStore.currentSelectedItem.id,
       sessionStore.currentSelectedItem.type,
@@ -397,7 +443,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
 
   const invokeGenerationRequestForTarget = async (
     userMsg: ChatMessage,
-    target: { ownerId: string; ownerType: "agent" | "group"; topicId: string },
+    target: ChatTarget,
     turnSource: AffectTurnSource = "user",
   ): Promise<{ started: true; messageId?: string }> => {
     const agentId = target.ownerId;
@@ -406,11 +452,12 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     const settings = settingsStore.settings;
     if (!settings) throw new Error("应用尚未完成初始化");
 
-    const responseMessageId = turnSource === "lifecycle_scheduled"
-      ? undefined
-      : target.ownerType === "agent"
-        ? `msg_${agentId}_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`
-        : `group-turn-${topicId}-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    const responseMessageId =
+      turnSource === "lifecycle_scheduled"
+        ? undefined
+        : target.ownerType === "agent"
+          ? `msg_${agentId}_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`
+          : `group-turn-${topicId}-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
     const generationToken = streamStore.beginGeneration(
       target.ownerId,
       target.ownerType,
@@ -419,49 +466,60 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     );
 
     const streamChannel = new Channel<any>();
-    streamChannel.onmessage = (event) => streamStore.processStreamEvent(event, {
-      onMessageCreated: (msg, tid) => {
-        if (tid === sessionStore.currentTopicId && !currentChatHistory.value.some(m => m.id === msg.id)) {
-          currentChatHistory.value.push(msg);
-          currentChatHistory.value.sort((a, b) => a.timestamp - b.timestamp);
-        }
-      },
-      onStreamFinished: (_messageId, tid) => {
-        if (tid === sessionStore.currentTopicId) {
-          summarizeTopic();
-        }
-      }
-    });
+    streamChannel.onmessage = (event) =>
+      streamStore.processStreamEvent(event, {
+        onMessageCreated: (msg, tid) => {
+          if (
+            tid === target.topicId &&
+            isTargetActive(target) &&
+            !currentChatHistory.value.some((m) => m.id === msg.id)
+          ) {
+            currentChatHistory.value.push(msg);
+            currentChatHistory.value.sort((a, b) => a.timestamp - b.timestamp);
+          }
+        },
+        onStreamFinished: (_messageId, tid) => {
+          if (tid === target.topicId && isTargetActive(target)) {
+            summarizeTopic(target);
+          }
+        },
+      });
 
     try {
       if (target.ownerType === "group") {
-        const result = await invoke<{ messageId?: string }>("handle_group_chat_message", {
-          payload: {
-            groupId: target.ownerId,
-            topicId,
-            userMessage: userMsg,
-            turnSource,
-            turnId: responseMessageId,
-            vcpUrl: settings.vcpServerUrl || "",
-            vcpApiKey: settings.vcpApiKey || "",
+        const result = await invoke<{ messageId?: string }>(
+          "handle_group_chat_message",
+          {
+            payload: {
+              groupId: target.ownerId,
+              topicId,
+              userMessage: userMsg,
+              turnSource,
+              turnId: responseMessageId,
+              vcpUrl: settings.vcpServerUrl || "",
+              vcpApiKey: settings.vcpApiKey || "",
+            },
+            streamChannel,
           },
-          streamChannel
-        });
+        );
         return { started: true, messageId: result?.messageId };
       }
 
-      const result = await invoke<{ messageId?: string }>("handle_agent_chat_message", {
-        payload: {
-          agentId,
-          topicId,
-          userMessage: userMsg,
-          turnSource,
-          responseMessageId,
-          vcpUrl: settings.vcpServerUrl || "",
-          vcpApiKey: settings.vcpApiKey || "",
+      const result = await invoke<{ messageId?: string }>(
+        "handle_agent_chat_message",
+        {
+          payload: {
+            agentId,
+            topicId,
+            userMessage: userMsg,
+            turnSource,
+            responseMessageId,
+            vcpUrl: settings.vcpServerUrl || "",
+            vcpApiKey: settings.vcpApiKey || "",
+          },
+          streamChannel,
         },
-        streamChannel
-      });
+      );
       return { started: true, messageId: result?.messageId };
     } finally {
       streamStore.endGeneration(target.ownerId, topicId, generationToken);
@@ -471,43 +529,103 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
   const invokeGenerationRequest = async (
     userMsg: ChatMessage,
     turnSource: AffectTurnSource = "user",
+    target: ChatTarget | null = getCurrentTarget(),
   ) => {
-    if (!sessionStore.currentSelectedItem || !sessionStore.currentTopicId) return false;
-    const result = await invokeGenerationRequestForTarget(userMsg, {
-      ownerId: sessionStore.currentSelectedItem.id,
-      ownerType: sessionStore.currentSelectedItem.type === "group" ? "group" : "agent",
-      topicId: sessionStore.currentTopicId,
-    }, turnSource);
+    if (!target) return false;
+    const result = await invokeGenerationRequestForTarget(
+      userMsg,
+      target,
+      turnSource,
+    );
     return result.started;
   };
 
   /**
    * 触发 AI 生成逻辑
    */
-  const triggerGeneration = async (userMsg: ChatMessage) => {
-    if (!sessionStore.currentSelectedItem || !sessionStore.currentTopicId) return false;
+  const triggerGeneration = async (
+    userMsg: ChatMessage,
+    target: ChatTarget | null = getCurrentTarget(),
+    onPersisted?: (compiledBlocks: ContentBlock[]) => void,
+  ) => {
+    if (!target) return false;
 
-    const topicId = sessionStore.currentTopicId;
+    const transientAttachments = (userMsg.attachments || []).filter(
+      (attachment) => attachment.transient,
+    );
+    const durableAttachments = (userMsg.attachments || []).filter(
+      (attachment) => !attachment.transient,
+    );
+    const persistedUserMsg: ChatMessage = {
+      ...userMsg,
+      attachments: durableAttachments.length > 0 ? durableAttachments : undefined,
+      transientContext: undefined,
+      transientSystemPrompt: undefined,
+    };
+    const cleanupTransientAttachments = async () => {
+      await Promise.allSettled(
+        transientAttachments
+          .map((attachment) => attachment.hash)
+          .filter((hash): hash is string => Boolean(hash))
+          .map((hash) => invoke("cleanup_single_orphaned_attachment", { hash })),
+      );
+      const visibleMessage = currentChatHistory.value.find(
+        (message) => message.id === userMsg.id,
+      );
+      if (visibleMessage?.attachments) {
+        visibleMessage.attachments = visibleMessage.attachments.filter(
+          (attachment) => !attachment.transient,
+        );
+      }
+      if (visibleMessage) {
+        visibleMessage.transientContext = undefined;
+        visibleMessage.transientSystemPrompt = undefined;
+      }
+    };
+
+    let compiledBlocks: ContentBlock[];
     try {
-      const compiledBlocks = await invoke<ContentBlock[]>("append_single_message", {
-        ownerId: sessionStore.currentSelectedItem.id,
-        ownerType: sessionStore.currentSelectedItem.type,
-        topicId,
-        message: {
-          ...userMsg,
-          blocks: undefined, // 强行设为 undefined，迫使后端执行真正的编译，生成 markdown AST 节点与表情包匹配
+      compiledBlocks = await invoke<ContentBlock[]>(
+        "append_single_message",
+        {
+          ownerId: target.ownerId,
+          ownerType: target.ownerType,
+          topicId: target.topicId,
+          message: {
+            ...persistedUserMsg,
+            blocks: undefined, // 强行设为 undefined，迫使后端执行真正的编译，生成 markdown AST 节点与表情包匹配
+          },
         },
+      );
+    } catch (e) {
+      await cleanupTransientAttachments();
+      console.error("[ChatHistoryStore] Message persistence failed:", e);
+      notificationStore.addNotification({
+        type: "error",
+        title: "消息保存失败",
+        message: e instanceof Error ? e.message : String(e),
+        toastOnly: true,
+        duration: 5000,
       });
+      return false;
+    }
 
-      const targetIndex = currentChatHistory.value.findIndex(m => m.id === userMsg.id);
-      if (targetIndex !== -1) {
-        currentChatHistory.value[targetIndex] = {
-          ...currentChatHistory.value[targetIndex],
-          blocks: compiledBlocks as any,
+    if (onPersisted) {
+      onPersisted(compiledBlocks);
+    } else {
+      const messageIndex = isTargetActive(target)
+        ? currentChatHistory.value.findIndex((m) => m.id === userMsg.id)
+        : -1;
+      if (messageIndex !== -1) {
+        currentChatHistory.value[messageIndex] = {
+          ...currentChatHistory.value[messageIndex],
+          blocks: compiledBlocks,
         };
       }
+    }
 
-      return await invokeGenerationRequest(userMsg, "user");
+    try {
+      return await invokeGenerationRequest(userMsg, "user", target);
     } catch (e) {
       console.error("[ChatHistoryStore] Generation failed:", e);
       notificationStore.addNotification({
@@ -518,14 +636,25 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
         duration: 5000,
       });
       return false;
+    } finally {
+      await cleanupTransientAttachments();
     }
   };
 
   const triggerHiddenLifecycleMessage = async (
     content: string,
-    expected?: { ownerId: string; ownerType: "agent" | "group"; topicId: string },
+    expected?: {
+      ownerId: string;
+      ownerType: "agent" | "group";
+      topicId: string;
+    },
   ) => {
-    if (!sessionStore.currentSelectedItem || !sessionStore.currentTopicId || !content.trim()) return false;
+    if (
+      !sessionStore.currentSelectedItem ||
+      !sessionStore.currentTopicId ||
+      !content.trim()
+    )
+      return false;
 
     const selectedItem = sessionStore.currentSelectedItem;
     const topicId = sessionStore.currentTopicId;
@@ -556,7 +685,10 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     try {
       return await invokeGenerationRequest(userMsg, "lifecycle_heartbeat");
     } catch (e) {
-      console.error("[ChatHistoryStore] Hidden lifecycle generation failed:", e);
+      console.error(
+        "[ChatHistoryStore] Hidden lifecycle generation failed:",
+        e,
+      );
       return false;
     }
   };
@@ -597,18 +729,26 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
       groupId: job.ownerType === "group" ? job.ownerId : undefined,
       isGroupMessage: job.ownerType === "group",
     };
-    const result = await invokeGenerationRequestForTarget(userMsg, {
-      ownerId: job.ownerId,
-      ownerType: job.ownerType,
-      topicId: job.topicId,
-    }, "lifecycle_scheduled");
+    const result = await invokeGenerationRequestForTarget(
+      userMsg,
+      {
+        ownerId: job.ownerId,
+        ownerType: job.ownerType,
+        topicId: job.topicId,
+      },
+      "lifecycle_scheduled",
+    );
     return result.messageId || null;
   };
 
   const injectDebugAssistantRenderProbe = async (
     content: string = DEBUG_ASSISTANT_RENDER_PROBE,
   ) => {
-    if (!sessionStore.currentSelectedItem || !sessionStore.currentTopicId || !content.trim()) {
+    if (
+      !sessionStore.currentSelectedItem ||
+      !sessionStore.currentTopicId ||
+      !content.trim()
+    ) {
       return false;
     }
 
@@ -616,10 +756,14 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     const selectedItem = sessionStore.currentSelectedItem;
     let blocks: ContentBlock[];
     try {
-      blocks = await invoke<ContentBlock[]>("process_message_content", { content });
+      blocks = await invoke<ContentBlock[]>("process_message_content", {
+        content,
+      });
       console.info("[ChatHistoryStore] Debug render probe compiled", {
         blockTypes: blocks.map((block) => block.type),
-        hasFullVcpProbe: JSON.stringify(blocks).includes('data-vcp-probe=\\"full-vcp\\"'),
+        hasFullVcpProbe: JSON.stringify(blocks).includes(
+          'data-vcp-probe=\\"full-vcp\\"',
+        ),
       });
     } catch (e) {
       console.error("[ChatHistoryStore] Debug render probe compile failed:", e);
@@ -650,9 +794,19 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
    * 发送消息
    */
   const sendMessage = async (content: string) => {
-    if (!sessionStore.currentSelectedItem || !sessionStore.currentTopicId || (!content.trim() && attachmentStore.stagedAttachments.length === 0)) return false;
+    const target = getCurrentTarget();
+    if (
+      !target ||
+      (!content.trim() && attachmentStore.stagedAttachments.length === 0)
+    ) {
+      return false;
+    }
 
-    if (attachmentStore.stagedAttachments.some((attachment) => attachment.status === "loading")) {
+    if (
+      attachmentStore.stagedAttachments.some(
+        (attachment) => attachment.status === "loading",
+      )
+    ) {
       notificationStore.addNotification({
         type: "warning",
         title: "附件仍在处理中",
@@ -665,28 +819,65 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
 
     if (editingOriginalMessageId.value) {
       const originalId = editingOriginalMessageId.value;
-      editingOriginalMessageId.value = null;
-      const targetIndex = currentChatHistory.value.findIndex(m => m.id === originalId);
+      const targetIndex = currentChatHistory.value.findIndex(
+        (message) => message.id === originalId,
+      );
       if (targetIndex !== -1) {
-        const targetMsg = currentChatHistory.value[targetIndex];
-        targetMsg.content = content;
-        targetMsg.blocks = [{ type: "markdown" as const, content }];
+        const targetMsg: ChatMessage = {
+          ...currentChatHistory.value[targetIndex],
+          content,
+          blocks: [{ type: "markdown" as const, content }],
+        };
         await invoke("truncate_history_after_timestamp", {
-          ownerId: sessionStore.currentSelectedItem.id,
-          ownerType: sessionStore.currentSelectedItem.type,
-          topicId: sessionStore.currentTopicId,
+          ownerId: target.ownerId,
+          ownerType: target.ownerType,
+          topicId: target.topicId,
           timestamp: targetMsg.timestamp,
         });
-        currentChatHistory.value = currentChatHistory.value.slice(0, targetIndex + 1);
-        return await triggerGeneration(targetMsg);
+        const countToDelete = currentChatHistory.value.length - targetIndex - 1;
+        if (isTargetActive(target)) {
+          const currentIndex = currentChatHistory.value.findIndex(
+            (message) => message.id === originalId,
+          );
+          if (currentIndex !== -1) {
+            currentChatHistory.value = currentChatHistory.value.slice(
+              0,
+              currentIndex + 1,
+            );
+          }
+        }
+        if (countToDelete > 0) {
+          topicStore.decrementTopicMsgCount(target.topicId, countToDelete);
+        }
+        return await triggerGeneration(targetMsg, target, (compiledBlocks) => {
+          editingOriginalMessageId.value = null;
+          if (!isTargetActive(target)) return;
+          const currentIndex = currentChatHistory.value.findIndex(
+            (message) => message.id === originalId,
+          );
+          if (currentIndex !== -1) {
+            currentChatHistory.value[currentIndex] = {
+              ...targetMsg,
+              blocks: compiledBlocks,
+            };
+          }
+        });
       }
     }
 
-    const currentStaged = [...attachmentStore.stagedAttachments];
-    if (currentStaged.length > 0) {
-      await attachmentStore.preProcessDocuments(currentStaged);
+    const durableStaged = [...attachmentStore.stagedAttachments];
+    if (durableStaged.length > 0) {
+      await attachmentStore.preProcessDocuments(durableStaged);
     }
 
+    const watchContext = await watchTogetherStore.prepareOutgoingContext();
+    const currentStaged = [
+      ...durableStaged,
+      ...(watchContext?.attachment ? [watchContext.attachment] : []),
+    ];
+    const stagedIds = currentStaged
+      .map((attachment) => attachment.id)
+      .filter((id): id is string => typeof id === "string");
     const now = Date.now();
     const userName = settingsStore.settings?.userName || "User";
     const userMsg: ChatMessage = {
@@ -695,178 +886,299 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
       name: userName,
       content,
       timestamp: now,
+      topicId: target.topicId,
+      agentId: target.ownerType === "agent" ? target.ownerId : undefined,
+      groupId: target.ownerType === "group" ? target.ownerId : undefined,
+      isGroupMessage: target.ownerType === "group",
       attachments: currentStaged.length > 0 ? currentStaged : undefined,
+      transientContext: watchContext?.transientContext,
+      transientSystemPrompt: watchContext?.transientSystemPrompt,
       shell: streamStore.computeShell({ role: "user", name: userName }),
       blocks: [{ type: "markdown" as const, content }],
     };
 
-    attachmentStore.clearStaged();
-    currentChatHistory.value.push(userMsg);
-    if (sessionStore.currentTopicId) {
-      topicStore.incrementTopicMsgCount(sessionStore.currentTopicId);
-    }
-    return await triggerGeneration(userMsg);
+    return await triggerGeneration(userMsg, target, (compiledBlocks) => {
+      attachmentStore.consumeStaged(stagedIds);
+      if (isTargetActive(target)) {
+        currentChatHistory.value.push({
+          ...userMsg,
+          blocks: compiledBlocks,
+        });
+      }
+      topicStore.incrementTopicMsgCount(target.topicId);
+    });
   };
 
   /**
    * 删除消息
    */
-  const deleteMessage = async (messageId: string, deleteAfter: boolean = false) => {
-    if (!sessionStore.currentSelectedItem || !sessionStore.currentTopicId) return;
+  const deleteMessage = async (
+    messageId: string,
+    deleteAfter: boolean = false,
+  ) => {
+    const target = getCurrentTarget();
+    if (!target) {
+      throw new Error("当前会话状态无效，无法删除消息");
+    }
 
-    const targetIndex = currentChatHistory.value.findIndex(m => m.id === messageId);
-    if (targetIndex === -1) return;
+    const targetIndex = currentChatHistory.value.findIndex(
+      (m) => m.id === messageId,
+    );
+    if (targetIndex === -1) {
+      throw new Error("消息已不存在或不属于当前话题");
+    }
 
-    const targetMsg = currentChatHistory.value[targetIndex];
+    const targetMsg = { ...currentChatHistory.value[targetIndex] };
     if (deleteAfter) {
       const countToDelete = currentChatHistory.value.length - targetIndex;
       await invoke("truncate_history_after_timestamp", {
-        ownerId: sessionStore.currentSelectedItem.id,
-        ownerType: sessionStore.currentSelectedItem.type,
-        topicId: sessionStore.currentTopicId,
+        ownerId: target.ownerId,
+        ownerType: target.ownerType,
+        topicId: target.topicId,
         timestamp: targetMsg.timestamp - 1,
       });
-      currentChatHistory.value.splice(targetIndex);
-      if (sessionStore.currentTopicId) {
-        topicStore.decrementTopicMsgCount(sessionStore.currentTopicId, countToDelete);
+      if (isTargetActive(target)) {
+        const currentIndex = currentChatHistory.value.findIndex(
+          (message) => message.id === messageId,
+        );
+        if (currentIndex !== -1) currentChatHistory.value.splice(currentIndex);
       }
+      topicStore.decrementTopicMsgCount(target.topicId, countToDelete);
     } else {
       await invoke("delete_messages", {
-        ownerId: sessionStore.currentSelectedItem.id,
-        ownerType: sessionStore.currentSelectedItem.type,
-        topicId: sessionStore.currentTopicId,
+        ownerId: target.ownerId,
+        ownerType: target.ownerType,
+        topicId: target.topicId,
         msgIds: [messageId],
       });
-      currentChatHistory.value.splice(targetIndex, 1);
-      if (sessionStore.currentTopicId) {
-        topicStore.decrementTopicMsgCount(sessionStore.currentTopicId, 1);
+      if (isTargetActive(target)) {
+        const currentIndex = currentChatHistory.value.findIndex(
+          (message) => message.id === messageId,
+        );
+        if (currentIndex !== -1) {
+          currentChatHistory.value.splice(currentIndex, 1);
+        }
       }
+      topicStore.decrementTopicMsgCount(target.topicId, 1);
     }
   };
 
-  const updateMessageContent = async (messageId: string, newContent: string) => {
-    clearMessageCache(messageId);
-    const targetIndex = currentChatHistory.value.findIndex(m => m.id === messageId);
+  const deleteAttachment = async (
+    topicId: string,
+    messageId: string,
+    hash: string,
+  ) => {
+    await invoke("delete_message_attachment", {
+      topicId,
+      messageId,
+      hash,
+    });
+
+    const message =
+      sessionStore.currentTopicId === topicId
+        ? currentChatHistory.value.find((item) => item.id === messageId)
+        : undefined;
+    if (message?.attachments) {
+      message.attachments = message.attachments.filter(
+        (attachment) => attachment.hash !== hash,
+      );
+    }
+  };
+
+  const updateMessageContent = async (
+    messageId: string,
+    newContent: string,
+  ) => {
+    const target = getCurrentTarget();
+    if (!target) return;
+    const targetIndex = currentChatHistory.value.findIndex(
+      (message) => message.id === messageId,
+    );
     if (targetIndex === -1) return;
 
-    const msg = currentChatHistory.value[targetIndex];
-    currentChatHistory.value[targetIndex] = {
-      ...msg,
+    const updatedMessage: ChatMessage = {
+      ...currentChatHistory.value[targetIndex],
       content: newContent,
       blocks: [{ type: "markdown" as const, content: newContent }],
     };
 
-    if (sessionStore.currentSelectedItem?.id && sessionStore.currentTopicId) {
-      try {
-        const compiledBlocks = await invoke("patch_single_message", {
-          ownerId: sessionStore.currentSelectedItem.id,
-          ownerType: sessionStore.currentSelectedItem.type,
-          topicId: sessionStore.currentTopicId,
+    try {
+      const compiledBlocks = await invoke<ContentBlock[]>(
+        "patch_single_message",
+        {
+          ownerId: target.ownerId,
+          ownerType: target.ownerType,
+          topicId: target.topicId,
           message: {
-            ...currentChatHistory.value[targetIndex],
+            ...updatedMessage,
             blocks: undefined,
           },
-        });
-        currentChatHistory.value[targetIndex] = {
-          ...currentChatHistory.value[targetIndex],
-          blocks: compiledBlocks as any,
-        };
-      } catch (e) {
-        console.error("[updateMessageContent] patch_single_message failed:", e);
-        currentChatHistory.value[targetIndex] = {
-          ...currentChatHistory.value[targetIndex],
-          blocks: [{ type: "markdown" as const, content: newContent }],
-        };
-      }
+        },
+      );
+      if (!isTargetActive(target)) return;
+      const currentIndex = currentChatHistory.value.findIndex(
+        (message) => message.id === messageId,
+      );
+      if (currentIndex === -1) return;
+      clearMessageCache(messageId);
+      currentChatHistory.value[currentIndex] = {
+        ...updatedMessage,
+        blocks: compiledBlocks,
+      };
+    } catch (e) {
+      console.error("[updateMessageContent] patch_single_message failed:", e);
+      notificationStore.addNotification({
+        type: "error",
+        title: "消息编辑失败",
+        message: e instanceof Error ? e.message : String(e),
+        toastOnly: true,
+        duration: 5000,
+      });
+      throw e;
     }
   };
 
   const regenerateResponse = async (targetMessageId: string) => {
-    const targetIndex = currentChatHistory.value.findIndex(m => m.id === targetMessageId);
+    const target = getCurrentTarget();
+    if (!target) return;
+    const targetIndex = currentChatHistory.value.findIndex(
+      (message) => message.id === targetMessageId,
+    );
     if (targetIndex === -1) return;
 
-    if (!sessionStore.currentSelectedItem?.id || !sessionStore.currentTopicId) return;
-
-    const topicId = sessionStore.currentTopicId;
-    const ownerId = sessionStore.currentSelectedItem.id;
-    const ownerType = sessionStore.currentSelectedItem.type;
+    const { topicId, ownerId, ownerType } = target;
 
     // 1. 寻找该 AI 消息之前的最后一条用户消息
     let lastUserMsgIndex = targetIndex - 1;
-    while (lastUserMsgIndex >= 0 && currentChatHistory.value[lastUserMsgIndex].role !== "user") {
+    while (
+      lastUserMsgIndex >= 0 &&
+      currentChatHistory.value[lastUserMsgIndex].role !== "user"
+    ) {
       lastUserMsgIndex--;
     }
-    
+
     if (lastUserMsgIndex === -1) {
-      console.warn("[ChatHistoryStore] No user message found to regenerate from.");
+      console.warn(
+        "[ChatHistoryStore] No user message found to regenerate from.",
+      );
       return;
     }
 
     const lastUserMsg = currentChatHistory.value[lastUserMsgIndex];
 
     // 2. 乐观更新 UI：截断历史
-    const countToDelete = currentChatHistory.value.length - (lastUserMsgIndex + 1);
-    currentChatHistory.value = currentChatHistory.value.slice(0, lastUserMsgIndex + 1);
+    const countToDelete =
+      currentChatHistory.value.length - (lastUserMsgIndex + 1);
+    currentChatHistory.value = currentChatHistory.value.slice(
+      0,
+      lastUserMsgIndex + 1,
+    );
     topicStore.decrementTopicMsgCount(topicId, countToDelete);
 
-    // 3. 调用后端重构后的重生接口
+    // 3. 调用后端重生成接口
     try {
       const streamChannel = new Channel<any>();
-      streamChannel.onmessage = (event) => streamStore.processStreamEvent(event, {
-        onMessageCreated: (msg, tid) => {
-          if (tid === sessionStore.currentTopicId && !currentChatHistory.value.some(m => m.id === msg.id)) {
-            currentChatHistory.value.push(msg);
-            currentChatHistory.value.sort((a, b) => a.timestamp - b.timestamp);
-          }
-        },
-        onStreamFinished: (_messageId, tid) => {
-          if (tid === sessionStore.currentTopicId) {
-            summarizeTopic();
-          }
-        }
-      });
+      streamChannel.onmessage = (event) =>
+        streamStore.processStreamEvent(event, {
+          onMessageCreated: (msg, tid) => {
+            if (
+              tid === target.topicId &&
+              isTargetActive(target) &&
+              !currentChatHistory.value.some((m) => m.id === msg.id)
+            ) {
+              currentChatHistory.value.push(msg);
+              currentChatHistory.value.sort(
+                (a, b) => a.timestamp - b.timestamp,
+              );
+            }
+          },
+          onStreamFinished: (_messageId, tid) => {
+            if (tid === target.topicId && isTargetActive(target)) {
+              summarizeTopic(target);
+            }
+          },
+        });
 
       await invoke("regenerate_topic_response", {
         ownerId,
         ownerType,
         topicId,
         targetUserMsgId: lastUserMsg.id,
-        streamChannel
+        streamChannel,
       });
     } catch (e) {
       console.error("[ChatHistoryStore] Regeneration failed:", e);
+      if (isTargetActive(target)) {
+        await Promise.all([
+          loadHistoryPaginated(ownerId, ownerType, topicId),
+          topicStore.loadTopicList(ownerId, ownerType),
+        ]);
+        notificationStore.addNotification({
+          type: "error",
+          title: "重新生成失败",
+          message: e instanceof Error ? e.message : String(e),
+          toastOnly: true,
+          duration: 5000,
+        });
+      }
     }
   };
 
-
   const fetchRawContent = async (messageId: string): Promise<string> => {
-    const existingMsg = currentChatHistory.value.find(m => m.id === messageId);
-    if (existingMsg && existingMsg.content) return existingMsg.content;
+    const target = getCurrentTarget();
+    if (!target) return "";
+    const existingMsg = currentChatHistory.value.find(
+      (message) => message.id === messageId,
+    );
+    if (existingMsg?.content) return existingMsg.content;
     try {
-      const content = await invoke<string>('fetch_raw_message_content', { messageId });
-      if (existingMsg) existingMsg.content = content;
+      const content = await invoke<string>("fetch_raw_message_content", {
+        messageId,
+        topicId: target.topicId,
+      });
+      if (isTargetActive(target)) {
+        const currentMessage = currentChatHistory.value.find(
+          (message) => message.id === messageId,
+        );
+        if (currentMessage) currentMessage.content = content;
+      }
       return content;
-    } catch (e) {
+    } catch (_error) {
       return "";
     }
   };
 
-  const persistMessageBlocks = async (messageId: string, blocks: ContentBlock[]) => {
-    const msg = currentChatHistory.value.find(m => m.id === messageId);
-    if (!msg || !sessionStore.currentSelectedItem?.id || !sessionStore.currentTopicId) return;
-    msg.blocks = blocks;
+  const persistMessageBlocks = async (
+    messageId: string,
+    blocks: ContentBlock[],
+  ) => {
+    const target = getCurrentTarget();
+    if (!target) return;
+    const message = currentChatHistory.value.find(
+      (item) => item.id === messageId,
+    );
+    if (!message) return;
+    message.blocks = blocks;
     try {
       await invoke("patch_single_message", {
-        ownerId: sessionStore.currentSelectedItem.id,
-        ownerType: sessionStore.currentSelectedItem.type,
-        topicId: sessionStore.currentTopicId,
-        message: msg,
+        ownerId: target.ownerId,
+        ownerType: target.ownerType,
+        topicId: target.topicId,
+        message: { ...message, blocks },
       });
-    } catch (e) {}
+    } catch (e) {
+      console.error("[persistMessageBlocks] patch_single_message failed:", e);
+    }
   };
 
   const reRenderMessage = async (messageId: string, topicId: string) => {
-    const targetIndex = currentChatHistory.value.findIndex(m => m.id === messageId);
+    const target = getCurrentTarget();
+    if (!target || target.topicId !== topicId) {
+      throw new Error("消息未在当前历史记录中找到");
+    }
+    const targetIndex = currentChatHistory.value.findIndex(
+      (message) => message.id === messageId,
+    );
     if (targetIndex === -1) {
       throw new Error("消息未在当前历史记录中找到");
     }
@@ -878,8 +1190,13 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
         messageId,
         topicId,
       });
-      currentChatHistory.value[targetIndex] = {
-        ...currentChatHistory.value[targetIndex],
+      if (!isTargetActive(target)) return;
+      const currentIndex = currentChatHistory.value.findIndex(
+        (message) => message.id === messageId,
+      );
+      if (currentIndex === -1) return;
+      currentChatHistory.value[currentIndex] = {
+        ...currentChatHistory.value[currentIndex],
         blocks: compiledBlocks,
       };
     } catch (e) {
@@ -901,6 +1218,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     loadMoreHistory,
     sendMessage,
     deleteMessage,
+    deleteAttachment,
     triggerGeneration,
     triggerHiddenLifecycleMessage,
     triggerScheduledLifecycleMessage,

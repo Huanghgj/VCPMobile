@@ -5,12 +5,14 @@ import { useTopicStore } from "../../core/stores/topicListManager";
 import { useChatSessionStore } from "../../core/stores/chatSessionStore";
 import { useAssistantStore } from "../../core/stores/assistant";
 import { useLayoutStore } from "../../core/stores/layout";
+import { useNotificationStore } from "../../core/stores/notification";
 import { createDefaultTopicTitle } from "../../core/utils/topicTitle";
 
 const topicStore = useTopicStore();
 const sessionStore = useChatSessionStore();
 const assistantStore = useAssistantStore();
 const layoutStore = useLayoutStore();
+const notificationStore = useNotificationStore();
 const router = useRouter();
 
 const isCreating = ref(false);
@@ -52,26 +54,32 @@ const handleCreateTopic = async () => {
   );
 
   if (!currentItemId.value) {
-    window.alert("请先选择一个助手或群组");
+    notificationStore.addNotification({
+      type: "warning",
+      title: "无法创建话题",
+      message: "请先选择一个助手或群组",
+      toastOnly: true,
+    });
     return;
   }
 
   isCreating.value = true;
 
   const newTopicName = createDefaultTopicTitle();
+  const ownerId = currentItemId.value;
 
   try {
-    const ownerType = assistantStore.agents.some((a) => a.id === currentItemId.value)
+    const ownerType = assistantStore.agents.some((a) => a.id === ownerId)
       ? "agent"
       : "group";
 
     const newTopic = await topicStore.createTopic(
-      currentItemId.value,
+      ownerId,
       ownerType,
       newTopicName,
     );
-    if (newTopic?.id) {
-      await selectTopic(currentItemId.value, newTopic.id, newTopic.name);
+    if (newTopic?.id && currentItemId.value === ownerId) {
+      await selectTopic(ownerId, newTopic.id, newTopic.name);
     }
   } catch (error) {
     console.error("[TopicCreator] create-topic failed", error);

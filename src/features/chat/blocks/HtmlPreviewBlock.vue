@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { ref, watch, computed, onMounted, onUnmounted, nextTick } from "vue";
+import DOMPurify from "dompurify";
+import type { Attachment } from "../../../core/types/chat";
 import { useThemeStore } from "../../../core/stores/theme";
 import { useChatHistoryStore } from "../../../core/stores/chatHistoryStore";
 import { useModalHistory } from "../../../core/composables/useModalHistory";
@@ -23,7 +25,9 @@ const props = defineProps<{
 
 const themeStore = useThemeStore();
 const historyStore = useChatHistoryStore();
-const isPreviewing = ref(!props.isStreaming);
+// HTML is the rendered response itself. Keep the sandbox inline from the first
+// streaming frame instead of presenting source code as an intermediate state.
+const isPreviewing = ref(true);
 const isFullScreen = ref(false);
 const fullScreenTab = ref<"code" | "preview">("code");
 const blockRef = ref<HTMLElement | null>(null);
@@ -86,7 +90,10 @@ watch([state, isPreviewing], ([nextState, previewing]) => {
 // 代码预览转义处理 (优先使用后端预渲染 syntect 高亮，无值时回退为安全 HTML 转义)
 const highlightedCode = computed(() => {
   if (props.highlightedContent) {
-    return props.highlightedContent;
+    return DOMPurify.sanitize(props.highlightedContent, {
+      ALLOWED_TAGS: ["div", "pre", "code", "span"],
+      ALLOWED_ATTR: ["class", "style"],
+    });
   }
   return props.content
     .replace(/&/g, "&amp;")
@@ -107,12 +114,60 @@ const copyCode = async () => {
   }
 };
 
+function mediaAlias(value?: string): string {
+  if (!value) return "";
+  const normalized = value.split(/[?#]/, 1)[0].replace(/\\/g, "/");
+  const basename = normalized.slice(normalized.lastIndexOf("/") + 1);
+  try {
+    return decodeURIComponent(basename).trim().toLowerCase();
+  } catch {
+    return basename.trim().toLowerCase();
+  }
+}
+
+function mediaUrl(attachment: Attachment): string {
+  const resolved = attachment.resolvedSrc || "";
+  return /^(?:https?:|data:|blob:|asset:|tauri:)/i.test(resolved)
+    ? resolved
+    : "";
+}
+
+const recentMediaSources = computed<Record<string, string>>(() => {
+  const history = historyStore.currentChatHistory;
+  const currentIndex = history.findIndex((item) => item.id === props.messageId);
+  const start = currentIndex >= 0 ? currentIndex : history.length - 1;
+  const sources: Record<string, string> = {};
+
+  for (let index = start; index >= Math.max(0, start - 24); index -= 1) {
+    for (const attachment of history[index]?.attachments || []) {
+      if (
+        !attachment.type.startsWith("video/") &&
+        !attachment.type.startsWith("audio/")
+      ) {
+        continue;
+      }
+      const url = mediaUrl(attachment);
+      if (!url) continue;
+      for (const candidate of [
+        attachment.name,
+        attachment.src,
+        attachment.internalPath,
+      ]) {
+        const alias = mediaAlias(candidate);
+        if (alias && !sources[alias]) sources[alias] = url;
+      }
+    }
+  }
+  return sources;
+});
+
 // Active content executes inside an opaque-origin iframe, not the app document.
 const sandboxHtml = computed(() => {
   return buildActiveHtmlDocument(
     props.content,
     themeStore.isDarkResolved,
     bridgeNonce,
+    recentMediaSources.value,
   );
 });
 
@@ -123,7 +178,12 @@ interface ActiveHtmlMessage {
   height?: number;
   actionId?: string;
   action?: string;
+  copyId?: string;
+  text?: string;
+  secret?: string;
 }
+
+const frameBridgeSecrets = new WeakMap<HTMLIFrameElement, string>();
 
 function trustedFrame(
   event: MessageEvent<ActiveHtmlMessage>,
@@ -168,6 +228,26 @@ async function handleSandboxAction(
   }
 }
 
+async function handleSandboxCopy(
+  frame: HTMLIFrameElement,
+  data: ActiveHtmlMessage,
+) {
+  const copyId = data.copyId || "";
+  const text = data.text;
+  if (!copyId || typeof text !== "string" || text.length > 4_000_000) {
+    postToFrame(frame, { type: "copy-result", copyId, success: false });
+    return;
+  }
+
+  try {
+    await navigator.clipboard.writeText(text);
+    postToFrame(frame, { type: "copy-result", copyId, success: true });
+  } catch (error) {
+    console.error("[HtmlPreviewBlock] Failed to copy sandbox text:", error);
+    postToFrame(frame, { type: "copy-result", copyId, success: false });
+  }
+}
+
 function handleSandboxMessage(event: MessageEvent<ActiveHtmlMessage>) {
   const data = event.data;
   if (
@@ -180,6 +260,21 @@ function handleSandboxMessage(event: MessageEvent<ActiveHtmlMessage>) {
   }
   const frame = trustedFrame(event);
   if (!frame) return;
+
+  if (data.type === "bridge-ready") {
+    if (
+      !frameBridgeSecrets.has(frame) &&
+      typeof data.secret === "string" &&
+      data.secret.length >= 16 &&
+      data.secret.length <= 200
+    ) {
+      frameBridgeSecrets.set(frame, data.secret);
+      lastFrameVisibility.delete(frame);
+      scheduleVisibilityUpdate(true);
+    }
+    return;
+  }
+  if (frameBridgeSecrets.get(frame) !== data.secret) return;
 
   if (data.type === "render-size") {
     const nextHeight = Math.ceil(Number(data.height));
@@ -208,6 +303,8 @@ function handleSandboxMessage(event: MessageEvent<ActiveHtmlMessage>) {
     scheduleVisibilityUpdate(true);
   } else if (data.type === "ai-action") {
     void handleSandboxAction(frame, data);
+  } else if (data.type === "copy-text") {
+    void handleSandboxCopy(frame, data);
   }
 }
 
@@ -285,7 +382,10 @@ function scheduleVisibilityUpdate(immediate: boolean | Event = false) {
 
 function handleFrameLoad(event: Event) {
   if (event.currentTarget instanceof HTMLIFrameElement) {
-    lastFrameVisibility.delete(event.currentTarget);
+    const frame = event.currentTarget;
+    frameBridgeSecrets.delete(frame);
+    lastFrameVisibility.delete(frame);
+    postToFrame(frame, { type: "bridge-challenge" });
   }
   scheduleVisibilityUpdate(true);
 }

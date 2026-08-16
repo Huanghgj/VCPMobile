@@ -435,6 +435,7 @@ pub fn get_free_disk_space<R: Runtime>(app: AppHandle<R>) -> Result<DiskSpaceInf
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PickedFileInfo {
+    pub native_id: Option<String>,
     pub path: String,
     pub name: String,
     pub mime: String,
@@ -443,31 +444,63 @@ pub struct PickedFileInfo {
     pub thumbnail_path: Option<String>,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PickFileError {
+    pub native_id: Option<String>,
+    pub message: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PickedFileBatch {
+    pub files: Vec<PickedFileInfo>,
+    #[serde(default)]
+    pub errors: Vec<PickFileError>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+#[cfg(target_os = "android")]
+enum NativePickFileResult {
+    Batch(PickedFileBatch),
+    Single(PickedFileInfo),
+}
+
 #[tauri::command]
 pub fn pick_file<R: Runtime>(
     app: AppHandle<R>,
     mode: Option<String>,
-) -> Result<PickedFileInfo, String> {
+    request_id: Option<String>,
+) -> Result<PickedFileBatch, String> {
     #[cfg(target_os = "android")]
     {
         let state = app.state::<VcpMobileState<R>>();
         let handle = state.plugin_handle.lock().map_err(|e| e.to_string())?;
         let plugin_handle = handle.as_ref().ok_or("Plugin handle not initialized")?;
 
-        let file_info = plugin_handle
-            .run_mobile_plugin::<PickedFileInfo>(
+        let result = plugin_handle
+            .run_mobile_plugin::<NativePickFileResult>(
                 "pickFile",
                 serde_json::json!({
-                    "mode": mode.unwrap_or_else(|| "file".to_string())
+                    "mode": mode.unwrap_or_else(|| "file".to_string()),
+                    "requestId": request_id.unwrap_or_default()
                 }),
             )
             .map_err(|e| format!("run_mobile_plugin failed: {}", e))?;
-        Ok(file_info)
+        Ok(match result {
+            NativePickFileResult::Batch(batch) => batch,
+            NativePickFileResult::Single(file) => PickedFileBatch {
+                files: vec![file],
+                errors: Vec::new(),
+            },
+        })
     }
     #[cfg(not(target_os = "android"))]
     {
         let _ = app;
         let _ = mode;
+        let _ = request_id;
         Err("该接口仅在 Android 物理端可用".to_string())
     }
 }
@@ -709,13 +742,21 @@ pub fn delete_temp_file<R: Runtime>(app: AppHandle<R>, file_path: String) -> Res
         use std::path::Path;
         let path = Path::new(&file_path);
 
-        // 安全防护：限制仅允许删除 App 自身的 cache_dir 缓存目录下的文件，防路径遍历越权
+        // Canonicalize both sides before the containment check. A lexical
+        // `starts_with` accepts paths such as cache/../files/settings.json.
         use tauri::Manager;
         let cache_dir = app.path().cache_dir().map_err(|e| e.to_string())?;
-
-        if path.starts_with(&cache_dir) && path.exists() && path.is_file() {
-            std::fs::remove_file(path).map_err(|e| e.to_string())?;
+        if !path.exists() {
+            return Ok(());
         }
+        let canonical_cache = std::fs::canonicalize(&cache_dir)
+            .map_err(|e| format!("Failed to canonicalize cache directory: {e}"))?;
+        let canonical_path = std::fs::canonicalize(path)
+            .map_err(|e| format!("Failed to canonicalize temp file: {e}"))?;
+        if !canonical_path.starts_with(&canonical_cache) || !canonical_path.is_file() {
+            return Err("Refusing to delete a file outside the app cache directory".to_string());
+        }
+        std::fs::remove_file(canonical_path).map_err(|e| e.to_string())?;
         Ok(())
     }
     #[cfg(not(target_os = "android"))]
@@ -820,6 +861,25 @@ pub fn request_overlay_permission<R: Runtime>(app: AppHandle<R>) -> Result<(), S
     Ok(())
 }
 
+#[tauri::command]
+pub fn mark_share_intent_ready<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let state = app.state::<VcpMobileState<R>>();
+        let handle = state.plugin_handle.lock().map_err(|e| e.to_string())?;
+        let plugin_handle = handle.as_ref().ok_or("Plugin handle not initialized")?;
+
+        plugin_handle
+            .run_mobile_plugin::<serde_json::Value>("markShareIntentReady", serde_json::json!({}))
+            .map_err(|e| format!("run_mobile_plugin failed: {e}"))?;
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+    }
+    Ok(())
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SharedFileItem {
@@ -841,17 +901,21 @@ pub fn register_shared_files<R: Runtime>(
 
         let mut results = Vec::new();
         for file in files {
-            let file_info = plugin_handle
-                .run_mobile_plugin::<PickedFileInfo>(
-                    "processSharedFile",
-                    serde_json::json!({
-                        "cachePath": file.cache_path,
-                        "mimeType": file.mime_type,
-                        "fileName": file.file_name,
-                    }),
-                )
-                .map_err(|e| format!("run_mobile_plugin processSharedFile failed: {}", e))?;
-            results.push(file_info);
+            match plugin_handle.run_mobile_plugin::<PickedFileInfo>(
+                "processSharedFile",
+                serde_json::json!({
+                    "cachePath": file.cache_path,
+                    "mimeType": file.mime_type,
+                    "fileName": file.file_name,
+                }),
+            ) {
+                Ok(file_info) => results.push(file_info),
+                Err(error) => log::warn!(
+                    "[VcpMobilePlugin] Failed to process shared file {}: {}",
+                    file.file_name,
+                    error
+                ),
+            }
         }
         Ok(results)
     }

@@ -29,6 +29,7 @@ export function stopStreamService(agentName: string): Promise<void> {
 // ==================================================================
 
 export interface PickedFile {
+  nativeId?: string;
   path: string;
   name: string;
   mime: string;
@@ -37,8 +38,24 @@ export interface PickedFile {
   thumbnailPath?: string;
 }
 
-export function pickFile(mode = "file"): Promise<PickedFile> {
-  return invoke<PickedFile>("plugin:vcp-mobile|pick_file", { mode });
+export interface PickFileError {
+  nativeId?: string;
+  message: string;
+}
+
+export interface PickedFileBatch {
+  files: PickedFile[];
+  errors: PickFileError[];
+}
+
+export function pickFile(
+  mode = "file",
+  requestId?: string,
+): Promise<PickedFileBatch> {
+  return invoke<PickedFileBatch>("plugin:vcp-mobile|pick_file", {
+    mode,
+    requestId,
+  });
 }
 
 export function openFileNative(path: string): Promise<void> {
@@ -80,6 +97,10 @@ export function writeTempFile(
     bytes: Array.from(bytes),
     fileName,
   });
+}
+
+export function deleteTempFile(filePath: string): Promise<void> {
+  return invoke("plugin:vcp-mobile|delete_temp_file", { filePath });
 }
 
 // ==================================================================

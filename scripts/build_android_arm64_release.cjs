@@ -7,10 +7,14 @@ const {
   statSync,
 } = require("node:fs");
 const { createHash } = require("node:crypto");
-const { join, resolve } = require("node:path");
+const { dirname, join, resolve } = require("node:path");
 
 const root = resolve(__dirname, "..");
 const androidDir = join(root, "src-tauri", "gen", "android");
+const localSigningHelperGuard = "VCPMOBILE_RELEASE_HELPER_ACTIVE";
+const githubUploadGuard = "VCPMOBILE_UPLOAD_GITHUB";
+const expectedReleaseCertificateDigest =
+  "35fa1397daa390653c67049f413b575ebd8bcb0c3ab76badcd3db21e794f6a1d";
 const sccacheBin =
   process.env.SCCACHE ||
   (isWindowsPathCandidate()
@@ -40,6 +44,73 @@ function readTargetArg() {
   return process.env.ANDROID_BUILD_TARGET || "aarch64";
 }
 
+function findLocalSigningHelper() {
+  if (!isWindowsPathCandidate()) return null;
+
+  const configured = String(process.env.VCPMOBILE_RELEASE_HELPER || "").trim();
+  const userProfile = String(process.env.USERPROFILE || "").trim();
+  const candidates = [
+    configured,
+    userProfile
+      ? join(
+          userProfile,
+          ".android",
+          "vcp-mobile-release",
+          "build-vcpmobile-release.ps1",
+        )
+      : "",
+  ].filter(Boolean);
+
+  return candidates.find((candidate) => existsSync(candidate)) || null;
+}
+
+function delegateToLocalSigningHelper(helperPath, uploadToGitHub) {
+  const windowsRoot =
+    process.env.SystemRoot || process.env.WINDIR || "C:\\Windows";
+  const bundledPowerShell = join(
+    windowsRoot,
+    "System32",
+    "WindowsPowerShell",
+    "v1.0",
+    "powershell.exe",
+  );
+  const powershell = existsSync(bundledPowerShell)
+    ? bundledPowerShell
+    : "powershell.exe";
+
+  console.log(
+    `[android-release] using persisted local release-signing helper: ${helperPath}`,
+  );
+  const delegated = spawnSync(
+    powershell,
+    [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      helperPath,
+      "-Repository",
+      root,
+    ],
+    {
+      cwd: root,
+      stdio: "inherit",
+      shell: false,
+      env: {
+        ...process.env,
+        [localSigningHelperGuard]: "1",
+        [githubUploadGuard]: uploadToGitHub ? "1" : "0",
+      },
+    },
+  );
+  if (delegated.error) {
+    console.error(
+      `[android-release] failed to start local signing helper: ${delegated.error.message}`,
+    );
+  }
+  process.exit(delegated.status ?? 1);
+}
+
 const targetName = readTargetArg();
 const targetConfig = TARGETS[targetName];
 if (!targetConfig) {
@@ -47,6 +118,37 @@ if (!targetConfig) {
     `[android-release] Unsupported target '${targetName}'. Supported: ${Object.keys(TARGETS).join(", ")}`,
   );
   process.exit(1);
+}
+
+const allowDebugSigning = process.argv.includes("--allow-debug-signing");
+const uploadToGitHub =
+  process.argv.includes("--upload-github") ||
+  process.env[githubUploadGuard] === "1";
+if (uploadToGitHub && allowDebugSigning) {
+  console.error(
+    "[android-release] Refusing to upload an Android Debug-signed APK to GitHub.",
+  );
+  process.exit(2);
+}
+let usingDefaultDebugSigning = false;
+if (allowDebugSigning) {
+  const hasAnySigningEnvironment = [
+    "ANDROID_KEYSTORE_PATH",
+    "ANDROID_KEY_ALIAS",
+    "ANDROID_KEYSTORE_PASSWORD",
+    "ANDROID_KEY_PASSWORD",
+  ].some((name) => String(process.env[name] || "").trim());
+  if (!hasAnySigningEnvironment) {
+    usingDefaultDebugSigning = true;
+    process.env.ANDROID_KEYSTORE_PATH = join(
+      process.env.USERPROFILE || "",
+      ".android",
+      "debug.keystore",
+    );
+    process.env.ANDROID_KEY_ALIAS = "androiddebugkey";
+    process.env.ANDROID_KEYSTORE_PASSWORD = "android";
+    process.env.ANDROID_KEY_PASSWORD = "android";
+  }
 }
 
 const signingEnvironment = [
@@ -58,6 +160,17 @@ const signingEnvironment = [
 const missingSigningEnvironment = signingEnvironment.filter(
   (name) => !String(process.env[name] || "").trim(),
 );
+if (
+  !allowDebugSigning &&
+  !process.argv.includes("--verify-existing") &&
+  missingSigningEnvironment.length > 0 &&
+  process.env[localSigningHelperGuard] !== "1"
+) {
+  const localSigningHelper = findLocalSigningHelper();
+  if (localSigningHelper) {
+    delegateToLocalSigningHelper(localSigningHelper, uploadToGitHub);
+  }
+}
 if (missingSigningEnvironment.length > 0) {
   console.error(
     `[android-release] Refusing to build a release APK without formal signing: missing ${missingSigningEnvironment.join(", ")}`,
@@ -65,6 +178,42 @@ if (missingSigningEnvironment.length > 0) {
   process.exit(2);
 }
 const releaseKeystorePath = resolve(process.env.ANDROID_KEYSTORE_PATH);
+if (usingDefaultDebugSigning && !existsSync(releaseKeystorePath)) {
+  mkdirSync(dirname(releaseKeystorePath), { recursive: true });
+  console.log(
+    `[android-release] generating standard Android debug keystore: ${releaseKeystorePath}`,
+  );
+  const generated = spawnSync(
+    "keytool",
+    [
+      "-genkeypair",
+      "-v",
+      "-keystore",
+      releaseKeystorePath,
+      "-storepass",
+      "android",
+      "-alias",
+      "androiddebugkey",
+      "-keypass",
+      "android",
+      "-keyalg",
+      "RSA",
+      "-keysize",
+      "2048",
+      "-validity",
+      "10000",
+      "-dname",
+      "CN=Android Debug,O=Android,C=US",
+    ],
+    { stdio: "inherit", shell: false },
+  );
+  if (generated.error || generated.status !== 0) {
+    console.error(
+      "[android-release] failed to generate Android debug keystore.",
+    );
+    process.exit(generated.status || 1);
+  }
+}
 if (
   !existsSync(releaseKeystorePath) ||
   statSync(releaseKeystorePath).size === 0
@@ -118,8 +267,14 @@ function pnpmExecArgs(args) {
       args: [process.env.npm_execpath, ...args],
     };
   }
+  if (isWindows) {
+    return {
+      command: process.env.ComSpec || "cmd.exe",
+      args: ["/d", "/s", "/c", "pnpm.cmd", ...args],
+    };
+  }
   return {
-    command: isWindows ? "pnpm.cmd" : "pnpm",
+    command: "pnpm",
     args,
   };
 }
@@ -151,6 +306,7 @@ function run(label, command, args, options = {}) {
   const result = spawnSync(command, args, {
     cwd: options.cwd || root,
     stdio: options.captureOutput ? ["inherit", "pipe", "pipe"] : "inherit",
+    maxBuffer: options.captureOutput ? 64 * 1024 * 1024 : undefined,
     shell: false,
     env: {
       ...process.env,
@@ -174,7 +330,7 @@ function run(label, command, args, options = {}) {
 }
 
 function isWindowsSymlinkFailure(result) {
-  if (!isWindows || result.error || result.status === 0) return false;
+  if (!isWindows || result.status === 0) return false;
   const output = `${result.stdout || ""}\n${result.stderr || ""}`.toLowerCase();
   return (
     output.includes("symlink") ||
@@ -311,9 +467,9 @@ if (verifyExisting) {
     isWindowsSymlinkFailure(tauri) && !isFreshApk(apk, totalStart);
 
   if (needsGradleFallback) {
-    if (!existsSync(soSrc) || statSync(soSrc).mtimeMs < totalStart) {
+    if (!existsSync(soSrc) || statSync(soSrc).size === 0) {
       console.error(
-        `[android-release] Rust library not found after failed Tauri build: ${soSrc}`,
+        `[android-release] Rust library not found or empty after failed Tauri build: ${soSrc}`,
       );
       process.exit(tauri.status || 1);
     }
@@ -394,13 +550,19 @@ const apkCertificate = run(
 if (apkCertificate.error || apkCertificate.status !== 0) {
   process.exit(apkCertificate.status || 1);
 }
-if (
-  /android debug/i.test(`${apkCertificate.stdout}\n${apkCertificate.stderr}`)
-) {
+const isDebugCertificate = /android debug/i.test(
+  `${apkCertificate.stdout}\n${apkCertificate.stderr}`,
+);
+if (isDebugCertificate && !allowDebugSigning) {
   console.error(
     "[android-release] APK is signed with Android Debug key; refusing artifact.",
   );
   process.exit(1);
+}
+if (isDebugCertificate) {
+  console.warn(
+    "[android-release] Explicit fallback enabled: accepting Android Debug certificate for this release build.",
+  );
 }
 const apkDigest = normalizeCertificateDigest(
   apkCertificate.stdout.match(
@@ -434,6 +596,12 @@ if (!apkDigest || !keystoreDigest || apkDigest !== keystoreDigest) {
   );
   process.exit(1);
 }
+if (!isDebugCertificate && apkDigest !== expectedReleaseCertificateDigest) {
+  console.error(
+    "[android-release] APK certificate does not match the pinned VCPMobile release certificate.",
+  );
+  process.exit(1);
+}
 
 const badging = run(
   "inspect APK manifest and ABI",
@@ -451,10 +619,11 @@ if (/application-debuggable/i.test(badging.stdout)) {
   process.exit(1);
 }
 const nativeCodeLine = badging.stdout.match(/^native-code:.*$/m)?.[0] || "";
-if (
-  !nativeCodeLine.includes("'arm64-v8a'") ||
-  /'x86(?:_64)?'|'armeabi-v7a'/.test(nativeCodeLine)
-) {
+const packagedAbis = Array.from(
+  nativeCodeLine.matchAll(/'([^']+)'/g),
+  (match) => match[1],
+);
+if (packagedAbis.length !== 1 || packagedAbis[0] !== targetConfig.jniAbi) {
   console.error(
     `[android-release] Unexpected native ABI set: ${nativeCodeLine || "missing"}`,
   );
@@ -463,13 +632,42 @@ if (
 
 const version = require(join(root, "src-tauri", "tauri.conf.json")).version;
 const artifactDir = join(root, "release-artifacts");
-const artifactPath = join(artifactDir, `VCPMobile_v${version}_arm64-v8a.apk`);
+const signingSuffix = isDebugCertificate ? "_release-debug-signed" : "";
+let artifactPath = join(
+  artifactDir,
+  `VCPMobile_v${version}_${targetConfig.jniAbi}${signingSuffix}.apk`,
+);
+if (existsSync(artifactPath)) {
+  const buildStamp = new Date().toISOString().replace(/[-:]/g, "").slice(0, 15);
+  artifactPath = join(
+    artifactDir,
+    `VCPMobile_v${version}_${targetConfig.jniAbi}${signingSuffix}-${buildStamp}.apk`,
+  );
+}
 mkdirSync(artifactDir, { recursive: true });
 copyFileSync(apk, artifactPath);
 
 console.log("\n[android-release] APK ready");
 console.log(`[android-release] path: ${artifactPath}`);
 console.log(`[android-release] sha256: ${hashFile(artifactPath)}`);
+if (uploadToGitHub) {
+  const uploaderPath = join(
+    root,
+    "scripts",
+    "upload_android_release_asset.cjs",
+  );
+  const upload = run("upload APK to GitHub Release", process.execPath, [
+    uploaderPath,
+    "--artifact",
+    artifactPath,
+  ]);
+  if (upload.error || upload.status !== 0) {
+    console.error(
+      `[android-release] Local APK remains available at: ${artifactPath}`,
+    );
+    process.exit(upload.status || 1);
+  }
+}
 console.log(
   `[android-release] total elapsed: ${formatMs(Date.now() - totalStart)}`,
 );

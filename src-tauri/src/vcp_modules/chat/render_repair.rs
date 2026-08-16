@@ -24,6 +24,8 @@ lazy_static::lazy_static! {
         Regex::new(r"(?im)^[ \t]*~~~[ \t]*\r?$").unwrap();
 }
 
+const TOOL_REQUEST_MARKER: &str = "<<<[TOOL_REQUEST]>>>";
+
 /// Repairs renderable AI output before it is compiled and persisted.
 ///
 /// The important behavior is boundary-aware repair: if a naked HTML render block
@@ -194,6 +196,13 @@ pub fn repair_html_fragment(fragment: &str) -> String {
             }
 
             output.push_str(tag_text);
+            if !tag.self_closing && is_raw_text_tag(&tag.name) {
+                if let Some(raw_end) = find_raw_text_element_end(fragment, gt + 1, &tag.name) {
+                    output.push_str(&fragment[gt + 1..raw_end]);
+                    cursor = raw_end;
+                    continue;
+                }
+            }
             if !tag.self_closing && !is_void_tag(&tag.name) {
                 stack.push(tag.name);
             }
@@ -294,6 +303,14 @@ pub(crate) fn repair_premature_vcp_root_closes(fragment: &str) -> Cow<'_, str> {
             }
         }
 
+        if !tag.closing && !tag.self_closing && is_raw_text_tag(&tag.name) {
+            if let Some(raw_end) = find_raw_text_element_end(fragment, gt + 1, &tag.name) {
+                output.push_str(&fragment[lt..raw_end]);
+                cursor = raw_end;
+                continue;
+            }
+        }
+
         output.push_str(tag_text);
         cursor = gt + 1;
     }
@@ -351,6 +368,12 @@ fn has_later_orphan_close(fragment: &str, start: usize, tag_name: &str) -> bool 
         let Some(tag) = parse_html_tag(tag_text) else {
             continue;
         };
+        if !tag.closing && !tag.self_closing && is_raw_text_tag(&tag.name) {
+            if let Some(raw_end) = find_raw_text_element_end(fragment, gt + 1, &tag.name) {
+                cursor = raw_end;
+                continue;
+            }
+        }
         if tag.name != tag_name || tag.self_closing || is_void_tag(&tag.name) {
             continue;
         }
@@ -368,12 +391,123 @@ fn has_later_orphan_close(fragment: &str, start: usize, tag_name: &str) -> bool 
     false
 }
 
+/// Finds a tool request that is stuck directly to a rendered HTML block. The
+/// regular protocol regex remains line-anchored so prose and code examples do
+/// not become control blocks; this narrow path only accepts a real closing HTML
+/// tag outside literal HTML elements such as script/style/pre/code.
+pub(crate) fn find_stuck_tool_request_start(text: &str) -> Option<(usize, usize)> {
+    let mut search_from = 0;
+
+    while let Some(relative_start) = text[search_from..].find(TOOL_REQUEST_MARKER) {
+        let start = search_from + relative_start;
+        let end = start + TOOL_REQUEST_MARKER.len();
+        let prefix = text[..start].trim_end();
+        let Some(tag_start) = prefix.rfind('<') else {
+            search_from = end;
+            continue;
+        };
+        let Some(tag) = parse_html_tag(&prefix[tag_start..]) else {
+            search_from = end;
+            continue;
+        };
+        let is_block_boundary = tag.closing
+            && matches!(
+                tag.name.as_str(),
+                "div"
+                    | "section"
+                    | "article"
+                    | "header"
+                    | "footer"
+                    | "main"
+                    | "aside"
+                    | "figure"
+                    | "figcaption"
+                    | "details"
+                    | "p"
+                    | "w2g"
+                    | "catsay"
+                    | "bginfor"
+            );
+
+        if is_block_boundary && !is_inside_html_raw_text_or_tag(text, start) {
+            return Some((start, end));
+        }
+        search_from = end;
+    }
+
+    None
+}
+
+/// Finds an unambiguous tool boundary while an outer generated HTML container
+/// is still open. A line-anchored protocol marker is valid even when the model
+/// forgot to close the surrounding HTML first, but markers inside literal HTML
+/// elements or tag attributes must remain document text.
+pub(crate) fn find_tool_request_boundary_in_html(text: &str) -> Option<(usize, usize)> {
+    let anchored = crate::vcp_modules::content_parser::TOOL_START
+        .find_iter(text)
+        .find(|marker| !is_inside_html_raw_text_or_tag(text, marker.start()))
+        .map(|marker| (marker.start(), marker.end()));
+    let stuck = find_stuck_tool_request_start(text);
+
+    match (anchored, stuck) {
+        (Some(left), Some(right)) => Some(if left.0 <= right.0 { left } else { right }),
+        (Some(boundary), None) | (None, Some(boundary)) => Some(boundary),
+        (None, None) => None,
+    }
+}
+
+fn is_inside_html_raw_text_or_tag(text: &str, end: usize) -> bool {
+    let mut cursor = 0;
+    let mut raw_text_tag: Option<String> = None;
+
+    while cursor < end {
+        let Some(relative_lt) = text[cursor..end].find('<') else {
+            break;
+        };
+        let lt = cursor + relative_lt;
+
+        if text[lt..].starts_with("<!--") {
+            let Some(relative_comment_end) = text[lt + 4..].find("-->") else {
+                return true;
+            };
+            let comment_end = lt + 4 + relative_comment_end + 3;
+            if comment_end > end {
+                return true;
+            }
+            cursor = comment_end;
+            continue;
+        }
+
+        let Some(gt) = find_tag_end(text, lt) else {
+            return true;
+        };
+        if gt >= end {
+            return true;
+        }
+        let tag_text = &text[lt..=gt];
+        if let Some(tag) = parse_html_tag(tag_text) {
+            if let Some(active_raw_tag) = raw_text_tag.as_deref() {
+                if tag.closing && tag.name == active_raw_tag {
+                    raw_text_tag = None;
+                }
+            } else if !tag.closing
+                && !tag.self_closing
+                && matches!(
+                    tag.name.as_str(),
+                    "script" | "style" | "textarea" | "title" | "pre" | "code"
+                )
+            {
+                raw_text_tag = Some(tag.name);
+            }
+        }
+        cursor = gt + 1;
+    }
+
+    raw_text_tag.is_some()
+}
+
 fn find_earliest_protected_block(text: &str) -> Option<(usize, usize, ProtectedBlock)> {
-    let checks: [(&Regex, ProtectedBlock); 10] = [
-        (
-            &crate::vcp_modules::content_parser::TOOL_START,
-            ProtectedBlock::Tool,
-        ),
+    let checks: [(&Regex, ProtectedBlock); 9] = [
         (
             &crate::vcp_modules::content_parser::THOUGHT_START,
             ProtectedBlock::Thought,
@@ -415,6 +549,14 @@ fn find_earliest_protected_block(text: &str) -> Option<(usize, usize, ProtectedB
             {
                 earliest = Some((m.start(), m.end(), block_type));
             }
+        }
+    }
+    if let Some((start, end)) = find_tool_request_boundary_in_html(text) {
+        if earliest
+            .as_ref()
+            .is_none_or(|(current_start, _, _)| start < *current_start)
+        {
+            earliest = Some((start, end, ProtectedBlock::Tool));
         }
     }
     earliest
@@ -546,6 +688,30 @@ fn parse_html_tag(tag_text: &str) -> Option<HtmlTag> {
     })
 }
 
+fn is_raw_text_tag(name: &str) -> bool {
+    matches!(name, "script" | "style" | "textarea" | "title")
+}
+
+fn find_raw_text_element_end(text: &str, body_start: usize, tag_name: &str) -> Option<usize> {
+    let suffix = text.get(body_start..)?;
+    let lowercase = suffix.to_ascii_lowercase();
+    let needle = format!("</{tag_name}");
+    let mut search_from = 0;
+
+    while let Some(relative_close) = lowercase[search_from..].find(&needle) {
+        let close_start = body_start + search_from + relative_close;
+        let name_end = close_start + needle.len();
+        let boundary = text.get(name_end..)?.chars().next()?;
+        if boundary.is_ascii_whitespace() || boundary == '>' {
+            let close_end = find_tag_end(text, close_start)? + 1;
+            return Some(close_end);
+        }
+        search_from += relative_close + needle.len();
+    }
+
+    None
+}
+
 fn is_void_tag(name: &str) -> bool {
     matches!(
         name,
@@ -620,6 +786,76 @@ mod tests {
             blocks[1],
             crate::vcp_modules::content_parser::ContentBlock::ToolUse { .. }
         ));
+    }
+
+    #[test]
+    fn closes_generated_root_around_stuck_tool_request() {
+        let input = concat!(
+            "<div id=\"vcp-root\"><div data-probe=\"body\">visible</div>",
+            "<<<[TOOL_REQUEST]>>>\n",
+            "maid:「始」Nova「末」,\n",
+            "tool_name:「始」DailyNote「末」,\n",
+            "command:「始」create「末」,\n",
+            "Date:「始」2026-08-02「末」,\n",
+            "Content:「始ESCAPE」diary body「末ESCAPE」\n",
+            "<<<[END_TOOL_REQUEST]>>>\n",
+            "<w2g><catsay>tail card</catsay></w2g></div>"
+        );
+
+        let repaired = repair_message_content_before_persist(input);
+
+        assert!(
+            repaired.contains("<div data-probe=\"body\">visible</div></div><<<[TOOL_REQUEST]>>>"),
+            "outer generated HTML must close before the tool marker: {repaired}"
+        );
+        assert!(repaired.contains("<w2g><catsay>tail card</catsay></w2g>"));
+
+        let line_separated = input.replace(
+            "<div data-probe=\"body\">visible</div><<<[TOOL_REQUEST]>>>",
+            "<div data-probe=\"body\">visible</div>\n<<<[TOOL_REQUEST]>>>",
+        );
+        assert!(find_stuck_tool_request_start(&line_separated).is_some());
+    }
+
+    #[test]
+    fn does_not_extract_tool_marker_from_script_text() {
+        let input = concat!(
+            "<div><script>",
+            "const example = '</div><<<[TOOL_REQUEST]>>>';",
+            "</script></div>"
+        );
+
+        assert!(find_stuck_tool_request_start(input).is_none());
+        assert_eq!(repair_message_content_before_persist(input), input);
+    }
+
+    #[test]
+    fn closes_unclosed_html_before_line_anchored_tool_request() {
+        let input = concat!(
+            "<div id=\"vcp-root\"><p>visible</p><w2g><catsay>tail text\n",
+            "<<<[TOOL_REQUEST]>>>\n",
+            "tool_name:「始」ComfyUIGen「末」"
+        );
+
+        let repaired = repair_message_content_before_persist(input);
+
+        assert!(
+            repaired.contains("<w2g><catsay>tail text\n</catsay></w2g></div><<<[TOOL_REQUEST]>>>"),
+            "open HTML must close before the protocol boundary: {repaired}"
+        );
+    }
+
+    #[test]
+    fn does_not_extract_line_anchored_tool_marker_from_preformatted_html() {
+        let input = concat!(
+            "<div id=\"vcp-root\"><pre><code>example\n",
+            "<<<[TOOL_REQUEST]>>>\n",
+            "tool_name: demo\n",
+            "</code></pre></div>"
+        );
+
+        assert!(find_tool_request_boundary_in_html(input).is_none());
+        assert_eq!(repair_message_content_before_persist(input), input);
     }
 
     #[test]

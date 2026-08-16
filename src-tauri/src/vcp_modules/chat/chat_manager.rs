@@ -1,6 +1,7 @@
 use crate::vcp_modules::content_parser::ContentBlock;
 use crate::vcp_modules::message_service;
 use serde::{Deserialize, Serialize};
+use tauri::Manager;
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct Attachment {
@@ -72,6 +73,20 @@ pub struct ChatMessage {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_hash: Option<String>,
+
+    #[serde(
+        rename = "transientContext",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub transient_context: Option<String>,
+
+    #[serde(
+        rename = "transientSystemPrompt",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub transient_system_prompt: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -201,11 +216,34 @@ pub async fn patch_single_message(
 
 #[tauri::command]
 pub async fn delete_messages(
+    app_handle: tauri::AppHandle,
     db_state: tauri::State<'_, crate::vcp_modules::db_manager::DbState>,
+    owner_id: String,
+    owner_type: String,
     topic_id: String,
     msg_ids: Vec<String>,
 ) -> Result<(), String> {
-    message_service::delete_messages(&db_state.pool, &topic_id, msg_ids).await
+    message_service::ensure_active_topic_owner(&db_state.pool, &topic_id, &owner_id, &owner_type)
+        .await?;
+    if let Some(active_requests) =
+        app_handle.try_state::<crate::vcp_modules::vcp_client::ActiveRequests>()
+    {
+        active_requests.cancel_ids(msg_ids.iter().map(String::as_str));
+    }
+    let deleted_ids = message_service::delete_messages(&db_state.pool, &topic_id, msg_ids).await?;
+    if let Some(sync_state) =
+        app_handle.try_state::<crate::vcp_modules::sync::sync_service::SyncState>()
+    {
+        for message_id in deleted_ids {
+            let _ = sync_state.ws_sender.send(
+                crate::vcp_modules::sync::sync_service::SyncCommand::NotifyDelete {
+                    data_type: crate::vcp_modules::sync::sync_types::SyncDataType::Message,
+                    id: message_id,
+                },
+            );
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]

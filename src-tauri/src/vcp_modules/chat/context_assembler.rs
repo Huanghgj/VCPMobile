@@ -22,9 +22,23 @@ pub async fn orchestrate_chat_context(
     topic_id: &str,
     agent_name: &str,
     scope: &str, // "agent" | "group"
-    base_system_prompt: String,
+    mut base_system_prompt: String,
     invite_prompt: Option<String>,
 ) -> Result<Vec<Value>, String> {
+    if let Some(transient_prompt) = history
+        .iter()
+        .rev()
+        .find_map(|message| message.transient_system_prompt.as_deref())
+        .filter(|prompt| !prompt.trim().is_empty())
+    {
+        if !base_system_prompt.is_empty() {
+            base_system_prompt.push_str("\n\n");
+        }
+        base_system_prompt.push_str("<watch_together>\n");
+        base_system_prompt.push_str(transient_prompt);
+        base_system_prompt.push_str("\n</watch_together>");
+    }
+
     // 1. 快速查询会话内时间锚定机制 V2 的启用状态
     let enable_time_anchoring = match sqlx::query_scalar::<_, i32>(
         "SELECT is_enabled FROM tarven_rules WHERE id = 'time_anchoring_v2'",
@@ -156,6 +170,15 @@ pub fn assemble_history_for_vcp(
             msg.content.clone()
         };
         combined_text.push_str(&message_content);
+
+        if let Some(transient_context) = msg
+            .transient_context
+            .as_deref()
+            .filter(|context| !context.trim().is_empty())
+        {
+            combined_text.push_str("\n\n");
+            combined_text.push_str(transient_context);
+        }
 
         let mut content_parts = Vec::new();
 
@@ -290,6 +313,8 @@ mod tests {
             blocks: None,
             shell: None,
             content_hash: None,
+            transient_context: None,
+            transient_system_prompt: None,
         }
     }
 
@@ -423,6 +448,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn watch_context_and_video_are_added_to_the_current_user_turn() {
+        let mut user_message = message("user", "这个角色刚才为什么停顿？");
+        user_message.transient_context = Some(
+            "[共同观看上下文]\n片名：示例影片\n播放位置：00:12:34\n片段范围：00:12:22 - 00:12:34"
+                .to_string(),
+        );
+        user_message.attachments = Some(vec![Attachment {
+            r#type: "video/webm".to_string(),
+            src: "fallback/watch.webm".to_string(),
+            name: "watch-clip.webm".to_string(),
+            internal_path: "attachments/watch-clip.webm".to_string(),
+            ..Default::default()
+        }]);
+
+        let messages = assemble_history_for_vcp(&[user_message], false, false);
+        let parts = messages[0]["content"].as_array().unwrap();
+
+        assert!(parts[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("播放位置：00:12:34"));
+        assert_eq!(parts[1]["type"], "local_file");
+        assert_eq!(parts[1]["path"], "attachments/watch-clip.webm");
+        assert_eq!(parts[1]["mime"], "video/webm");
+    }
+
     #[tokio::test]
     async fn orchestrated_context_includes_system_prompt_every_time() {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -490,5 +542,55 @@ mod tests {
             second_messages[0]["content"].as_str(),
             Some("固定系统提示词")
         );
+    }
+
+    #[tokio::test]
+    async fn orchestrated_context_includes_transient_watch_prompt() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE tarven_rules (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                rule_type TEXT NOT NULL,
+                is_enabled INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                wrap INTEGER NOT NULL,
+                role TEXT,
+                depth INTEGER,
+                position TEXT,
+                sort_order INTEGER NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut current_turn = message("user", "分析这一幕");
+        current_turn.transient_system_prompt =
+            Some("你正与用户一起看视频。只依据本轮提供的画面或片段回答。".to_string());
+
+        let messages = orchestrate_chat_context(
+            &pool,
+            &[current_turn],
+            "topic_watch",
+            "AgentA",
+            "agent",
+            "固定系统提示词".to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+        let system_prompt = messages[0]["content"].as_str().unwrap();
+
+        assert_eq!(system_count(&messages), 1);
+        assert!(system_prompt.starts_with("固定系统提示词"));
+        assert!(system_prompt.contains("<watch_together>"));
+        assert!(system_prompt.contains("你正与用户一起看视频"));
+        assert!(system_prompt.ends_with("</watch_together>"));
     }
 }
