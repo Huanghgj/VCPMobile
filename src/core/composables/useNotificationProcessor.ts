@@ -710,7 +710,7 @@ export function useNotificationProcessor() {
    * 对标桌面端 notificationRenderer.js 的解析逻辑
    * 负责将后端原始 JSON 转化为前端 UI 可用的结构
    */
-  const processPayload = (payload: any): Partial<VcpNotification> => {
+  const processPayloadInternal = (payload: any): Partial<VcpNotification> => {
     // 0. P2-7 Gap: 连接底层状态指示器 (VCPLog)
     // 同步状态不再渲染到全局状态栏（同步已改为完全手动触发，避免状态栏干扰）
     if (payload.type === 'vcp-log-status') {
@@ -955,6 +955,16 @@ export function useNotificationProcessor() {
       result.id = notificationId;
     }
 
+    return result;
+  };
+
+  const processPayload = (payload: any): Partial<VcpNotification> => {
+    const result = processPayloadInternal(payload);
+    // 后台期间缓存、回前台补发的历史消息（Rust 侧标记 vcp_replayed）：
+    // 只写入通知中心，不重放 Toast，避免"刚启动弹一堆历史通知"
+    if (payload?.vcp_replayed === true && result && !result.silent) {
+      return { ...result, historyOnly: true };
+    }
     return result;
   };
 

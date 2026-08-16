@@ -17,6 +17,31 @@ const router = useRouter();
 
 const isCreating = ref(false);
 
+// create_topic 走 SQLite 事务，与同步写队列争锁时可能长时间挂起（busy_timeout 30s）。
+// 若不设上限，isCreating 永不复位，按钮将永久禁用（表现为"点了没反应"）。
+const CREATE_TOPIC_TIMEOUT_MS = 10000;
+
+class CreateTopicTimeoutError extends Error {
+  constructor() {
+    super("创建话题超时");
+  }
+}
+
+const withTimeout = <T>(promise: Promise<T>, ms: number): Promise<T> =>
+  new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new CreateTopicTimeoutError()), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+
 const currentItemId = computed(
   () =>
     sessionStore.currentSelectedItem?.id || assistantStore.agents[0]?.id || null,
@@ -73,17 +98,25 @@ const handleCreateTopic = async () => {
       ? "agent"
       : "group";
 
-    const newTopic = await topicStore.createTopic(
-      ownerId,
-      ownerType,
-      newTopicName,
+    const newTopic = await withTimeout(
+      topicStore.createTopic(ownerId, ownerType, newTopicName),
+      CREATE_TOPIC_TIMEOUT_MS,
     );
     if (newTopic?.id && currentItemId.value === ownerId) {
       await selectTopic(ownerId, newTopic.id, newTopic.name);
     }
   } catch (error) {
     console.error("[TopicCreator] create-topic failed", error);
-    // 错误通知已在 store 层处理
+    if (error instanceof CreateTopicTimeoutError) {
+      // store 层只对 invoke 抛错弹通知；超时由这里兜底提示
+      notificationStore.addNotification({
+        type: "error",
+        title: "创建话题超时",
+        message: "数据库繁忙，请稍后重试",
+        duration: 5000,
+      });
+    }
+    // 其余错误通知已在 store 层处理
   } finally {
     // 1秒防抖/锁定，防止快速连击
     setTimeout(() => {

@@ -2,6 +2,9 @@ import type { DirectiveBinding, ObjectDirective } from "vue";
 
 const LONG_PRESS_DELAY_MS = 600;
 const MOVE_TOLERANCE_PX = 10;
+// 长按释放后，合成 click 会紧随 pointerup 派发；抑制窗口只需覆盖这一瞬间。
+// 窗口过长会吞掉用户随后的正常点击（表现为"点了没反应"）。
+const CLICK_SUPPRESS_WINDOW_MS = 400;
 
 type LongPressCallback = (event: Event) => void;
 
@@ -12,6 +15,7 @@ type LongPressState = {
   pointerId: number | null;
   startX: number;
   startY: number;
+  longPressFired: boolean;
   suppressNextClick: boolean;
   cleanup: () => void;
 };
@@ -38,6 +42,7 @@ export const vLongpress: ObjectDirective<HTMLElement, LongPressCallback> = {
       pointerId: null,
       startX: 0,
       startY: 0,
+      longPressFired: false,
       suppressNextClick: false,
       cleanup: () => undefined,
     };
@@ -49,6 +54,14 @@ export const vLongpress: ObjectDirective<HTMLElement, LongPressCallback> = {
       }
     };
 
+    const clearClickSuppression = () => {
+      state.suppressNextClick = false;
+      if (state.suppressResetTimer !== null) {
+        window.clearTimeout(state.suppressResetTimer);
+        state.suppressResetTimer = null;
+      }
+    };
+
     const armClickSuppression = () => {
       state.suppressNextClick = true;
       if (state.suppressResetTimer !== null) {
@@ -57,7 +70,7 @@ export const vLongpress: ObjectDirective<HTMLElement, LongPressCallback> = {
       state.suppressResetTimer = window.setTimeout(() => {
         state.suppressNextClick = false;
         state.suppressResetTimer = null;
-      }, 1000);
+      }, CLICK_SUPPRESS_WINDOW_MS);
     };
 
     const onPointerDown = (event: PointerEvent) => {
@@ -65,13 +78,17 @@ export const vLongpress: ObjectDirective<HTMLElement, LongPressCallback> = {
         return;
       }
 
+      // 新手势开始：清掉上一次长按遗留的抑制状态，确保本次正常点击不被吞掉
+      clearClickSuppression();
+      state.longPressFired = false;
+
       clearPressTimer();
       state.pointerId = event.pointerId;
       state.startX = event.clientX;
       state.startY = event.clientY;
       state.timer = window.setTimeout(() => {
         state.timer = null;
-        armClickSuppression();
+        state.longPressFired = true;
         state.callback(event);
       }, LONG_PRESS_DELAY_MS);
     };
@@ -92,15 +109,19 @@ export const vLongpress: ObjectDirective<HTMLElement, LongPressCallback> = {
       if (event.pointerId !== state.pointerId) return;
       clearPressTimer();
       state.pointerId = null;
+      // 只在长按已触发且是正常抬起时抑制紧随其后的合成 click；
+      // pointercancel 后不会派发 click，无需抑制
+      if (state.longPressFired) {
+        state.longPressFired = false;
+        if (event.type === "pointerup") {
+          armClickSuppression();
+        }
+      }
     };
 
     const onClickCapture = (event: MouseEvent) => {
       if (!state.suppressNextClick) return;
-      state.suppressNextClick = false;
-      if (state.suppressResetTimer !== null) {
-        window.clearTimeout(state.suppressResetTimer);
-        state.suppressResetTimer = null;
-      }
+      clearClickSuppression();
       event.preventDefault();
       event.stopImmediatePropagation();
     };
@@ -109,6 +130,7 @@ export const vLongpress: ObjectDirective<HTMLElement, LongPressCallback> = {
       event.preventDefault();
       clearPressTimer();
       state.pointerId = null;
+      state.longPressFired = false;
       armClickSuppression();
       state.callback(event);
     };

@@ -711,7 +711,7 @@ pub async fn regenerate_topic_response(
         topic_id: Some(topic_id.clone()),
         is_group_message: Some(row.get::<i64, _>("is_group_message") != 0),
         finish_reason: None,
-        attachments: None, // 重新生成时，上下文组装会自动从数据库重新拉取附件
+        attachments: None, // 附件由上下文历史加载器从数据库回填；下游合并时不得用 None 覆盖
         blocks: None,
         shell: None,
         content_hash: None,

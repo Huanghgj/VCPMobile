@@ -98,6 +98,31 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
   // 用于防止并发加载与话题切换导致竞态的消息拉取中止控制器 (AbortController)
   let currentLoadAbortController: AbortController | null = null;
 
+  // 单个异步步骤的兜底超时：invoke 或资源解析永久挂起时（如 DB busy、WebView 冻结），
+  // 保证 loadHistory 的 finally 一定能执行、isLoadingHistory 一定复位。
+  const HISTORY_STEP_TIMEOUT_MS = 20000;
+
+  const raceWithTimeout = async <T>(
+    promise: Promise<T>,
+    ms: number,
+    label: string,
+  ): Promise<{ timedOut: boolean; value?: T }> => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    try {
+      return await Promise.race([
+        promise.then((value) => ({ timedOut: false, value })),
+        new Promise<{ timedOut: true }>((resolve) => {
+          timer = setTimeout(() => {
+            console.warn(`[ChatHistoryStore] ${label} timed out after ${ms}ms`);
+            resolve({ timedOut: true });
+          }, ms);
+        }),
+      ]);
+    } finally {
+      if (timer !== null) clearTimeout(timer);
+    }
+  };
+
   const sessionStore = useChatSessionStore();
   const streamStore = useChatStreamStore();
   const attachmentStore = useAttachmentStore();
@@ -321,14 +346,25 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
         }
       };
 
-      const total = await invoke<number>("load_chat_history_streamed", {
-        ownerId,
-        ownerType,
-        topicId,
-        limit,
-        offset,
-        onMessage: channel,
-      });
+      const invokeResult = await raceWithTimeout(
+        invoke<number>("load_chat_history_streamed", {
+          ownerId,
+          ownerType,
+          topicId,
+          limit,
+          offset,
+          onMessage: channel,
+        }),
+        HISTORY_STEP_TIMEOUT_MS,
+        `load_chat_history_streamed(${topicId})`,
+      );
+      if (invokeResult.timedOut) {
+        // 放行 finally 复位加载标志；晚到的通道消息由 canApplyLoad/序列号校验兜底
+        flushHistory(true);
+        completeLoad();
+        return;
+      }
+      const total = invokeResult.value as number;
 
       if (!canApplyLoad() || cancelledByTopicChange) {
         completeLoad();
@@ -381,12 +417,16 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
 
       const messagesToResolve =
         offset === 0 ? currentChatHistory.value : buffer;
-      await Promise.all(
-        messagesToResolve.map(async (msg) => {
-          await attachmentStore.resolveMessageAssets(msg);
-        }),
+      // 资源解析不在 15s 完成看门狗的保护范围内，单独兜底，防止卡死加载标志
+      await raceWithTimeout(
+        Promise.all(
+          messagesToResolve.map(async (msg) => {
+            await attachmentStore.resolveMessageAssets(msg);
+          }),
+        ).then(() => preloadMessageImages(messagesToResolve)),
+        HISTORY_STEP_TIMEOUT_MS,
+        `resolveMessageAssets(${topicId})`,
       );
-      await preloadMessageImages(messagesToResolve);
     } catch (e) {
       console.error("[ChatHistoryStore] Failed to stream history:", e);
     } finally {

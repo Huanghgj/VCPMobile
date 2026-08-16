@@ -101,7 +101,15 @@ pub fn flush_background_logs<R: tauri::Runtime>(app: &AppHandle<R>) {
         .lock()
         .map(|mut cache| cache.drain(..).collect::<Vec<_>>())
         .unwrap_or_default();
-    for payload in events {
+    let count = events.len();
+    if count > 0 {
+        log::info!("[VCPLog] Flushing {count} background-cached events as replay (history only)");
+    }
+    for mut payload in events {
+        // 标记为后台补发：前端只写入通知中心，不重放 Toast 弹窗
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("vcp_replayed".to_string(), Value::Bool(true));
+        }
         let _ = app.emit("vcp-system-event", payload);
     }
 }

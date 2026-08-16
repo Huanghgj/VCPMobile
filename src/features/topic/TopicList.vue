@@ -4,6 +4,7 @@ import { useRouter } from "vue-router";
 import { useVirtualList } from "@vueuse/core";
 import { useTopicStore, type Topic } from "../../core/stores/topicListManager";
 import { useChatSessionStore } from "../../core/stores/chatSessionStore";
+import { useChatHistoryStore } from "../../core/stores/chatHistoryStore";
 import { useAssistantStore } from "../../core/stores/assistant";
 import { useLayoutStore } from "../../core/stores/layout";
 import { useOverlayStore } from "../../core/stores/overlay";
@@ -16,6 +17,7 @@ const emit = defineEmits<{
 
 const topicListStore = useTopicStore();
 const sessionStore = useChatSessionStore();
+const historyStore = useChatHistoryStore();
 const assistantStore = useAssistantStore();
 const layoutStore = useLayoutStore();
 const overlayStore = useOverlayStore();
@@ -219,7 +221,20 @@ const selectTopic = async (
     await router.push("/chat");
   }
 
+  // ChatView 依赖 currentTopicId 的"变化"来触发历史加载；重按当前话题时值不变、
+  // watch 不会触发。若上次加载失败会停留在空白，这里强制重载一次作为自救路径。
+  const isReselect =
+    sessionStore.currentTopicId === topicId &&
+    sessionStore.currentSelectedItem?.id === itemId;
+
   await sessionStore.selectTopicById(itemId, topicId);
+
+  if (isReselect) {
+    const ownerType = assistantStore.agents.some((a) => a.id === itemId)
+      ? "agent"
+      : "group";
+    historyStore.loadHistoryPaginated(itemId, ownerType, topicId);
+  }
 
   // 在移动端，选择话题后自动关闭侧边栏
   layoutStore.setLeftDrawer(false);

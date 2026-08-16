@@ -19,6 +19,9 @@ describe("chatSessionStore.reconcilePersistedSelection", () => {
   });
 
   it("clears a persisted owner that no longer exists", async () => {
+    const assistant = useAssistantStore();
+    // 列表非空说明数据已加载完成，缺失的 owner 是真的被删除了
+    assistant.agents = [{ id: "surviving-agent", name: "Survivor" } as any];
     const session = useChatSessionStore();
     session.currentSelectedItem = {
       id: "deleted-agent",
@@ -33,6 +36,24 @@ describe("chatSessionStore.reconcilePersistedSelection", () => {
     expect(session.currentSelectedItem).toBeNull();
     expect(session.currentTopicId).toBeNull();
     expect(session.lastActiveTopicMap["deleted-agent"]).toBeUndefined();
+  });
+
+  it("keeps the persisted selection when assistant lists have not loaded", async () => {
+    const session = useChatSessionStore();
+    session.currentSelectedItem = {
+      id: "agent-1",
+      name: "Agent 1",
+      type: "agent",
+    };
+    session.currentTopicId = "topic-1";
+    session.lastActiveTopicMap["agent-1"] = "topic-1";
+
+    // agents/groups 均为空：视为数据未就绪，不得清空用户选择
+    await session.reconcilePersistedSelection();
+
+    expect(session.currentSelectedItem?.id).toBe("agent-1");
+    expect(session.currentTopicId).toBe("topic-1");
+    expect(session.lastActiveTopicMap["agent-1"]).toBe("topic-1");
   });
 
   it("falls back from a deleted topic to the newest active topic", async () => {

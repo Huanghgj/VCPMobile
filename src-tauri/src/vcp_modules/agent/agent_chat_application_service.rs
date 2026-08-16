@@ -214,7 +214,13 @@ pub async fn internal_process_agent_chat_message(
             .find(|message| message.id == user_message.id)
         {
             // The frontend may add request-only media/context after persisting the visible message.
+            // 重新生成路径传入的消息不带附件（attachments: None）；此时必须保留数据库中
+            // 已持久化的附件，否则多模态内容在重生成时会静默丢失。
+            let persisted_attachments = persisted_message.attachments.take();
             *persisted_message = user_message.clone();
+            if persisted_message.attachments.is_none() {
+                persisted_message.attachments = persisted_attachments;
+            }
         } else {
             log::warn!(
                 "[AgentChatAppService] Latest user message missing from persisted history; injecting inline for request context. topic_id={}, user_msg_id={}",

@@ -113,7 +113,12 @@ export const useChatSessionStore = defineStore(
         topicId: string,
       ) => Promise<void>,
     ) => {
-      if (sequence !== selectionSequence) return;
+      if (sequence !== selectionSequence) {
+        console.warn(
+          `[ChatSessionStore] Selection ${topicId} superseded (seq ${sequence} != ${selectionSequence}), dropped.`,
+        );
+        return;
+      }
 
       // 立即更新 currentTopicId，确保话题列表高亮实时响应
       currentTopicId.value = topicId;
@@ -232,6 +237,17 @@ export const useChatSessionStore = defineStore(
       );
       const activeOwner = agent || group;
       if (!activeOwner) {
+        // 双列表为空通常意味着数据尚未加载（而非用户删光了所有助手）。
+        // 此时清空持久化选择会导致启动后"无选中、新建话题按钮禁用"，故跳过。
+        if (
+          assistantStore.agents.length === 0 &&
+          assistantStore.groups.length === 0
+        ) {
+          console.warn(
+            "[ChatSessionStore] Skip reconcile: assistant lists are empty (possibly not loaded yet).",
+          );
+          return;
+        }
         delete lastActiveTopicMap.value[selected.id];
         currentSelectedItem.value = null;
         currentTopicId.value = null;
