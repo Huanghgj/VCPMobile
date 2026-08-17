@@ -10,8 +10,8 @@ defineProps<{
     variant === 'glass' ? 'bg-white/5 border-white/10' : 'bg-black/5 dark:bg-white/5 border-black/5 dark:border-white/10',
     variant === 'danger' ? 'border-red-500/20 bg-red-500/5' : '',
     variant === 'warning' ? 'border-yellow-500/20 bg-yellow-500/5' : '',
-    'border rounded-2xl shadow-sm',
-    noPadding ? '' : 'px-3 py-4'
+    'border rounded-xl shadow-sm',
+    noPadding ? '' : 'px-3 py-3.5'
   ]">
     <slot></slot>
   </div>

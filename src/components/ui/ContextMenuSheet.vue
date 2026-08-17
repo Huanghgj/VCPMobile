@@ -23,19 +23,19 @@ const handleAction = (action: OverlayActionItem) => {
 <template>
   <Teleport to="body">
     <Transition name="fade">
-      <div v-if="isOpen" class="fixed inset-0 bg-black/20 pointer-events-auto z-dialog"
+      <div v-if="isOpen" class="fixed inset-0 bg-black/40 pointer-events-auto z-dialog"
         @click="handleBackdropClick">
         <div
-          class="absolute left-1/2 -translate-x-1/2 w-[calc(100%-24px)] max-w-sm rounded-3xl border border-black/5 dark:border-white/10 bg-white/92 dark:bg-[#111827]/92 shadow-2xl overflow-hidden"
+          class="absolute left-1/2 -translate-x-1/2 w-[calc(100%-24px)] max-w-sm rounded-2xl border border-black/10 dark:border-white/10 bg-white dark:bg-zinc-900 shadow-xl overflow-hidden"
           :style="{ bottom: 'calc(var(--vcp-safe-bottom, 48px) + 24px)' }"
           @click.stop>
-          <div v-if="title" class="px-5 pt-5 pb-3 border-b border-black/5 dark:border-white/10">
-            <h3 class="text-sm font-black tracking-wide">{{ title }}</h3>
+          <div v-if="title" class="px-4 pt-4 pb-2.5 border-b border-black/5 dark:border-white/10">
+            <h3 class="text-xs font-bold uppercase tracking-wider text-gray-500 dark:text-gray-400">{{ title }}</h3>
           </div>
-          <div class="p-2">
+          <div class="p-1.5 space-y-0.5">
             <button v-for="action in actions" :key="action.label" @click="handleAction(action)"
               :disabled="action.disabled"
-              class="w-full flex items-center gap-3 px-4 py-3 rounded-2xl text-left transition-all" :class="[
+              class="w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-left transition-all active:opacity-80 active:scale-[0.99]" :class="[
                 action.danger ? 'text-red-500 hover:bg-red-500/10' : 'hover:bg-black/5 dark:hover:bg-white/5',
                 action.disabled ? 'opacity-40 cursor-not-allowed' : ''
               ]">

@@ -64,13 +64,13 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
-.life-indicator { position:fixed; left:50%; bottom:calc(var(--vcp-safe-bottom,20px) + 12px); transform:translateX(-50%); z-index:42; max-width:min(86vw,300px); min-height:34px; padding:7px 11px; border-radius:999px; display:flex; align-items:center; gap:7px; color:rgba(255,255,255,.88); background:rgba(15,23,42,.72); border:1px solid rgba(255,255,255,.12); box-shadow:0 10px 34px rgba(0,0,0,.24); backdrop-filter:blur(18px) saturate(1.25); font-size:10px; font-weight:850; }
+.life-indicator { position:fixed; left:50%; bottom:calc(var(--vcp-safe-bottom,20px) + 12px); transform:translateX(-50%); z-index:42; max-width:min(86vw,300px); min-height:34px; padding:7px 11px; border-radius:999px; display:flex; align-items:center; gap:7px; color:rgba(255,255,255,.9); background:rgba(15,23,42,.95); border:1px solid rgba(255,255,255,.15); box-shadow:0 6px 20px rgba(0,0,0,.3); font-size:10px; font-weight:700; }
 .life-indicator span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .life-indicator i { width:26px; height:3px; border-radius:99px; background:linear-gradient(90deg,#22c55e var(--health),rgba(255,255,255,.12) var(--health)); }
-.life-indicator.sending { background:rgba(37,99,235,.78); }
-.life-indicator.paused { background:rgba(120,53,15,.72); }
+.life-indicator.sending { background:rgba(37,99,235,.95); }
+.life-indicator.paused { background:rgba(120,53,15,.95); }
 .life-spin { animation:life-spin 1.5s linear infinite; }
 .life-indicator-enter-active,.life-indicator-leave-active { transition:opacity .2s ease,transform .2s ease; }
-.life-indicator-enter-from,.life-indicator-leave-to { opacity:0; transform:translate(-50%,8px) scale(.96); }
+.life-indicator-enter-from,.life-indicator-leave-to { opacity:0; transform:translate(-50%,8px) scale(.98); }
 @keyframes life-spin { to { transform:rotate(360deg); } }
 </style>

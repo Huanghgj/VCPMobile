@@ -603,7 +603,9 @@ const handleFloatingBallClick = async () => {
 };
 
 onMounted(async () => {
-  if (isRendererProbe) {
+  // isRendererProbe 是 computed ref：script 中必须显式 .value（模板才会自动解包）。
+  // 漏掉 .value 时对象恒为真，onMounted 提前 return，bootstrap 永不执行 → 永久卡在启动屏。
+  if (isRendererProbe.value) {
     await router.isReady();
     return;
   }

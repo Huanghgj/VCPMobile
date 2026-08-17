@@ -18,12 +18,12 @@ const toggle = () => {
 
 <template>
   <div
-    class="settings-disclosure border border-black/5 dark:border-white/10 rounded-2xl overflow-hidden transition-all duration-300"
+    class="settings-disclosure border border-black/5 dark:border-white/10 rounded-xl overflow-hidden transition-all duration-300"
     :class="[
       isOpen ? 'bg-black/[0.02] dark:bg-white/[0.02] shadow-sm' : 'bg-transparent'
     ]">
     <button @click="toggle"
-      class="w-full flex items-center justify-between p-4 hover:bg-black/5 dark:hover:bg-white/5 transition-colors">
+      class="w-full flex items-center justify-between px-3.5 py-3 hover:bg-black/5 dark:hover:bg-white/5 transition-colors">
       <div class="flex items-center gap-3 min-w-0">
         <div v-if="icon" class="shrink-0 opacity-60" :class="accentColor">
           <component :is="icon" :size="18" />

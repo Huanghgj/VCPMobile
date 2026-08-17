@@ -62,7 +62,7 @@ const toggleMask = () => {
     <div class="relative group">
       <input :type="inputType" :value="modelValue ?? ''" :placeholder="placeholder" :disabled="disabled"
         autocomplete="off" autocapitalize="off" spellcheck="false"
-        class="w-full bg-black/5 dark:bg-white/5 p-3.5 rounded-2xl outline-none border transition-all duration-200" :class="[
+        class="w-full bg-black/5 dark:bg-white/5 px-3.5 py-3 rounded-xl outline-none border transition-all duration-200" :class="[
           mono || isSecure ? 'font-mono text-sm' : 'text-[14px]',
           center ? 'text-center' : '',
           error ? 'border-red-500/50 bg-red-500/5' : 'border-black/5 dark:border-white/5 focus:border-blue-500/50 focus:bg-black/10 dark:focus:bg-white/10',

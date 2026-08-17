@@ -82,7 +82,7 @@ const handleAction = async (action: NonNullable<VcpNotification['actions']>[numb
 <template>
   <div
     ref="el"
-    class="pointer-events-auto flex items-center justify-between gap-3 px-3.5 py-2.5 rounded-xl bg-white/90 dark:bg-zinc-900/90 backdrop-blur-md border border-black/5 dark:border-white/10 shadow-[0_8px_30px_rgba(0,0,0,0.12)] w-full max-w-[calc(100vw-32px)] sm:w-[320px] overflow-hidden transition-all active:scale-[0.98] cursor-pointer touch-none select-none no-swipe"
+    class="pointer-events-auto flex items-center justify-between gap-3 px-3.5 py-2.5 rounded-xl bg-white dark:bg-zinc-900 border border-black/10 dark:border-white/10 shadow-lg w-full max-w-[calc(100vw-32px)] sm:w-[320px] overflow-hidden transition-all active:opacity-90 active:scale-[0.99] cursor-pointer touch-none select-none no-swipe"
     :style="swipeStyle"
     @click="handleClick"
   >
@@ -95,7 +95,7 @@ const handleAction = async (action: NonNullable<VcpNotification['actions']>[numb
         </span>
         <div v-if="toast.tags && toast.tags.length > 0" class="flex flex-wrap gap-1 mt-1 max-h-[36px] overflow-y-auto pr-1">
           <span v-for="(tag, idx) in toast.tags" :key="`${tag}-${idx}`"
-            class="text-[7.5px] font-bold px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-500/90 shrink-0">
+            class="text-[7.5px] font-mono font-bold px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-500/90 shrink-0">
             {{ tag }}
           </span>
         </div>
@@ -116,7 +116,7 @@ const handleAction = async (action: NonNullable<VcpNotification['actions']>[numb
           <button
             v-for="act in toast.actions"
             :key="act.label"
-            class="rounded-md px-2 py-1.5 text-[10px] font-bold text-white shadow-sm active:scale-95 disabled:opacity-60"
+            class="rounded-md px-2 py-1.5 text-[10px] font-bold text-white shadow-sm active:opacity-80 active:scale-[0.98] disabled:opacity-60"
             :class="act.color"
             :disabled="isActionRunning"
             @click.stop="handleAction(act)"

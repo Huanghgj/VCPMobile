@@ -833,7 +833,7 @@ onUnmounted(() => {
   border: 1px solid;
   border-radius: 8px;
   box-shadow: 0 2px 10px rgba(0, 0, 0, 0.16);
-  backdrop-filter: blur(10px);
+  background: color-mix(in srgb, var(--secondary-bg) 95%, transparent);
 }
 
 .html-preview-action {

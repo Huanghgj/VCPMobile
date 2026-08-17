@@ -23,24 +23,24 @@ const store = useNotificationStore();
 }
 
 .toast-enter-active {
-  transition: all 0.5s cubic-bezier(0.18, 0.89, 0.32, 1.28);
+  transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .toast-leave-active {
-  transition: all 0.4s ease-in;
+  transition: all 0.25s ease-out;
 }
 
 .toast-enter-from {
   opacity: 0;
-  transform: translateY(-40px) scale(0.8);
+  transform: translateY(-16px);
 }
 
 .toast-leave-to {
   opacity: 0;
-  transform: translateY(-20px) scale(0.9);
+  transform: translateY(-12px);
 }
 
 .toast-move {
-  transition: transform 0.4s ease;
+  transition: transform 0.3s ease;
 }
 </style>

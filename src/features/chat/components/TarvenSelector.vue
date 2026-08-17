@@ -53,50 +53,50 @@ onMounted(() => {
       </div>
     </Transition>
 
-    <!-- 抽屉体 (高颜值磨砂玻璃) -->
+    <!-- 抽屉体 -->
     <Transition name="slide-up">
       <div v-if="tarvenStore.isSelectorOpen"
-        class="fixed bottom-0 left-0 right-0 z-sheet bg-white/95 dark:bg-zinc-900/95 backdrop-blur-xl rounded-t-[1.8rem] shadow-2xl p-5 flex flex-col border-t border-white/20 dark:border-white/5"
+        class="fixed bottom-0 left-0 right-0 z-sheet bg-white dark:bg-zinc-900 rounded-t-2xl shadow-xl p-4 flex flex-col border-t border-black/10 dark:border-white/10"
         style="padding-bottom: calc(var(--vcp-safe-bottom, 20px) + 12px);">
         
         <!-- 拖手线 -->
-        <div class="w-10 h-1 bg-black/10 dark:bg-white/15 rounded-full mx-auto mb-4"></div>
+        <div class="w-10 h-1 bg-black/10 dark:bg-white/15 rounded-full mx-auto mb-3"></div>
 
         <!-- 头部导航 -->
-        <div class="flex items-center justify-between mb-4 px-1">
+        <div class="flex items-center justify-between mb-3 px-1">
           <div class="flex flex-col">
             <span class="text-[10px] font-bold text-zinc-400 uppercase tracking-widest leading-none">Context System</span>
-            <span class="text-[17px] font-extrabold text-zinc-800 dark:text-zinc-100 mt-1">VCPChatTarven 规则仓</span>
+            <span class="text-[16px] font-extrabold text-zinc-800 dark:text-zinc-100 mt-1">VCPChatTarven 规则仓</span>
           </div>
           <!-- 齿轮配置入口 -->
           <button @click="goToSettings"
-            class="w-9 h-9 flex items-center justify-center rounded-full bg-black/5 dark:bg-white/5 text-zinc-600 dark:text-zinc-400 active:scale-90 transition-transform">
-            <div class="i-heroicons-cog-6-tooth text-xl"></div>
+            class="w-8 h-8 flex items-center justify-center rounded-full bg-black/5 dark:bg-white/5 text-zinc-600 dark:text-zinc-400 active:opacity-75 active:scale-95 transition-all">
+            <div class="i-heroicons-cog-6-tooth text-lg"></div>
           </button>
         </div>
 
         <!-- 内容区域 -->
-        <div class="flex flex-col max-h-[300px] overflow-y-auto px-1 gap-2 scrollbar-none">
+        <div class="flex flex-col max-h-[300px] overflow-y-auto px-1 gap-1.5 scrollbar-none">
           <template v-if="tarvenStore.rules.length > 0">
             <div v-for="rule in tarvenStore.rules" :key="rule.id"
-              class="flex items-center justify-between p-3.5 rounded-2xl bg-zinc-50 dark:bg-zinc-800/40 border border-zinc-100 dark:border-zinc-800 transition-all select-none cursor-pointer"
+              class="flex items-center justify-between p-3 rounded-xl bg-zinc-50 dark:bg-zinc-800/40 border border-zinc-100 dark:border-zinc-800 transition-all select-none cursor-pointer"
               :class="{ 'border-emerald-500/40 dark:border-emerald-500/35 bg-emerald-500/[0.04] dark:bg-emerald-500/[0.02]': rule.isEnabled, 'opacity-70': !rule.isEnabled }"
               @click="toggleRuleState(rule.id)"
             >
               <div class="flex items-center gap-3 flex-1 min-w-0 pr-4">
-                <!-- 预留图标，降级为简洁规则板 -->
-                <div class="w-10 h-10 flex items-center justify-center rounded-xl bg-zinc-100 dark:bg-zinc-800 text-zinc-500 shrink-0 transition-colors"
+                <!-- 规则板图标 -->
+                <div class="w-9 h-9 flex items-center justify-center rounded-lg bg-zinc-100 dark:bg-zinc-800 text-zinc-500 shrink-0 transition-colors"
                   :class="{ '!bg-emerald-500/10 !text-emerald-500': rule.isEnabled }">
-                  <div class="i-heroicons-sparkles text-lg"></div>
+                  <div class="i-heroicons-sparkles text-base"></div>
                 </div>
                 <div class="flex flex-col min-w-0">
-                  <span class="text-[14px] font-black text-zinc-800 dark:text-zinc-100 truncate transition-colors"
+                  <span class="text-[13px] font-bold text-zinc-800 dark:text-zinc-100 truncate transition-colors"
                     :class="{ 'text-emerald-600 dark:text-emerald-400': rule.isEnabled }">{{ rule.name }}</span>
                   
                   <!-- 标签化元数据展示 -->
-                  <div class="flex flex-wrap items-center gap-1.5 mt-1.5">
+                  <div class="flex flex-wrap items-center gap-1.5 mt-1">
                     <!-- 类型标签 -->
-                    <span class="px-2 py-0.5 rounded-md text-[9px] font-bold uppercase tracking-wider"
+                    <span class="px-1.5 py-0.5 rounded text-[8.5px] font-mono font-bold uppercase tracking-wider"
                       :class="{
                         'bg-blue-500/10 text-blue-500 border border-blue-500/20': rule.ruleType === 'system_suffix',
                         'bg-emerald-500/10 text-emerald-500 border border-emerald-500/20': rule.ruleType === 'user_suffix',
@@ -110,7 +110,7 @@ onMounted(() => {
                     </span>
 
                     <!-- 作用域标签 -->
-                    <span class="px-2 py-0.5 rounded-md text-[9px] font-bold bg-zinc-100 dark:bg-zinc-800 text-zinc-500 border border-zinc-200 dark:border-zinc-700">
+                    <span class="px-1.5 py-0.5 rounded text-[8.5px] font-mono font-bold bg-zinc-100 dark:bg-zinc-800 text-zinc-500 border border-zinc-200 dark:border-zinc-700">
                       {{ 
                         rule.scope === 'global' ? '全局' : 
                         rule.scope === 'agent' ? '智能体' : '群组' 
@@ -119,18 +119,18 @@ onMounted(() => {
 
                     <!-- 注入专用信息 (角色与深度) -->
                     <span v-if="rule.ruleType === 'context_inject'" 
-                      class="px-2 py-0.5 rounded-md text-[9px] font-bold bg-zinc-100 dark:bg-zinc-800 text-zinc-400 border border-zinc-200 dark:border-zinc-700">
+                      class="px-1.5 py-0.5 rounded text-[8.5px] font-mono font-bold bg-zinc-100 dark:bg-zinc-800 text-zinc-400 border border-zinc-200 dark:border-zinc-700">
                       {{ rule.role === 'user' ? '用户' : '助手' }} · 深度 {{ rule.depth || 0 }}
                     </span>
                   </div>
                 </div>
               </div>
 
-              <!-- iOS 经典优雅 Switch (亮绿高对比度) -->
-              <div class="relative shrink-0 w-[42px] h-[24px] bg-zinc-200 dark:bg-zinc-700 rounded-full transition-colors duration-200"
+              <!-- Switch -->
+              <div class="relative shrink-0 w-[38px] h-[22px] bg-zinc-200 dark:bg-zinc-700 rounded-full transition-colors duration-200"
                 :class="{ '!bg-emerald-500': rule.isEnabled }">
-                <div class="absolute top-[2px] left-[2px] w-[20px] h-[20px] bg-white rounded-full shadow-sm transition-transform duration-200"
-                  :class="{ 'translate-x-[18px]': rule.isEnabled }">
+                <div class="absolute top-[2px] left-[2px] w-[18px] h-[18px] bg-white rounded-full shadow-sm transition-transform duration-200"
+                  :class="{ 'translate-x-[16px]': rule.isEnabled }">
                 </div>
               </div>
             </div>

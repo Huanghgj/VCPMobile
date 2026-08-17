@@ -266,16 +266,16 @@ onUnmounted(() => {
     <div ref="messageListRef" class="flex-1 overflow-y-auto relative no-rubber-band">
       <!-- 零数据引导状态 -->
       <div v-if="historyStore.currentChatHistory.length === 0"
-        class="absolute inset-0 flex flex-col items-center justify-center text-center px-10">
+        class="absolute inset-0 flex flex-col items-center justify-center text-center px-10 select-none">
         <div
-          class="w-24 h-24 rounded-[2.5rem] bg-gradient-to-br from-primary/20 to-blue-500/20 flex-center mb-8 border border-white/10 shadow-2xl rotate-3">
-          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
-            class="text-primary opacity-60">
+          class="w-14 h-14 rounded-xl bg-black/5 dark:bg-white/5 flex-center mb-5 border border-black/5 dark:border-white/10 opacity-70">
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+            class="text-blue-500 opacity-80">
             <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
           </svg>
         </div>
-        <h3 class="text-xl font-bold text-primary-text mb-3">开启智能对话</h3>
-        <p class="text-sm opacity-50 leading-relaxed max-w-[260px]">
+        <h3 class="text-base font-bold text-primary-text mb-2">开启智能对话</h3>
+        <p class="text-xs opacity-50 leading-relaxed max-w-[260px]">
           {{
             sessionStore.currentSelectedItem
               ? "当前话题暂无消息，开始发送第一条吧！"
@@ -283,7 +283,7 @@ onUnmounted(() => {
           }}
         </p>
         <button v-if="!sessionStore.currentSelectedItem" @click="layoutStore.toggleLeftDrawer()"
-          class="mt-10 px-8 py-4 bg-primary text-white rounded-2xl text-sm font-bold shadow-lg shadow-primary/20 active:scale-95 transition-all">
+          class="mt-8 px-6 py-2.5 bg-blue-600 hover:bg-blue-500 text-white rounded-xl text-xs font-semibold shadow-md active:opacity-85 active:scale-[0.98] transition-all">
           立即开始
         </button>
       </div>
@@ -305,10 +305,10 @@ onUnmounted(() => {
     <!-- 一键置底按钮 -->
     <Transition name="fade-slide-up">
       <button v-if="showScrollToBottom" @click="scrollToBottom(true)"
-        class="absolute right-4 w-10 h-10 bg-white/80 dark:bg-gray-800/80 rounded-full shadow-lg border border-black/10 dark:border-white/10 flex items-center justify-center text-primary-text z-local active:scale-90 transition-[bottom,transform,opacity] duration-300 ease-[cubic-bezier(0.34,1.56,0.64,1)]"
+        class="absolute right-4 w-10 h-10 bg-white dark:bg-zinc-800 rounded-full shadow-lg border border-black/10 dark:border-white/10 flex items-center justify-center text-primary-text z-local active:opacity-80 active:scale-95 transition-[bottom,transform,opacity] duration-200 ease-[cubic-bezier(0.16,1,0.3,1)]"
         :style="{ bottom: `calc(var(--vcp-safe-bottom, 48px) + 6rem + ${isMenuExpanded ? 112 : 0}px + var(--keyboard-offset, 0px))` }"
       >
-        <ArrowDown :size="20" />
+        <ArrowDown :size="18" />
       </button>
     </Transition>
 

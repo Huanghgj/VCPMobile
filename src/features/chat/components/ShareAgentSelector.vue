@@ -67,29 +67,29 @@ onUnmounted(() => {
     <Transition name="slide-up">
       <div
         v-if="isOpen"
-        class="fixed bottom-0 left-0 right-0 z-sheet bg-white/95 dark:bg-zinc-900/95 backdrop-blur-xl rounded-t-[1.8rem] shadow-2xl p-5 flex flex-col border-t border-white/20 dark:border-white/5"
+        class="fixed bottom-0 left-0 right-0 z-sheet bg-white dark:bg-zinc-900 rounded-t-2xl shadow-xl p-4 flex flex-col border-t border-black/10 dark:border-white/10"
         :style="{ paddingBottom: 'calc(var(--vcp-safe-bottom, 48px) + 12px)' }"
       >
         <!-- 拖手线 -->
-        <div class="w-10 h-1 bg-black/10 dark:bg-white/15 rounded-full mx-auto mb-4"></div>
+        <div class="w-10 h-1 bg-black/10 dark:bg-white/15 rounded-full mx-auto mb-3"></div>
 
         <!-- 标题 -->
-        <div class="flex flex-col mb-4 px-1">
+        <div class="flex flex-col mb-3 px-1">
           <span class="text-[10px] font-bold text-zinc-400 uppercase tracking-widest leading-none">Share Intent</span>
-          <span class="text-[17px] font-extrabold text-zinc-800 dark:text-zinc-100 mt-1">选择对话助手</span>
+          <span class="text-[16px] font-extrabold text-zinc-800 dark:text-zinc-100 mt-1">选择对话助手</span>
         </div>
 
         <!-- 分享内容预览 -->
         <div
           v-if="previewText || sharedFileCount > 0"
-          class="mx-1 mb-4 px-3 py-2.5 rounded-xl bg-black/5 dark:bg-white/5 border border-black/5 dark:border-white/10"
+          class="mx-1 mb-3 px-3 py-2 rounded-xl bg-black/5 dark:bg-white/5 border border-black/5 dark:border-white/10"
         >
-          <div v-if="previewText" class="text-[13px] text-zinc-600 dark:text-zinc-400 leading-relaxed break-all line-clamp-4">
+          <div v-if="previewText" class="text-[12px] text-zinc-600 dark:text-zinc-400 leading-relaxed break-all line-clamp-3">
             {{ previewText }}
           </div>
           <div
             v-if="sharedFileCount > 0"
-            class="flex items-center gap-1.5 mt-1.5 text-[12px] font-medium text-blue-500"
+            class="flex items-center gap-1.5 mt-1 text-[11px] font-medium text-blue-500"
           >
             <div class="i-heroicons-paper-clip text-sm"></div>
             <span>{{ sharedFileCount }} 个附件</span>
@@ -98,14 +98,14 @@ onUnmounted(() => {
 
         <!-- Agent 列表 -->
         <div class="flex flex-col max-h-[320px] overflow-y-auto px-1 gap-1 scrollbar-none">
-          <div v-if="availableAgents.length === 0" class="text-center py-6 text-[14px] text-zinc-400">
+          <div v-if="availableAgents.length === 0" class="text-center py-6 text-[13px] text-zinc-400">
             暂无可用助手
           </div>
           <button
             v-for="agent in availableAgents"
             :key="agent.id"
             @click="handleSelect(agent)"
-            class="flex items-center gap-3 px-3 py-2.5 rounded-xl hover:bg-black/5 dark:hover:bg-white/5 active:scale-[0.98] transition-all text-left"
+            class="flex items-center gap-3 px-3 py-2.5 rounded-xl hover:bg-black/5 dark:hover:bg-white/5 active:opacity-80 active:scale-[0.99] transition-all text-left"
           >
             <VcpAvatar
               :owner-id="agent.id"
@@ -115,10 +115,10 @@ onUnmounted(() => {
               owner-type="agent"
             />
             <div class="flex-1 min-w-0">
-              <div class="text-[15px] font-semibold text-zinc-800 dark:text-zinc-100 truncate">
+              <div class="text-[14px] font-semibold text-zinc-800 dark:text-zinc-100 truncate">
                 {{ agent.name }}
               </div>
-              <div class="text-[12px] text-zinc-400 dark:text-zinc-500 truncate mt-0.5">
+              <div class="text-[11px] font-mono text-zinc-400 dark:text-zinc-500 truncate mt-0.5">
                 {{ agent.model || '默认模型' }}
               </div>
             </div>

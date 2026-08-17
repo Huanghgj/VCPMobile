@@ -1,5 +1,9 @@
 buildscript {
     repositories {
+        // 镜像必须排在 google()/mavenCentral() 之前：Gradle 对网络错误不做仓库回退
+        maven { url = uri("https://maven.aliyun.com/repository/google") }
+        maven { url = uri("https://maven.aliyun.com/repository/central") }
+        maven { url = uri("https://maven.aliyun.com/repository/public") }
         google()
         mavenCentral()
         maven {
@@ -8,9 +12,6 @@ buildscript {
                 includeGroupByRegex("com\\.github\\..*")
             }
         }
-        maven { url = uri("https://maven.aliyun.com/repository/google") }
-        maven { url = uri("https://maven.aliyun.com/repository/central") }
-        maven { url = uri("https://maven.aliyun.com/repository/public") }
     }
     dependencies {
         classpath("com.android.tools.build:gradle:8.11.0")
@@ -20,6 +21,10 @@ buildscript {
 
 allprojects {
     repositories {
+        // 镜像必须排在 google()/mavenCentral() 之前：Gradle 对网络错误不做仓库回退
+        maven { url = uri("https://maven.aliyun.com/repository/google") }
+        maven { url = uri("https://maven.aliyun.com/repository/central") }
+        maven { url = uri("https://maven.aliyun.com/repository/public") }
         google()
         mavenCentral()
         maven {
@@ -28,9 +33,6 @@ allprojects {
                 includeGroupByRegex("com\\.github\\..*")
             }
         }
-        maven { url = uri("https://maven.aliyun.com/repository/google") }
-        maven { url = uri("https://maven.aliyun.com/repository/central") }
-        maven { url = uri("https://maven.aliyun.com/repository/public") }
     }
 }
 

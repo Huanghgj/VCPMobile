@@ -78,8 +78,7 @@ const openWatchTogether = async () => {
 
     <!-- 顶部 Tabs -->
     <div class="sidebar-header-safe px-4 pb-2 shrink-0 border-b border-black/5 dark:border-white/5">
-      <h2 class="text-xl font-black opacity-90 mb-4 tracking-tighter text-blue-500 dark:text-blue-400 px-2">VCP MOBILE
-      </h2>
+      <h2 class="text-lg font-black tracking-tight text-blue-500 dark:text-blue-400 px-1 mb-3">VCP MOBILE</h2>
 
       <SidebarTabs v-model:activeTab="activeTab" />
       <SidebarSearch v-model="searchQuery" :activeTab="activeTab" />
@@ -109,7 +108,7 @@ const openWatchTogether = async () => {
       </template>
 
       <button
-        class="w-full flex items-center justify-between p-3 bg-black/5 dark:bg-white/5 hover:bg-black/10 dark:hover:bg-white/10 active:scale-95 rounded-xl transition-all border border-black/5 dark:border-white/5 text-primary-text"
+        class="w-full flex items-center justify-between p-3 bg-black/5 dark:bg-white/5 hover:bg-black/10 dark:hover:bg-white/10 active:opacity-80 active:scale-[0.99] rounded-xl transition-all border border-black/5 dark:border-white/5 text-primary-text"
         :class="{ 'watch-entry-active': isWatchActive }"
         @click="openWatchTogether"
       >
@@ -121,7 +120,7 @@ const openWatchTogether = async () => {
       </button>
 
       <button
-        class="w-full flex items-center justify-between p-3 bg-black/5 dark:bg-white/5 hover:bg-black/10 dark:hover:bg-white/10 active:scale-95 rounded-xl transition-all border border-black/5 dark:border-white/5 text-primary-text"
+        class="w-full flex items-center justify-between p-3 bg-black/5 dark:bg-white/5 hover:bg-black/10 dark:hover:bg-white/10 active:opacity-80 active:scale-[0.99] rounded-xl transition-all border border-black/5 dark:border-white/5 text-primary-text"
         @click="openSettings">
         <div class="flex items-center gap-3">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
