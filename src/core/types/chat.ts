@@ -383,7 +383,7 @@ export interface StreamContextDto {
 
 /** Rust `StreamEvent` 的完整 Channel 载荷；Option 字段会被序列化为 null。 */
 export interface StreamEventDto {
-  type: "thinking" | "aurora" | "end" | "error" | "reconnecting" | "data";
+  type: "thinking" | "aurora" | "end" | "error";
   chunk: unknown | null;
   messageId: string;
   context: StreamContextDto | null;

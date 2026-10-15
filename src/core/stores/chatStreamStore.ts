@@ -7,6 +7,7 @@ import { useAssistantStore } from "./assistant";
 import { useAvatarStore } from "./avatar";
 import { useTopicStore } from "./topicListManager";
 import { useChatHistoryStore } from "./chatHistoryStore";
+import { useNotificationStore } from "./notification";
 import type {
   ActiveGenerationDto,
   AuroraRecoverySnapshot,
@@ -687,7 +688,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     ownerType: ConversationOwnerType,
     topicId: string,
     messageId: string,
-    retainMessageUntilTerminal = false,
+    discardImmediately = false,
   ) => {
     const key = conversationMapKey(ownerId, ownerType, topicId);
     const messageKey = streamMessageMapKey(
@@ -706,9 +707,12 @@ export const useChatStreamStore = defineStore("chatStream", () => {
         delete sessionActiveStreams.value[key];
       }
     }
-    // 手动停止只撤销活跃 UI，原消息对象必须等权威 end/error 复用并收口。
-    // 若终态永久缺失，既有流消息池上限会回收这个非活跃对象。
-    if (retainMessageUntilTerminal) return;
+    if (discardImmediately) {
+      activeStreamMessages.delete(messageKey);
+      streamConsumerRevisions.delete(messageKey);
+      clearRAFUpdate(messageKey, false);
+      return;
+    }
 
     // 同时从全局池中移除 (延迟移除，确保 finalizeStream 能拿到对象)
     const cleanupTimer = setTimeout(() => {
@@ -720,6 +724,20 @@ export const useChatStreamStore = defineStore("chatStream", () => {
       }
     }, 1000);
     cleanupTimers.add(cleanupTimer);
+  };
+
+  // 只在后端删除已提交后调用；同一消息的迟到事件、快照和恢复回调全部失效。
+  const forgetDeletedMessage = (
+    ownerId: string,
+    ownerType: ConversationOwnerType,
+    topicId: string,
+    messageId: string,
+  ) => {
+    const messageKey = streamMessageMapKey(ownerId, ownerType, topicId, messageId);
+    recordStreamTerminalTombstone(messageKey);
+    recoveryMessageIds.delete(messageKey);
+    if (streamingMessageKey.value === messageKey) streamingMessageKey.value = null;
+    removeSessionStream(ownerId, ownerType, topicId, messageId, true);
   };
 
   /**
@@ -1060,7 +1078,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
         }
       }
     } else if (type === "error") {
-      // error 只表示 durable finalizer 未能提交。保留当前 partial 和 active owner，
+      // error 表示尚未 durable（终态提交失败或 Helper 接管中断）。保留 partial 和 active owner，
       // 不写终态 tombstone；后续 recovery 的权威 end 仍必须能够进入。
       clearRAFUpdate(messageKey, true);
       if (typeof event.content === "string") msg!.content = event.content;
@@ -1251,8 +1269,8 @@ export const useChatStreamStore = defineStore("chatStream", () => {
         `[ChatStreamStore] Found ${activeGens.length} interrupted active generations:`,
         activeGens,
       );
-      // 必须在注入恢复占位对象前冻结；否则冷启动消息会被恒定误判为 warm。
-      const warmMessageIds = new Set(activeStreamMessages.keys());
+      // 扫描前已有的活跃消息无需再次标记未读。
+      const existingMessageIds = new Set(activeStreamMessages.keys());
       const recoveryUnreadUpdates: Promise<void>[] = [];
 
       // 2. UI 预处理：在内存中将消息标记为 reconnecting，让用户在界面上看到“重连中”
@@ -1311,6 +1329,8 @@ export const useChatStreamStore = defineStore("chatStream", () => {
         } else {
           msg.isReconnecting = true;
         }
+        // 数据库仍将该消息列为 pending；上次接续拒绝的临时错误不属于生成终态。
+        if (msg.finishReason === "error") msg.finishReason = undefined;
         addSessionStream(ownerId, ownerType, topicId, msgId);
       }
 
@@ -1344,16 +1364,12 @@ export const useChatStreamStore = defineStore("chatStream", () => {
           && recoveryMessageIds.get(messageKey) === recoveryOwner
           && !hasStreamTerminalTombstone(messageKey);
 
-        const isWarm = warmMessageIds.has(messageKey);
-        if (!isWarm && ownerType === "agent" && !recoveryKey) {
+        if (!existingMessageIds.has(messageKey) && ownerType === "agent" && !recoveryKey) {
           recoveryUnreadUpdates.push(
             topicStore.setTopicUnread(ownerId, ownerType, topicId, true),
           );
         }
         let msg = activeStreamMessages.get(messageKey);
-        const originalContent = msg?.content || "";
-        const originalBlocks = msg?.blocks ? [...msg.blocks] : [];
-
         if (!msg) {
           // 说明是冷启动后第一次加载或者流不在活跃池中
           const historyStore = useChatHistoryStore();
@@ -1367,14 +1383,29 @@ export const useChatStreamStore = defineStore("chatStream", () => {
         }
 
         const recoveryMessage = msg;
+        // 保留已显示内容，首个权威 snapshot 会原子覆盖正文、稳定块与尾部。
         if (recoveryMessage) {
           recoveryMessage.isThinking = false;
-          if (!isWarm) {
-            // 冷接续没有旧 AST 基线，必须从 helper 的事件 0 完整回放。
-            recoveryMessage.content = "";
-            recoveryMessage.blocks = [];
-          }
         }
+
+        const compileRecoveredContent = () => {
+          if (!recoveryMessage) return;
+          const content = recoveryMessage.content || "";
+          const consumerRevision = streamConsumerRevisions.get(messageKey);
+          void invoke<ContentBlock[]>("process_message_content", { content })
+            .then((compiledBlocks) => {
+              if (disposed || hasStreamTerminalTombstone(messageKey)
+                || streamConsumerRevisions.get(messageKey) !== consumerRevision
+                || recoveryMessage.content !== content) return;
+              recoveryMessage.blocks = compiledBlocks;
+              recoveryMessage.tailContent = "";
+              recoveryMessage.tailBlock = undefined;
+              recoveryMessage.tailOp = undefined;
+            })
+            .catch((error) => {
+              console.error("[ChatStreamStore] Failed to compile recovered message:", error);
+            });
+        };
 
         const streamChannel = useChatHistoryStore().makeStreamChannel(null);
 
@@ -1388,7 +1419,6 @@ export const useChatStreamStore = defineStore("chatStream", () => {
           topicId,
           msgId,
           streamChannel,
-          isWarm,
         })
           .then((res) => {
             if (!ownsRecovery()) return;
@@ -1404,24 +1434,9 @@ export const useChatStreamStore = defineStore("chatStream", () => {
               recoveryMessage.isReconnecting = false;
               recoveryMessage.isThinking = false;
               if (typeof res.content === "string") {
+                clearRAFUpdate(messageKey, false);
                 recoveryMessage.content = res.content;
-                const content = res.content;
-                const consumerRevision = streamConsumerRevisions.get(messageKey);
-                invoke<ContentBlock[]>("process_message_content", {
-                  content,
-                })
-                  .then((compiledBlocks) => {
-                    if (disposed || hasStreamTerminalTombstone(messageKey)
-                      || streamConsumerRevisions.get(messageKey) !== consumerRevision
-                      || recoveryMessage.content !== content) return;
-                    recoveryMessage.blocks = compiledBlocks;
-                  })
-                  .catch((e) => {
-                    console.error(
-                      "[ChatStreamStore] Failed to compile recovered message:",
-                      e,
-                    );
-                  });
+                compileRecoveredContent();
               }
               if (res.status === "failed" || res.status === "not_found") {
                 recoveryMessage.finishReason = "error";
@@ -1450,13 +1465,18 @@ export const useChatStreamStore = defineStore("chatStream", () => {
               err,
             );
             if (recoveryMessage) {
+              clearRAFUpdate(messageKey, true);
               recoveryMessage.isReconnecting = false;
               recoveryMessage.finishReason = "error";
-              recoveryMessage.content =
-                originalContent + "\n\n> VCP流式错误: 接续失败";
-              recoveryMessage.blocks = originalBlocks;
+              compileRecoveredContent();
             }
             removeSessionStream(ownerId, ownerType, topicId, msgId);
+            useNotificationStore().addNotification({
+              type: "error",
+              title: "流式接续失败",
+              message: err instanceof Error ? err.message : String(err),
+              toastOnly: true,
+            });
           })
           .finally(() => {
             if (!attached && recoveryMessageIds.get(messageKey) === recoveryOwner) {
@@ -1508,6 +1528,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     computeShell,
     addSessionStream,
     removeSessionStream,
+    forgetDeletedMessage,
     requestAuroraSnapshot,
     processStreamEvent,
     stopMessage,

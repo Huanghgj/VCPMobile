@@ -241,7 +241,6 @@ pub async fn create_topic(
 pub async fn delete_topic(
     app_handle: AppHandle,
     db_state: State<'_, DbState>,
-    active_requests: State<'_, crate::vcp_modules::vcp_client::ActiveRequests>,
     owner_id: String,
     owner_type: String,
     topic_id: String,
@@ -275,13 +274,11 @@ pub async fn delete_topic(
     }
 
     for message_key in deletion.active_messages {
-        if let Err(error) = active_requests.cancel(&message_key) {
-            log::warn!(
-                "Failed to cancel generation from deleted topic {}: {}",
-                message_key.msg_id,
-                error
-            );
-        }
+        crate::vcp_modules::vcp_client::discard_deleted_generation(
+            &app_handle,
+            &message_key,
+        )
+        .await;
     }
 
     if let Some(sync_state) = app_handle.try_state::<SyncState>() {
@@ -1059,13 +1056,11 @@ pub async fn regenerate_topic_response(
     )
     .await?;
     for msg_id in &deletion.active_ids {
-        if let Err(error) = active_requests.cancel(&MessageKey::new(key.clone(), msg_id)) {
-            log::warn!(
-                "Failed to cancel regenerated generation {}: {}",
-                msg_id,
-                error
-            );
-        }
+        crate::vcp_modules::vcp_client::discard_deleted_generation(
+            &app_handle,
+            &MessageKey::new(key.clone(), msg_id),
+        )
+        .await;
     }
     crate::vcp_modules::chat_manager::notify_message_deletions(&app_handle, &key, &deletion);
 

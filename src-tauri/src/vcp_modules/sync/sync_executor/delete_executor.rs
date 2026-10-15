@@ -71,18 +71,8 @@ impl DeleteExecutor {
 
         // Cancellation is intentionally post-commit: late finalizers already require the
         // active row, so the durable tombstone remains the authority if cancellation races.
-        if let Some(active_requests) =
-            app.try_state::<crate::vcp_modules::vcp_client::ActiveRequests>()
-        {
-            for key in active_ids {
-                if let Err(error) = active_requests.cancel(&key) {
-                    log::warn!(
-                        "[DeleteExecutor] Failed to cancel generation {} after topic delete: {}",
-                        key.msg_id,
-                        error
-                    );
-                }
-            }
+        for key in active_ids {
+            crate::vcp_modules::vcp_client::discard_deleted_generation(app, &key).await;
         }
 
         Ok(())
@@ -114,18 +104,12 @@ impl DeleteExecutor {
         let active_ids =
             crate::vcp_modules::message_service::apply_sync_message_tombstones(&db, key, &writes)
                 .await?;
-        if let Some(active_requests) =
-            app.try_state::<crate::vcp_modules::vcp_client::ActiveRequests>()
-        {
-            for active_id in active_ids {
-                if let Err(error) =
-                    active_requests.cancel(&MessageKey::new(key.clone(), &active_id))
-                {
-                    log::warn!(
-                        "[DeleteExecutor] Failed to cancel generation {active_id} after message delete: {error}"
-                    );
-                }
-            }
+        for active_id in active_ids {
+            crate::vcp_modules::vcp_client::discard_deleted_generation(
+                app,
+                &MessageKey::new(key.clone(), &active_id),
+            )
+            .await;
         }
         Ok(())
     }

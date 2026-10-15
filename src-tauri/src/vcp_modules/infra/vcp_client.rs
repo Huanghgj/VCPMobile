@@ -2,6 +2,7 @@ use crate::vcp_modules::media_processor::convert_local_image_for_multimodal;
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use futures_util::StreamExt;
+#[cfg(not(target_os = "android"))]
 use futures_util::TryStreamExt;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use reqwest::Client;
@@ -9,11 +10,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tauri::{ipc::Channel, AppHandle, Manager, Runtime};
 #[cfg(target_os = "android")]
 use tokio_util::codec::LengthDelimitedCodec;
-use tokio_util::codec::{FramedRead, LinesCodec};
+use tokio_util::codec::FramedRead;
+#[cfg(not(target_os = "android"))]
 use tokio_util::io::StreamReader;
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -240,25 +242,6 @@ pub fn preview_chat_endpoint(
     })
 }
 
-#[cfg(any(target_os = "android", test))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HelperStartErrorDisposition {
-    AdoptExistingSession,
-    Fail,
-}
-
-#[cfg(any(target_os = "android", test))]
-fn classify_helper_start_error(
-    error: &str,
-    observed_generation: Option<u64>,
-) -> HelperStartErrorDisposition {
-    if observed_generation.is_none() && error == "Session already exists" {
-        HelperStartErrorDisposition::AdoptExistingSession
-    } else {
-        HelperStartErrorDisposition::Fail
-    }
-}
-
 impl VcpRequestPayload {
     /// 内部 transport 未显式分配时兼容既有单 step 请求身份。
     pub fn effective_transport_request_id(&self) -> &str {
@@ -284,13 +267,13 @@ pub fn message_transport_request_id(key: &MessageKey) -> String {
 #[derive(Debug, Serialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamEvent {
-    pub r#type: String, // "end" 是唯一 durable 终态；"error" 仅表示终态提交失败、仍可恢复
+    pub r#type: String, // "end" 是唯一 durable 终态；"error" 表示交付/提交未完成、仍可恢复
     pub chunk: Option<Value>, // 数据块 (仅 type="data" 时有效)
     pub message_id: String, // 消息ID
     pub context: Option<Value>, // 透传的上下文信息
     pub finish_reason: Option<String>, // 结束原因
     pub error: Option<String>, // 错误信息 (仅 type="error" 时有效)
-    pub content: Option<String>, // durable end / commit failure 的权威正文
+    pub content: Option<String>, // durable end 的权威正文，或未提交错误时已完整接收的正文前缀
     pub aurora: Option<AuroraUpdate>, // Aurora 语义沉淀更新 (type="aurora" 时有效)
     pub blocks: Option<Vec<ContentBlock>>, // 持久化后的预渲染块 (仅 type="end" 时有效)
     pub timestamp: Option<u64>, // ⚡ 新增物理落笔时间戳
@@ -359,6 +342,7 @@ impl StreamEvent {
 pub struct VcpRequestFailure {
     message: String,
     partial_content: Option<String>,
+    recovery_pending: bool,
 }
 
 impl VcpRequestFailure {
@@ -366,7 +350,21 @@ impl VcpRequestFailure {
         Self {
             message: message.into(),
             partial_content: Some(partial_content),
+            recovery_pending: false,
         }
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    fn recoverable_helper(message: impl Into<String>, partial_content: Option<String>) -> Self {
+        Self {
+            message: message.into(),
+            partial_content,
+            recovery_pending: true,
+        }
+    }
+
+    pub(crate) fn is_recovery_pending(&self) -> bool {
+        self.recovery_pending
     }
 
     pub fn into_parts(self) -> (String, Option<String>) {
@@ -387,44 +385,12 @@ impl From<String> for VcpRequestFailure {
         Self {
             message,
             partial_content: None,
+            recovery_pending: false,
         }
     }
 }
 
-fn streaming_failure(
-    buffer: &mut AuroraBuffer,
-    pending_chunk: &mut String,
-    message: impl Into<String>,
-) -> VcpRequestFailure {
-    if !pending_chunk.is_empty() {
-        buffer.append_chunk(pending_chunk);
-        pending_chunk.clear();
-    }
-    VcpRequestFailure::streaming(message, buffer.full_text.clone())
-}
-
 const AURORA_PARSE_INTERVAL: Duration = Duration::from_millis(33);
-
-fn remaining_aurora_parse_delay(elapsed: Duration) -> Duration {
-    AURORA_PARSE_INTERVAL.saturating_sub(elapsed)
-}
-
-#[cfg(any(target_os = "android", test))]
-fn merge_recovery_partial(helper_content: &str, partial_content: Option<String>) -> String {
-    let Some(partial_content) = partial_content else {
-        return helper_content.to_string();
-    };
-    if partial_content.starts_with(helper_content) {
-        partial_content
-    } else if helper_content.starts_with(&partial_content) {
-        helper_content.to_string()
-    } else {
-        log::warn!(
-            "[VCPClient] Recovery partial diverged from helper snapshot; preserving helper-owned content"
-        );
-        helper_content.to_string()
-    }
-}
 
 pub(crate) fn stream_error_content(partial_content: &str, error: &str) -> String {
     let suffix = format!("\n\n> VCP流式错误: {error}");
@@ -466,9 +432,36 @@ fn next_consumer_revision() -> u64 {
 struct RequestOutput {
     state: std::sync::Mutex<RequestOutputState>,
     changed: tokio::sync::Notify,
+    #[cfg(target_os = "android")]
+    helper_handoff: std::sync::Mutex<Option<HelperHandoff>>,
+}
+
+/// Keep the consumer socket alive through the database transaction. Dropping it
+/// before commit would turn every online result into an offline disk write.
+#[cfg(target_os = "android")]
+struct HelperHandoff {
+    transport_request_id: String,
+    generation: String,
+    _stream: Option<tokio::net::TcpStream>,
 }
 
 impl RequestOutput {
+    #[cfg(target_os = "android")]
+    fn retain_helper_handoff(
+        &self,
+        transport_request_id: String,
+        generation: String,
+        stream: Option<tokio::net::TcpStream>,
+    ) {
+        if let Ok(mut handoff) = self.helper_handoff.lock() {
+            *handoff = Some(HelperHandoff {
+                transport_request_id,
+                generation,
+                _stream: stream,
+            });
+        }
+    }
+
     fn bind_initial(&self, channel: Option<Channel<StreamEvent>>) {
         if let Ok(mut state) = self.state.lock() {
             if state.channel.is_none() && !state.closed {
@@ -496,10 +489,6 @@ impl RequestOutput {
         Ok(true)
     }
 
-    fn needs_snapshot(&self) -> bool {
-        self.state.lock().is_ok_and(|state| state.snapshot_pending && !state.closed)
-    }
-
     fn send(&self, event: StreamEvent) -> bool {
         let Ok(mut state) = self.state.lock() else {
             return false;
@@ -512,7 +501,12 @@ impl RequestOutput {
         if event.r#type == "end" || event.r#type == "error" {
             state.closed = true;
         }
-        Self::send_locked(&state, event)
+        let delivered = Self::send_locked(&state, event);
+        if !delivered {
+            state.channel = None;
+            state.snapshot_pending = true;
+        }
+        delivered
     }
 
     fn send_locked(state: &RequestOutputState, mut event: StreamEvent) -> bool {
@@ -539,7 +533,12 @@ impl RequestOutput {
         if state.closed {
             return;
         }
-        let prepared = if state.snapshot_pending || force_snapshot || finish_reason.is_some() {
+        if state.channel.is_none() {
+            buffer.discard_pending_delivery();
+            state.snapshot_pending = true;
+            return;
+        }
+        let prepared = if state.snapshot_pending || force_snapshot {
             Some(buffer.prepare_snapshot_update())
         } else {
             buffer.prepare_delta_update()
@@ -552,6 +551,10 @@ impl RequestOutput {
         if Self::send_locked(&state, event) {
             buffer.commit_delivery(commit);
             state.snapshot_pending = false;
+        } else {
+            state.channel = None;
+            state.snapshot_pending = true;
+            buffer.discard_pending_delivery();
         }
     }
 
@@ -594,6 +597,96 @@ pub(crate) fn deliver_request_event<R: Runtime>(
     event: StreamEvent,
 ) {
     request_output(app, key, channel).send(event);
+}
+
+/// Only the durable owner can acknowledge a helper result. Delivery to a
+/// WebView is deliberately unrelated to this resource handoff.
+pub(crate) async fn release_committed_helper<R: Runtime>(app: &AppHandle<R>, key: &MessageKey) {
+    settle_helper_handoff(app, key, true).await;
+}
+
+pub(crate) async fn discard_request_helper<R: Runtime>(app: &AppHandle<R>, key: &MessageKey) {
+    settle_helper_handoff(app, key, false).await;
+}
+
+/// Called after a deletion transaction commits, including when the main
+/// process has restarted and no local request lease exists anymore.
+pub(crate) async fn discard_deleted_generation<R: Runtime>(app: &AppHandle<R>, key: &MessageKey) {
+    if let Some(requests) = app.try_state::<ActiveRequests>() {
+        let _ = requests.cancel(key);
+    }
+    #[cfg(target_os = "android")]
+    {
+        let request_id = message_transport_request_id(key);
+        // Query only the existing helper; deleting history must not start a
+        // foreground service. The UUID prevents a late control affecting a
+        // different helper generation.
+        let generation = query_helper_generation(app, &request_id).await.ok();
+        let Some(db) = app.try_state::<DbState>() else { return; };
+        let pending = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM active_generations
+             WHERE owner_type = ? AND owner_id = ? AND topic_id = ? AND msg_id = ?)",
+        )
+        .bind(&key.topic.owner_type)
+        .bind(&key.topic.owner_id)
+        .bind(&key.topic.topic_id)
+        .bind(&key.msg_id)
+        .fetch_one(&db.pool)
+        .await;
+        if !matches!(pending, Ok(false)) {
+            return;
+        }
+        discard_request_helper(app, key).await;
+        if let Some(generation) = generation {
+            if let Err(error) = discard_helper_session(app, &request_id, &generation).await {
+                log::warn!("[VCPClient] Deleted generation helper cleanup failed: {error}");
+            }
+        }
+        let Ok(cache) = app.path().app_cache_dir() else { return; };
+        let prefix = format!("{}.", crate::vcp_modules::infra::utils::calculate_sha256(request_id.as_bytes()));
+        if let Ok(mut entries) = tokio::fs::read_dir(cache.join("sse_offline_completed")).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with(&prefix) && name.ends_with(".completed") {
+                    if let Err(error) = tokio::fs::remove_file(entry.path()).await {
+                        if error.kind() != std::io::ErrorKind::NotFound {
+                            log::warn!("[VCPClient] Deleted generation file cleanup failed: {error}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn settle_helper_handoff<R: Runtime>(
+    app: &AppHandle<R>,
+    key: &MessageKey,
+    committed: bool,
+) {
+    #[cfg(target_os = "android")]
+    {
+        let output = app.try_state::<ActiveRequests>()
+            .and_then(|requests| requests.0.get(key).map(|entry| entry.output.clone()));
+        let handoff = output.and_then(|output| {
+            output.helper_handoff.lock().ok().and_then(|mut handoff| handoff.take())
+        });
+        if let Some(handoff) = handoff {
+            let result = if committed {
+                ack_helper_committed(app, &handoff.transport_request_id, &handoff.generation).await
+            } else {
+                discard_helper_session(app, &handoff.transport_request_id, &handoff.generation).await
+            };
+            if let Err(error) = result {
+                // The database result remains authoritative. Dropping the
+                // socket lets the helper publish an orphan for later cleanup.
+                log::warn!("[VCPClient] Helper terminal handoff failed: {error}");
+            }
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    let _ = (app, key, committed);
 }
 
 pub type ActiveRequestMap = Arc<DashMap<MessageKey, Arc<ActiveRequestEntry>>>;
@@ -841,7 +934,20 @@ pub async fn sendToVCP<R: Runtime>(
     {
         Ok(val) => val,
         Err(failure) => {
+            let recovery_pending = failure.is_recovery_pending();
             let (error, partial_content) = failure.into_parts();
+            if recovery_pending {
+                let notice = format!("后台生成连接中断，稍后返回前台可继续接管：{error}");
+                let mut event = StreamEvent::error(message_id.clone(), context.clone(), notice.clone());
+                event.content = partial_content;
+                deliver_request_event(
+                    &app,
+                    &request_key,
+                    Some(stream_channel.clone()),
+                    event,
+                );
+                return Err(notice);
+            }
             if is_stream {
                 let pool = app
                     .state::<crate::vcp_modules::db_manager::DbState>()
@@ -931,10 +1037,25 @@ pub async fn perform_vcp_request<R: Runtime>(
     payload: VcpRequestPayload,
     stream_channel: Option<Channel<StreamEvent>>,
 ) -> Result<(Value, bool), VcpRequestFailure> {
-    let (lease, cancellation_token) = ActiveRequestLease::try_acquire(active_requests, request_key)
+    #[cfg(target_os = "android")]
+    let transport_request_id = payload.effective_transport_request_id().to_string();
+    let (lease, cancellation_token) = ActiveRequestLease::try_acquire(active_requests, request_key.clone())
         .map_err(VcpRequestFailure::from)?;
     let result =
         perform_vcp_request_registered(app, payload, stream_channel, cancellation_token).await;
+    // This entry point serves the ephemeral assistant, which has no database
+    // finalizer and must not leave an unclaimable offline result behind.
+    discard_request_helper(app, &request_key).await;
+    #[cfg(target_os = "android")]
+    if result.as_ref().is_err_and(|failure| failure.is_recovery_pending()) {
+        // A broken local socket intentionally leaves no handoff for normal
+        // chat recovery. This ephemeral caller has no such recovery owner.
+        if let Ok(generation) = query_helper_generation(app, &transport_request_id).await {
+            if let Err(error) = discard_helper_session(app, &transport_request_id, &generation).await {
+                log::warn!("[VCPClient] Ephemeral helper cleanup failed: {error}");
+            }
+        }
+    }
     drop(lease);
     result
 }
@@ -1017,8 +1138,6 @@ pub async fn perform_vcp_request_registered<R: Runtime>(
             cancellation_token,
             output,
             false,
-            None,
-            None,
         )
         .await
     } else {
@@ -1284,13 +1403,10 @@ fn extract_timestamp_bindings(messages: &mut [Value]) -> Vec<Value> {
 }
 
 #[cfg(target_os = "android")]
-fn get_helper_port<R: Runtime>(app: &AppHandle<R>) -> Result<u16, String> {
+async fn get_helper_port<R: Runtime>(app: &AppHandle<R>) -> Result<u16, String> {
     let cache_dir = app.path().app_cache_dir().map_err(|e| e.to_string())?;
     let port_file = cache_dir.join("sse_helper.port");
-    if !port_file.exists() {
-        return Err("sse_helper.port file not found. Is SseProxyService running?".to_string());
-    }
-    let content = std::fs::read_to_string(port_file).map_err(|e| e.to_string())?;
+    let content = tokio::fs::read_to_string(port_file).await.map_err(|e| e.to_string())?;
     let port = content.trim().parse::<u16>().map_err(|e| e.to_string())?;
     Ok(port)
 }
@@ -1306,21 +1422,21 @@ async fn connect_to_helper<R: Runtime>(
     let port_file = cache_dir.join("sse_helper.port");
 
     // 1. 尝试使用已有的端口文件进行连接（适用于 helper 已经在运行且就绪的情况）
-    if port_file.exists() {
-        if let Ok(content) = std::fs::read_to_string(&port_file) {
-            if let Ok(port) = content.trim().parse::<u16>() {
-                if let Ok(stream) = connect_helper_port(port).await {
-                    log::info!(
-                        "[VCPClient] Connected to existing sse helper socket on 127.0.0.1:{}",
-                        port
-                    );
-                    return send_command_to_stream(stream, action, msg_id, extra_params).await;
-                }
+    if let Ok(content) = tokio::fs::read_to_string(&port_file).await {
+        if let Ok(port) = content.trim().parse::<u16>() {
+            if let Ok(stream) = connect_helper_port(port).await {
+                log::info!(
+                    "[VCPClient] Connected to existing sse helper socket on 127.0.0.1:{}",
+                    port
+                );
+                return send_command_to_stream(stream, action, msg_id, extra_params).await;
             }
         }
     }
-
-    // 2. 如果连接失败或文件不存在，启动/唤醒 helper 服务
+    // 2. 如果连接失败或文件不存在，启动/唤醒 helper 服务。
+    // A missing/stale port file or connect timeout does not prove that the
+    // generation vanished. Resume must obtain the helper's explicit response;
+    // waking this service never starts another upstream request.
     log::info!(
         "[VCPClient] Helper not responding or port file missing. Starting/Waking helper service..."
     );
@@ -1336,12 +1452,7 @@ async fn connect_to_helper<R: Runtime>(
         if tokio::time::Instant::now() >= ready_deadline {
             break;
         }
-        if !port_file.exists() {
-            tokio::time::sleep(delay).await;
-            continue;
-        }
-
-        let content = match std::fs::read_to_string(&port_file) {
+        let content = match tokio::fs::read_to_string(&port_file).await {
             Ok(c) => c,
             Err(e) => {
                 last_err = format!("Read port file error: {}", e);
@@ -1404,8 +1515,8 @@ async fn send_command_to_stream(
         "requestId": msg_id
     });
     if let Some(params) = extra_params {
-        if let Some(obj) = cmd.as_object_mut() {
-            for (k, v) in params.as_object().unwrap() {
+        if let (Some(obj), Some(params)) = (cmd.as_object_mut(), params.as_object()) {
+            for (k, v) in params {
                 obj.insert(k.clone(), v.clone());
             }
         }
@@ -1438,83 +1549,221 @@ async fn send_command_to_stream(
 #[cfg(target_os = "android")]
 async fn query_helper_generation<R: Runtime>(
     app: &AppHandle<R>,
-    msg_id: &str,
-) -> Result<u64, String> {
-    let port = get_helper_port(app)?;
+    request_id: &str,
+) -> Result<String, String> {
+    let port = get_helper_port(app).await?;
     let stream = connect_helper_port(port).await?;
-    let stream = send_command_to_stream(stream, "query", msg_id, None).await?;
+    let stream = send_command_to_stream(stream, "query", request_id, None).await?;
     let mut reader = FramedRead::new(stream, helper_frame_codec());
     let frame = tokio::time::timeout(HELPER_IO_TIMEOUT, reader.next())
         .await
         .map_err(|_| "Helper generation query timed out".to_string())?
         .ok_or_else(|| "Helper generation query ended at EOF".to_string())?
-        .map_err(|e| format!("Helper generation query frame error: {}", e))?;
-    let response = serde_json::from_slice::<Value>(&frame)
-        .map_err(|e| format!("Invalid helper generation response: {}", e))?;
-    if response.get("requestId").and_then(Value::as_str) != Some(msg_id) {
-        return Err("Helper generation response identity mismatch".to_string());
+        .map_err(|error| format!("Helper generation query frame error: {error}"))?;
+    let response: Value = serde_json::from_slice(&frame)
+        .map_err(|error| format!("Invalid helper query response: {error}"))?;
+    if response["requestId"].as_str() != Some(request_id) {
+        return Err("Helper generation query identity mismatch".to_string());
     }
-    response
-        .get("generation")
-        .and_then(Value::as_u64)
-        .filter(|generation| *generation > 0)
-        .ok_or_else(|| "Helper session has no active generation".to_string())
+    response["generation"].as_str().filter(|generation| !generation.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| HELPER_SESSION_NOT_FOUND.to_string())
 }
 
 #[cfg(target_os = "android")]
-async fn send_stop_to_helper<R: Runtime>(
+async fn helper_session_control<R: Runtime>(
     app: &AppHandle<R>,
-    msg_id: &str,
-    expected_generation: Option<u64>,
+    action: &str,
+    request_id: &str,
+    generation: &str,
 ) -> Result<(), String> {
-    let expected_generation = match expected_generation.filter(|generation| *generation > 0) {
-        Some(generation) => generation,
-        None => query_helper_generation(app, msg_id).await?,
-    };
-    let port = get_helper_port(app)?;
+    let port = get_helper_port(app).await?;
     let stream = connect_helper_port(port).await?;
     let stream = send_command_to_stream(
         stream,
-        "stop",
-        msg_id,
-        Some(json!({ "generation": expected_generation })),
-    )
-    .await?;
+        action,
+        request_id,
+        Some(json!({ "generation": generation })),
+    ).await?;
     let mut reader = FramedRead::new(stream, helper_frame_codec());
     let frame = tokio::time::timeout(HELPER_IO_TIMEOUT, reader.next())
         .await
-        .map_err(|_| "Helper stop ACK timed out".to_string())?
-        .ok_or_else(|| "Helper stop ACK ended at EOF".to_string())?
-        .map_err(|e| format!("Helper stop ACK frame error: {}", e))?;
-    let ack = serde_json::from_slice::<Value>(&frame)
-        .map_err(|e| format!("Invalid helper stop ACK: {}", e))?;
-    validate_helper_stop_ack(&ack, msg_id, expected_generation)
+        .map_err(|_| format!("Helper {action} ACK timed out"))?
+        .ok_or_else(|| format!("Helper {action} ACK ended at EOF"))?
+        .map_err(|error| format!("Helper {action} ACK frame error: {error}"))?;
+    let ack: Value = serde_json::from_slice(&frame)
+        .map_err(|error| format!("Invalid helper {action} ACK: {error}"))?;
+    validate_helper_control_ack(&ack, action, request_id, generation)
 }
 
 #[cfg(any(target_os = "android", test))]
-fn validate_helper_stop_ack(
+fn validate_helper_control_ack(
     ack: &Value,
-    msg_id: &str,
-    expected_generation: u64,
+    action: &str,
+    request_id: &str,
+    generation: &str,
 ) -> Result<(), String> {
-    if ack.get("action").and_then(Value::as_str) == Some("stop_ack")
-        && ack.get("requestId").and_then(Value::as_str) == Some(msg_id)
-        && ack.get("generation").and_then(Value::as_u64) == Some(expected_generation)
-        && ack.get("stopped").and_then(Value::as_bool) == Some(true)
+    let expected_action = format!("{action}_ack");
+    if ack.get("action").and_then(Value::as_str) == Some(expected_action.as_str())
+        && ack.get("requestId").and_then(Value::as_str) == Some(request_id)
+        && ack.get("generation").and_then(Value::as_str) == Some(generation)
+        && ack.get("accepted").and_then(Value::as_bool) == Some(true)
     {
         return Ok(());
     }
-
-    Err(format!(
-        "Helper stop ACK rejected: expected requestId={} generation={}, got {}",
-        msg_id, expected_generation, ack
-    ))
+    Err(format!("Helper {action} ACK rejected for request {request_id}"))
 }
 
-/// 3. 流式请求循环（固定 33ms Aurora 解析门禁）
+#[cfg(target_os = "android")]
+pub(crate) async fn ack_helper_committed<R: Runtime>(
+    app: &AppHandle<R>,
+    request_id: &str,
+    generation: &str,
+) -> Result<(), String> {
+    helper_session_control(app, "ack_committed", request_id, generation).await
+}
+
+#[cfg(target_os = "android")]
+pub(crate) async fn discard_helper_session<R: Runtime>(
+    app: &AppHandle<R>,
+    request_id: &str,
+    generation: &str,
+) -> Result<(), String> {
+    helper_session_control(app, "discard", request_id, generation).await
+}
+
+/// Decode complete SSE events, independently of HTTP chunk or line boundaries.
+/// EOF does not dispatch a pending event without its terminating blank line.
+#[derive(Default)]
+#[cfg(any(not(target_os = "android"), test))]
+struct SseDecoder {
+    scanned: usize,
+    skip_lf: bool,
+    first_line_seen: bool,
+    data: Option<String>,
+}
+
+#[cfg(any(not(target_os = "android"), test))]
+impl tokio_util::codec::Decoder for SseDecoder {
+    type Item = String;
+    type Error = std::io::Error;
+
+    fn decode(&mut self, source: &mut bytes::BytesMut) -> Result<Option<String>, Self::Error> {
+        loop {
+            if self.skip_lf {
+                if source.is_empty() {
+                    return Ok(None);
+                }
+                if source[0] == b'\n' {
+                    let _ = source.split_to(1);
+                }
+                self.skip_lf = false;
+            }
+            let Some(end) = source[self.scanned..]
+                .iter()
+                .position(|byte| matches!(byte, b'\n' | b'\r'))
+                .map(|offset| self.scanned + offset)
+            else {
+                self.scanned = source.len();
+                return Ok(None);
+            };
+            let line = source.split_to(end + 1);
+            self.scanned = 0;
+            self.skip_lf = line[end] == b'\r';
+            let line = String::from_utf8_lossy(&line[..end]);
+            let line = if self.first_line_seen {
+                line.as_ref()
+            } else {
+                self.first_line_seen = true;
+                line.strip_prefix('\u{feff}').unwrap_or(&line)
+            };
+            if line.is_empty() {
+                if let Some(mut data) = self.data.take() {
+                    data.pop(); // Every data field appends exactly one newline.
+                    return Ok(Some(data));
+                }
+                continue;
+            }
+            if line.starts_with(':') {
+                continue;
+            }
+            let (field, value) = line.split_once(':').unwrap_or((line, ""));
+            if field == "data" {
+                let data = self.data.get_or_insert_with(String::new);
+                data.push_str(value.strip_prefix(' ').unwrap_or(value));
+                data.push('\n');
+            }
+        }
+    }
+
+    fn decode_eof(&mut self, source: &mut bytes::BytesMut) -> Result<Option<String>, Self::Error> {
+        if let Some(event) = self.decode(source)? {
+            return Ok(Some(event));
+        }
+        source.clear();
+        self.scanned = 0;
+        self.data = None;
+        Ok(None)
+    }
+}
+
+#[cfg(any(not(target_os = "android"), test))]
+fn absorb_sse_data(
+    data: &str,
+    pending_chunk: &mut String,
+    last_finish_reason: &mut Option<String>,
+) -> Result<bool, String> {
+    if data.trim() == "[DONE]" {
+        return Ok(true);
+    }
+    if data.trim().is_empty() {
+        return Ok(false);
+    }
+    let value: Value = serde_json::from_str(data)
+        .map_err(|error| format!("Invalid SSE JSON: {error}"))?;
+    if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
+        let message = error.as_str()
+            .or_else(|| error.get("message").and_then(Value::as_str))
+            .unwrap_or("Upstream SSE request failed");
+        return Err(message.to_string());
+    }
+    if let Some(choice) = value.get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+    {
+        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str)
+            .filter(|reason| !reason.is_empty())
+        {
+            *last_finish_reason = Some(reason.to_string());
+        }
+        if let Some(content) = choice.get("delta")
+            .and_then(|delta| delta.get("content"))
+            .and_then(Value::as_str)
+        {
+            pending_chunk.push_str(content);
+        }
+    }
+    Ok(false)
+}
+
+pub(crate) const STREAM_CAPACITY_EXHAUSTED: &str = "同时进行的请求已达到 8 路，请稍后重试";
+#[cfg(any(target_os = "android", test))]
+pub(crate) const HELPER_SESSION_NOT_FOUND: &str = "helper_session_not_found";
+static CHAT_TRANSPORT_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
+
+fn flush_aurora_window(buffer: &mut AuroraBuffer, pending_chunk: &mut String) {
+    if !pending_chunk.is_empty() {
+        buffer.append_chunk(pending_chunk);
+        pending_chunk.clear();
+        buffer.process_queue();
+    }
+}
+
+/// One transport owns one generation. Rendering runs on its own 33ms clock;
+/// neither a model-round finish reason nor a suspended WebView ends the stream.
 #[allow(clippy::too_many_arguments, unused_variables)]
 async fn handle_streaming_request<R: Runtime>(
-    _app: &AppHandle<R>,
+    app: &AppHandle<R>,
     client: Client,
     final_url: &str,
     api_key: &str,
@@ -1525,656 +1774,285 @@ async fn handle_streaming_request<R: Runtime>(
     cancellation_token: CancellationToken,
     output: Arc<RequestOutput>,
     is_resume: bool,
-    last_event_index: Option<i64>,
-    initial_content: Option<String>,
 ) -> Result<(Value, bool), VcpRequestFailure> {
-    let send_stream_event = |event: StreamEvent| output.send(event);
-
-    let message_id_inner = message_id.clone();
-    let context_inner = context.clone();
-
-    let mut last_finish_reason: Option<String> = None;
-    #[allow(unused_mut)]
-    let mut last_received_index: Option<i64> = last_event_index;
-    #[cfg(target_os = "android")]
-    let mut helper_generation: Option<u64> = None;
+    let _transport_slot = CHAT_TRANSPORT_SLOTS.try_acquire()
+        .map_err(|_| VcpRequestFailure::from(STREAM_CAPACITY_EXHAUSTED.to_string()))?;
     let mut aurora_buffer = AuroraBuffer::new();
-    let mut pending_aurora_chunk = String::new();
-    let mut last_aurora_parse = Instant::now() - Duration::from_millis(33);
-    let mut retry_count = 0;
-    let mut backoff = Duration::from_millis(500);
-
-    let send_aurora_update = |buffer: &mut AuroraBuffer, finish_reason: Option<String>| {
-        output.send_aurora(buffer, &message_id_inner, &context_inner, finish_reason, false);
-    };
-
-    let flush_aurora_parse = |buffer: &mut AuroraBuffer,
-                              pending_chunk: &mut String,
-                              last_parse: &mut Instant,
-                              force: bool|
-     -> (bool, bool) {
-        if pending_chunk.is_empty() {
-            return (false, false);
-        }
-        if !force && last_parse.elapsed() < AURORA_PARSE_INTERVAL {
-            return (false, false);
-        }
-
-        buffer.append_chunk(pending_chunk);
-        pending_chunk.clear();
-        *last_parse = Instant::now();
-        buffer.process_queue()
-    };
-
-    type BoxedLineStream =
-        Box<dyn futures_util::Stream<Item = Result<String, std::io::Error>> + Unpin + Send>;
-
-    let to_line_stream = |resp: reqwest::Response| -> BoxedLineStream {
-        let stream = resp.bytes_stream().map_err(std::io::Error::other);
-        let reader = StreamReader::new(stream);
-        let framed = FramedRead::new(reader, LinesCodec::new_with_max_length(512 * 1024));
-        let mapped = framed.map_err(std::io::Error::other);
-        Box::new(mapped)
+    let mut pending_chunk = String::new();
+    let mut last_finish_reason = None;
+    let send_update = |buffer: &mut AuroraBuffer| {
+        output.send_aurora(buffer, &message_id, &context, None, false);
     };
 
     #[cfg(target_os = "android")]
-    let mut tcp_reader: Option<FramedRead<tokio::net::TcpStream, LengthDelimitedCodec>> = None;
+    let mut reader = {
+        let (action, params) = if is_resume {
+            ("resume", None)
+        } else {
+            let mut helper_context = context.clone().unwrap_or_else(|| json!({}));
+            helper_context["messageId"] = json!(message_id);
+            ("start", Some(json!({
+                "url": final_url,
+                "headers": json!({
+                    "Authorization": format!("Bearer {api_key}"),
+                    "Content-Type": "application/json",
+                }).to_string(),
+                "body": request_body.to_string(),
+                "context": helper_context,
+            })))
+        };
+        let stream = connect_to_helper(app, action, &transport_request_id, params)
+            .await
+            .map_err(|error| VcpRequestFailure::recoverable_helper(error, None))?;
+        FramedRead::new(stream, helper_frame_codec())
+    };
+    #[cfg(target_os = "android")]
+    let mut helper_generation: Option<String> = None;
+    #[cfg(target_os = "android")]
+    let mut snapshot_in_progress = false;
+    #[cfg(target_os = "android")]
+    let mut snapshot_received = false;
+    #[cfg(target_os = "android")]
+    let mut helper_terminal_received = false;
+    #[cfg(target_os = "android")]
+    let mut cancel_sent = false;
 
     #[cfg(not(target_os = "android"))]
-    let mut lines: Option<BoxedLineStream> = None;
-
-    // 1. 声明状态机的所有状态
-    enum State {
-        Init,
-        Connecting,
-        Resuming,
-        Streaming,
-        Aligning,
-        Retrying,
-    }
-
-    let mut state = State::Init;
-
-    // 2. 状态机驱动循环
-    loop {
-        if output.needs_snapshot() {
-            flush_aurora_parse(
-                &mut aurora_buffer,
-                &mut pending_aurora_chunk,
-                &mut last_aurora_parse,
-                true,
-            );
-            send_aurora_update(&mut aurora_buffer, None);
+    let mut reader = {
+        if is_resume {
+            return Err("This platform has no surviving background transport".to_string().into());
         }
-        match state {
-            State::Init => {
-                if let Some(ref content) = initial_content {
-                    aurora_buffer.append_chunk(content);
-                    let _ = aurora_buffer.process_queue();
+        let response = tokio::select! {
+            biased;
+            _ = cancellation_token.cancelled() => {
+                return Ok((json!({
+                    "fullContent": "",
+                    "finishReason": "cancelled_by_user",
+                    "streamingStarted": false,
+                }), true));
+            }
+            response = client.post(final_url)
+                .header(AUTHORIZATION, format!("Bearer {api_key}"))
+                .header(CONTENT_TYPE, "application/json")
+                .json(&request_body)
+                .send() => response.map_err(|error| error.to_string())?,
+        };
+        if !response.status().is_success() {
+            return Err(format!("VCP Error: {}", response.status()).into());
+        }
+        let stream = response.bytes_stream().map_err(std::io::Error::other);
+        FramedRead::new(StreamReader::new(stream), SseDecoder::default())
+    };
 
-                    // 暖接续只发送一次 helper 权威 Snapshot，并以 reset frame 建立新序列基线。
-                    output.send_aurora(
-                        &mut aurora_buffer,
-                        &message_id_inner,
-                        &context_inner,
-                        None,
-                        true,
-                    );
-                }
-                if is_resume {
-                    state = State::Resuming;
-                } else {
-                    state = State::Connecting;
+    let mut render_clock = tokio::time::interval_at(
+        tokio::time::Instant::now() + AURORA_PARSE_INTERVAL,
+        AURORA_PARSE_INTERVAL,
+    );
+    render_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut cancelled = false;
+    #[cfg(target_os = "android")]
+    let mut cancel_deadline = None;
+
+    let outcome: Result<(), String> = async {
+        loop {
+            #[cfg(target_os = "android")]
+            if cancelled && !cancel_sent {
+                if let Some(generation) = helper_generation.as_deref() {
+                    helper_session_control(app, "cancel", &transport_request_id, generation).await?;
+                    cancel_sent = true;
                 }
             }
-            State::Connecting => {
-                #[cfg(target_os = "android")]
-                {
-                    let headers_json = json!({
-                        "Authorization": format!("Bearer {}", api_key),
-                        "Content-Type": "application/json"
-                    });
-                    let mut sse_context = json!({});
-                    if let Some(ref ctx) = context_inner {
-                        if let Some(agent_name) = ctx.get("agentName").and_then(|v| v.as_str()) {
-                            sse_context["agentName"] = json!(agent_name);
-                        }
-                        if let Some(topic_id) = ctx.get("topicId").and_then(|v| v.as_str()) {
-                            sse_context["topicId"] = json!(topic_id);
-                        }
-                        if let Some(owner_id) = ctx.get("ownerId").and_then(|v| v.as_str()) {
-                            sse_context["ownerId"] = json!(owner_id);
-                        }
-                        if let Some(owner_type) = ctx.get("ownerType").and_then(|v| v.as_str()) {
-                            sse_context["ownerType"] = json!(owner_type);
-                        }
-                    }
 
-                    let params = json!({
-                        "url": final_url,
-                        "headers": headers_json.to_string(),
-                        "body": request_body.to_string(),
-                        "context": sse_context
-                    });
-
-                    match connect_to_helper(_app, "start", &transport_request_id, Some(params))
-                        .await
-                    {
-                        Ok(stream) => {
-                            tcp_reader = Some(FramedRead::new(stream, helper_frame_codec()));
-                            state = State::Streaming;
-                        }
-                        Err(e) => {
-                            log::error!("[VCPClient] connect_to_helper failed: {:?}", e);
-                            return Err(streaming_failure(
-                                &mut aurora_buffer,
-                                &mut pending_aurora_chunk,
-                                e,
-                            ));
-                        }
-                    }
-                }
-                #[cfg(not(target_os = "android"))]
-                {
-                    let res_future = client
-                        .post(final_url)
-                        .header(AUTHORIZATION, format!("Bearer {}", api_key))
-                        .header(CONTENT_TYPE, "application/json")
-                        .json(&request_body)
-                        .send();
-
-                    tokio::select! {
-                        _ = cancellation_token.cancelled() => {
-                            log::warn!("[VCPClient] Request aborted during connection: {}", message_id_inner);
-                            flush_aurora_parse(&mut aurora_buffer, &mut pending_aurora_chunk, &mut last_aurora_parse, true);
-                            aurora_buffer.finalize();
-                            send_aurora_update(
-                                &mut aurora_buffer,
-                                Some("cancelled_by_user".to_string()),
-                            );
-                            return Ok((json!({ "fullContent": aurora_buffer.full_text, "streamingStarted": false }), true));
-                        }
-                        response_res = res_future => {
-                            match response_res {
-                                Ok(resp) if resp.status().is_success() => {
-                                    lines = Some(to_line_stream(resp));
-                                    state = State::Streaming;
-                                }
-                                Ok(resp) => {
-                                    let status = resp.status();
-                                    let text = tokio::select! {
-                                        _ = cancellation_token.cancelled() => {
-                                            return Ok((json!({
-                                                "fullContent": aurora_buffer.full_text,
-                                                "finishReason": "cancelled_by_user",
-                                            }), true));
-                                        }
-                                        text = resp.text() => text.unwrap_or_default(),
-                                    };
-                                    log::warn!("[VCPClient] VCP server rejected request: {} - {}", status, text);
-                                    return Err(streaming_failure(
-                                        &mut aurora_buffer,
-                                        &mut pending_aurora_chunk,
-                                        format!("VCP Error: {}", status),
-                                    ));
-                                }
-                                Err(e) => {
-                                    log::warn!("[VCPClient] Connection failed, transitioning to Retrying: {:?}", e);
-                                    state = State::Retrying;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            State::Resuming => {
-                while !crate::vcp_modules::infra::lifecycle_manager::is_app_in_foreground(_app) {
-                    log::info!(
-                        "[VCPClient] App is in background. Suspending reconnection for message: {}",
-                        message_id_inner
-                    );
-                    tokio::select! {
-                        _ = cancellation_token.cancelled() => {
-                            #[cfg(target_os = "android")]
-                            {
-                                if let Err(error) = send_stop_to_helper(
-                                    _app,
-                                    &transport_request_id,
-                                    helper_generation,
-                                ).await {
-                                    log::warn!("[VCPClient] Best-effort helper stop after cancellation failed: {}", error);
-                                }
-                            }
-                            flush_aurora_parse(&mut aurora_buffer, &mut pending_aurora_chunk, &mut last_aurora_parse, true);
-                            aurora_buffer.finalize();
-                            send_aurora_update(
-                                &mut aurora_buffer,
-                                Some("cancelled_by_user".to_string()),
-                            );
-                            return Ok((json!({ "fullContent": aurora_buffer.full_text, "finishReason": Some("cancelled_by_user") }), true));
-                        }
-                        _ = tokio::time::sleep(Duration::from_secs(2)) => {}
-                    }
-                }
-
-                #[cfg(target_os = "android")]
-                {
-                    log::info!(
-                        "[VCPClient] Resuming SSE from local proxy socket for message: {}",
-                        message_id_inner
-                    );
-
-                    let start_idx = last_received_index.map(|idx| idx + 1).unwrap_or(0);
-                    let params = json!({
-                        "startIndex": start_idx
-                    });
-
-                    match connect_to_helper(_app, "resume", &transport_request_id, Some(params))
-                        .await
-                    {
-                        Ok(stream) => {
-                            log::info!("[VCPClient] Successfully reconnected to sse helper socket");
-                            tcp_reader = Some(FramedRead::new(stream, helper_frame_codec()));
-                            retry_count = 0;
-                            backoff = Duration::from_millis(500);
-                            state = State::Streaming;
-                        }
-                        Err(e) => {
-                            log::warn!("[VCPClient] Failed to reconnect to sse helper: {:?}", e);
-                            state = State::Aligning;
-                        }
-                    }
-                }
-                #[cfg(not(target_os = "android"))]
-                {
-                    log::warn!("[VCPClient] Reconnection is only supported on Android via SSE proxy. Transitioning to Aligning.");
-                    state = State::Aligning;
-                }
-            }
-            State::Streaming => {
-                let mut stream_ended_normally = false;
-
-                #[cfg(target_os = "android")]
-                {
-                    if let Some(ref mut reader) = tcp_reader {
-                        loop {
-                            let pending_flush_delay =
-                                remaining_aurora_parse_delay(last_aurora_parse.elapsed());
-                            tokio::select! {
-                                biased;
-                                _ = cancellation_token.cancelled() => {
-                                    log::warn!("[VCPClient] Request aborted during streaming: {}", message_id_inner);
-                                    if let Err(error) = send_stop_to_helper(
-                                        _app,
-                                        &transport_request_id,
-                                        helper_generation,
-                                    ).await {
-                                        log::warn!("[VCPClient] Best-effort helper stop after cancellation failed: {}", error);
-                                    }
-                                    flush_aurora_parse(&mut aurora_buffer, &mut pending_aurora_chunk, &mut last_aurora_parse, true);
-                                    aurora_buffer.finalize();
-                                    send_aurora_update(
-                                        &mut aurora_buffer,
-                                        Some("cancelled_by_user".to_string()),
-                                    );
-                                    return Ok((json!({ "fullContent": aurora_buffer.full_text, "finishReason": Some("cancelled_by_user") }), true));
-                                }
-                                _ = output.changed.notified() => {
-                                    flush_aurora_parse(
-                                        &mut aurora_buffer,
-                                        &mut pending_aurora_chunk,
-                                        &mut last_aurora_parse,
-                                        true,
-                                    );
-                                    send_aurora_update(&mut aurora_buffer, None);
-                                }
-                                _ = tokio::time::sleep(pending_flush_delay), if !pending_aurora_chunk.is_empty() => {
-                                    flush_aurora_parse(
-                                        &mut aurora_buffer,
-                                        &mut pending_aurora_chunk,
-                                        &mut last_aurora_parse,
-                                        true,
-                                    );
-                                    send_aurora_update(&mut aurora_buffer, None);
-                                }
-                                next_line = reader.next() => {
-                                    match next_line {
-                                        Some(Ok(line)) => {
-                                            if let Ok(event) = serde_json::from_slice::<Value>(&line) {
-                                                if let Some(generation) = event.get("generation").and_then(Value::as_u64) {
-                                                    if let Some(current) = helper_generation {
-                                                        if current != generation {
-                                                            return Err(streaming_failure(
-                                                                &mut aurora_buffer,
-                                                                &mut pending_aurora_chunk,
-                                                                format!(
-                                                                    "Helper generation changed during stream: expected {}, got {}",
-                                                                    current, generation
-                                                                ),
-                                                            ));
-                                                        }
-                                                    } else {
-                                                        helper_generation = Some(generation);
-                                                    }
-                                                }
-                                                let event_type = event["eventType"].as_str().unwrap_or("");
-                                                let event_data = event["eventData"].as_str().unwrap_or("");
-
-                                                if let Some(idx) = event.get("index").and_then(|v| v.as_i64()) {
-                                                    last_received_index = Some(idx);
-                                                }
-
-                                                if event_type == "message" {
-                                                    if event_data == "[DONE]" {
-                                                        stream_ended_normally = true;
-                                                        break;
-                                                    }
-                                                    if let Ok(data_val) = serde_json::from_str::<Value>(event_data) {
-                                                        if let Some(reason) = data_val.get("finish_reason").and_then(|r| r.as_str()) {
-                                                            last_finish_reason = Some(reason.to_string());
-                                                        }
-                                                        if let Some(delta) = data_val.get("choices").and_then(|c| c.as_array()).and_then(|a| a.first()).and_then(|o| o.get("delta")).and_then(|d| d.get("content")).and_then(|s| s.as_str()) {
-                                                            pending_aurora_chunk.push_str(delta);
-                                                            let _ = flush_aurora_parse(
-                                                                &mut aurora_buffer,
-                                                                &mut pending_aurora_chunk,
-                                                                &mut last_aurora_parse,
-                                                                false,
-                                                            );
-                                                            send_aurora_update(&mut aurora_buffer, None);
-                                                        }
-                                                    }
-                                                } else if event_type == "closed" {
-                                                    stream_ended_normally = true;
-                                                    break;
-                                                } else if event_type == "error" {
-                                                    let err_msg = if let Ok(err_val) = serde_json::from_str::<Value>(event_data) {
-                                                        err_val["error"].as_str().unwrap_or("Unknown proxy error").to_string()
-                                                    } else {
-                                                        "Unknown proxy error".to_string()
-                                                    };
-                                                    if classify_helper_start_error(
-                                                        &err_msg,
-                                                        helper_generation,
-                                                    ) == HelperStartErrorDisposition::AdoptExistingSession
-                                                    {
-                                                        let generation = match query_helper_generation(
-                                                            _app,
-                                                            &transport_request_id,
-                                                        )
-                                                        .await
-                                                        {
-                                                            Ok(generation) => generation,
-                                                            Err(query_error) => {
-                                                                return Err(streaming_failure(
-                                                                    &mut aurora_buffer,
-                                                                    &mut pending_aurora_chunk,
-                                                                    format!(
-                                                                        "Cannot adopt existing helper session: {query_error}"
-                                                                    ),
-                                                                ));
-                                                            }
-                                                        };
-                                                        helper_generation = Some(generation);
-                                                        last_received_index = None;
-                                                        log::info!(
-                                                            "[VCPClient] Adopting existing helper session for transport {}, generation {}",
-                                                            transport_request_id,
-                                                            generation
-                                                        );
-                                                        state = State::Resuming;
-                                                        break;
-                                                    }
-                                                    log::warn!("[VCPClient] Stream proxy error: {}. Failing stream immediately.", err_msg);
-                                                    if let Err(stop_error) = send_stop_to_helper(
-                                                        _app,
-                                                        &transport_request_id,
-                                                        helper_generation,
-                                                    )
-                                                    .await
-                                                    {
-                                                        log::warn!(
-                                                            "[VCPClient] Best-effort helper stop after proxy error failed: {}",
-                                                            stop_error
-                                                        );
-                                                    }
-                                                    return Err(streaming_failure(
-                                                        &mut aurora_buffer,
-                                                        &mut pending_aurora_chunk,
-                                                        err_msg,
-                                                    ));
-                                                }
-                                            }
-                                        }
-                                        Some(Err(e)) => {
-                                            log::warn!("[VCPClient] TCP socket read error: {:?}, transitioning to Retrying", e);
-                                            flush_aurora_parse(
-                                                &mut aurora_buffer,
-                                                &mut pending_aurora_chunk,
-                                                &mut last_aurora_parse,
-                                                true,
-                                            );
-                                            send_aurora_update(&mut aurora_buffer, None);
-                                            state = State::Retrying;
-                                            break;
-                                        }
-                                        None => {
-                                            log::warn!("[VCPClient] TCP socket closed by server. Transitioning to Retrying.");
-                                            flush_aurora_parse(
-                                                &mut aurora_buffer,
-                                                &mut pending_aurora_chunk,
-                                                &mut last_aurora_parse,
-                                                true,
-                                            );
-                                            send_aurora_update(&mut aurora_buffer, None);
-                                            state = State::Retrying;
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        log::error!("[VCPClient] Streaming state entered but tcp_reader is None. Transitioning to Retrying.");
-                        state = State::Retrying;
-                    }
-                }
-
-                #[cfg(not(target_os = "android"))]
-                {
-                    if let Some(ref mut line_stream) = lines {
-                        loop {
-                            let pending_flush_delay =
-                                remaining_aurora_parse_delay(last_aurora_parse.elapsed());
-                            tokio::select! {
-                                biased;
-                                _ = cancellation_token.cancelled() => {
-                                    log::warn!("[VCPClient] Request aborted during streaming: {}", message_id_inner);
-                                    flush_aurora_parse(&mut aurora_buffer, &mut pending_aurora_chunk, &mut last_aurora_parse, true);
-                                    aurora_buffer.finalize();
-                                    send_aurora_update(
-                                        &mut aurora_buffer,
-                                        Some("cancelled_by_user".to_string()),
-                                    );
-                                    return Ok((json!({ "fullContent": aurora_buffer.full_text, "finishReason": Some("cancelled_by_user") }), true));
-                                }
-                                _ = output.changed.notified() => {
-                                    flush_aurora_parse(
-                                        &mut aurora_buffer,
-                                        &mut pending_aurora_chunk,
-                                        &mut last_aurora_parse,
-                                        true,
-                                    );
-                                    send_aurora_update(&mut aurora_buffer, None);
-                                }
-                                _ = tokio::time::sleep(pending_flush_delay), if !pending_aurora_chunk.is_empty() => {
-                                    flush_aurora_parse(
-                                        &mut aurora_buffer,
-                                        &mut pending_aurora_chunk,
-                                        &mut last_aurora_parse,
-                                        true,
-                                    );
-                                    send_aurora_update(&mut aurora_buffer, None);
-                                }
-                                next_line = line_stream.next() => {
-                                    match next_line {
-                                        Some(Ok(line)) => {
-                                            if let Some(stripped) = line.strip_prefix("data:") {
-                                                let data_content = stripped.trim();
-                                                if data_content == "[DONE]" {
-                                                    stream_ended_normally = true;
-                                                    break;
-                                                }
-                                                if let Ok(val) = serde_json::from_str::<Value>(data_content) {
-                                                    if let Some(reason) = val.get("finish_reason").and_then(|r| r.as_str()) {
-                                                        last_finish_reason = Some(reason.to_string());
-                                                    }
-                                                    if let Some(delta) = val.get("choices").and_then(|c| c.as_array()).and_then(|a| a.first()).and_then(|o| o.get("delta")).and_then(|d| d.get("content")).and_then(|s| s.as_str()) {
-                                                        pending_aurora_chunk.push_str(delta);
-                                                        let _ = flush_aurora_parse(
-                                                            &mut aurora_buffer,
-                                                            &mut pending_aurora_chunk,
-                                                            &mut last_aurora_parse,
-                                                            false,
-                                                        );
-                                                        send_aurora_update(&mut aurora_buffer, None);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        Some(Err(e)) => {
-                                            log::warn!("[VCPClient] Stream read error: {:?}, transitioning to Retrying", e);
-                                            flush_aurora_parse(
-                                                &mut aurora_buffer,
-                                                &mut pending_aurora_chunk,
-                                                &mut last_aurora_parse,
-                                                true,
-                                            );
-                                            send_aurora_update(&mut aurora_buffer, None);
-                                            state = State::Retrying;
-                                            break;
-                                        }
-                                        None => {
-                                            if !aurora_buffer.full_text.is_empty() || last_finish_reason.is_some() {
-                                                stream_ended_normally = true;
-                                            } else {
-                                                log::warn!("[VCPClient] Stream ended unexpectedly (None), transitioning to Retrying");
-                                                flush_aurora_parse(
-                                                    &mut aurora_buffer,
-                                                    &mut pending_aurora_chunk,
-                                                    &mut last_aurora_parse,
-                                                    true,
-                                                );
-                                                send_aurora_update(&mut aurora_buffer, None);
-                                                state = State::Retrying;
-                                            }
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        log::warn!("[VCPClient] Streaming state entered but lines is None. Transitioning to Retrying.");
-                        state = State::Retrying;
-                    }
-                }
-
-                if stream_ended_normally {
-                    flush_aurora_parse(
-                        &mut aurora_buffer,
-                        &mut pending_aurora_chunk,
-                        &mut last_aurora_parse,
-                        true,
-                    );
-                    aurora_buffer.finalize();
-                    send_aurora_update(&mut aurora_buffer, last_finish_reason.clone());
+            tokio::select! {
+                biased;
+                _ = cancellation_token.cancelled(), if !cancelled => {
+                    cancelled = true;
                     #[cfg(target_os = "android")]
                     {
-                        if let Err(error) =
-                            send_stop_to_helper(_app, &transport_request_id, helper_generation)
-                                .await
-                        {
-                            log::warn!("[VCPClient] Best-effort helper cleanup after completed stream failed: {}", error);
-                        }
+                        cancel_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(10));
                     }
-                    return Ok((
-                        json!({
-                            "fullContent": aurora_buffer.full_text,
-                            "streamingStarted": true,
-                            "finishReason": last_finish_reason
-                        }),
-                        false,
-                    ));
+                    #[cfg(not(target_os = "android"))]
+                    {
+                        last_finish_reason = Some("cancelled_by_user".to_string());
+                        return Ok(());
+                    }
                 }
-            }
-            State::Aligning => {
-                log::warn!("[VCPClient] Stream alignment failed (cache was empty or errored). Failing stream.");
-                let error = "流连接意外断开且本地缓存不可用".to_string();
-                return Err(streaming_failure(
-                    &mut aurora_buffer,
-                    &mut pending_aurora_chunk,
-                    error,
-                ));
-            }
-            State::Retrying => {
-                const MAX_RETRIES: u32 = 3;
-                if retry_count >= MAX_RETRIES {
-                    log::error!(
-                        "[VCPClient] Max retries reached ({}) for message: {}",
-                        MAX_RETRIES,
-                        message_id_inner
-                    );
-                    return Err(streaming_failure(
-                        &mut aurora_buffer,
-                        &mut pending_aurora_chunk,
-                        "Max retries reached".to_string(),
-                    ));
+                _ = async {
+                    #[cfg(target_os = "android")]
+                    if let Some(deadline) = cancel_deadline {
+                        tokio::time::sleep_until(deadline).await;
+                        return;
+                    }
+                    std::future::pending::<()>().await;
+                } => {
+                    return Err("Helper cancellation did not reach its terminal state".to_string());
                 }
-
-                retry_count += 1;
-                log::info!(
-                    "[VCPClient] Reconnecting {}/{} for message: {}",
-                    retry_count,
-                    MAX_RETRIES,
-                    message_id_inner
-                );
-
-                send_stream_event(StreamEvent {
-                    r#type: "reconnecting".into(),
-                    message_id: message_id_inner.clone(),
-                    context: context_inner.clone(),
-                    ..Default::default()
-                });
-
-                tokio::select! {
-                    _ = cancellation_token.cancelled() => {
-                        log::warn!("[VCPClient] Aborted during retry backoff sleep");
-                        #[cfg(target_os = "android")]
-                        {
-                            if let Err(error) = send_stop_to_helper(
-                                _app,
-                                &transport_request_id,
-                                helper_generation,
-                            ).await {
-                                log::warn!("[VCPClient] Best-effort helper stop during retry cancellation failed: {}", error);
+                _ = output.changed.notified() => {
+                    #[cfg(target_os = "android")]
+                    if snapshot_in_progress {
+                        continue;
+                    }
+                    flush_aurora_window(&mut aurora_buffer, &mut pending_chunk);
+                    send_update(&mut aurora_buffer);
+                }
+                _ = render_clock.tick() => {
+                    #[cfg(target_os = "android")]
+                    if snapshot_in_progress {
+                        continue;
+                    }
+                    if !pending_chunk.is_empty() {
+                        flush_aurora_window(&mut aurora_buffer, &mut pending_chunk);
+                        send_update(&mut aurora_buffer);
+                    }
+                }
+                next = reader.next() => {
+                    #[cfg(not(target_os = "android"))]
+                    match next {
+                        Some(Ok(data)) => {
+                            if absorb_sse_data(&data, &mut pending_chunk, &mut last_finish_reason)? {
+                                return Ok(());
                             }
                         }
-                        flush_aurora_parse(&mut aurora_buffer, &mut pending_aurora_chunk, &mut last_aurora_parse, true);
-                        aurora_buffer.finalize();
-                        send_aurora_update(
-                            &mut aurora_buffer,
-                            Some("cancelled_by_user".to_string()),
-                        );
-                        return Ok((json!({ "fullContent": aurora_buffer.full_text, "finishReason": Some("cancelled_by_user") }), true));
+                        Some(Err(error)) => return Err(format!("SSE stream read failed: {error}")),
+                        None => return Ok(()),
                     }
-                    _ = tokio::time::sleep(backoff) => {}
+                    #[cfg(target_os = "android")]
+                    match next {
+                        Some(Ok(frame)) => {
+                            let event: Value = serde_json::from_slice(&frame)
+                                .map_err(|error| format!("Invalid helper stream frame: {error}"))?;
+                            if event["requestId"].as_str() != Some(transport_request_id.as_str()) {
+                                return Err("Helper stream identity mismatch".to_string());
+                            }
+                            let event_type = event["eventType"].as_str().unwrap_or("");
+                            if event_type == "error" && event["code"].as_str() == Some("session_not_found") {
+                                return Err(HELPER_SESSION_NOT_FOUND.to_string());
+                            }
+                            if event_type == "error" && event["code"].as_str() == Some("capacity_exhausted") {
+                                return Err(STREAM_CAPACITY_EXHAUSTED.to_string());
+                            }
+                            if let Some(generation) = event["generation"].as_str() {
+                                if let Some(current) = helper_generation.as_deref() {
+                                    if current != generation {
+                                        return Err("Helper generation changed during stream".to_string());
+                                    }
+                                } else {
+                                    helper_generation = Some(generation.to_string());
+                                }
+                            } else if event_type != "error" {
+                                return Err("Helper stream frame is missing generation".to_string());
+                            }
+                            match event_type {
+                                "started" => {}
+                                "data" => {
+                                    if snapshot_in_progress || (is_resume && !snapshot_received) {
+                                        return Err("Helper data arrived before a complete snapshot".to_string());
+                                    }
+                                    let content = event["content"].as_str()
+                                        .ok_or_else(|| "Helper data frame is missing content".to_string())?;
+                                    pending_chunk.push_str(content);
+                                    if let Some(reason) = event["finishReason"].as_str() {
+                                        last_finish_reason = Some(reason.to_string());
+                                    }
+                                }
+                                "snapshot_start" => {
+                                    if !is_resume || snapshot_in_progress || !aurora_buffer.full_text.is_empty() || !pending_chunk.is_empty() {
+                                        return Err("Unexpected helper snapshot boundary".to_string());
+                                    }
+                                    snapshot_in_progress = true;
+                                }
+                                "snapshot_chunk" => {
+                                    if !snapshot_in_progress {
+                                        return Err("Helper snapshot chunk has no active snapshot".to_string());
+                                    }
+                                    let content = event["content"].as_str()
+                                        .ok_or_else(|| "Helper snapshot chunk is missing content".to_string())?;
+                                    pending_chunk.push_str(content);
+                                }
+                                "snapshot_end" => {
+                                    if !snapshot_in_progress {
+                                        return Err("Helper snapshot end has no active snapshot".to_string());
+                                    }
+                                    let completed = event["completed"].as_bool()
+                                        .ok_or_else(|| "Helper snapshot end is missing completion state".to_string())?;
+                                    snapshot_in_progress = false;
+                                    snapshot_received = true;
+                                    flush_aurora_window(&mut aurora_buffer, &mut pending_chunk);
+                                    output.send_aurora(&mut aurora_buffer, &message_id, &context, None, true);
+                                    if let Some(reason) = event["finishReason"].as_str() {
+                                        last_finish_reason = Some(reason.to_string());
+                                    }
+                                    if completed {
+                                        helper_terminal_received = true;
+                                        if let Some(error) = event["error"].as_str() {
+                                            return Err(error.to_string());
+                                        }
+                                        return Ok(());
+                                    }
+                                }
+                                "terminal" => {
+                                    if snapshot_in_progress || (is_resume && !snapshot_received) {
+                                        return Err("Helper terminal arrived before a complete snapshot".to_string());
+                                    }
+                                    helper_terminal_received = true;
+                                    if let Some(reason) = event["finishReason"].as_str() {
+                                        last_finish_reason = Some(reason.to_string());
+                                    }
+                                    if let Some(error) = event["error"].as_str() {
+                                        return Err(error.to_string());
+                                    }
+                                    return Ok(());
+                                }
+                                "error" => {
+                                    return Err(event["error"].as_str()
+                                        .unwrap_or("Helper stream request failed").to_string());
+                                }
+                                _ => return Err("Unknown helper stream event".to_string()),
+                            }
+                        }
+                        Some(Err(error)) => return Err(format!("Helper stream read failed: {error}")),
+                        None => return Err("Helper connection closed before its terminal event".to_string()),
+                    }
                 }
-                backoff *= 2;
-                state = State::Resuming;
             }
         }
+    }.await;
+
+    #[cfg(target_os = "android")]
+    let outcome = match outcome {
+        Err(message) if !helper_terminal_received && message != STREAM_CAPACITY_EXHAUSTED => {
+            // Losing the local transport says nothing about the upstream
+            // generation. The helper remains its owner; a later explicit
+            // recovery can claim a complete snapshot or its completed mailbox.
+            drop(reader);
+            let partial_content = if is_resume && !snapshot_received {
+                None
+            } else {
+                flush_aurora_window(&mut aurora_buffer, &mut pending_chunk);
+                send_update(&mut aurora_buffer);
+                Some(aurora_buffer.full_text)
+            };
+            return Err(VcpRequestFailure::recoverable_helper(message, partial_content));
+        }
+        outcome => outcome,
+    };
+
+    #[cfg(target_os = "android")]
+    if let Some(generation) = helper_generation {
+        // A terminal TCP write is not a database commit. Keep the helper's
+        // connection alive until the finalizer commits or abandons this attempt.
+        output.retain_helper_handoff(transport_request_id, generation, Some(reader.into_inner()));
     }
+    flush_aurora_window(&mut aurora_buffer, &mut pending_chunk);
+    aurora_buffer.finalize();
+    send_update(&mut aurora_buffer);
+    outcome.map_err(|message| VcpRequestFailure::streaming(message, aurora_buffer.full_text.clone()))?;
+    let is_aborted = last_finish_reason.as_deref() == Some("cancelled_by_user");
+    Ok((json!({
+        "fullContent": aurora_buffer.full_text,
+        "streamingStarted": true,
+        "finishReason": last_finish_reason.unwrap_or_else(|| "completed".to_string()),
+    }), is_aborted))
 }
 
 /// 4. 抽离非流式请求循环
@@ -2189,6 +2067,8 @@ async fn handle_non_streaming_request(
     cancellation_token: CancellationToken,
     output: Arc<RequestOutput>,
 ) -> Result<(Value, bool), String> {
+    let _transport_slot = CHAT_TRANSPORT_SLOTS.try_acquire()
+        .map_err(|_| STREAM_CAPACITY_EXHAUSTED.to_string())?;
     let send_stream_event = |event: StreamEvent| { output.send(event); };
     let cancelled_result = || (json!({
         "response": Value::Null,
@@ -2425,14 +2305,16 @@ pub async fn get_active_generations(
     for request in active_requests.0.iter() {
         request.output.attach(stream_channel.clone())?;
     }
+    recover_offline_completed(&app, &active_requests, stream_channel.clone()).await?;
     let db = app.state::<DbState>();
     let rows = sqlx::query(
         "SELECT ag.msg_id, ag.topic_id, ag.owner_id, ag.owner_type, ag.created_at, \
                 m.agent_id, COALESCE(m.name, a.name) AS agent_name \
          FROM active_generations ag \
-         LEFT JOIN messages m ON m.owner_type = ag.owner_type \
+         JOIN messages m ON m.owner_type = ag.owner_type \
             AND m.owner_id = ag.owner_id AND m.topic_id = ag.topic_id AND m.msg_id = ag.msg_id \
          LEFT JOIN agents a ON a.owner_type = 'agent' AND a.agent_id = m.agent_id \
+         WHERE m.deleted_at IS NULL AND m.finish_reason IS NULL \
          ORDER BY ag.created_at ASC",
     )
     .fetch_all(&db.pool)
@@ -2525,41 +2407,315 @@ pub(crate) async fn finalize_stream_error<R: Runtime>(
             "[VCPClient] Generation {} is no longer pending; skipping late error finalization.",
             key.msg_id
         );
+        discard_request_helper(app_handle, key).await;
     }
     Ok(None)
 }
 
-fn clean_old_cache_files(cache_dir: &std::path::Path) {
-    let sse_cache_dir = cache_dir.join("sse_cache");
-    if !sse_cache_dir.exists() {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(sse_cache_dir) else {
-        return;
-    };
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OfflineCompletedContext {
+    message_id: String,
+    owner_type: String,
+    owner_id: String,
+    topic_id: String,
+}
 
-    for entry in entries.flatten() {
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OfflineCompletedMetadata {
+    schema_version: u32,
+    request_id: String,
+    generation: String,
+    completed_at: i64,
+    context: OfflineCompletedContext,
+    finish_reason: Option<String>,
+    error: Option<String>,
+}
+
+impl OfflineCompletedMetadata {
+    fn message_key(&self) -> Result<MessageKey, String> {
+        if self.schema_version != 1 || uuid::Uuid::parse_str(&self.generation).is_err() {
+            return Err("Unsupported offline SSE metadata".to_string());
+        }
+        let context = &self.context;
+        if !matches!(context.owner_type.as_str(), "agent" | "group")
+            || context.owner_id.is_empty()
+            || context.topic_id.is_empty()
+            || context.message_id.is_empty()
+        {
+            return Err("Offline SSE metadata has no complete message identity".to_string());
+        }
+        Ok(MessageKey::new(
+            TopicKey::new(&context.owner_type, &context.owner_id, &context.topic_id),
+            &context.message_id,
+        ))
+    }
+
+    fn file_name(&self) -> String {
+        let digest = crate::vcp_modules::infra::utils::calculate_sha256(self.request_id.as_bytes());
+        format!("{digest}.{}.completed", self.generation)
+    }
+}
+
+struct OfflineCompletedFile {
+    path: std::path::PathBuf,
+    metadata: OfflineCompletedMetadata,
+    content_offset: u64,
+}
+
+async fn open_offline_completed(path: std::path::PathBuf) -> Result<OfflineCompletedFile, String> {
+    use tokio::io::AsyncBufReadExt;
+
+    let file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut reader = tokio::io::BufReader::new(file);
+    let mut header = String::new();
+    let content_offset = reader
+        .read_line(&mut header)
+        .await
+        .map_err(|error| error.to_string())? as u64;
+    if !header.ends_with('\n') {
+        return Err("Offline SSE metadata line is incomplete".to_string());
+    }
+    let metadata: OfflineCompletedMetadata = serde_json::from_str(&header)
+        .map_err(|error| format!("Invalid offline SSE metadata: {error}"))?;
+    metadata.message_key()?;
+    if path.file_name().and_then(|name| name.to_str()) != Some(metadata.file_name().as_str()) {
+        return Err("Offline SSE filename does not match request generation".to_string());
+    }
+    Ok(OfflineCompletedFile {
+        path,
+        metadata,
+        content_offset,
+    })
+}
+
+async fn offline_completed_paths<R: Runtime>(
+    app: &AppHandle<R>,
+    request_id: Option<&str>,
+) -> Result<Vec<std::path::PathBuf>, String> {
+    let directory = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| error.to_string())?
+        .join("sse_offline_completed");
+    let mut entries = match tokio::fs::read_dir(directory).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let prefix = request_id.map(|request_id| {
+        format!(
+            "{}.",
+            crate::vcp_modules::infra::utils::calculate_sha256(request_id.as_bytes())
+        )
+    });
+    let mut paths = Vec::new();
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|error| error.to_string())?
+    {
         let path = entry.path();
-        if !path.is_file() || path.extension().is_none_or(|ext| ext != "json") {
+        if path
+            .extension()
+            .is_none_or(|extension| extension != "completed")
+            || !entry
+                .file_type()
+                .await
+                .map_err(|error| error.to_string())?
+                .is_file()
+            || prefix
+                .as_ref()
+                .is_some_and(|prefix| !entry.file_name().to_string_lossy().starts_with(prefix))
+        {
             continue;
         }
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        let Ok(modified) = metadata.modified() else {
-            continue;
-        };
-        let Ok(elapsed) = modified.elapsed() else {
-            continue;
-        };
-        if elapsed.as_secs() > 24 * 3600 {
-            log::info!(
-                "[VCPClient] Deleting orphaned cache file older than 24 hours: {:?}",
-                path
-            );
-            let _ = std::fs::remove_file(path);
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
+async fn remove_offline_completed(path: &std::path::Path) -> Result<(), String> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Called with the message's ActiveRequestLease held. The helper file remains
+/// available after read or transaction failures; only a durable DB decision consumes it.
+async fn finalize_offline_completed<R: Runtime>(
+    app: &AppHandle<R>,
+    key: &MessageKey,
+    file: OfflineCompletedFile,
+    stream_channel: Channel<StreamEvent>,
+) -> Result<Value, String> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let db = app.state::<DbState>();
+    let row: Option<(String, Option<String>, Option<i64>, Option<String>, bool)> = sqlx::query_as(
+        "SELECT m.content, m.finish_reason, m.deleted_at, m.agent_id,
+                EXISTS(SELECT 1 FROM active_generations ag
+                       WHERE ag.owner_type = m.owner_type AND ag.owner_id = m.owner_id
+                         AND ag.topic_id = m.topic_id AND ag.msg_id = m.msg_id)
+         FROM messages m
+         WHERE m.owner_type = ? AND m.owner_id = ? AND m.topic_id = ? AND m.msg_id = ?",
+    )
+    .bind(&key.topic.owner_type)
+    .bind(&key.topic.owner_id)
+    .bind(&key.topic.topic_id)
+    .bind(&key.msg_id)
+    .fetch_optional(&db.pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    let Some((content, finish_reason, deleted_at, agent_id, pending)) = row else {
+        remove_offline_completed(&file.path).await?;
+        return Ok(json!({ "status": "not_found", "content": "" }));
+    };
+    if deleted_at.is_some() || finish_reason.is_some() {
+        remove_offline_completed(&file.path).await?;
+        return Ok(if deleted_at.is_some() {
+            json!({ "status": "not_found", "content": "" })
+        } else {
+            json!({ "status": "completed", "content": content, "finishReason": finish_reason })
+        });
+    }
+    if !pending {
+        return Err(format!(
+            "Offline SSE message {} is not pending; retaining file",
+            key.msg_id
+        ));
+    }
+    let mut content = String::new();
+    let mut reader = tokio::fs::File::open(&file.path)
+        .await
+        .map_err(|error| error.to_string())?;
+    reader
+        .seek(std::io::SeekFrom::Start(file.content_offset))
+        .await
+        .map_err(|error| error.to_string())?;
+    reader
+        .read_to_string(&mut content)
+        .await
+        .map_err(|error| error.to_string())?;
+    let finish_reason = if let Some(error) = file.metadata.error.as_deref() {
+        content = stream_error_content(&content, error);
+        "error".to_string()
+    } else {
+        file.metadata
+            .finish_reason
+            .unwrap_or_else(|| "completed".to_string())
+    };
+    let content = crate::vcp_modules::chat::message_service::finalize_stream_message(
+        app.clone(),
+        &db.pool,
+        key,
+        content,
+        finish_reason == "cancelled_by_user",
+        Some(finish_reason.clone()),
+        Some(stream_channel),
+        agent_id,
+    )
+    .await?;
+    remove_offline_completed(&file.path).await?;
+    Ok(json!({ "status": "completed", "content": content, "finishReason": finish_reason }))
+}
+
+async fn recover_offline_completed<R: Runtime>(
+    app: &AppHandle<R>,
+    active_requests: &ActiveRequests,
+    stream_channel: Channel<StreamEvent>,
+) -> Result<(), String> {
+    let mut files = Vec::new();
+    for path in offline_completed_paths(app, None).await? {
+        match open_offline_completed(path.clone()).await {
+            Ok(file) => files.push(file),
+            Err(error) => log::warn!(
+                "[VCPClient] Keeping unreadable offline SSE file {:?}: {}",
+                path,
+                error
+            ),
         }
     }
+    files.sort_by_key(|file| std::cmp::Reverse(file.metadata.completed_at));
+    for file in files {
+        let key = file.metadata.message_key()?;
+        // CLI step transports belong to their turn owner, not the chat-message
+        // finalizer. Never commit one step as the whole message on cold recovery.
+        if file.metadata.request_id != message_transport_request_id(&key) {
+            continue;
+        }
+        let Ok((_lease, _cancellation)) =
+            ActiveRequestLease::try_acquire(active_requests.0.clone(), key.clone())
+        else {
+            continue;
+        };
+        request_output(app, &key, Some(stream_channel.clone()));
+        if let Err(error) =
+            finalize_offline_completed(app, &key, file, stream_channel.clone()).await
+        {
+            log::warn!(
+                "[VCPClient] Offline SSE recovery for {} remains pending: {}",
+                key.msg_id,
+                error
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn recover_offline_generation<R: Runtime>(
+    app: &AppHandle<R>,
+    key: &MessageKey,
+    stream_channel: Channel<StreamEvent>,
+) -> Result<Option<Value>, String> {
+    let request_id = message_transport_request_id(key);
+    let mut files = Vec::new();
+    for path in offline_completed_paths(app, Some(&request_id)).await? {
+        let file = open_offline_completed(path).await?;
+        if file.metadata.request_id != request_id || file.metadata.message_key()? != *key {
+            return Err("Offline SSE file message identity mismatch".to_string());
+        }
+        files.push(file);
+    }
+    files.sort_by_key(|file| std::cmp::Reverse(file.metadata.completed_at));
+    let mut recovered = None;
+    for file in files {
+        let result = finalize_offline_completed(app, key, file, stream_channel.clone()).await?;
+        if recovered.is_none() {
+            recovered = Some(result);
+        }
+    }
+    Ok(recovered)
+}
+
+async fn terminal_generation_result(
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    key: &MessageKey,
+) -> Result<Value, String> {
+    let terminal: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT content, finish_reason FROM messages
+         WHERE owner_type = ? AND owner_id = ? AND topic_id = ? AND msg_id = ?
+           AND deleted_at IS NULL",
+    )
+    .bind(&key.topic.owner_type)
+    .bind(&key.topic.owner_id)
+    .bind(&key.topic.topic_id)
+    .bind(&key.msg_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(match terminal {
+        Some((content, Some(finish_reason))) => json!({
+            "status": "completed", "content": content, "finishReason": finish_reason,
+        }),
+        Some((content, None)) => json!({ "status": "failed", "content": content }),
+        None => json!({ "status": "not_found", "content": "" }),
+    })
 }
 
 #[tauri::command]
@@ -2572,7 +2728,6 @@ pub async fn recover_active_generation<R: Runtime>(
     topic_id: String,
     msg_id: String,
     stream_channel: Channel<StreamEvent>,
-    is_warm: bool,
 ) -> Result<Value, String> {
     log::info!(
         "[VCPClient] recover_active_generation called for {}/{}/{}/{}",
@@ -2582,7 +2737,6 @@ pub async fn recover_active_generation<R: Runtime>(
         msg_id,
     );
     let key = MessageKey::new(TopicKey::new(&owner_type, &owner_id, &topic_id), &msg_id);
-    let transport_request_id = message_transport_request_id(&key);
 
     if let Some(turns) = app.try_state::<ActiveGroupTurns>() {
         turns.attach_output(&active_requests, &key.topic, stream_channel.clone())?;
@@ -2595,7 +2749,11 @@ pub async fn recover_active_generation<R: Runtime>(
         match ActiveRequestLease::try_acquire(active_requests.0.clone(), key.clone()) {
             Ok(claim) => break claim,
             Err(_) => {
-                let Some(entry) = active_requests.0.get(&key).map(|entry| entry.value().clone()) else {
+                let Some(entry) = active_requests
+                    .0
+                    .get(&key)
+                    .map(|entry| entry.value().clone())
+                else {
                     continue;
                 };
                 if entry.output.attach(stream_channel.clone())? {
@@ -2607,13 +2765,18 @@ pub async fn recover_active_generation<R: Runtime>(
     };
     request_output(&app, &key, Some(stream_channel.clone()));
 
+    if let Some(recovered) = recover_offline_generation(&app, &key, stream_channel.clone()).await? {
+        return Ok(recovered);
+    }
+
     let db = app.state::<DbState>();
     let pending: Option<(Option<String>,)> = sqlx::query_as(
         "SELECT m.agent_id \
          FROM active_generations ag \
-         LEFT JOIN messages m ON m.owner_type = ag.owner_type AND m.owner_id = ag.owner_id \
+         JOIN messages m ON m.owner_type = ag.owner_type AND m.owner_id = ag.owner_id \
             AND m.topic_id = ag.topic_id AND m.msg_id = ag.msg_id \
-         WHERE ag.owner_type = ? AND ag.owner_id = ? AND ag.topic_id = ? AND ag.msg_id = ?",
+         WHERE ag.owner_type = ? AND ag.owner_id = ? AND ag.topic_id = ? AND ag.msg_id = ? \
+           AND m.deleted_at IS NULL AND m.finish_reason IS NULL",
     )
     .bind(&owner_type)
     .bind(&owner_id)
@@ -2624,9 +2787,49 @@ pub async fn recover_active_generation<R: Runtime>(
     .map_err(|e| e.to_string())?;
 
     let Some((agent_id,)) = pending else {
-        let terminal: Option<(String, Option<String>)> = sqlx::query_as(
-            "SELECT content, finish_reason FROM messages
-                 WHERE owner_type = ? AND owner_id = ? AND topic_id = ? AND msg_id = ?",
+        return terminal_generation_result(&db.pool, &key).await;
+    };
+
+    #[cfg(target_os = "android")]
+    {
+        let resumed = resume_claimed_generation(
+            &app,
+            &key,
+            agent_id,
+            stream_channel,
+            _recovery_cancellation_token,
+        )
+        .await?;
+        return Ok(json!({
+            "status": resumed["status"].as_str().unwrap_or("completed"),
+            "content": resumed["fullContent"],
+            "finishReason": resumed["finishReason"],
+        }));
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = agent_id;
+
+        log::warn!(
+        "[VCPClient] Active generation {} not found in active_requests and no local cache available. Marking as failed.",
+        msg_id
+    );
+
+        let _ = finalize_stream_error(
+            &app,
+            &db.pool,
+            &key,
+            String::new(),
+            "后台进程已被系统销毁，流式对话中断".to_string(),
+            Some(stream_channel.clone()),
+        )
+        .await?;
+
+        let content: Option<String> = sqlx::query_scalar(
+            "SELECT content FROM messages
+         WHERE owner_type = ? AND owner_id = ? AND topic_id = ? AND msg_id = ?
+           AND deleted_at IS NULL",
         )
         .bind(&owner_type)
         .bind(&owner_id)
@@ -2635,229 +2838,89 @@ pub async fn recover_active_generation<R: Runtime>(
         .fetch_optional(&db.pool)
         .await
         .map_err(|e| e.to_string())?;
-        return Ok(match terminal {
-            Some((content, Some(finish_reason))) => json!({
-                "status": "completed",
-                "content": content,
-                "finishReason": finish_reason,
-            }),
-            Some((content, None)) => json!({ "status": "failed", "content": content }),
-            None => json!({ "status": "not_found", "content": "" }),
-        });
-    };
-
-    #[cfg(not(target_os = "android"))]
-    let _ = is_warm;
-
-    let cache_dir = app.path().app_cache_dir().map_err(|e| e.to_string())?;
-
-    // 异步清理超过 24 小时的孤立缓存文件
-    let cache_dir_clone = cache_dir.clone();
-    tokio::spawn(async move {
-        clean_old_cache_files(&cache_dir_clone);
-    });
-
-    // 2. 检查是否存在 5 分钟超时后由助手转存的本地 JSON 恢复文件 (24小时内认领有效)
-    let safe_msg_id =
-        crate::vcp_modules::infra::utils::calculate_sha256(transport_request_id.as_bytes());
-    let recovered_file = cache_dir
-        .join("sse_cache")
-        .join(format!("sse_recovered_{}.json", safe_msg_id));
-    if recovered_file.exists() {
-        log::info!(
-            "[VCPClient] Found local sse_recovered JSON file for msg_id: {}. Recovering from disk.",
-            msg_id
-        );
-        if let Ok(content_str) = std::fs::read_to_string(&recovered_file) {
-            if let Ok(val) = serde_json::from_str::<Value>(&content_str) {
-                let timestamp = val["timestamp"].as_i64().unwrap_or(0);
-                let now = chrono::Utc::now().timestamp_millis();
-
-                // 检查是否超过 24 小时 (24 * 3600 * 1000 ms)
-                if now - timestamp > 24 * 3600 * 1000 {
-                    log::warn!("[VCPClient] Recovered JSON file is older than 24 hours. Deleting and failing.");
-                    let _ = std::fs::remove_file(&recovered_file);
-                } else {
-                    let content = val["content"].as_str().unwrap_or("").to_string();
-                    let finish_reason = val["finishReason"].as_str().map(|s| s.to_string());
-
-                    log::info!("[VCPClient] Successfully read recovered JSON: content_len={}, finish_reason={:?}", content.len(), finish_reason);
-
-                    crate::vcp_modules::chat::message_service::finalize_stream_message(
-                        app.clone(),
-                        &db.pool,
-                        &key,
-                        content.clone(),
-                        false,
-                        finish_reason.or(Some("completed".to_string())),
-                        Some(stream_channel.clone()),
-                        agent_id.clone(),
-                    )
-                    .await?;
-
-                    let _ = std::fs::remove_file(&recovered_file);
-                    return Ok(json!({
-                        "status": "completed",
-                        "content": content
-                    }));
-                }
-            }
-        }
+        Ok(json!({ "status": "failed", "content": content.unwrap_or_default() }))
     }
-
-    // 3. 在 Android 上通过 TCP 套接字向助手查询该会话状态 (5 分钟内的内存数据)
-    #[cfg(target_os = "android")]
-    {
-        log::info!(
-            "[VCPClient] Querying helper process via TCP for msg_id: {}",
-            msg_id
-        );
-        let query_res = async {
-            let port = get_helper_port(&app)?;
-            log::info!("[VCPClient] Helper port discovered: {}", port);
-            let stream = connect_helper_port(port).await?;
-
-            let stream =
-                send_command_to_stream(stream, "query", &transport_request_id, None).await?;
-
-            log::info!("[VCPClient] Query command sent, waiting for response frame...");
-            let mut reader = FramedRead::new(stream, helper_frame_codec());
-            let line = tokio::time::timeout(HELPER_IO_TIMEOUT, reader.next())
-                .await
-                .map_err(|_| "Helper query response timed out".to_string())?
-                .ok_or_else(|| "No query response received (EOF)".to_string())?
-                .map_err(|e| format!("Helper query frame error: {}", e))?;
-            let resp = serde_json::from_slice::<Value>(&line).map_err(|e| e.to_string())?;
-            if resp.get("requestId").and_then(Value::as_str) != Some(transport_request_id.as_str())
-            {
-                return Err("Helper query response identity mismatch".to_string());
-            }
-            Ok::<Value, String>(resp)
-        }
-        .await;
-
-        match query_res {
-            Ok(resp) => {
-                let status = resp["status"].as_str().unwrap_or("not_found");
-                let content = resp["content"].as_str().unwrap_or("").to_string();
-                let last_finish_reason = resp["lastFinishReason"].as_str().map(|s| s.to_string());
-
-                log::info!(
-                    "[VCPClient] Query response received: status={}, content_len={}, finish_reason={:?}",
-                    status,
-                    content.len(),
-                    last_finish_reason
-                );
-
-                if status == "completed" {
-                    let helper_generation = resp["generation"]
-                        .as_u64()
-                        .filter(|generation| *generation > 0)
-                        .ok_or_else(|| {
-                            "Completed helper session is missing generation".to_string()
-                        })?;
-                    log::info!("[VCPClient] Session completed in helper memory. Finalizing message in SQLite database.");
-                    crate::vcp_modules::chat::message_service::finalize_stream_message(
-                        app.clone(),
-                        &db.pool,
-                        &key,
-                        content.clone(),
-                        false,
-                        last_finish_reason.or(Some("completed".to_string())),
-                        Some(stream_channel.clone()),
-                        agent_id.clone(),
-                    )
-                    .await?;
-
-                    log::info!("[VCPClient] Finalization complete. Sending stop command to helper to release memory.");
-                    if let Err(stop_error) =
-                        send_stop_to_helper(&app, &transport_request_id, Some(helper_generation))
-                            .await
-                    {
-                        log::warn!(
-                            "[VCPClient] Best-effort helper cleanup after durable finalization failed: {}",
-                            stop_error
-                        );
-                    }
-
-                    return Ok(json!({
-                        "status": "completed",
-                        "content": content
-                    }));
-                } else if status == "streaming" {
-                    log::info!("[VCPClient] Session is still streaming in helper. Claiming and resuming it atomically.");
-                    let initial_content = is_warm.then(|| content.clone());
-                    let last_event_index = if is_warm {
-                        resp["lastEventIndex"].as_i64()
-                    } else {
-                        None
-                    };
-                    let resumed = resume_claimed_generation(
-                        &app,
-                        &key,
-                        agent_id.clone(),
-                        stream_channel.clone(),
-                        initial_content,
-                        content,
-                        last_event_index,
-                        _recovery_cancellation_token,
-                    )
-                    .await?;
-                    let resumed_status = resumed["status"].as_str().unwrap_or("completed");
-                    return Ok(json!({
-                        "status": resumed_status,
-                        "content": resumed["fullContent"],
-                        "finishReason": resumed["finishReason"],
-                    }));
-                } else {
-                    log::warn!("[VCPClient] Session status is 'not_found' in helper.");
-                }
-            }
-            Err(e) => {
-                log::warn!("[VCPClient] Failed to query helper via TCP socket: {}", e);
-            }
-        }
-    }
-
-    log::warn!(
-        "[VCPClient] Active generation {} not found in active_requests and no local cache available. Marking as failed.",
-        msg_id
-    );
-
-    let _ = finalize_stream_error(
-        &app,
-        &db.pool,
-        &key,
-        String::new(),
-        "后台进程已被系统销毁，流式对话中断".to_string(),
-        Some(stream_channel.clone()),
-    )
-    .await?;
-
-    let content: Option<String> = sqlx::query_scalar(
-        "SELECT content FROM messages
-         WHERE owner_type = ? AND owner_id = ? AND topic_id = ? AND msg_id = ?",
-    )
-    .bind(&owner_type)
-    .bind(&owner_id)
-    .bind(&topic_id)
-    .bind(&msg_id)
-    .fetch_optional(&db.pool)
-    .await
-    .map_err(|e| e.to_string())?;
-    Ok(json!({ "status": "failed", "content": content.unwrap_or_default() }))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[cfg(any(target_os = "android", test))]
+async fn handle_recovery_failure<R: Runtime>(
+    app: &AppHandle<R>,
+    key: &MessageKey,
+    failure: VcpRequestFailure,
+    stream_channel: Channel<StreamEvent>,
+) -> Result<Value, String> {
+    let recovery_pending = failure.is_recovery_pending();
+    let (error, partial_content) = failure.into_parts();
+    if error == HELPER_SESSION_NOT_FOUND {
+        // Publication and live-session removal are one helper transition.
+        // Even a recoverable transport failure can confirm this specific
+        // absence; recheck the mailbox before declaring the owner lost.
+        if let Some(recovered) =
+            recover_offline_generation(app, key, stream_channel.clone()).await?
+        {
+            return Ok(json!({
+                "status": recovered["status"],
+                "fullContent": recovered["content"],
+                "finishReason": recovered["finishReason"],
+            }));
+        }
+    } else if recovery_pending || error == STREAM_CAPACITY_EXHAUSTED {
+        // The helper still owns the complete response. A local attachment or
+        // admission failure must not commit our absent or incomplete snapshot.
+        // Notify the current consumer as well: it may have attached from a
+        // replacement WebView that cannot observe this invoke's rejection.
+        let context = Some(json!({
+            "ownerType": key.topic.owner_type,
+            "ownerId": key.topic.owner_id,
+            "topicId": key.topic.topic_id,
+        }));
+        deliver_request_event(
+            app,
+            key,
+            Some(stream_channel),
+            StreamEvent::error(key.msg_id.clone(), context, error.clone()),
+        );
+        return Err(error);
+    }
+
+    let partial_content = partial_content.unwrap_or_default();
+    let error = if error == HELPER_SESSION_NOT_FOUND {
+        "后台进程已被系统销毁，流式对话中断".to_string()
+    } else {
+        format!("接续失败: {error}")
+    };
+    let db = app.state::<DbState>();
+    let pool = &db.pool;
+    let committed_content = finalize_stream_error(
+        app,
+        pool,
+        key,
+        partial_content,
+        error,
+        Some(stream_channel),
+    )
+    .await?;
+    let Some(committed_content) = committed_content else {
+        let terminal = terminal_generation_result(pool, key).await?;
+        return Ok(json!({
+            "status": terminal["status"],
+            "fullContent": terminal["content"],
+            "finishReason": terminal["finishReason"],
+        }));
+    };
+    Ok(json!({
+        "status": "failed",
+        "fullContent": committed_content,
+        "finishReason": "error",
+    }))
+}
+
 #[cfg(target_os = "android")]
 async fn resume_claimed_generation<R: Runtime>(
     app: &AppHandle<R>,
     key: &MessageKey,
     agent_id: Option<String>,
     stream_channel: Channel<StreamEvent>,
-    initial_content: Option<String>,
-    helper_content: String,
-    last_event_index: Option<i64>,
     cancellation_token: CancellationToken,
 ) -> Result<Value, String> {
     let msg_id = key.msg_id.clone();
@@ -2865,10 +2928,9 @@ async fn resume_claimed_generation<R: Runtime>(
     let owner_id = key.topic.owner_id.clone();
     let owner_type = key.topic.owner_type.clone();
     log::info!(
-        "[VCPClient] resume_claimed_generation called for messageId: {}, topicId: {}, lastEventIndex: {:?}",
+        "[VCPClient] Resuming helper snapshot for messageId: {}, topicId: {}",
         msg_id,
-        topic_id,
-        last_event_index
+        topic_id
     );
 
     // 共享 ChatStream 画像 Client（见 http_clients.rs；克隆仅复制 Arc 句柄）
@@ -2897,8 +2959,6 @@ async fn resume_claimed_generation<R: Runtime>(
         cancellation_token,
         request_output(app, key, Some(stream_channel.clone())),
         true,
-        last_event_index,
-        initial_content.clone(),
     )
     .await
     {
@@ -2908,22 +2968,7 @@ async fn resume_claimed_generation<R: Runtime>(
                 "[VCPClient] Claimed recovery failed during handle_streaming_request: {}",
                 failure
             );
-            let (error, partial_content) = failure.into_parts();
-            let partial_content = merge_recovery_partial(&helper_content, partial_content);
-            let committed_content = finalize_stream_error(
-                app,
-                &pool,
-                key,
-                partial_content.clone(),
-                format!("接续失败: {}", error),
-                Some(stream_channel.clone()),
-            )
-            .await?;
-            return Ok(json!({
-                "status": "failed",
-                "fullContent": committed_content.unwrap_or(partial_content),
-                "finishReason": "error",
-            }));
+            return handle_recovery_failure(app, key, failure, stream_channel).await;
         }
     };
 
@@ -2951,8 +2996,278 @@ async fn resume_claimed_generation<R: Runtime>(
 }
 
 #[cfg(test)]
+mod offline_completed_tests {
+    use super::*;
+
+    async fn fixture() -> (DbState, MessageKey, tempfile::TempDir, std::path::PathBuf) {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("test database");
+        sqlx::raw_sql(include_str!("../../../migrations/0100_baseline_v2.sql"))
+            .execute(&pool)
+            .await
+            .expect("schema");
+        sqlx::raw_sql(
+            "INSERT INTO agents (owner_type, agent_id, name, model, updated_at)
+             VALUES ('agent', 'offline-agent', 'Agent', 'test', 1);
+             INSERT INTO topics (topic_id, owner_type, owner_id, title, created_at, updated_at)
+             VALUES ('offline-topic', 'agent', 'offline-agent', 'Topic', 1, 1);",
+        )
+        .execute(&pool)
+        .await
+        .expect("conversation");
+        let db = DbState::new(pool, std::path::PathBuf::new());
+        let key = MessageKey::new(
+            TopicKey::new("agent", "offline-agent", "offline-topic"),
+            "offline-message",
+        );
+        crate::vcp_modules::chat::message_service::begin_stream_message(
+            &db,
+            &key,
+            Some("offline-agent"),
+            Some("Agent"),
+        )
+        .await
+        .expect("pending message");
+        tokio::fs::create_dir_all("target/test-fixtures")
+            .await
+            .expect("fixture root");
+        let directory = tempfile::Builder::new()
+            .prefix("offline-sse-")
+            .tempdir_in("target/test-fixtures")
+            .expect("fixture directory");
+        let request_id = message_transport_request_id(&key);
+        let metadata = json!({
+            "schemaVersion": 1,
+            "requestId": request_id,
+            "generation": uuid::Uuid::new_v4().to_string(),
+            "completedAt": 42,
+            "context": {
+                "messageId": key.msg_id,
+                "ownerType": key.topic.owner_type,
+                "ownerId": key.topic.owner_id,
+                "topicId": key.topic.topic_id,
+            },
+            "finishReason": "stop",
+        });
+        let parsed: OfflineCompletedMetadata =
+            serde_json::from_value(metadata.clone()).expect("metadata");
+        let path = directory.path().join(parsed.file_name());
+        tokio::fs::write(
+            &path,
+            format!("{metadata}\n第一行 🦀\n{{\"正文不是JSON\":true}}\n"),
+        )
+        .await
+        .expect("offline file");
+        (db, key, directory, path)
+    }
+
+    #[tokio::test]
+    async fn recovery_capacity_and_partial_snapshot_failures_preserve_pending_content() {
+        let (db, key, _directory, path) = fixture().await;
+        let pool = db.pool.clone();
+        let original: (String, Option<String>) = sqlx::query_as(
+            "SELECT content, finish_reason FROM messages",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("pending content");
+        let app = tauri::test::mock_app();
+        app.manage(db);
+        app.manage(ActiveRequests::default());
+        let (sent, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let channel = Channel::new(move |body| {
+            let _ = sent.send(body.deserialize::<Value>()?);
+            Ok(())
+        });
+        for failure in [
+            VcpRequestFailure::from(STREAM_CAPACITY_EXHAUSTED.to_string()),
+            VcpRequestFailure::recoverable_helper("incomplete snapshot", None),
+            VcpRequestFailure::recoverable_helper("local connection lost", Some("第一行".to_string())),
+        ] {
+            let requests = app.state::<ActiveRequests>();
+            let (_lease, _) = ActiveRequestLease::try_acquire(requests.0.clone(), key.clone())
+                .expect("recovery lease");
+            let old_channel = Channel::new(|_| panic!("replaced WebView received an event"));
+            let output = request_output(app.handle(), &key, Some(old_channel.clone()));
+            output.attach(channel.clone()).expect("replacement WebView");
+            let reason = failure.to_string();
+            let result = handle_recovery_failure(app.handle(), &key, failure, old_channel).await;
+            assert_eq!(result.expect_err("attachment failure must remain retryable"), reason);
+            let after: (String, Option<String>) = sqlx::query_as(
+                "SELECT content, finish_reason FROM messages",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("retained content");
+            assert_eq!(after, original);
+            let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM active_generations")
+                .fetch_one(&pool)
+                .await
+                .expect("pending count");
+            assert_eq!(pending, 1);
+            assert!(tokio::fs::try_exists(&path).await.expect("complete backup retained"));
+            let event = events.try_recv().expect("replacement consumer notified");
+            assert_eq!(event["type"], "error");
+            assert!(event["content"].is_null());
+            assert!(events.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_completed_is_consumed_only_after_sqlite_commit() {
+        let (db, key, _directory, path) = fixture().await;
+        let pool = db.pool.clone();
+        let app = tauri::test::mock_app();
+        app.manage(db);
+        sqlx::raw_sql(
+            "CREATE TRIGGER reject_offline_commit BEFORE UPDATE ON messages
+             BEGIN SELECT RAISE(ABORT, 'forced commit failure'); END;",
+        )
+        .execute(&pool)
+        .await
+        .expect("failure injection");
+        let channel = Channel::new(|_| Ok(()));
+        let file = open_offline_completed(path.clone())
+            .await
+            .expect("read offline file");
+        assert!(
+            finalize_offline_completed(app.handle(), &key, file, channel.clone())
+                .await
+                .is_err()
+        );
+        assert!(tokio::fs::try_exists(&path).await.expect("file remains"));
+        let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM active_generations")
+            .fetch_one(&pool)
+            .await
+            .expect("pending count");
+        assert_eq!(pending, 1);
+        sqlx::query("DROP TRIGGER reject_offline_commit")
+            .execute(&pool)
+            .await
+            .expect("remove failure");
+
+        let file = open_offline_completed(path.clone())
+            .await
+            .expect("reread retained file");
+        let result = finalize_offline_completed(app.handle(), &key, file, channel)
+            .await
+            .expect("durable recovery");
+        assert_eq!(result["content"], "第一行 🦀\n{\"正文不是JSON\":true}\n");
+        assert_eq!(result["finishReason"], "stop");
+        assert!(!tokio::fs::try_exists(&path).await.expect("file consumed"));
+        let durable: (String, Option<String>) =
+            sqlx::query_as("SELECT content, finish_reason FROM messages")
+                .fetch_one(&pool)
+                .await
+                .expect("committed message");
+        assert_eq!(durable.0, result["content"].as_str().unwrap());
+        assert_eq!(durable.1.as_deref(), Some("stop"));
+        let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM active_generations")
+            .fetch_one(&pool)
+            .await
+            .expect("pending count");
+        assert_eq!(pending, 0);
+    }
+
+    #[tokio::test]
+    async fn offline_completed_tombstone_is_cleaned_without_emitting_old_content() {
+        let (db, key, _directory, path) = fixture().await;
+        sqlx::raw_sql("UPDATE messages SET deleted_at = 9; DELETE FROM active_generations;")
+            .execute(&db.pool)
+            .await
+            .expect("delete message");
+        let app = tauri::test::mock_app();
+        app.manage(db);
+        let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let event_count = sent.clone();
+        let channel = Channel::new(move |_| {
+            event_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+        let file = open_offline_completed(path.clone())
+            .await
+            .expect("read file");
+        let result = finalize_offline_completed(app.handle(), &key, file, channel)
+            .await
+            .expect("discard deleted file");
+        assert_eq!(result["status"], "not_found");
+        assert_eq!(result["content"], "");
+        assert_eq!(sent.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!tokio::fs::try_exists(&path).await.expect("file consumed"));
+        let terminal = terminal_generation_result(&app.state::<DbState>().pool, &key)
+            .await
+            .expect("late recovery result");
+        assert_eq!(terminal["status"], "not_found");
+        assert_eq!(terminal["content"], "");
+    }
+
+    #[tokio::test]
+    async fn offline_completed_rejects_a_different_generation_filename() {
+        let (_db, _key, directory, path) = fixture().await;
+        let wrong_path = directory.path().join("different-generation.completed");
+        tokio::fs::rename(path, &wrong_path)
+            .await
+            .expect("rename fixture");
+        assert!(open_offline_completed(wrong_path.clone()).await.is_err());
+        assert!(tokio::fs::try_exists(wrong_path)
+            .await
+            .expect("unreadable file retained"));
+    }
+}
+
+#[cfg(test)]
 mod active_request_tests {
     use super::*;
+
+    #[test]
+    fn sse_decoder_handles_utf8_bom_and_all_line_endings_across_byte_splits() {
+        use tokio_util::codec::Decoder;
+        let mut decoder = SseDecoder::default();
+        let mut buffer = bytes::BytesMut::new();
+        let mut events = Vec::new();
+        for byte in "\u{feff}: heartbeat\r\ndata: first\rdata: 中国\r\rdata:\n\ndata: discarded".as_bytes() {
+            buffer.extend_from_slice(&[*byte]);
+            while let Some(event) = decoder.decode(&mut buffer).unwrap() {
+                events.push(event);
+            }
+        }
+        assert_eq!(events, ["first\n中国", ""]);
+        assert!(decoder.decode_eof(&mut buffer).unwrap().is_none());
+    }
+
+    #[test]
+    fn sse_decoder_keeps_large_events_and_discards_only_unterminated_events() {
+        use tokio_util::codec::Decoder;
+        let content = "x".repeat(600 * 1024);
+        let mut decoder = SseDecoder::default();
+        let mut buffer = bytes::BytesMut::from(format!("data: {content}\n\ndata: unfinished\n").as_bytes());
+        assert_eq!(decoder.decode(&mut buffer).unwrap(), Some(content));
+        assert!(decoder.decode_eof(&mut buffer).unwrap().is_none());
+    }
+
+    #[test]
+    fn sse_round_finish_keeps_collecting_until_done_and_reports_upstream_errors() {
+        let mut text = String::new();
+        let mut reason = None;
+        for data in [
+            r#"{"choices":[{"delta":{"content":"before"},"finish_reason":"tool_calls"}]}"#,
+            r#"{"choices":[{"delta":{"content":"after"},"finish_reason":"stop"}]}"#,
+        ] {
+            assert!(!absorb_sse_data(data, &mut text, &mut reason).unwrap());
+        }
+        assert_eq!(text, "beforeafter");
+        assert_eq!(reason.as_deref(), Some("stop"));
+        assert!(absorb_sse_data("[DONE]", &mut text, &mut reason).unwrap());
+        assert_eq!(
+            absorb_sse_data(r#"{"error":{"message":"quota exhausted"}}"#, &mut text, &mut reason),
+            Err("quota exhausted".to_string()),
+        );
+        assert!(absorb_sse_data("{", &mut text, &mut reason).is_err());
+        assert_eq!(text, "beforeafter");
+    }
 
     fn event_channel() -> (Channel<StreamEvent>, tokio::sync::mpsc::UnboundedReceiver<Value>) {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -2961,6 +3276,105 @@ mod active_request_tests {
             Ok(())
         });
         (channel, receiver)
+    }
+
+    #[test]
+    fn failed_consumer_is_detached_until_a_new_consumer_takes_a_snapshot() {
+        let failures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts = failures.clone();
+        let output = RequestOutput::default();
+        output.bind_initial(Some(Channel::new(move |_| {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(std::io::Error::other("WebView closed").into())
+        })));
+        let mut buffer = AuroraBuffer::new();
+        for _ in 0..100 {
+            buffer.append_chunk("正文 ");
+            buffer.process_queue();
+            output.send_aurora(&mut buffer, "message", &None, None, false);
+            assert!(buffer.pending_mutations.is_empty());
+        }
+        assert_eq!(failures.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let (channel, mut events) = event_channel();
+        assert!(output.attach(channel).unwrap());
+        output.send_aurora(&mut buffer, "message", &None, None, false);
+        let event = events.try_recv().unwrap();
+        assert_eq!(event["aurora"]["kind"], "snapshot");
+        assert_eq!(event["aurora"]["content"], "正文 ".repeat(100));
+        assert!(buffer.pending_mutations.is_empty());
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "android"))]
+    async fn sse_http_eof_flushes_multiline_rounds_without_a_done_marker() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).await.unwrap();
+            let body = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"first\"},\n",
+                "data: \"finish_reason\":\"tool_calls\"}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"tail\"},\"finish_reason\":\"stop\"}]}\n\n",
+            );
+            socket.write_all(format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len(),
+            ).as_bytes()).await.unwrap();
+        });
+        let app = tauri::test::mock_app();
+        let (channel, mut events) = event_channel();
+        let output = Arc::new(RequestOutput::default());
+        output.bind_initial(Some(channel));
+        let (result, aborted) = handle_streaming_request(
+            app.handle(), Client::new(), &endpoint, "", json!({}),
+            "message".into(), "transport".into(), None,
+            CancellationToken::new(), output, false,
+        ).await.unwrap();
+        assert_eq!(result["fullContent"], "firsttail");
+        assert_eq!(result["finishReason"], "stop");
+        assert!(!aborted);
+        let mut delivered = String::new();
+        while let Ok(event) = events.try_recv() {
+            assert_eq!(event["aurora"]["kind"], "delta");
+            if let Some(chunk) = event["aurora"]["chunk"].as_str() {
+                delivered.push_str(chunk);
+            }
+        }
+        assert_eq!(delivered, "firsttail");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "android"))]
+    async fn sse_http_read_failure_preserves_received_text_without_reconnecting() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).await.unwrap();
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"saved partial\"}}]}\n\n";
+            socket.write_all(format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n",
+                body.len(),
+            ).as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+            assert!(tokio::time::timeout(Duration::from_millis(100), listener.accept()).await.is_err());
+        });
+        let app = tauri::test::mock_app();
+        let failure = handle_streaming_request(
+            app.handle(), Client::new(), &endpoint, "", json!({}),
+            "message".into(), "transport".into(), None,
+            CancellationToken::new(), Arc::default(), false,
+        ).await.unwrap_err();
+        let (error, partial) = failure.into_parts();
+        assert!(error.starts_with("SSE stream read failed:"), "{error}");
+        assert_eq!(partial.as_deref(), Some("saved partial"));
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -2992,7 +3406,7 @@ mod active_request_tests {
             handle_streaming_request(
                 &request_app, Client::new(), &endpoint, "", json!({}),
                 "message".to_string(), "transport".to_string(), None,
-                request_cancel, request_output, false, None, None,
+                request_cancel, request_output, false,
             ).await
         });
         let first = tokio::time::timeout(Duration::from_secs(2), old_events.recv()).await.unwrap().unwrap();
@@ -3238,52 +3652,6 @@ mod active_request_tests {
     }
 
     #[test]
-    fn streaming_failure_captures_buffer_and_unflushed_pending_content() {
-        let mut buffer = AuroraBuffer::new();
-        buffer.append_chunk("abc");
-        let mut pending = "def".to_string();
-
-        let failure = streaming_failure(&mut buffer, &mut pending, "network failed");
-        let (message, partial_content) = failure.into_parts();
-        assert_eq!(message, "network failed");
-        assert_eq!(partial_content.as_deref(), Some("abcdef"));
-        assert!(pending.is_empty());
-    }
-
-    #[test]
-    fn aurora_parse_interval_is_fixed_at_30hz() {
-        assert_eq!(AURORA_PARSE_INTERVAL, Duration::from_millis(33));
-    }
-
-    #[test]
-    fn aurora_parse_deadline_is_anchored_to_the_last_parse() {
-        assert_eq!(
-            remaining_aurora_parse_delay(Duration::from_millis(10)),
-            Duration::from_millis(23)
-        );
-        assert_eq!(
-            remaining_aurora_parse_delay(Duration::from_millis(99)),
-            Duration::ZERO
-        );
-    }
-
-    #[test]
-    fn recovery_partial_only_advances_along_the_helper_prefix() {
-        assert_eq!(
-            merge_recovery_partial("abc", Some("abcdef".to_string())),
-            "abcdef"
-        );
-        assert_eq!(
-            merge_recovery_partial("abcdef", Some("abc".to_string())),
-            "abcdef"
-        );
-        assert_eq!(
-            merge_recovery_partial("helper", Some("diverged".to_string())),
-            "helper"
-        );
-    }
-
-    #[test]
     fn stream_error_content_appends_one_terminal_suffix() {
         let final_content = stream_error_content("partial", "network failed");
         assert_eq!(final_content, "partial\n\n> VCP流式错误: network failed");
@@ -3393,45 +3761,24 @@ mod active_request_tests {
     }
 
     #[test]
-    fn helper_stop_ack_requires_stopped_and_exact_generation() {
+    fn helper_control_ack_requires_acceptance_and_exact_identity() {
         let valid = json!({
-            "action": "stop_ack",
+            "action": "ack_committed_ack",
             "requestId": "message-3",
-            "generation": 17,
-            "stopped": true,
+            "generation": "generation-17",
+            "accepted": true,
         });
-        assert!(validate_helper_stop_ack(&valid, "message-3", 17).is_ok());
+        assert!(validate_helper_control_ack(&valid, "ack_committed", "message-3", "generation-17").is_ok());
+        assert!(validate_helper_control_ack(&valid, "discard", "message-3", "generation-17").is_err());
+        assert!(validate_helper_control_ack(&valid, "ack_committed", "message-4", "generation-17").is_err());
+        assert!(validate_helper_control_ack(&valid, "ack_committed", "message-3", "generation-18").is_err());
 
-        let stale_generation = json!({
-            "action": "stop_ack",
+        let rejected = json!({
+            "action": "ack_committed_ack",
             "requestId": "message-3",
-            "generation": 16,
-            "stopped": true,
+            "generation": "generation-17",
+            "accepted": false,
         });
-        assert!(validate_helper_stop_ack(&stale_generation, "message-3", 17).is_err());
-
-        let not_stopped = json!({
-            "action": "stop_ack",
-            "requestId": "message-3",
-            "generation": 17,
-            "stopped": false,
-        });
-        assert!(validate_helper_stop_ack(&not_stopped, "message-3", 17).is_err());
-    }
-
-    #[test]
-    fn helper_collision_adopts_only_the_exact_unversioned_start_error() {
-        assert_eq!(
-            classify_helper_start_error("Session already exists", None),
-            HelperStartErrorDisposition::AdoptExistingSession
-        );
-        assert_eq!(
-            classify_helper_start_error("Session already exists", Some(7)),
-            HelperStartErrorDisposition::Fail
-        );
-        assert_eq!(
-            classify_helper_start_error("Session not found", None),
-            HelperStartErrorDisposition::Fail
-        );
+        assert!(validate_helper_control_ack(&rejected, "ack_committed", "message-3", "generation-17").is_err());
     }
 }

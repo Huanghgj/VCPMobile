@@ -712,19 +712,8 @@ pub async fn delete_group_internal<R: Runtime>(
         .map_err(|e| e.to_string())?;
 
     tx.commit().await.map_err(|e| e.to_string())?;
-    if let Some(active_requests) =
-        app_handle.try_state::<crate::vcp_modules::vcp_client::ActiveRequests>()
-    {
-        for key in active_keys {
-            if let Err(error) = active_requests.cancel(&key) {
-                log::warn!(
-                    "Failed to cancel generation {} after deleting Group {}: {}",
-                    key.msg_id,
-                    group_id,
-                    error
-                );
-            }
-        }
+    for key in active_keys {
+        crate::vcp_modules::vcp_client::discard_deleted_generation(app_handle, &key).await;
     }
 
     state.caches.remove(group_id);

@@ -661,6 +661,13 @@ impl AuroraBuffer {
         }
     }
 
+    /// A detached consumer will receive a fresh snapshot on attachment. Keep
+    /// the parser's current AST, but do not retain obsolete delivery mutations.
+    pub fn discard_pending_delivery(&mut self) {
+        self.pending_mutations.clear();
+        self.tail_reset_pending = true;
+    }
+
     /// 暖接续的权威数据基线：一次性完整覆盖 content/stable/tail 与 reset AST。
     #[allow(dead_code)]
     pub fn take_recovery_baseline(&mut self) -> AuroraUpdate {

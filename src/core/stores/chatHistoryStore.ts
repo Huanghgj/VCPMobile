@@ -787,6 +787,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
         topicId: key.topicId,
         msgIds: [messageId],
       });
+      streamStore.forgetDeletedMessage(key.ownerId, key.ownerType, key.topicId, messageId);
       if (canCommitConversation(key)) {
         const currentIndex = currentChatHistory.value.findIndex(message => message.id === messageId);
         if (currentIndex !== -1) currentChatHistory.value.splice(currentIndex, 1);

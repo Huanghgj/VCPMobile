@@ -1,134 +1,244 @@
-# SSE 缓存、终态交接与内存管理重构方案
+# SSE 流式通信、内存管理与离线接管方案
 
-## 1. 目标与确定边界
+## 1. 架构目标与设计原则
 
-重构 Android helper 的缓存结构，并同时治理纯 Rust 直连的正文、解析和投递生命周期。保留现有增量渲染能力。
+构建单向流动的移动端 SSE 通信体系，统一 iOS 纯 Rust 直连与 Android Helper 的正文、终态和持久化边界。host 路径仅用于开发验证，不是桌面产品入口。
 
-- **单次连接的正文上限统一为 32 MiB，按 UTF-8 字节计量。** 同一连接内智能体的多轮输出累计计费，不因中间 `finish_reason` 重置。
-- 删除累计事件数限制、完整原始 SSE 历史，以及固定 5 分钟内存保留。
-- 删除失败连接的自动重试、指数退避和按事件序号重放。失败保留部分正文并终结；重新生成继续由前端入口发起。
-- 保留两种接管：存活 Rust 请求更换 WebView 消费者；主进程重建后接管仍在生成的 helper。接管不重新请求上游。
-- 冷恢复使用正文快照，直接重建显示，不回放历史动画。
-- Android 保持最多 8 个活动生成，纯 Rust 路径统一采用同一并发上限；已封存结果不占生成名额。
-- **32 MiB 是正文容量，不是总进程内存上限。** 本次消除历史包装、无界积压和不必要复制；保留合法代码、HTML、思考及工具块能力，不通过纯文本降级或截断 AST 控制内存。
+2026-10-15 依据生产代码完成 Melchior（系统）、Balthasar（交互）、Casper（交付）审查后扩展。本文件沿用用户最新方案；用户已再次确认：**生成期间零正文落盘，接受 Helper 也被杀时丢失尚未持久化的正文。**
 
-## 2. Helper：正文文件作为累计内容来源
+- **单向时钟节流（33ms / 约 30Hz）**：Rust 合并待解析正文，计时器保证没有后续网络片段时仍可刷新。Vue 被动消费增量，不等待前端 ACK；33ms 是解析投递节奏，不是 UI 帧率或无卡顿承诺。
+- **纯正文缓冲**：Helper 每个会话只累计一个 `StringBuilder`，不保存原始 SSE JSON 或事件历史。JSON 包装仅用于当前解析、发送，不进入历史集合。
+- **并发与容量**：两条传输路径实际限制最多 8 路生成；已结束、等待提交的结果不占生成名额。不设正文累计字节/事件数截断。`max_tokens` 不能约束同连接多轮 Agent 输出总量，8 路也不能证明堆内存安全；峰值须实测。
+- **离线终态单次原子落盘**：推流期间保持 0 正文磁盘 I/O。仅当主进程断开且后台流达到物理终态时，执行单次原子写盘，保障冷启动恢复；主进程入库后即刻删除文件。端口发现文件、初始消息数据库记录及系统日志不属于正文缓存。
+- **确切终态归约**：`choices[0].finish_reason` 仅记录轮次状态；`[DONE]` 或正常上游 EOF 完成，读取错误、协议错误或用户取消分别收口。不自动重新请求上游，失败保留已收正文。
 
-主要调整 [SseProxyService.kt](G:/VCPMobile/src-tauri/plugins/vcp-mobile/android/src/main/java/com/vcp/mobile/service/SseProxyService.kt)。
+---
 
-### 缓存结构
+## 2. 总体架构拓扑
 
-每个 generation 使用独立目录，包含顺序追加的 `body.utf8` 和小型 `meta.json`。
+```mermaid
+flowchart TD
+    subgraph Upstream ["上游 (VCPToolBox)"]
+        SSEStream["单次 HTTP SSE 长连接\n(支持 Agent 多轮工具循环，以 [DONE]/EOF 为物理终态)"]
+    end
 
-- 收到 SSE 后提取实际消费的正文与终态信息；原始 JSON 解析完即释放。
-- 删除 `eventBuffer`，不再保留完整 `StringBuilder` 或另一份全文镜像。
-- 每会话使用 **64 KiB 写缓冲**，达到容量或 **33 ms** 即写出；不逐 token 同步磁盘。终态封存时 flush、同步正文，再原子发布终态元数据。
-- 所有写入由会话的单一串行 IO owner 执行。临时排队上限为每会话 **512 KiB**、全局 **4 MiB**，满时施加背压，不因瞬时队列满主动截断回复。
-- 通知摘要从正文按块读取，提取到足够的可显示内容即停止，避免为通知重建全文。
-- 写入失败明确结束为缓存 IO 错误，保留已写正文和有界的未写尾部；不得静默退回全量内存缓存。
+    subgraph Android_Helper [":helper 进程 (后台保活与离线中转)"]
+        OkHttp["OkHttp SSE 监听器"]
+        Builder["单会话 StringBuilder 纯正文累加\n(无对象包装，无显式字节上限)"]
+        DiskWriter["离线单次原子落盘\n(触发条件: 主进程断开 && 流结束)"]
+    end
 
-元数据仅保存恢复和清理必需的信息：
+    subgraph Main_Process ["主进程 (Rust 业务核心 + SQLite)"]
+        LocalSocket["本地回环 TCP 接收器"]
+        WindowThrottle["33ms (~30Hz) 单向累加窗口\n(flush_aurora_parse，平滑聚合网络流)"]
+        AuroraBuffer["Aurora AST 增量解析器\n(full_text 连续内存 + 局部尾部活跃 AST)"]
+        Channel["Tauri Channel (单向 Delta 推送)"]
+        SQLite[("SQLite 数据库\n(全局唯一权威存储)")]
+    end
 
-| 字段                                        | 用途                                         |
-| ------------------------------------------- | -------------------------------------------- |
-| `schemaVersion`                             | 文件格式版本                                 |
-| 完整消息身份、`transportId`                 | 对应所属会话和消息                           |
-| `generation`                                | 使用 UUID，隔离旧结果、旧回调和新生成        |
-| `state`                                     | `receiving / completed / failed / cancelled` |
-| `bodyBytes`                                 | 已发布正文的准确字节长度                     |
-| `finishReason`、`errorCode`、`errorMessage` | 保留真实终态，避免只在正文中隐藏错误         |
-| `updatedAt`、`completedAt`                  | 中断判定与过期清理                           |
+    subgraph Frontend ["Vue 3 渲染层"]
+        View["ChatStreamStore / MessageItem\n(被动响应式消费)"]
+    end
 
-不保存原始事件、AST、动画状态、请求头或提示词。通知所需的智能体名称和导航信息保留在会话的小型上下文中。
+    subgraph Cold_Start ["冷启动恢复链路"]
+        OfflineFile[("<requestId hash>.<generation>.completed\n(首行元数据 + 纯 UTF-8 正文)")]
+    end
 
-### 接管协议
+    %% 在线推流链路
+    SSEStream --> OkHttp
+    OkHttp --> Builder
+    OkHttp -- "本地 TCP 直通推流" --> LocalSocket
+    LocalSocket --> WindowThrottle
+    WindowThrottle --> AuroraBuffer
+    AuroraBuffer -- "增量 Delta" --> Channel
+    Channel --> View
+    LocalSocket -- "终态收口入库" --> SQLite
 
-- 删除 `resume(startIndex)` 和原始事件索引；控制查询只返回状态与身份，不返回巨型全文 JSON。
-- 接管时，串行 owner 先刷新正文，原子确定 **generation、快照字节边界和新消费者**。
-- 正文快照与后续增量均按不超过 **64 KiB 的有效 UTF-8 块**发送。先完成固定边界之前的快照，再发送边界之后的内容。
-- 慢消费者只持有读取偏移，通过正文文件追赶，不建立待发送历史列表。
-- 保留现有单帧防护，不通过放大 10 MiB 本地协议帧上限支持 32 MiB 正文。
-- 若上游已经失败，接管只能取得部分正文及失败结果，不能复活请求。若 helper 已消失，遗留生成中文件按中断结果恢复，不重连上游。
-
-## 3. 终态：封存、提交、确认删除
-
-调整 [vcp_client.rs](G:/VCPMobile/src-tauri/src/vcp_modules/infra/vcp_client.rs) 与实际业务 finalizer，明确区分以下动作：
-
-- `cancel`：停止上游，封存部分正文，保留恢复结果。
-- `ack_committed`：Rust 已成功提交数据库，允许删除对应 generation 的恢复文件。
-- `discard`：用户删除、截断或替换旧消息，明确取消并丢弃该 generation。
-- 接管：只绑定既有生成及其快照，不承担重试。
-
-正常完成、错误和用户停止统一经过：
-
-```text
-确定唯一终态
-→ 封存正文与元数据
-→ 释放 helper 大对象和生成名额
-→ Rust 提交消息数据库
-→ ack_committed
-→ 删除恢复文件和剩余会话记录
+    %% 离线断开与冷启动链路
+    OkHttp -. "主进程断开 (Socket 关闭)" .-> DiskWriter
+    Builder -. "流终结时单次刷出" .-> DiskWriter
+    DiskWriter --> OfflineFile
+    OfflineFile -- "主进程冷启动扫描入库" --> SQLite
+    SQLite -. "入库成功即刻删除" .-> OfflineFile
 ```
 
-具体约束：
+---
 
-- Rust 的确认点是 **SQLite 事务成功提交**，不是收到 `[DONE]`、socket 写完或 Vue 显示完成。
-- 删除当前收流结束后提前 `stop` 并清空 helper 的行为。
-- 内部成功结果和失败结果携带类型化清理凭据 `{ transportId, generation }`；单聊、群聊每棒、直接调用及冷恢复共用同一提交后清理入口，不把凭据混入前端业务 JSON。
-- 数据库提交失败不发送删除确认；恢复文件保留，已结束的 helper 不持有整篇正文内存。
-- 终态只能确定一次，取消产生的迟到回调不能覆盖原始错误或成功结果。
-- 重复确认幂等；旧 generation 的确认、取消及清理不得影响新生成。
-- 删除和重新生成沿现有数据库所有权处理旧结果，避免恢复已删除消息。
-- 达到 32 MiB 时保留 UTF-8 完整字符边界内的正文，结束为明确的 `content_limit_exceeded`；系统附加错误说明不计入上游正文额度。
+## 3. 主进程（Rust 核心与前端渲染）
 
-兼容与维护：
+### 3.1 33ms 单向时间窗口节流
+主进程接收来自网络（iOS；host 仅开发验证）或 Local TCP Socket（Android Helper）的正文时，采用 33ms 时间窗口：
 
-- 新实现只生产新格式；旧 `sse_recovered_<hash>.json` 保留只读导入，提交成功后删除。
-- 旧文件没有 generation，不能用于取消或确认新版活动会话。
-- 文件清理由统一 owner 管理，沿用 **24 小时**未认领结果过期策略，排除活动文件。
-- 保留现有服务空闲退出机制，不再为已结束的全文保留 5 分钟。
+1. **片段缓冲**：收到的文本片段写入 `pending_aurora_chunk.push_str(delta)`。
+2. **时钟门禁**：解析计时器每 33ms 唤醒，跳过错过的周期，避免网络突发触发连续补帧。
+   - 未达到 33ms 间隔且非强制刷新时，不执行 AST 解析；
+   - `aurora_buffer` 未变化，不向前端发射 IPC。
+3. **周期释放**：达到 33ms 或流遇到 EOF/强制刷新时，将积攒的文本片段喂给 `AuroraBuffer`，计算差异并将当前帧 Delta 推送给前端。
+4. **单向消费**：前端仅负责接收增量并驱动 UI 响应式更新，不存在反向确认依赖，切后台或界面挂起不阻塞数据管道。
 
-## 4. 纯 Rust 与前端投递：控制积压和复制
+### 3.2 内存布局与多线程并发
+- **堆内存分布**：
+  - `full_text: String` 是 Rust 权威正文；Helper 的 `StringBuilder` 是独立进程的接管副本。
+  - `stable_blocks` 实际持有块正文与渲染数据，并非仅切片索引；尾部 AST、HTML 和代码结构随内容增长。
+  - `pending_mutations` 是待交付差量。无消费者或 Channel 真实发送失败时清除差量，保留解析器当前结构，下一消费者取得快照；不继续反复构建失效帧。
+  - 正常在线使用 Delta；消费者替换/冷接管使用一次权威 Snapshot；持久化终态 `end` 含最终正文及 blocks。此处不承诺零复制、固定 AST 峰值或后台 WebView 队列恒定大小。
+- **并发与任务隔离**：
+  - 基于 Tokio 多线程运行时，所有命令通过 `commands.rs` offload 到工作线程池。
+  - 每个会话分配独立的 `AuroraBuffer` 与异步任务，由 `ActiveRequests`（`DashMap`）维护句柄。
+  - Rust 传输入口用共享 8 路 permit，Helper 自身原子准入 8 路；拒绝超额请求，不建立等待生成队列。恢复遇到容量已满保留 pending 状态，不能当作生成失败入库。
 
-纯 Rust 当前逐行消费 SSE，没有 helper 的原始事件历史；主要治理对象是正文派生结构、临时批次、消费者积压和结束峰值。
+---
 
-### Rust 数据生命周期
+## 4. Android Helper 进程（`SseProxyService`）
 
-- 两种传输共享正文计量和终态归约规则；32 MiB 在追加前检查。
-- 请求建立后释放只用于发送的请求体、序列化中间数据和多模态上下文副本。
-- 非成功 HTTP 响应最多读取 **64 KiB 错误摘要**，随后释放响应。
-- 输入批次以 **33 ms 或 256 KiB**先到者触发处理；单个较大的合法输入直接消费，避免先复制进积压批次。
-- 返回成功或错误结果时移动正文所有权，减少全文 `clone` 和通用 JSON 中转。
-- 结束时不再先构造完整 Aurora 终态快照，再重新编译一次最终正文；持久化后的权威 `end` 负责最终展示。
-- 最终编译沿用现有 worker 数量限制，并增加 **32 MiB 源正文加权许可**；在复制与编译之前取得许可，避免多条巨型回复同时制造结束峰值。
-- 纯 Rust 数据库提交失败时，将终态正文写入同格式恢复文件；不新增纯 Rust 上游断线续传。
+### 4.1 会话数据结构
+Helper 在 `:helper` 进程中保持最小化内存占用，单会话维护单一纯文本缓冲区：
 
-### Aurora 与 Channel 背压
+```kotlin
+internal class StreamSession(
+    val requestId: String,
+    val generation: String, // 每次生成独立 UUID，跨 Helper 重启仍唯一
+    @Volatile var eventSource: EventSource? = null,
+    val fullContent: StringBuilder = StringBuilder(), // 纯文本单一对象
+    @Volatile var isCompleted: Boolean = false,
+    @Volatile var lastFinishReason: String? = null,
+    var terminalError: String? = null,
+    var activeConnection: ClientConnection? = null,
+    val contextJson: JSONObject? = null
+)
+```
 
-沿现有 `RequestOutput` 和 [chatStreamStore.ts](G:/VCPMobile/src/core/stores/chatStreamStore.ts) 增加消费确认：
+- 移除中间事件对象包装与事件集合，单会话生命周期内仅有一个正文对象。
+- 不据 `StringBuilder` 对象数量推断正文占用：字符数组、扩容、发送编码、AST 和最终编译均计入实际峰值。移除旧 20,000 事件、8 MiB 单会话、24 MiB 全局正文截断与五分钟终态保留。
 
-- 每个 `MessageKey + consumerRevision` 最多一个在途 Aurora 更新，增加独立 `deliverySeq`。
-- 前端在 Store 的 rAF 原子应用完成后，通过批量 `ack_stream_delivery` 归还许可；不等待动画播放。
-- 发送成功时提交已发送基线；ACK 只控制下一次发送，不能清掉发送后新增的差量。
-- 未发送 mutation 达到 **512 KiB 或 512 项**时，清除历史差量并标记“下次需要快照”；继续保留当前权威内容。
-- 正常消费继续发送 delta，仅发生积压压缩或消费者切换时发送快照。
-- Channel 真实发送失败后解绑该消费者，不反复构造和发送同一积压；等待明确接管。
-- 不使用 ACK 超时自动重发，避免旧帧仍在 Tauri 队列时继续堆积。
-- 持久化后的终态允许作为最多一个额外终态通知发出，替代未发送差量；数据库提交、helper 清理和请求释放均不等待 UI ACK。
+### 4.2 进程通信与三态生命周期
+1. **在线推流态（主进程连接正常）**：
+   - OkHttp 收到 chunk，通过本地 TCP Socket 写入主进程，同时向 `fullContent` 追加备份。
+2. **孤立接收态（主进程断开）**：
+   - TCP Socket 断开（主进程退出或被系统回收），Helper 依靠前台服务保持连接，在内存中继续接收并追加文本。
+3. **终态收口与即时释放**：
+   - **主进程在线**：Socket 推送 `terminal` 事件；Rust 把连接保留至 SQLite 事务成功，再发送带精确 generation 的 `ack_committed`，Helper 删除对应 Session/文件。若提交失败，断开连接触发离线终态保存。
+   - **主进程离线**：触发原子落盘（见第 5 节），文件写入完成后立即释放 `fullContent` 并注销 Session。
 
-前端删除冷恢复前清空正文、从事件 0 回放及 `isWarm` 协议分支；保留未读标记、现有消费者身份校验和无动画快照应用。恢复等待与数据库提交失败状态继续表达真实状态，不再显示网络自动重试。
+---
 
-本次不重做整个富文本分页或可见区渲染架构。单个快照及最终 AST 仍可能较大，必须通过长代码、HTML 等真实结构验证峰值，不能仅凭正文上限宣称固定内存。
+## 5. 离线原子持久化与冷启动接管
 
-## 5. 验证与交付标准
+### 5.1 触发时机
+严格限定为**终态单次触发**，推流过程中 0 正文磁盘 I/O：
+```kotlin
+if (session.activeConnection == null && session.isCompleted) {
+    persistOfflineCompletedSession(session)
+}
+```
 
-- **长度与碎片**：相同正文分别以少量大帧、超过 200,000 个小帧输入，结果一致；不因累计事件数失败。验证 32 MiB 边界、多字节字符和同连接多轮输出。
-- **缓存效率**：持续输出接近 32 MiB 时，helper 常驻正文缓冲保持在设定工作集内；文件线性增长，没有原始事件历史或全文镜像。
-- **接管一致性**：快照期间继续生成、主进程重建、消费者替换均无漏字、重复；上游请求计数始终为一次。
-- **失败行为**：连接失败、读错误、缓存写失败、正文超限各自终结且保留可用正文；不产生自动重新请求。
-- **交接顺序**：在读取结束、文件封存、数据库提交前后分别注入故障；提交失败不删除结果，成功确认及时清理，旧确认不影响新 generation。
-- **取消与删除**：验证用户停止、删除、截断和重新生成，确保正确终态及无旧消息复活。
-- **投递背压**：暂停前端消费、发送失败、迟到或重复 ACK、新消费者接管，验证在途数量及 mutation 工作集有界，恢复后内容完整。
-- **解析峰值**：覆盖长代码、未闭合 HTML、思考块、工具输出和大量短段落；记录接收、接管、最终编译及结束后的存活对象和峰值，区分必要结构增长与泄漏。
-- 执行 `pnpm check`、相关 Rust/Vue 测试、Android 插件编译及 JVM 测试。Android 后台和进程重建使用 Debug 链路取得具名设备证据；iOS 保持源码审计与既定阶段构建边界。
-- 不修改发布流程，不提交或推送。交付时分别报告源码、静态检查、目标构建和设备验证结论。
+### 5.2 存储格式与原子写入
+- **目录**：`context.cacheDir.resolve("sse_offline_completed")`，这是短期恢复信箱，系统清理 cache 会影响可恢复性。
+- **文件身份**：`sha256(requestId).generation.completed`；正文不进入 JSON。元数据含 `schemaVersion=1`、`requestId`、UUID `generation`、`completedAt`、完整 `context`（`messageId/ownerType/ownerId/topicId/agentId`）以及 `finishReason/error`。
+- **原子落盘**：UTF-8 小块写入 `.tmp`，flush 并同步文件描述符，检查 rename 成功后再移除内存 Session。失败保留 Session，不删除唯一正文。原稿 `bufferedWriter.use` 只关闭流，并不等于 fsync；实现必须显式同步，不能忽略 rename 失败。示意流程：
+  ```kotlin
+  val dir = File(context.cacheDir, "sse_offline_completed").apply { mkdirs() }
+  // 文件名与 meta 都绑定同一个 requestId + generation。
+  // 持有当前 session owner；按小块读取 Builder，避免 toString() 全文复制。
+  writeMetadataAndBodyToTemporaryFile()
+  flushAndSyncFile()
+  checkAtomicRenameSucceeded()
+  removeCompletedSession()
+  ```
+
+### 5.3 主进程冷启动接管闭环
+1. 复用前端启动/回前台的 `get_active_generations` 入口，数据库就绪后异步扫描 `sse_offline_completed/`，不新增第二套启动 owner。
+2. 逐一读取 `.completed` 文件：
+   - 首行解析元数据 JSON（获取 `messageId`、`finishReason`、上下文等）；
+   - 后续正文作为完整内容，执行 SQLite 事务入库；
+   - 终态仍走现有 `finalize_stream_message`：事务更新消息、render cache、话题时间并移除 `active_generations`，随后发送 durable `end`。
+3. **入库成功后，立即调用 `file.delete()` 彻底删除该文件**。
+4. 已提交、已删除或已永久删除的消息对应文件可幂等清理；读取/入库失败保留文件。只更新仍 pending 的消息，不创建已删消息，也不回放历史动画。
+5. 正在生成的 Helper 直接 `resume` 原子绑定新消费者并发送正文快照。若 `session_not_found`，再次检查文件，覆盖第一次扫描与终态 rename 之间的竞态；不得重新请求上游。
+
+---
+
+## 6. 多轮 Agent 流式终态协议
+
+针对上游在单次 HTTP SSE 连接内流式执行多轮 Agent 工具调用的通信特性：
+
+1. **中间信号归约**：
+   - 大模型在中间轮次准备调用工具时输出的 `finish_reason: "stop"` 或 `"tool_calls"`，以及上游注入的角色切分符（`ROLE_DIVIDE_USER`）与工具摘要，仅作为轮次状态记录保存至 `last_finish_reason`，不触发会话结束。
+2. **物理终态判定**：
+   - `[DONE]` 或 HTTP 正常 EOF 确立完成。TCP reset/读取异常属于失败；Helper 本地 IPC EOF 不代表上游成功，不能与正常 HTTP EOF 混同。
+3. **异常中断处理**：
+   - 若连接意外断开，保留已累积的正文，沿现有数据库契约写入 `finish_reason="error"`；用户停止为 `cancelled_by_user`，由用户决定是否重新生成。不因中间 `stop/tool_calls`、角色分隔符或工具摘要结束。
+
+Rust 直连按 [WHATWG SSE 事件解释规则](https://html.spec.whatwg.org/multipage/server-sent-events.html#event-stream-interpretation) 处理 UTF-8 分片、BOM、CR/LF/CRLF、多行 `data:` 和空行边界；EOF 不把未闭合的事件当成完整 JSON。仅复用解析规则，POST 生成请求不采用浏览器 EventSource 自动重连语义。
+
+---
+
+## 7. 模块改造清单
+
+| 模块 | 涉及路径 | 改造动作 |
+| :--- | :--- | :--- |
+| **Android Helper** | `src-tauri/plugins/vcp-mobile/android/src/main/java/com/vcp/mobile/service/SseProxyService.kt` | 单正文 owner；分页快照；终态、取消和确认删除；离线原子发布 |
+| **Rust 传输与恢复** | `src-tauri/src/vcp_modules/infra/vcp_client.rs` | SSE decoder；33ms 时钟；8 路准入；取消排空；连接保留到提交；离线扫描、直接快照接管 |
+| **持久化与删除** | `chat/message_service.rs`；Agent/Group/Topic/Sync 删除入口 | 唯一事务成功后确认 Helper；墓碑提交后取消并丢弃对应资源，包括主进程重建后无本地 lease 的 Helper |
+| **增量交付** | `chat/aurora_pipeline.rs`；`src/core/stores/chatStreamStore.ts` | 无消费者清理待交付差量；冷恢复保留已显示正文；快照原子覆盖；已删除消息拒绝迟到回调 |
+
+---
+
+## 8. 验证标准
+
+1. **内存与并发验证**：
+   - 在 Android Debug 设备上运行长对话、长代码/HTML/思考/工具块与 8 路并发，记录 JVM/Native 峰值、关闭后的存活对象及 GC。正文会随生成增长，移除引用不等于 RSS 立即下降；需区分正常结构增长与泄漏。
+2. **离线防杀与冷启动恢复验证**：
+   - 发起长生成请求后切入后台，通过命令终止主进程；
+   - 验证 Helper 依靠前台服务完成后台流接收；
+   - 验证流结束后生成单个 `<hash>.<generation>.completed` 文件，成功发布后 Session 不再持有正文；
+   - 重新启动应用，验证主进程成功从离线文件恢复消息持久化，且磁盘文件完成清理。
+3. **静态检查与构建**：
+   - 执行 `pnpm check`（TypeScript + Rust check）；
+   - 执行 `./gradlew :tauri-plugin-vcp-mobile:testDebugUnitTest` 验证 Android 插件编译与单元测试。
+
+## 9. 接管、取消与提交的具体契约
+
+沿用 4 字节大端长度 + UTF-8 JSON 的本地 TCP 帧；保留 10 MiB 单帧边界，正文累计长度不受此限制。每帧绑定 `requestId` 和 UUID `generation`，新协议没有事件 index 或历史回放。
+
+| 方向/动作 | 字段与结果 | 所有权边界 |
+| --- | --- | --- |
+| Rust → `start` | URL、headers、body、小型 context；返回 `started` | 唯一一次上游 POST |
+| Rust → `resume` | requestId；返回 `snapshot_start` → 多个 `snapshot_chunk{content}` → `snapshot_end{completed,finishReason,error?}` | 同一 session 锁内冻结正文边界并更换消费者；之后才发送 live data |
+| Helper → `data` | 当前 `content` 与可选 `finishReason` | 不保留 JSON 历史；多轮 finish 不结束 |
+| Helper → `terminal` | `finishReason`、可选 `error` | 终态只归约一次；连接仍保留到 durable ACK |
+| Rust → `cancel` | requestId + generation；`cancel_ack{accepted}` | 停止上游，原流先排完已收正文再 terminal；Rust 排空至 terminal 后提交部分正文 |
+| Rust → `ack_committed` | 精确身份；`ack_committed_ack{accepted}` | 仅 SQLite 已成功提交才允许删除对应结果 |
+| Rust → `discard` | 精确身份；`discard_ack{accepted}` | 已提交删除墓碑或无持久化 owner 的辅助请求，显式丢弃结果 |
+| Rust → `query` | 只返回状态/generation | 用于删除时发现仍存活 Helper，不携带正文、不参与两阶段恢复 |
+
+- 快照按最多 16 Ki UTF-16 字符分片，避开代理对边界；单 writer 任务逐段编码发送，不预构建全量帧列表。发送队列保留有界瞬态帧；消费者过慢导致断开时 Helper 正文仍继续接收。
+- snapshot_start 至 snapshot_end 期间 Rust 不向旧前端正文追加快照片段；结束时一次权威 snapshot 替换，之后正常 Delta。存活 Rust 请求更换 WebView 同样只更换消费者。
+- Channel 发送失败后解绑消费者，不重发旧帧；后续明确接管取得快照。不增加前端 ACK、ACK 超时或 UI 驱动的业务完成状态。
+- 取消、上游失败和完成都经过同一个消息 finalizer；取消控制 ACK 不是数据库提交 ACK。提交失败不清理结果；Helper 清理失败不撤销已成功的 SQLite 事务。
+- 本地 IPC 中断不代表上游失败：Helper 可能比 Rust 已接收到更多正文。因此未收到完整 `terminal` 或终态 `snapshot_end` 时，不提交局部正文、不取消 Helper、不 ACK；保留 `active_generations` 并告知稍后返回前台接管。恢复容量已满、连接失败或快照未完整同样保留 pending。只有确认 Helper 不存在且再次扫描也没有完成文件，才归约为无法恢复的中断。此恢复不重新 POST 上游。
+- 消息删除、截断、重新生成和所属 Agent/Group/Topic 删除，均先提交数据库墓碑，再取消/discard；旧 generation 控制不能删除新生成。前端删除成功后同时清流池、rAF、恢复 owner，并用现有 tombstone 拒绝迟到回调。
+- 不入库的辅助调用在请求返回时显式 discard，不能产生无人认领的完成信箱。非普通消息 transport 身份不得被扫描器错误当成完整聊天消息入库。
+
+## 10. 需要取得的验证证据
+
+| 问题 | 验证方法 |
+| --- | --- |
+| 中间 finish 后继续出字；多行 SSE/Unicode/EOF/错误 | Rust decoder 与传输定向测试，确保仅一次上游请求 |
+| 无后续 chunk 时仍刷新，暂停消费者不阻塞完成 | 计时与 Channel 定向测试；前端 rAF 合帧测试 |
+| 超过旧事件数/字节阈值与长快照 | Helper JVM 测试覆盖正文累计、Unicode 分片、超过 128 分片仍单 writer task |
+| 离线 commit 与删除顺序 | SQLite + 临时文件：成功删除、事务失败保留、已删不复活 |
+| 快照后 live、旧回调、删除与恢复并发 | 前端 store 和 Helper ownership 定向测试 |
+| Android 后台存活、内存峰值、实际 UI | 仅 Debug 具名设备证据；源码、host 检查和 JVM 测试不能替代 |
+
+### 2026-10-15 实施结果
+
+- 已完成上述 Helper、Rust、Vue、持久化确认和删除入口改造。生成期间零正文落盘；无原始事件历史、累计正文截断、上游自动重试或前端 ACK。
+- `pnpm check` 通过；`cargo check --locked --manifest-path src-tauri/Cargo.toml --target aarch64-linux-android` 通过，覆盖 Android 专属协议、资源交接代码和插件 Rust 边界。
+- `cargo test --locked --lib vcp_modules::infra::vcp_client`：24/24 通过。包含真实本地 HTTP EOF/断流、消费者替换、Channel 发送失败，以及真实 SQLite 事务失败/恢复容量不足/快照中断保留数据。需要允许测试绑定本地回环端口。
+- 前端 `ChatConcurrencyGuards` 与 `StreamRenderBackpressure`：30/30 通过，覆盖冷 snapshot→delta、删除与迟到恢复、失败保留正文及再次接管。
+- Android `SseProxyConnectionOwnershipTest` 与 `SseProxyProtocolTest`：13/13 通过，插件 Kotlin 编译通过。覆盖实际生产方法的 20,005 个小 chunk、多轮 finish、DONE 幂等、分页快照与取消顺序、精确 generation ACK、离线 UTF-8 原文及写盘失败保留。
+- 本机生成的 `tauri.settings.gradle` 仍引用不存在的 Tauri 2.11.5 缓存；验证通过临时 Gradle init script 将 `:tauri-android` 指向 `Cargo.lock` 已锁定的 2.12.1 源码。没有修改依赖版本、锁文件或生成树；此项是本机构建输入修正，不是产品代码变更。
+- `git diff --check` 通过。未提交、未推送、未执行发布。
+
+尚未取得 Android 真机后台存活、主进程被回收后的冷恢复、8 路长输出内存/帧率证据；上述源码、host、Android 编译与 JVM 结果不替代这些观察。iOS 保持源码审计与既定 G1/G2 阶段构建范围，本次未执行 Apple 构建或实机验证，未操作个人 Android Release。

@@ -230,7 +230,6 @@ pub async fn patch_single_message(
 pub async fn delete_messages(
     app_handle: tauri::AppHandle,
     db_state: tauri::State<'_, crate::vcp_modules::db_manager::DbState>,
-    active_requests: tauri::State<'_, crate::vcp_modules::vcp_client::ActiveRequests>,
     owner_id: String,
     owner_type: String,
     topic_id: String,
@@ -239,9 +238,11 @@ pub async fn delete_messages(
     let key = TopicKey::new(owner_type, owner_id, &topic_id);
     let result = message_service::delete_messages(&db_state, &key, msg_ids, None).await?;
     for msg_id in &result.active_ids {
-        if let Err(error) = active_requests.cancel(&MessageKey::new(key.clone(), msg_id)) {
-            log::warn!("Failed to cancel deleted generation {}: {}", msg_id, error);
-        }
+        crate::vcp_modules::vcp_client::discard_deleted_generation(
+            &app_handle,
+            &MessageKey::new(key.clone(), msg_id),
+        )
+        .await;
     }
     notify_message_deletions(&app_handle, &key, &result);
     Ok(TopicActivityDto {
@@ -269,7 +270,6 @@ pub fn notify_message_deletions<R: tauri::Runtime>(
 pub async fn truncate_history_after_message(
     app_handle: tauri::AppHandle,
     db_state: tauri::State<'_, crate::vcp_modules::db_manager::DbState>,
-    active_requests: tauri::State<'_, crate::vcp_modules::vcp_client::ActiveRequests>,
     owner_id: String,
     owner_type: String,
     topic_id: String,
@@ -280,13 +280,11 @@ pub async fn truncate_history_after_message(
         message_service::truncate_history_after_message(&db_state, &key, &anchor_message_id)
             .await?;
     for msg_id in &deletion.active_ids {
-        if let Err(error) = active_requests.cancel(&MessageKey::new(key.clone(), msg_id)) {
-            log::warn!(
-                "Failed to cancel truncated generation {}: {}",
-                msg_id,
-                error
-            );
-        }
+        crate::vcp_modules::vcp_client::discard_deleted_generation(
+            &app_handle,
+            &MessageKey::new(key.clone(), msg_id),
+        )
+        .await;
     }
     notify_message_deletions(&app_handle, &key, &deletion);
     Ok(TopicActivityDto {

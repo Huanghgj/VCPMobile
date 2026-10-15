@@ -31,9 +31,13 @@ import okhttp3.sse.EventSourceListener
 import okhttp3.sse.EventSources
 import org.json.JSONObject
 import java.io.File
+import java.io.FileOutputStream
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.CountDownLatch
@@ -43,7 +47,15 @@ import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicLong
+
+internal fun contentChunkEnd(content: CharSequence, start: Int, limit: Int): Int {
+    var end = minOf(start + SseProxyService.CONTENT_FRAME_CHARS, limit)
+    if (end < limit && end > start &&
+        Character.isHighSurrogate(content[end - 1]) && Character.isLowSurrogate(content[end])) {
+        end--
+    }
+    return end
+}
 
 internal class ClientConnection(
     val socket: Socket,
@@ -89,12 +101,15 @@ internal class ClientConnection(
         }
     }
 
-    fun enqueueBatch(frames: List<String>): Boolean {
+    // A snapshot occupies one queue slot. Frames are produced lazily, so a long
+    // reply never becomes a second in-memory list of serialized event objects.
+    fun enqueueFrames(produce: ((String) -> Unit) -> Unit): Boolean {
         if (closed.get()) return false
         return try {
             writer.execute {
                 try {
-                    for (json in frames) {
+                    produce { json ->
+                        if (closed.get()) throw java.io.IOException("Connection closed")
                         val timeout = writeWatchdog.schedule(
                             { close() },
                             WRITE_TIMEOUT_SECONDS,
@@ -178,10 +193,7 @@ class SseProxyService : Service() {
         const val NOTIFICATION_ID_SERVICE = 0x53545202
 
         internal const val MAX_ACTIVE_SESSIONS = 8
-        internal const val MAX_SESSION_EVENTS = 20_000
-        internal const val MAX_SESSION_BUFFER_BYTES = 8L * 1024L * 1024L
-        internal const val MAX_GLOBAL_BUFFER_BYTES = 24L * 1024L * 1024L
-        private const val COMPLETED_SESSION_GRACE_MS = 5 * 60 * 1000L
+        internal const val CONTENT_FRAME_CHARS = 16 * 1024
         private const val IDLE_SERVICE_GRACE_MS = 30 * 1000L
 
         @Volatile
@@ -190,18 +202,30 @@ class SseProxyService : Service() {
 
     internal class StreamSession(
         val requestId: String,
-        val generation: Long = 0,
+        val generation: String = UUID.randomUUID().toString(),
         @Volatile var eventSource: EventSource? = null,
-        val eventBuffer: MutableList<JSONObject> = mutableListOf(),
+        val fullContent: StringBuilder = StringBuilder(),
         @Volatile var isCompleted: Boolean = false,
         @Volatile var lastFinishReason: String? = null,
+        @Volatile var terminalError: String? = null,
         var activeConnection: ClientConnection? = null,
         val contextJson: JSONObject? = null,
-        var bufferedBytes: Long = 0,
-        val cleanupScheduled: AtomicBoolean = AtomicBoolean(false),
-        val budgetReleased: AtomicBoolean = AtomicBoolean(false),
-        val terminalOverflow: AtomicBoolean = AtomicBoolean(false),
     ) {
+        @Synchronized
+        internal fun complete(reason: String, error: String? = null): Boolean {
+            if (isCompleted) return false
+            lastFinishReason = reason
+            terminalError = error
+            isCompleted = true
+            return true
+        }
+
+        @Synchronized
+        internal fun contentChunk(start: Int, limit: Int): String {
+            val end = contentChunkEnd(fullContent, start, limit)
+            return fullContent.substring(start, end)
+        }
+
         @Synchronized
         internal fun replaceConnection(connection: ClientConnection): ClientConnection? {
             val previous = activeConnection
@@ -228,13 +252,12 @@ class SseProxyService : Service() {
         OkHttpClient.Builder()
             .readTimeout(0, TimeUnit.MILLISECONDS)
             .connectTimeout(15, TimeUnit.SECONDS)
+            .retryOnConnectionFailure(false)
             .build()
     }
 
     private val activeSessions = ConcurrentHashMap<String, StreamSession>()
     private val serviceScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
-    private val sessionGeneration = AtomicLong(0)
-    private val globalBufferedBytes = AtomicLong(0)
     @Volatile private var idleStopJob: Job? = null
     
     private var serverSocket: ServerSocket? = null
@@ -305,16 +328,16 @@ class SseProxyService : Service() {
         } catch (ignored: Exception) {}
         
         val sessions = activeSessions.values.toList()
-        activeSessions.clear()
         for (session in sessions) {
-            if (session.isCompleted) dumpSessionToFile(session)
             val detached = synchronized(session) {
+                if (!session.isCompleted) activeSessions.remove(session.requestId, session)
                 Pair(session.eventSource, session.takeConnection())
             }
             detached.first?.cancel()
             detached.second?.close()
-            releaseSessionBudget(session)
+            cleanupSessionIfCompletedAndDisconnected(session)
         }
+        activeSessions.clear()
         
         releaseLocks()
         serviceScope.cancel()
@@ -381,8 +404,8 @@ class SseProxyService : Service() {
                         }
                     }
                     "resume" -> {
-                        val startIndex = request.optInt("startIndex", 0)
-                        boundSession = handleResumeStream(requestId, startIndex, connection)
+                        val expectedGeneration = request.optString("generation").takeIf { it.isNotEmpty() }
+                        boundSession = handleResumeStream(requestId, expectedGeneration, connection)
                         if (boundSession != null) {
                             socket.soTimeout = 0
                             readSocketUntilClose(inputStream)
@@ -391,9 +414,8 @@ class SseProxyService : Service() {
                     "query" -> {
                         handleQueryStream(requestId, connection)
                     }
-                    "stop" -> {
-                        val expectedGeneration = request.optLong("generation", -1L)
-                        handleStopStream(requestId, expectedGeneration, connection)
+                    "cancel", "ack_committed", "discard" -> {
+                        handleControl(action, requestId, request.optString("generation"), connection)
                     }
                     else -> throw IllegalArgumentException("Unknown helper action: $action")
                 }
@@ -441,12 +463,11 @@ class SseProxyService : Service() {
         }
         val session = StreamSession(
             requestId,
-            generation = sessionGeneration.incrementAndGet(),
             activeConnection = connection,
             contextJson = contextJson,
         )
         val existing = synchronized(activeSessions) {
-            if (activeSessions.size >= MAX_ACTIVE_SESSIONS) {
+            if (activeSessions.values.count { !it.isCompleted } >= MAX_ACTIVE_SESSIONS) {
                 session
             } else {
                 activeSessions.putIfAbsent(requestId, session)
@@ -455,7 +476,8 @@ class SseProxyService : Service() {
         if (existing != null) {
             val message = if (existing === session) "Helper session limit reached" else "Session already exists"
             Log.w(TAG, "start rejected for id=$requestId: $message")
-            sendProtocolError(connection, requestId, message)
+            val code = if (existing === session) "capacity_exhausted" else "session_already_exists"
+            sendProtocolError(connection, requestId, message, code)
             return null
         }
         cancelIdleStop()
@@ -463,6 +485,11 @@ class SseProxyService : Service() {
             removeSession(session)
             sendProtocolError(connection, requestId, "Helper service is shutting down")
             return null
+        }
+        synchronized(session) {
+            if (!connection.enqueue(sessionEvent(session, "started").toString())) {
+                session.detachConnection(connection)
+            }
         }
         
         try {
@@ -487,43 +514,30 @@ class SseProxyService : Service() {
                 override fun onOpen(eventSource: EventSource, response: Response) {
                     if (!isCurrentSession(session)) return
                     Log.i(TAG, "SSE Connected: id=$requestId")
-                    sendEventToSession(session, "open", "")
                 }
                 
                 override fun onEvent(eventSource: EventSource, id: String?, type: String?, data: String) {
                     if (!isCurrentSession(session)) return
-                    sendEventToSession(session, "message", data)
+                    acceptUpstreamEvent(session, data)
                 }
                 
                 override fun onFailure(eventSource: EventSource, t: Throwable?, response: Response?) {
                     if (!isCurrentSession(session)) return
                     val errorMsg = t?.message ?: response?.message ?: "Unknown network error"
                     Log.w(TAG, "SSE Failed: id=$requestId, error=$errorMsg")
-                    val errObj = JSONObject().apply {
-                        put("error", errorMsg)
-                        put("status", response?.code ?: 0)
-                    }
-                    session.isCompleted = true
-                    session.lastFinishReason = "error"
-                    sendEventToSession(session, "error", errObj.toString())
-                    showStreamNotification(session, isSuccess = false, errorMsg = errorMsg)
-                    cleanupSessionIfCompletedAndDisconnected(session)
+                    completeSession(session, "error", errorMsg)
                 }
                 
                 override fun onClosed(eventSource: EventSource) {
                     if (!isCurrentSession(session)) return
                     Log.i(TAG, "SSE Closed: id=$requestId")
-                    session.isCompleted = true
-                    session.lastFinishReason = "completed"
-                    sendEventToSession(session, "closed", "")
-                    showStreamNotification(session, isSuccess = true, errorMsg = null)
-                    cleanupSessionIfCompletedAndDisconnected(session)
+                    completeSession(session, session.lastFinishReason ?: "completed")
                 }
             }
             
             val source = EventSources.createFactory(httpClient).newEventSource(requestBuilder.build(), listener)
             val installed = synchronized(session) {
-                if (isServiceRunning && isCurrentSession(session)) {
+                if (isServiceRunning && isCurrentSession(session) && !session.isCompleted) {
                     session.eventSource = source
                     true
                 } else {
@@ -535,7 +549,7 @@ class SseProxyService : Service() {
                 // Never leave an EventSource owned by a session that is no longer mapped.
                 source.cancel()
                 updateLocks()
-                return null
+                return session.takeIf { isCurrentSession(it) }
             }
             updateLocks()
         } catch (e: Exception) {
@@ -548,44 +562,52 @@ class SseProxyService : Service() {
         return session
     }
 
-    private fun handleResumeStream(requestId: String, startIndex: Int, connection: ClientConnection): StreamSession? {
+    private fun handleResumeStream(requestId: String, expectedGeneration: String?, connection: ClientConnection): StreamSession? {
         val session = activeSessions[requestId]
         if (session == null) {
-            Log.w(TAG, "resume: Session not found for id=$requestId")
-            sendProtocolError(connection, requestId, "Session not found")
+            sendProtocolError(connection, requestId, "Session not found", "session_not_found")
             return null
         }
-        
-        Log.i(TAG, "Resuming session id=$requestId, playing back events from $startIndex.")
-        
+        if (expectedGeneration != null && expectedGeneration != session.generation) {
+            sendProtocolError(connection, requestId, "Helper generation changed", "generation_mismatch")
+            return null
+        }
         var previousConnection: ClientConnection? = null
-        try {
-            var unavailable = false
-            synchronized(session) {
-                if (!isServiceRunning || !isCurrentSession(session)) {
-                    unavailable = true
-                } else {
-                    previousConnection = session.replaceConnection(connection)
-                    val bufferSize = session.eventBuffer.size
-                    val safeStartIndex = startIndex.coerceIn(0, bufferSize)
-                    val replay = (safeStartIndex until bufferSize).map { session.eventBuffer[it].toString() }
-                    if (!connection.enqueueBatch(replay)) {
-                        throw IllegalStateException("Resume writer queue overflow")
+        val accepted = synchronized(session) {
+            if (!isServiceRunning || !isCurrentSession(session) ||
+                (expectedGeneration != null && expectedGeneration != session.generation)) {
+                false
+            } else {
+                previousConnection = session.replaceConnection(connection)
+                val length = session.fullContent.length
+                val completed = session.isCompleted
+                val finishReason = session.lastFinishReason
+                val error = session.terminalError
+                // Enqueue the prefix and replace the consumer under the same
+                // lock used by live appends. Later data always follows it.
+                connection.enqueueFrames { emit ->
+                    emit(sessionEvent(session, "snapshot_start").toString())
+                    var offset = 0
+                    while (offset < length) {
+                        val chunk = session.contentChunk(offset, length)
+                        emit(sessionEvent(session, "snapshot_chunk").put("content", chunk).toString())
+                        offset += chunk.length
                     }
+                    emit(sessionEvent(session, "snapshot_end").apply {
+                        put("completed", completed)
+                        put("finishReason", finishReason)
+                        put("error", error)
+                    }.toString())
                 }
             }
-            if (unavailable) {
-                sendProtocolError(connection, requestId, "Session no longer available")
-                return null
-            }
-        } catch (e: Exception) {
+        }
+        previousConnection?.close()
+        if (!accepted) {
             if (session.detachConnection(connection)) {
                 cleanupSessionIfCompletedAndDisconnected(session)
             }
-            Log.e(TAG, "Failed playing back events to socket", e)
-            throw e
-        } finally {
-            previousConnection?.close()
+            sendProtocolError(connection, requestId, "Session no longer available", "session_not_found")
+            return null
         }
         updateLocks()
         return session
@@ -594,11 +616,18 @@ class SseProxyService : Service() {
     private fun isCurrentSession(session: StreamSession): Boolean =
         activeSessions[session.requestId] === session
 
-    private fun sendProtocolError(connection: ClientConnection, requestId: String, message: String) {
+    private fun sessionEvent(session: StreamSession, type: String): JSONObject = JSONObject().apply {
+        put("requestId", session.requestId)
+        put("generation", session.generation)
+        put("eventType", type)
+    }
+
+    private fun sendProtocolError(connection: ClientConnection, requestId: String, message: String, code: String = "protocol_error") {
         val errEvent = JSONObject().apply {
             put("requestId", requestId)
             put("eventType", "error")
-            put("eventData", JSONObject().apply { put("error", message) }.toString())
+            put("code", code)
+            put("error", message)
         }
         connection.enqueueAndAwait(errEvent.toString())
     }
@@ -611,35 +640,11 @@ class SseProxyService : Service() {
         if (session == null) {
             resp.put("status", "not_found")
         } else {
-            val events = synchronized(session) {
+            synchronized(session) {
                 resp.put("generation", session.generation)
                 resp.put("status", if (session.isCompleted) "completed" else "streaming")
-                resp.put("lastFinishReason", session.lastFinishReason ?: "")
-                resp.put("lastEventIndex", session.eventBuffer.size - 1)
-                session.eventBuffer.toList()
+                resp.put("finishReason", session.lastFinishReason)
             }
-            // 从内存快照拼接完整文本，不在 session 锁内执行 JSON 解析。
-            val fullText = StringBuilder()
-            for (event in events) {
-                if (event.getString("eventType") == "message") {
-                    val eventData = event.getString("eventData")
-                    if (eventData != "[DONE]") {
-                        try {
-                            val dataVal = JSONObject(eventData)
-                            val choices = dataVal.optJSONArray("choices")
-                            if (choices != null && choices.length() > 0) {
-                                val delta = choices.getJSONObject(0).optJSONObject("delta")
-                                val contentObj = delta?.opt("content")
-                                if (contentObj != null && contentObj !== JSONObject.NULL) {
-                                    fullText.append(contentObj.toString())
-                                }
-                            }
-                        }
-                        catch (ignored: Exception) {}
-                    }
-                }
-            }
-            resp.put("content", fullText.toString())
         }
         
         if (!connection.enqueueAndAwait(resp.toString())) {
@@ -647,70 +652,90 @@ class SseProxyService : Service() {
         }
     }
 
-    private fun handleStopStream(
+    private fun handleControl(
+        action: String,
         requestId: String,
-        expectedGeneration: Long,
+        expectedGeneration: String,
         controlConnection: ClientConnection,
     ) {
-        Log.i(TAG, "Stopping session: id=$requestId, expectedGeneration=$expectedGeneration")
         val session = activeSessions[requestId]
-        var stopped = false
-        var generation = 0L
-        if (session != null) {
+        var accepted = false
+        if (isGenerationId(expectedGeneration) && session != null) {
             val detached = synchronized(session) {
-                generation = session.generation
-                if (expectedGeneration <= 0L || session.generation != expectedGeneration) {
+                if (session.generation != expectedGeneration || !isCurrentSession(session)) {
                     return@synchronized null
                 }
+                if (action == "cancel") {
+                    accepted = true
+                    return@synchronized null
+                }
+                if (action == "ack_committed" && !session.isCompleted) return@synchronized null
                 if (!removeSession(session)) return@synchronized null
-                stopped = true
+                accepted = true
                 Pair(session.eventSource, session.takeConnection())
+            }
+            if (action == "cancel" && accepted) {
+                completeSession(session, "cancelled_by_user")
             }
             detached?.first?.cancel()
             detached?.second?.close()
         }
+        if (isGenerationId(expectedGeneration) && action != "cancel" &&
+            (accepted || activeSessions[requestId] == null)) {
+            val file = completedFile(requestId, expectedGeneration)
+            accepted = !file.exists() || file.delete()
+            if (!accepted) Log.e(TAG, "Failed to delete completed SSE file: $file")
+        }
         updateLocks()
         val ack = JSONObject().apply {
-            put("action", "stop_ack")
+            put("action", "${action}_ack")
             put("requestId", requestId)
-            put("generation", generation)
-            put("stopped", stopped)
+            put("generation", expectedGeneration)
+            put("accepted", accepted)
         }
         if (!controlConnection.enqueueAndAwait(ack.toString())) {
-            Log.w(TAG, "Failed to deliver stop ACK for requestId=$requestId")
+            Log.w(TAG, "Failed to deliver $action ACK for requestId=$requestId")
         }
     }
 
-    private fun sendEventToSession(session: StreamSession, eventType: String, data: String) {
+    private fun acceptUpstreamEvent(session: StreamSession, data: String) {
+        if (data.isBlank()) return
+        if (data.trim() == "[DONE]") {
+            completeSession(session, session.lastFinishReason ?: "completed")
+            return
+        }
+        val payload = try {
+            JSONObject(data)
+        } catch (error: Exception) {
+            completeSession(session, "error", "Invalid upstream SSE JSON: ${error.message}")
+            return
+        }
+        if (payload.has("error") && !payload.isNull("error")) {
+            val error = payload.get("error")
+            val message = (error as? JSONObject)?.opt("message") as? String ?: error.toString()
+            completeSession(session, "error", message)
+            return
+        }
+        val choice = payload.optJSONArray("choices")?.optJSONObject(0) ?: return
+        val content = choice.optJSONObject("delta")?.opt("content") as? String ?: ""
+        val reason = (choice.opt("finish_reason") as? String)?.takeIf { it.isNotEmpty() }
         var failedConnection: ClientConnection? = null
-        var overflowConnection: ClientConnection? = null
-        var overflowSource: EventSource? = null
         synchronized(session) {
-            if (!isCurrentSession(session) || session.terminalOverflow.get()) return
-            val eventObj = JSONObject().apply {
-                put("requestId", session.requestId)
-                put("generation", session.generation)
-                put("eventType", eventType)
-                put("eventData", data)
-                put("index", session.eventBuffer.size)
-            }
-            val eventJson = eventObj.toString()
-            val eventBytes = eventJson.toByteArray(Charsets.UTF_8).size.toLong()
-            val wouldOverflow = session.eventBuffer.size >= MAX_SESSION_EVENTS ||
-                session.bufferedBytes + eventBytes > MAX_SESSION_BUFFER_BYTES
-            if (wouldOverflow || !reserveGlobalBytes(eventBytes)) {
-                session.terminalOverflow.set(true)
-                session.isCompleted = true
-                session.lastFinishReason = "buffer_overflow"
-                overflowSource = session.eventSource
-                overflowConnection = session.takeConnection()
-                return@synchronized
-            }
-            session.eventBuffer.add(eventObj)
-            session.bufferedBytes += eventBytes
-            
+            if (!isCurrentSession(session) || session.isCompleted) return
+            session.fullContent.append(content)
+            if (reason != null) session.lastFinishReason = reason
             session.activeConnection?.let { connection ->
-                if (!connection.enqueue(eventJson)) {
+                if (!connection.enqueueFrames { emit ->
+                    var offset = 0
+                    do {
+                        val end = contentChunkEnd(content, offset, content.length)
+                        emit(sessionEvent(session, "data").apply {
+                            put("content", content.substring(offset, end))
+                            if (end == content.length) put("finishReason", reason)
+                        }.toString())
+                        offset = end
+                    } while (offset < content.length)
+                }) {
                     Log.w(TAG, "Client writer queue overflow. id=${session.requestId}")
                     if (session.detachConnection(connection)) {
                         failedConnection = connection
@@ -718,78 +743,55 @@ class SseProxyService : Service() {
                 }
             }
         }
-        if (overflowSource != null) {
-            Log.e(TAG, "Session buffer budget exceeded. id=${session.requestId}")
-            overflowSource?.cancel()
-            dumpSessionToFile(session)
-            overflowConnection?.enqueueAndAwait(JSONObject().apply {
-                put("requestId", session.requestId)
-                put("generation", session.generation)
-                put("eventType", "error")
-                put("eventData", JSONObject().apply { put("error", "Helper buffer limit exceeded") }.toString())
-            }.toString())
-            overflowConnection?.close()
-            cleanupCompletedSession(session)
-            return
-        }
         failedConnection?.close()
-        if (failedConnection != null) cleanupSessionIfCompletedAndDisconnected(session)
     }
 
-    private fun cleanupSessionIfCompletedAndDisconnected(session: StreamSession) {
-        val shouldDump = synchronized(session) {
-            if (!isCurrentSession(session) || !session.isCompleted) return
-            if (session.activeConnection == null) {
-                true
-            } else {
-                Log.i(TAG, "Session id=${session.requestId} completed while connected; grace cleanup armed.")
+    private fun completeSession(session: StreamSession, reason: String, error: String? = null) {
+        var failedConnection: ClientConnection? = null
+        val completed = synchronized(session) {
+            if (!isCurrentSession(session) || !session.complete(reason, error)) {
                 false
+            } else {
+                session.activeConnection?.let { connection ->
+                    val event = sessionEvent(session, "terminal").apply {
+                        put("finishReason", session.lastFinishReason)
+                        put("error", session.terminalError)
+                    }
+                    if (!connection.enqueue(event.toString()) && session.detachConnection(connection)) {
+                        failedConnection = connection
+                    }
+                }
+                true
             }
         }
-        if (shouldDump) {
-            Log.i(TAG, "Session id=${session.requestId} completed while disconnected. Dumping to disk immediately.")
-            dumpSessionToFile(session)
+        if (!completed) return
+        session.eventSource?.cancel()
+        failedConnection?.close()
+        if (reason != "cancelled_by_user") {
+            showStreamNotification(session, isSuccess = error == null, errorMsg = error)
         }
-        cleanupCompletedSession(session)
+        cleanupSessionIfCompletedAndDisconnected(session)
         updateLocks()
     }
 
-    private fun cleanupCompletedSession(session: StreamSession) {
-        if (!session.cleanupScheduled.compareAndSet(false, true)) return
-        Log.i(TAG, "Scheduling bounded cleanup for session id=${session.requestId}.")
-        serviceScope.launch(Dispatchers.IO) {
-            delay(COMPLETED_SESSION_GRACE_MS)
-            val detached = synchronized(session) {
-                if (!session.isCompleted || !removeSession(session)) return@synchronized null
-                Pair(session.eventSource, session.takeConnection())
+    private fun cleanupSessionIfCompletedAndDisconnected(session: StreamSession) {
+        synchronized(session) {
+            if (!isCurrentSession(session) || !session.isCompleted || session.activeConnection != null) return
+            // A resume waits for publication before observing not_found. The
+            // caller then rechecks the mailbox, avoiding an ownership gap.
+            if (persistOfflineCompletedSession(session)) {
+                removeSession(session)
             }
-            detached?.first?.cancel()
-            detached?.second?.close()
-            updateLocks()
         }
+        updateLocks()
     }
 
     private fun removeSession(session: StreamSession): Boolean {
         val removed = activeSessions.remove(session.requestId, session)
         if (removed) {
-            releaseSessionBudget(session)
             scheduleIdleStopIfNeeded()
         }
         return removed
-    }
-
-    private fun releaseSessionBudget(session: StreamSession) {
-        if (session.budgetReleased.compareAndSet(false, true)) {
-            globalBufferedBytes.addAndGet(-session.bufferedBytes)
-        }
-    }
-
-    private fun reserveGlobalBytes(bytes: Long): Boolean {
-        while (true) {
-            val current = globalBufferedBytes.get()
-            if (current + bytes > MAX_GLOBAL_BUFFER_BYTES) return false
-            if (globalBufferedBytes.compareAndSet(current, current + bytes)) return true
-        }
     }
 
     @Synchronized
@@ -810,46 +812,57 @@ class SseProxyService : Service() {
         }
     }
 
-    private fun dumpSessionToFile(session: StreamSession) {
-        try {
-            val cacheDir = File(applicationContext.cacheDir, "sse_cache")
-            if (!cacheDir.exists()) {
-                cacheDir.mkdirs()
+    private fun isGenerationId(value: String): Boolean = try {
+        UUID.fromString(value).toString() == value
+    } catch (_: IllegalArgumentException) {
+        false
+    }
+
+    private fun completedFile(requestId: String, generation: String): File =
+        File(applicationContext.cacheDir, "sse_offline_completed/${sha256(requestId)}.$generation.completed")
+
+    // Called with the session monitor held after it has physically terminated.
+    // On failure the session remains available for an explicit resume.
+    private fun persistOfflineCompletedSession(session: StreamSession): Boolean {
+        val target = completedFile(session.requestId, session.generation)
+        val temporary = File(target.parentFile, "${target.nameWithoutExtension}.tmp")
+        return try {
+            val directory = target.parentFile ?: throw java.io.IOException("Missing mailbox directory")
+            if (!directory.isDirectory && !directory.mkdirs()) {
+                throw java.io.IOException("Cannot create SSE mailbox directory")
             }
-            val safeId = sha256(session.requestId)
-            val file = File(cacheDir, "sse_recovered_$safeId.json")
-            
-            val events = synchronized(session) { session.eventBuffer.toList() }
-            val fullText = StringBuilder()
-            for (event in events) {
-                if (event.getString("eventType") == "message") {
-                    val eventData = event.getString("eventData")
-                    if (eventData != "[DONE]") {
-                        try {
-                            val dataVal = JSONObject(eventData)
-                            val choices = dataVal.optJSONArray("choices")
-                            if (choices != null && choices.length() > 0) {
-                                val delta = choices.getJSONObject(0).optJSONObject("delta")
-                                val contentObj = delta?.opt("content")
-                                if (contentObj != null && contentObj !== JSONObject.NULL) {
-                                    fullText.append(contentObj.toString())
-                                }
-                            }
-                        } catch (ignored: Exception) {}
-                    }
-                }
-            }
-            
-            val dumpObj = JSONObject().apply {
-                put("content", fullText.toString())
+            val metadata = JSONObject().apply {
+                put("schemaVersion", 1)
+                put("requestId", session.requestId)
+                put("generation", session.generation)
+                put("completedAt", System.currentTimeMillis())
+                put("context", session.contextJson)
                 put("finishReason", session.lastFinishReason ?: "completed")
-                put("timestamp", System.currentTimeMillis())
+                put("error", session.terminalError)
             }
-            
-            file.writeText(dumpObj.toString())
-            Log.i(TAG, "Successfully dumped session ${session.requestId} to file: ${file.absolutePath}")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to dump session to file", e)
+            FileOutputStream(temporary).use { stream ->
+                val writer = stream.bufferedWriter(Charsets.UTF_8)
+                writer.write(metadata.toString())
+                writer.write("\n")
+                var offset = 0
+                val length = session.fullContent.length
+                while (offset < length) {
+                    val chunk = session.contentChunk(offset, length)
+                    writer.write(chunk)
+                    offset += chunk.length
+                }
+                writer.flush()
+                stream.fd.sync()
+            }
+            Files.move(temporary.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+            Log.i(TAG, "Published completed SSE reply for ${session.requestId}")
+            true
+        } catch (error: Exception) {
+            Log.e(TAG, "Failed to publish completed SSE reply; retaining session ${session.requestId}", error)
+            if (temporary.exists() && !temporary.delete()) {
+                Log.w(TAG, "Failed to remove incomplete SSE temporary file: $temporary")
+            }
+            false
         }
     }
 
@@ -864,9 +877,8 @@ class SseProxyService : Service() {
 
     @Synchronized
     private fun checkSelfTermination() {
-        val hasRunning = activeSessions.values.any { !it.isCompleted }
-        if (isTaskRemoved && !hasRunning) {
-            Log.i(TAG, "Task removed and no running sessions. Stopping service.")
+        if (isTaskRemoved && activeSessions.isEmpty()) {
+            Log.i(TAG, "Task removed and all sessions released. Stopping service.")
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                 stopForeground(STOP_FOREGROUND_REMOVE)
             } else {
@@ -1013,13 +1025,9 @@ class SseProxyService : Service() {
     }
 
     private fun sha256(input: String): String {
-        return try {
-            val digest = java.security.MessageDigest.getInstance("SHA-256")
-            val hash = digest.digest(input.toByteArray(Charsets.UTF_8))
-            hash.joinToString("") { "%02x".format(it) }
-        } catch (e: Exception) {
-            input.hashCode().toString()
-        }
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+        val hash = digest.digest(input.toByteArray(Charsets.UTF_8))
+        return hash.joinToString("") { "%02x".format(it) }
     }
 
     private fun readLengthPrefixed(inputStream: java.io.InputStream): String? {
@@ -1105,28 +1113,9 @@ class SseProxyService : Service() {
         if (isSuccess) {
             title = "✨ $agentName 已回复"
             
-            val events = synchronized(session) { session.eventBuffer.toList() }
-            val fullText = StringBuilder()
-            for (event in events) {
-                    if (event.getString("eventType") == "message") {
-                        val eventData = event.getString("eventData")
-                        if (eventData != "[DONE]") {
-                            try {
-                                val dataVal = JSONObject(eventData)
-                                val choices = dataVal.optJSONArray("choices")
-                                if (choices != null && choices.length() > 0) {
-                                    val delta = choices.getJSONObject(0).optJSONObject("delta")
-                                    val contentObj = delta?.opt("content")
-                                    if (contentObj != null && contentObj !== JSONObject.NULL) {
-                                        fullText.append(contentObj.toString())
-                                    }
-                                }
-                            } catch (ignored: Exception) {}
-                        }
-                    }
+            val replyText = synchronized(session) {
+                session.contentChunk(0, session.fullContent.length).trim()
             }
-            
-            val replyText = fullText.toString().trim()
             val cleanReply = cleanTextForNotification(replyText)
             val singleLineReply = cleanReply.replace("\n", " ").replace("\r", " ").trim()
             

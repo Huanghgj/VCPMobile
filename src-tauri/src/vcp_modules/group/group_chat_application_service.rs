@@ -230,7 +230,20 @@ async fn run_group_speaker_turn(
             agent_id,
             failure
         );
+        let recovery_pending = failure.is_recovery_pending();
         let (error, partial_content) = failure.into_parts();
+        if recovery_pending {
+            let notice = format!("后台生成连接中断，稍后返回前台可继续接管：{error}");
+            let mut event = StreamEvent::error(message_id, context, notice.clone());
+            event.content = partial_content;
+            crate::vcp_modules::vcp_client::deliver_request_event(
+                app_handle,
+                &request_key,
+                stream_channel.clone(),
+                event,
+            );
+            return Err(notice);
+        }
         let _ = crate::vcp_modules::vcp_client::finalize_stream_error(
             app_handle,
             db_pool,

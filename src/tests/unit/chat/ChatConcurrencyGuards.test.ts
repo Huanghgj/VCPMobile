@@ -9,6 +9,7 @@ import { useChatStreamStore } from "@/core/stores/chatStreamStore";
 import { useSettingsStore } from "@/core/stores/settings";
 import { useAssistantStore } from "@/core/stores/assistant";
 import { useAttachmentStore } from "@/core/stores/attachmentStore";
+import { useNotificationStore } from "@/core/stores/notification";
 import {
   channelInstances,
   invokeMock,
@@ -140,6 +141,170 @@ describe("chat conversation concurrency guards", () => {
     expect(invokeMock.mock.calls.some(([command]) => command === "recover_active_generation")).toBe(false);
     expect(stream.isMessageActive("agent-a", "agent", "topic-a", "finished-during-scan")).toBe(false);
     expect(stream.getActiveStreamMessage("agent-a", "agent", "topic-a", "finished-during-scan")?.isReconnecting).toBe(false);
+  });
+
+  it("keeps loaded content until a cold recovery snapshot replaces it before live deltas", async () => {
+    const session = useChatSessionStore();
+    session.setConversation({ id: "agent-a", type: "agent" }, "topic-a");
+    mockInvoke("load_chat_history", () => [{
+      id: "recovering", role: "assistant", content: "saved partial", timestamp: 1,
+      blocks: [{ type: "markdown", content: "saved partial" }],
+    }]);
+    const history = useChatHistoryStore();
+    await history.loadHistory("agent-a", "agent", "topic-a");
+    mockInvoke("get_active_generations", () => [{
+      msgId: "recovering", topicId: "topic-a", ownerId: "agent-a", ownerType: "agent", createdAt: 1,
+    }]);
+    const recovery = deferred<any>();
+    let output: { emit: (event: unknown) => void } | undefined;
+    mockInvoke("recover_active_generation", args => {
+      output = args?.streamChannel as typeof output;
+      return recovery.promise;
+    });
+    const stream = useChatStreamStore();
+    await stream.checkAndRecoverInterruptedStreams();
+    expect(history.currentChatHistory[0]?.content).toBe("saved partial");
+    expect(history.currentChatHistory[0]?.blocks?.[0]).toMatchObject({ content: "saved partial" });
+
+    const event = {
+      type: "aurora", messageId: "recovering", consumerRevision: 130,
+      context: { ownerId: "agent-a", ownerType: "agent", topicId: "topic-a" },
+    };
+    output?.emit({ ...event, aurora: {
+      kind: "snapshot", streamId: 60, content: "helper snapshot", stableBlocks: [],
+      tailBlock: { type: "markdown", content: "helper snapshot", hash: "base" },
+    } });
+    output?.emit({ ...event, aurora: {
+      kind: "delta", streamId: 60, chunk: " + live",
+      tailOp: { op: "append", content: " + live", previousHash: "base", hash: "next", mode: "plain", blockType: "markdown" },
+    } });
+    await new Promise<void>(resolve => window.setTimeout(resolve, 0));
+    expect(history.currentChatHistory).toHaveLength(1);
+    expect(history.currentChatHistory[0]?.content).toBe("helper snapshot + live");
+    expect(history.currentChatHistory[0]?.tailContent).toBe("helper snapshot + live");
+    expect(history.currentChatHistory[0]?.blocks).toEqual([]);
+    recovery.resolve({ status: "attached" });
+    await flushPromises();
+  });
+
+  it("preserves new content on recovery rejection and clears its temporary error on the next pending scan", async () => {
+    const session = useChatSessionStore();
+    session.setConversation({ id: "agent-a", type: "agent" }, "topic-a");
+    const stream = useChatStreamStore();
+    const output = useChatHistoryStore().makeStreamChannel(null);
+    const event = {
+      type: "aurora", messageId: "partial", consumerRevision: 140,
+      context: { ownerId: "agent-a", ownerType: "agent", topicId: "topic-a" },
+    };
+    output.onmessage?.({ ...event, aurora: {
+      kind: "snapshot", streamId: 70, content: "old", stableBlocks: [],
+    } } as any);
+    await new Promise<void>(resolve => window.setTimeout(resolve, 0));
+    mockInvoke("get_active_generations", () => [{
+      msgId: "partial", topicId: "topic-a", ownerId: "agent-a", ownerType: "agent", createdAt: 1,
+    }]);
+    const recovery = deferred<any>();
+    mockInvoke("recover_active_generation", () => recovery.promise);
+    mockInvoke("process_message_content", args => [{ type: "markdown", content: args?.content }]);
+    await stream.checkAndRecoverInterruptedStreams();
+    output.onmessage?.({ ...event, aurora: {
+      kind: "delta", streamId: 70, chunk: " + newly received",
+    } } as any);
+    recovery.reject(new Error("connection unavailable"));
+    await flushPromises();
+    const partial = stream.getActiveStreamMessage("agent-a", "agent", "topic-a", "partial");
+    expect(partial?.content).toBe("old + newly received");
+    expect(partial?.blocks).toEqual([{ type: "markdown", content: "old + newly received" }]);
+    expect(partial?.isReconnecting).toBe(false);
+    expect(partial?.finishReason).toBe("error");
+    expect(stream.isMessageActive("agent-a", "agent", "topic-a", "partial")).toBe(false);
+    expect(useNotificationStore().activeToasts).toEqual(expect.arrayContaining([
+      expect.objectContaining({ title: "流式接续失败", message: "connection unavailable" }),
+    ]));
+
+    mockInvoke("recover_active_generation", () => ({ status: "attached" }));
+    await stream.checkAndRecoverInterruptedStreams();
+    expect(partial?.content).toBe("old + newly received");
+    expect(partial?.finishReason).toBeUndefined();
+    expect(partial?.isReconnecting).toBe(true);
+    output.onmessage?.({ ...event, consumerRevision: 141, aurora: {
+      kind: "snapshot", streamId: 71, content: "reattached content", stableBlocks: [],
+    } } as any);
+    await new Promise<void>(resolve => window.setTimeout(resolve, 0));
+    expect(partial?.content).toBe("reattached content");
+    expect(partial?.finishReason).toBeUndefined();
+    expect(partial?.isReconnecting).toBe(false);
+    expect(stream.isMessageActive("agent-a", "agent", "topic-a", "partial")).toBe(true);
+  });
+
+  it.each(["response", "rejection"])("keeps a committed deletion ahead of pending frames and a late recovery %s", async outcome => {
+    useAssistantStore().agents = [{ id: "agent-a", name: "Agent A", model: "test", avatarCalculatedColor: null }];
+    const session = useChatSessionStore();
+    session.setConversation({ id: "agent-a", type: "agent" }, "topic-a");
+    mockInvoke("load_chat_history", () => [{
+      id: "deleted", role: "assistant", content: "partial", timestamp: 1, blocks: [],
+    }]);
+    const history = useChatHistoryStore();
+    await history.loadHistory("agent-a", "agent", "topic-a");
+    mockInvoke("get_active_generations", () => [{
+      msgId: "deleted", topicId: "topic-a", ownerId: "agent-a", ownerType: "agent", createdAt: 1,
+    }]);
+    const recovery = deferred<any>();
+    let output: { emit: (event: unknown) => void } | undefined;
+    mockInvoke("recover_active_generation", args => {
+      output = args?.streamChannel as typeof output;
+      return recovery.promise;
+    });
+    mockInvoke("delete_messages", () => ({ msgCount: 0, updatedAt: 2 }));
+    mockInvoke("get_topics_streamed", args => {
+      const topics = args?.onChunk as { emit: (event: unknown) => void };
+      topics.emit([{ id: "topic-a", name: "Topic A", createdAt: 1 }]);
+    });
+    const stream = useChatStreamStore();
+    await stream.checkAndRecoverInterruptedStreams();
+    const context = { ownerId: "agent-a", ownerType: "agent", topicId: "topic-a" };
+    output?.emit({
+      type: "aurora", messageId: "deleted", consumerRevision: 150, context,
+      aurora: { kind: "snapshot", streamId: 80, content: "pending frame", stableBlocks: [] },
+    });
+    await history.deleteMessage(history.captureMessageActionKey("deleted")!);
+    output?.emit({
+      type: "end", messageId: "deleted", consumerRevision: 150, context,
+      content: "late terminal", finishReason: "completed", blocks: [],
+    });
+    if (outcome === "response") recovery.resolve({ status: "completed", content: "late result" });
+    else recovery.reject(new Error("late rejection"));
+    await flushPromises();
+    await new Promise<void>(resolve => window.setTimeout(resolve, 0));
+    expect(history.currentChatHistory).toEqual([]);
+    expect(stream.getActiveStreamMessage("agent-a", "agent", "topic-a", "deleted")).toBeUndefined();
+    expect(stream.isMessageActive("agent-a", "agent", "topic-a", "deleted")).toBe(false);
+    expect(useNotificationStore().activeToasts).toEqual([]);
+    await stream.checkAndRecoverInterruptedStreams();
+    expect(invokeMock.mock.calls.filter(([command]) => command === "recover_active_generation")).toHaveLength(1);
+  });
+
+  it("inserts an offline durable end delivered during the startup scan without a recovery placeholder", async () => {
+    const session = useChatSessionStore();
+    session.setConversation({ id: "agent-a", type: "agent" }, "topic-a");
+    mockInvoke("load_chat_history", () => []);
+    const history = useChatHistoryStore();
+    await history.loadHistory("agent-a", "agent", "topic-a");
+    mockInvoke("get_active_generations", args => {
+      const output = args?.streamChannel as { emit: (event: unknown) => void };
+      output.emit({
+        type: "end", messageId: "offline", consumerRevision: 160,
+        context: { ownerId: "agent-a", ownerType: "agent", topicId: "topic-a" },
+        content: "offline result", finishReason: "completed",
+        blocks: [{ type: "markdown", content: "offline result" }],
+      });
+      return [];
+    });
+    await useChatStreamStore().checkAndRecoverInterruptedStreams();
+    expect(history.currentChatHistory).toEqual([
+      expect.objectContaining({ id: "offline", content: "offline result", isReconnecting: false }),
+    ]);
+    expect(invokeMock.mock.calls.some(([command]) => command === "recover_active_generation")).toBe(false);
   });
 
   it("invalidates an A snapshot even when selection later returns to A", () => {
@@ -509,8 +674,8 @@ describe("chat conversation concurrency guards", () => {
     expect(recoveryCalls).toHaveLength(1);
     expect(recoveryCalls[0]?.[1]).toMatchObject({
       msgId: "assistant-recovery",
-      isWarm: false,
     });
+    expect(recoveryCalls[0]?.[1]).not.toHaveProperty("isWarm");
     expect(
       invokeMock.mock.calls.some(([command]) => command === "resume_stream"),
     ).toBe(false);

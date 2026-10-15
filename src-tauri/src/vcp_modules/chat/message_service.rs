@@ -1512,6 +1512,24 @@ async fn finalize_stream_message_inner<R: tauri::Runtime>(
                     (Some(blocks), start_timestamp, Some(updated_at))
                 }
                 Err(error) => {
+                    // A deletion or a competing durable commit may have won
+                    // while this stream was draining. Such a result has no
+                    // recovery owner; a real database failure still retains it.
+                    let pending = sqlx::query_scalar::<_, bool>(
+                        "SELECT EXISTS(SELECT 1 FROM active_generations
+                         WHERE owner_type = ? AND owner_id = ? AND topic_id = ? AND msg_id = ?)",
+                    )
+                    .bind(owner_type)
+                    .bind(owner_id)
+                    .bind(topic_id)
+                    .bind(message_id)
+                    .fetch_one(pool)
+                    .await;
+                    if matches!(pending, Ok(false)) {
+                        crate::vcp_modules::vcp_client::discard_request_helper(
+                            &app_handle, message_key,
+                        ).await;
+                    }
                     let mut event = crate::vcp_modules::vcp_client::StreamEvent::error(
                         message_id.to_string(),
                         context.clone(),
@@ -1525,6 +1543,8 @@ async fn finalize_stream_message_inner<R: tauri::Runtime>(
                 }
             }
         };
+
+    crate::vcp_modules::vcp_client::release_committed_helper(&app_handle, message_key).await;
 
     {
         let event = crate::vcp_modules::vcp_client::StreamEvent::end(
