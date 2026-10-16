@@ -171,11 +171,17 @@ async fn reconcile_ios_foreground_services(app: &AppHandle, is_foreground: bool)
     match read_settings(app.clone(), app.state()).await {
         Ok(settings) => {
             crate::vcp_modules::vcp_log_service::reconnect_log_connections(
-                app, settings.vcp_log_url, settings.vcp_log_key,
-            ).await;
-            crate::vcp_modules::infra::lifecycle_reconciler::reconcile_distributed_node(app, false).await;
+                app,
+                settings.vcp_log_url,
+                settings.vcp_log_key,
+            )
+            .await;
+            crate::vcp_modules::infra::lifecycle_reconciler::reconcile_distributed_node(app, false)
+                .await;
         }
-        Err(error) => log::warn!("[Lifecycle] Cannot restore configured foreground connections: {error}"),
+        Err(error) => {
+            log::warn!("[Lifecycle] Cannot restore configured foreground connections: {error}")
+        }
     }
     // Manual Sync is never restarted by foreground restoration. Chat reattaches
     // through its existing output owner; it is not reissued from lifecycle.
@@ -216,7 +222,7 @@ async fn reconcile_foreground_services(
 
         // 1.1b 申请持有 vcp_log 对应的原生进程级前台锁，以保证 10 分钟内后台存活
         if let Err(error) = tauri_plugin_vcp_mobile::stream::acquire_foreground_inner(
-            &app,
+            app,
             "vcp_log",
             10,
             "VCP Log Linger",
@@ -278,7 +284,7 @@ async fn reconcile_foreground_services(
                     return;
                 }
 
-                match tauri_plugin_vcp_mobile::stream::set_keepalive_mode_inner(&app, true) {
+                match tauri_plugin_vcp_mobile::stream::set_keepalive_mode_inner(app, true) {
                     Ok(()) => {
                         log::info!("[Lifecycle] Distributed background Guardian lease acquired.")
                     }
@@ -342,13 +348,13 @@ async fn reconcile_foreground_services(
             }
         }
         if let Err(error) =
-            tauri_plugin_vcp_mobile::stream::release_foreground_inner(&app, "vcp_log")
+            tauri_plugin_vcp_mobile::stream::release_foreground_inner(app, "vcp_log")
         {
             log::warn!("[Lifecycle] Failed to release VCP Log lease on resume: {error}");
         }
 
         // 2.2 lifecycle 是 distributed Guardian tag 的唯一 owner；回前台无条件收回后台租约。
-        if let Err(error) = tauri_plugin_vcp_mobile::stream::set_keepalive_mode_inner(&app, false) {
+        if let Err(error) = tauri_plugin_vcp_mobile::stream::set_keepalive_mode_inner(app, false) {
             log::warn!("[Lifecycle] Failed to release distributed lease on resume: {error}");
         }
 
@@ -366,13 +372,13 @@ async fn reconcile_foreground_services(
                 if !log_url.trim().is_empty() && !log_key.trim().is_empty() {
                     log::info!("[Lifecycle] App returned to foreground. Reconnecting VCPLog/Info.");
                     let _ = crate::vcp_modules::infra::vcp_log_service::reconnect_log_connections(
-                        &app, log_url, log_key,
+                        app, log_url, log_key,
                     )
                     .await;
                 }
             } else {
                 // 如果连接没有断开，则冲刷后台缓存的日志消息到前端 WebView
-                crate::vcp_modules::infra::vcp_log_service::flush_background_logs(&app);
+                crate::vcp_modules::infra::vcp_log_service::flush_background_logs(app);
             }
 
             if was_dist_disconnected && settings.distributed_enabled {
@@ -380,7 +386,7 @@ async fn reconcile_foreground_services(
                     "[Lifecycle] App returned to foreground. Reconnecting distributed client."
                 );
                 crate::vcp_modules::infra::lifecycle_reconciler::reconcile_distributed_node(
-                    &app, false,
+                    app, false,
                 )
                 .await;
             }

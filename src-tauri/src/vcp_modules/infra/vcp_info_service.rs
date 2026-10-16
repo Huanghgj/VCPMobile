@@ -11,17 +11,21 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 use url::Url;
 
+type ConnectionIntent = (u64, Option<Url>);
+
 lazy_static::lazy_static! {
     static ref INFO_CONNECTION_ACTIVE: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     static ref METADATA_LIST: Arc<RwLock<VecDeque<Value>>> = Arc::new(RwLock::new(VecDeque::new()));
     static ref COMPRESSED_PAYLOADS: Arc<RwLock<HashMap<String, Vec<u8>>>> = Arc::new(RwLock::new(HashMap::new()));
-    static ref WS_INFO_URL_CHANNEL: (watch::Sender<(u64, Option<Url>)>, watch::Receiver<(u64, Option<Url>)>) = watch::channel((0, None));
+    static ref WS_INFO_URL_CHANNEL: (watch::Sender<ConnectionIntent>, watch::Receiver<ConnectionIntent>) = watch::channel((0, None));
     static ref CURRENT_INFO_STATUS: Arc<RwLock<String>> = Arc::new(RwLock::new("closed".to_string()));
 }
 
 fn set_info_url(url: Option<Url>) {
     WS_INFO_URL_CHANNEL.0.send_if_modified(|current| {
-        if current.1 == url { return false; }
+        if current.1 == url {
+            return false;
+        }
         current.0 = current.0.wrapping_add(1);
         current.1 = url;
         true
@@ -299,7 +303,9 @@ async fn start_vcp_info_listener<R: tauri::Runtime>(app_handle: AppHandle<R>) {
 
         if connection_succeeded {
             if let Some(ws_stream) = ws_stream_opt {
-                if url_rx.borrow().0 != connection_revision { continue; }
+                if url_rx.borrow().0 != connection_revision {
+                    continue;
+                }
                 retry_delay = Duration::from_millis(1000);
                 {
                     *CURRENT_INFO_STATUS.write().await = "connected".to_string();

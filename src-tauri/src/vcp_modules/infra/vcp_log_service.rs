@@ -12,6 +12,8 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 use url::Url;
 
+type ConnectionIntent = (u64, Option<Url>);
+
 static HEARTBEAT_INTERVAL_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(15000);
 const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -29,7 +31,9 @@ impl Write for LogSizeBudget {
         Ok(bytes.len())
     }
 
-    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -48,7 +52,9 @@ impl BackgroundLogBuffer {
             return;
         }
         let size = MAX_BACKGROUND_LOG_BYTES - budget.0;
-        while self.entries.len() >= MAX_BACKGROUND_LOGS || self.bytes + size > MAX_BACKGROUND_LOG_BYTES {
+        while self.entries.len() >= MAX_BACKGROUND_LOGS
+            || self.bytes + size > MAX_BACKGROUND_LOG_BYTES
+        {
             if let Some((_, removed_size)) = self.entries.pop_front() {
                 self.bytes -= removed_size;
                 self.dropped = self.dropped.saturating_add(1);
@@ -65,7 +71,7 @@ lazy_static::lazy_static! {
     static ref LOG_CONNECTION_ACTIVE: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     static ref LOG_SENDER: Arc<tokio::sync::Mutex<Option<mpsc::Sender<Value>>>> = Arc::new(tokio::sync::Mutex::new(None));
     // 关键修复：保持 Sender 和一个 Receiver 都在生命周期内，防止通道因无接收者而被视为关闭
-    static ref WS_URL_CHANNEL: (watch::Sender<(u64, Option<Url>)>, watch::Receiver<(u64, Option<Url>)>) = watch::channel((0, None));
+    static ref WS_URL_CHANNEL: (watch::Sender<ConnectionIntent>, watch::Receiver<ConnectionIntent>) = watch::channel((0, None));
     static ref CURRENT_LOG_STATUS: Arc<tokio::sync::RwLock<String>> = Arc::new(tokio::sync::RwLock::new("closed".to_string()));
     static ref HEARTBEAT_RESET_TX: Arc<tokio::sync::Mutex<Option<mpsc::Sender<()>>>> = Arc::new(tokio::sync::Mutex::new(None));
     // 缓存 App 在后台期间接收到的 VCPLog 消息，避免丢弃和 WebView 积压，待返回前台时一并冲刷
@@ -74,7 +80,9 @@ lazy_static::lazy_static! {
 
 fn set_log_url(url: Option<Url>) {
     WS_URL_CHANNEL.0.send_if_modified(|current| {
-        if current.1 == url { return false; }
+        if current.1 == url {
+            return false;
+        }
         current.0 = current.0.wrapping_add(1);
         current.1 = url;
         true
@@ -133,7 +141,10 @@ pub fn flush_background_logs<R: tauri::Runtime>(app: &AppHandle<R>) {
         }
     };
     if logs.dropped > 0 {
-        log::warn!("[VCPLog] Background UI cache discarded {} older/oversized entries", logs.dropped);
+        log::warn!(
+            "[VCPLog] Background UI cache discarded {} older/oversized entries",
+            logs.dropped
+        );
     }
     if !logs.entries.is_empty() {
         log::info!(
@@ -424,7 +435,9 @@ async fn start_vcp_log_listener<R: tauri::Runtime>(app_handle: AppHandle<R>) {
 
         if connection_succeeded {
             if let Some(ws_stream) = ws_stream_opt {
-                if url_rx.borrow().0 != connection_revision { continue; }
+                if url_rx.borrow().0 != connection_revision {
+                    continue;
+                }
                 retry_delay = Duration::from_millis(1000);
                 // Outbound messages belong to this socket, not the persistent
                 // reconnect loop. Dropping it also drops unsent old-config data.
@@ -635,7 +648,13 @@ mod tests {
         for index in 0..MAX_BACKGROUND_LOGS + 3 {
             cache.push(serde_json::json!({ "index": index }));
         }
-        assert_eq!(cache.entries.front().map(|(value, _)| value["index"].as_u64()), Some(Some(3)));
+        assert_eq!(
+            cache
+                .entries
+                .front()
+                .map(|(value, _)| value["index"].as_u64()),
+            Some(Some(3))
+        );
         assert_eq!(cache.entries.len(), MAX_BACKGROUND_LOGS);
         let old_bytes = cache.bytes;
         cache.push(serde_json::json!({ "data": "x".repeat(MAX_BACKGROUND_LOG_BYTES) }));

@@ -1459,7 +1459,11 @@ pub fn write_clipboard_native<R: Runtime>(
     }
     #[cfg(target_os = "ios")]
     {
-        crate::ios::run::<R, ()>(app, "writeClipboard", serde_json::json!({ "content": content }))?;
+        crate::ios::run::<R, ()>(
+            app,
+            "writeClipboard",
+            serde_json::json!({ "content": content }),
+        )?;
     }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {

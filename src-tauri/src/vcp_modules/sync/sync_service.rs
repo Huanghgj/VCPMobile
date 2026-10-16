@@ -1316,7 +1316,9 @@ fn parse_sync_endpoint(
 
 fn endpoint_has_loopback_host(endpoint: &url::Url) -> bool {
     match endpoint.host() {
-        Some(url::Host::Domain(host)) => host.trim_end_matches('.').eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Domain(host)) => {
+            host.trim_end_matches('.').eq_ignore_ascii_case("localhost")
+        }
         Some(url::Host::Ipv4(address)) => address.is_loopback(),
         Some(url::Host::Ipv6(address)) => address.is_loopback(),
         None => false,
@@ -3188,10 +3190,7 @@ fn emit_operator_sync_log<R: Runtime>(
 }
 
 #[tauri::command]
-pub async fn stop_sync(
-    handle: AppHandle,
-    state: State<'_, SyncState>,
-) -> Result<(), String> {
+pub async fn stop_sync(handle: AppHandle, state: State<'_, SyncState>) -> Result<(), String> {
     stop_sync_session(&handle, &state, false).await
 }
 
@@ -3227,7 +3226,12 @@ async fn stop_sync_session(
     if let Some(session_id) = stopping_session_id {
         *state.connection_status.write().await = "stopping".to_string();
         if notify_background {
-            emit_operator_sync_log(handle, session_id, "warning", "应用已切到后台，正在结束手动同步");
+            emit_operator_sync_log(
+                handle,
+                session_id,
+                "warning",
+                "应用已切到后台，正在结束手动同步",
+            );
         }
     }
     let join_result = if let Some(session) = owned_session.as_mut() {
@@ -3289,7 +3293,15 @@ async fn finish_sync_session(handle: &AppHandle, session_id: u64, outcome: &Resu
     if status.as_str() == "stopping" {
         *status = "disconnected".to_string();
         drop(status);
-        emit_sync_interruption(handle, session_id, if outcome.is_ok() { "SYNC_STOPPED" } else { "SYNC_STOP_FAILED" });
+        emit_sync_interruption(
+            handle,
+            session_id,
+            if outcome.is_ok() {
+                "SYNC_STOPPED"
+            } else {
+                "SYNC_STOP_FAILED"
+            },
+        );
     }
 }
 
@@ -3310,7 +3322,11 @@ async fn cancel_and_join_session(
     tokio::time::timeout(wait, &mut session.join_handle)
         .await
         .ok()
-        .map(|result| result.map_err(|error| format!("同步会话退出失败: {error}")).and_then(|result| result))
+        .map(|result| {
+            result
+                .map_err(|error| format!("同步会话退出失败: {error}"))
+                .and_then(|result| result)
+        })
 }
 
 #[tauri::command]
@@ -3389,7 +3405,7 @@ pub async fn start_manual_sync(
         &settings,
         cfg!(any(target_os = "android", target_os = "ios")),
     )
-        .map_err(|error| encode_sync_command_error(error.code, &error.detail))?;
+    .map_err(|error| encode_sync_command_error(error.code, &error.detail))?;
 
     #[cfg(target_os = "ios")]
     if !crate::vcp_modules::lifecycle_manager::is_app_in_foreground(&handle) {
@@ -4513,12 +4529,20 @@ mod tests {
             write_finished.await.map_err(|error| error.to_string())?;
             Ok(())
         });
-        let mut session = SyncSessionHandle { session_id: 8, cancel_token, join_handle };
+        let mut session = SyncSessionHandle {
+            session_id: 8,
+            cancel_token,
+            join_handle,
+        };
 
-        assert!(cancel_and_join_session(&mut session, Duration::ZERO).await.is_none());
+        assert!(cancel_and_join_session(&mut session, Duration::ZERO)
+            .await
+            .is_none());
         assert!(session.cancel_token.is_cancelled());
         assert!(!session.join_handle.is_finished());
-        finish_write.send(()).expect("the old session must still own its accepted write");
+        finish_write
+            .send(())
+            .expect("the old session must still own its accepted write");
         cancel_and_join_session(&mut session, Duration::from_secs(1))
             .await
             .expect("the retained session must eventually settle")

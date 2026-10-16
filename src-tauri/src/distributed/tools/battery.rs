@@ -11,7 +11,8 @@ impl StreamingTool for BatteryInfoTool {
     fn manifest(&self) -> ToolManifest {
         ToolManifest {
             name: "MobileBatteryInfo".to_string(),
-            description: "读取电量、充电状态与低电量模式；系统未提供的电池温度等字段明确报告缺失。".to_string(),
+            description: "读取电量、充电状态与低电量模式；系统未提供的电池温度等字段明确报告缺失。"
+                .to_string(),
             display_name: "电池状态".to_string(),
             placeholder: Some("{{MobileBattery}}".to_string()),
             invocation_commands: vec![],

@@ -18,7 +18,9 @@ tauri::ios_plugin_binding!(init_plugin_vcp_mobile);
 // never be interpreted as a completed native operation on an iPhone or iPad.
 #[cfg(target_os = "ios")]
 fn ios_not_implemented<T>(operation: &str) -> Result<T, String> {
-    Err(format!("not_implemented: {operation} has no iOS adapter yet"))
+    Err(format!(
+        "not_implemented: {operation} has no iOS adapter yet"
+    ))
 }
 
 #[cfg(target_os = "ios")]

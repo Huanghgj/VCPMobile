@@ -274,11 +274,7 @@ pub async fn delete_topic(
     }
 
     for message_key in deletion.active_messages {
-        crate::vcp_modules::vcp_client::discard_deleted_generation(
-            &app_handle,
-            &message_key,
-        )
-        .await;
+        crate::vcp_modules::vcp_client::discard_deleted_generation(&app_handle, &message_key).await;
     }
 
     if let Some(sync_state) = app_handle.try_state::<SyncState>() {

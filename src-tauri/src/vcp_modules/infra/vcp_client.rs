@@ -12,9 +12,9 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::{ipc::Channel, AppHandle, Manager, Runtime};
+use tokio_util::codec::FramedRead;
 #[cfg(target_os = "android")]
 use tokio_util::codec::LengthDelimitedCodec;
-use tokio_util::codec::FramedRead;
 #[cfg(not(target_os = "android"))]
 use tokio_util::io::StreamReader;
 use tokio_util::sync::CancellationToken;
@@ -476,7 +476,11 @@ impl RequestOutput {
         if state.closed {
             return Ok(false);
         }
-        if state.channel.as_ref().is_some_and(|current| current.id() == channel.id()) {
+        if state
+            .channel
+            .as_ref()
+            .is_some_and(|current| current.id() == channel.id())
+        {
             return Ok(true);
         }
         state.channel = Some(channel);
@@ -512,9 +516,12 @@ impl RequestOutput {
     fn send_locked(state: &RequestOutputState, mut event: StreamEvent) -> bool {
         event.consumer_revision = state.consumer_revision;
         match &state.channel {
-            Some(channel) => channel.send(event).map_err(|error| {
-                log::warn!("[VCPClient] Stream consumer delivery failed: {error}");
-            }).is_ok(),
+            Some(channel) => channel
+                .send(event)
+                .map_err(|error| {
+                    log::warn!("[VCPClient] Stream consumer delivery failed: {error}");
+                })
+                .is_ok(),
             None => true,
         }
     }
@@ -571,10 +578,12 @@ fn request_output<R: Runtime>(
     key: &MessageKey,
     channel: Option<Channel<StreamEvent>>,
 ) -> Arc<RequestOutput> {
-    let output = app.try_state::<ActiveRequests>()
+    let output = app
+        .try_state::<ActiveRequests>()
         .and_then(|requests| requests.0.get(key).map(|entry| entry.output.clone()))
         .unwrap_or_default();
-    let group = app.try_state::<ActiveGroupTurns>()
+    let group = app
+        .try_state::<ActiveGroupTurns>()
         .and_then(|turns| turns.0.get(&key.topic).map(|entry| entry.value().clone()));
     if let Some(group) = group {
         if let Ok(mut current) = group.channel.lock() {
@@ -622,7 +631,9 @@ pub(crate) async fn discard_deleted_generation<R: Runtime>(app: &AppHandle<R>, k
         // foreground service. The UUID prevents a late control affecting a
         // different helper generation.
         let generation = query_helper_generation(app, &request_id).await.ok();
-        let Some(db) = app.try_state::<DbState>() else { return; };
+        let Some(db) = app.try_state::<DbState>() else {
+            return;
+        };
         let pending = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM active_generations
              WHERE owner_type = ? AND owner_id = ? AND topic_id = ? AND msg_id = ?)",
@@ -642,8 +653,13 @@ pub(crate) async fn discard_deleted_generation<R: Runtime>(app: &AppHandle<R>, k
                 log::warn!("[VCPClient] Deleted generation helper cleanup failed: {error}");
             }
         }
-        let Ok(cache) = app.path().app_cache_dir() else { return; };
-        let prefix = format!("{}.", crate::vcp_modules::infra::utils::calculate_sha256(request_id.as_bytes()));
+        let Ok(cache) = app.path().app_cache_dir() else {
+            return;
+        };
+        let prefix = format!(
+            "{}.",
+            crate::vcp_modules::infra::utils::calculate_sha256(request_id.as_bytes())
+        );
         if let Ok(mut entries) = tokio::fs::read_dir(cache.join("sse_offline_completed")).await {
             while let Ok(Some(entry)) = entries.next_entry().await {
                 let name = entry.file_name();
@@ -651,7 +667,9 @@ pub(crate) async fn discard_deleted_generation<R: Runtime>(app: &AppHandle<R>, k
                 if name.starts_with(&prefix) && name.ends_with(".completed") {
                     if let Err(error) = tokio::fs::remove_file(entry.path()).await {
                         if error.kind() != std::io::ErrorKind::NotFound {
-                            log::warn!("[VCPClient] Deleted generation file cleanup failed: {error}");
+                            log::warn!(
+                                "[VCPClient] Deleted generation file cleanup failed: {error}"
+                            );
                         }
                     }
                 }
@@ -660,23 +678,25 @@ pub(crate) async fn discard_deleted_generation<R: Runtime>(app: &AppHandle<R>, k
     }
 }
 
-async fn settle_helper_handoff<R: Runtime>(
-    app: &AppHandle<R>,
-    key: &MessageKey,
-    committed: bool,
-) {
+async fn settle_helper_handoff<R: Runtime>(app: &AppHandle<R>, key: &MessageKey, committed: bool) {
     #[cfg(target_os = "android")]
     {
-        let output = app.try_state::<ActiveRequests>()
+        let output = app
+            .try_state::<ActiveRequests>()
             .and_then(|requests| requests.0.get(key).map(|entry| entry.output.clone()));
         let handoff = output.and_then(|output| {
-            output.helper_handoff.lock().ok().and_then(|mut handoff| handoff.take())
+            output
+                .helper_handoff
+                .lock()
+                .ok()
+                .and_then(|mut handoff| handoff.take())
         });
         if let Some(handoff) = handoff {
             let result = if committed {
                 ack_helper_committed(app, &handoff.transport_request_id, &handoff.generation).await
             } else {
-                discard_helper_session(app, &handoff.transport_request_id, &handoff.generation).await
+                discard_helper_session(app, &handoff.transport_request_id, &handoff.generation)
+                    .await
             };
             if let Err(error) = result {
                 // The database result remains authoritative. Dropping the
@@ -825,7 +845,11 @@ impl ActiveGroupTurns {
         };
         let mut current = turn.channel.lock().map_err(|error| error.to_string())?;
         *current = Some(channel.clone());
-        for request in requests.0.iter().filter(|request| &request.key().topic == key) {
+        for request in requests
+            .0
+            .iter()
+            .filter(|request| &request.key().topic == key)
+        {
             request.output.attach(channel.clone())?;
         }
         Ok(())
@@ -938,14 +962,10 @@ pub async fn sendToVCP<R: Runtime>(
             let (error, partial_content) = failure.into_parts();
             if recovery_pending {
                 let notice = format!("后台生成连接中断，稍后返回前台可继续接管：{error}");
-                let mut event = StreamEvent::error(message_id.clone(), context.clone(), notice.clone());
+                let mut event =
+                    StreamEvent::error(message_id.clone(), context.clone(), notice.clone());
                 event.content = partial_content;
-                deliver_request_event(
-                    &app,
-                    &request_key,
-                    Some(stream_channel.clone()),
-                    event,
-                );
+                deliver_request_event(&app, &request_key, Some(stream_channel.clone()), event);
                 return Err(notice);
             }
             if is_stream {
@@ -1039,19 +1059,25 @@ pub async fn perform_vcp_request<R: Runtime>(
 ) -> Result<(Value, bool), VcpRequestFailure> {
     #[cfg(target_os = "android")]
     let transport_request_id = payload.effective_transport_request_id().to_string();
-    let (lease, cancellation_token) = ActiveRequestLease::try_acquire(active_requests, request_key.clone())
-        .map_err(VcpRequestFailure::from)?;
+    let (lease, cancellation_token) =
+        ActiveRequestLease::try_acquire(active_requests, request_key.clone())
+            .map_err(VcpRequestFailure::from)?;
     let result =
         perform_vcp_request_registered(app, payload, stream_channel, cancellation_token).await;
     // This entry point serves the ephemeral assistant, which has no database
     // finalizer and must not leave an unclaimable offline result behind.
     discard_request_helper(app, &request_key).await;
     #[cfg(target_os = "android")]
-    if result.as_ref().is_err_and(|failure| failure.is_recovery_pending()) {
+    if result
+        .as_ref()
+        .is_err_and(|failure| failure.is_recovery_pending())
+    {
         // A broken local socket intentionally leaves no handoff for normal
         // chat recovery. This ephemeral caller has no such recovery owner.
         if let Ok(generation) = query_helper_generation(app, &transport_request_id).await {
-            if let Err(error) = discard_helper_session(app, &transport_request_id, &generation).await {
+            if let Err(error) =
+                discard_helper_session(app, &transport_request_id, &generation).await
+            {
                 log::warn!("[VCPClient] Ephemeral helper cleanup failed: {error}");
             }
         }
@@ -1406,7 +1432,9 @@ fn extract_timestamp_bindings(messages: &mut [Value]) -> Vec<Value> {
 async fn get_helper_port<R: Runtime>(app: &AppHandle<R>) -> Result<u16, String> {
     let cache_dir = app.path().app_cache_dir().map_err(|e| e.to_string())?;
     let port_file = cache_dir.join("sse_helper.port");
-    let content = tokio::fs::read_to_string(port_file).await.map_err(|e| e.to_string())?;
+    let content = tokio::fs::read_to_string(port_file)
+        .await
+        .map_err(|e| e.to_string())?;
     let port = content.trim().parse::<u16>().map_err(|e| e.to_string())?;
     Ok(port)
 }
@@ -1565,7 +1593,9 @@ async fn query_helper_generation<R: Runtime>(
     if response["requestId"].as_str() != Some(request_id) {
         return Err("Helper generation query identity mismatch".to_string());
     }
-    response["generation"].as_str().filter(|generation| !generation.is_empty())
+    response["generation"]
+        .as_str()
+        .filter(|generation| !generation.is_empty())
         .map(str::to_string)
         .ok_or_else(|| HELPER_SESSION_NOT_FOUND.to_string())
 }
@@ -1584,7 +1614,8 @@ async fn helper_session_control<R: Runtime>(
         action,
         request_id,
         Some(json!({ "generation": generation })),
-    ).await?;
+    )
+    .await?;
     let mut reader = FramedRead::new(stream, helper_frame_codec());
     let frame = tokio::time::timeout(HELPER_IO_TIMEOUT, reader.next())
         .await
@@ -1611,7 +1642,9 @@ fn validate_helper_control_ack(
     {
         return Ok(());
     }
-    Err(format!("Helper {action} ACK rejected for request {request_id}"))
+    Err(format!(
+        "Helper {action} ACK rejected for request {request_id}"
+    ))
 }
 
 #[cfg(target_os = "android")]
@@ -1719,24 +1752,29 @@ fn absorb_sse_data(
     if data.trim().is_empty() {
         return Ok(false);
     }
-    let value: Value = serde_json::from_str(data)
-        .map_err(|error| format!("Invalid SSE JSON: {error}"))?;
+    let value: Value =
+        serde_json::from_str(data).map_err(|error| format!("Invalid SSE JSON: {error}"))?;
     if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
-        let message = error.as_str()
+        let message = error
+            .as_str()
             .or_else(|| error.get("message").and_then(Value::as_str))
             .unwrap_or("Upstream SSE request failed");
         return Err(message.to_string());
     }
-    if let Some(choice) = value.get("choices")
+    if let Some(choice) = value
+        .get("choices")
         .and_then(Value::as_array)
         .and_then(|choices| choices.first())
     {
-        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str)
+        if let Some(reason) = choice
+            .get("finish_reason")
+            .and_then(Value::as_str)
             .filter(|reason| !reason.is_empty())
         {
             *last_finish_reason = Some(reason.to_string());
         }
-        if let Some(content) = choice.get("delta")
+        if let Some(content) = choice
+            .get("delta")
             .and_then(|delta| delta.get("content"))
             .and_then(Value::as_str)
         {
@@ -1775,7 +1813,8 @@ async fn handle_streaming_request<R: Runtime>(
     output: Arc<RequestOutput>,
     is_resume: bool,
 ) -> Result<(Value, bool), VcpRequestFailure> {
-    let _transport_slot = CHAT_TRANSPORT_SLOTS.try_acquire()
+    let _transport_slot = CHAT_TRANSPORT_SLOTS
+        .try_acquire()
         .map_err(|_| VcpRequestFailure::from(STREAM_CAPACITY_EXHAUSTED.to_string()))?;
     let mut aurora_buffer = AuroraBuffer::new();
     let mut pending_chunk = String::new();
@@ -1791,15 +1830,18 @@ async fn handle_streaming_request<R: Runtime>(
         } else {
             let mut helper_context = context.clone().unwrap_or_else(|| json!({}));
             helper_context["messageId"] = json!(message_id);
-            ("start", Some(json!({
-                "url": final_url,
-                "headers": json!({
-                    "Authorization": format!("Bearer {api_key}"),
-                    "Content-Type": "application/json",
-                }).to_string(),
-                "body": request_body.to_string(),
-                "context": helper_context,
-            })))
+            (
+                "start",
+                Some(json!({
+                    "url": final_url,
+                    "headers": json!({
+                        "Authorization": format!("Bearer {api_key}"),
+                        "Content-Type": "application/json",
+                    }).to_string(),
+                    "body": request_body.to_string(),
+                    "context": helper_context,
+                })),
+            )
         };
         let stream = connect_to_helper(app, action, &transport_request_id, params)
             .await
@@ -1820,7 +1862,9 @@ async fn handle_streaming_request<R: Runtime>(
     #[cfg(not(target_os = "android"))]
     let mut reader = {
         if is_resume {
-            return Err("This platform has no surviving background transport".to_string().into());
+            return Err("This platform has no surviving background transport"
+                .to_string()
+                .into());
         }
         let response = tokio::select! {
             biased;
@@ -2032,7 +2076,10 @@ async fn handle_streaming_request<R: Runtime>(
                 send_update(&mut aurora_buffer);
                 Some(aurora_buffer.full_text)
             };
-            return Err(VcpRequestFailure::recoverable_helper(message, partial_content));
+            return Err(VcpRequestFailure::recoverable_helper(
+                message,
+                partial_content,
+            ));
         }
         outcome => outcome,
     };
@@ -2046,13 +2093,18 @@ async fn handle_streaming_request<R: Runtime>(
     flush_aurora_window(&mut aurora_buffer, &mut pending_chunk);
     aurora_buffer.finalize();
     send_update(&mut aurora_buffer);
-    outcome.map_err(|message| VcpRequestFailure::streaming(message, aurora_buffer.full_text.clone()))?;
+    outcome.map_err(|message| {
+        VcpRequestFailure::streaming(message, aurora_buffer.full_text.clone())
+    })?;
     let is_aborted = last_finish_reason.as_deref() == Some("cancelled_by_user");
-    Ok((json!({
-        "fullContent": aurora_buffer.full_text,
-        "streamingStarted": true,
-        "finishReason": last_finish_reason.unwrap_or_else(|| "completed".to_string()),
-    }), is_aborted))
+    Ok((
+        json!({
+            "fullContent": aurora_buffer.full_text,
+            "streamingStarted": true,
+            "finishReason": last_finish_reason.unwrap_or_else(|| "completed".to_string()),
+        }),
+        is_aborted,
+    ))
 }
 
 /// 4. 抽离非流式请求循环
@@ -2067,15 +2119,23 @@ async fn handle_non_streaming_request(
     cancellation_token: CancellationToken,
     output: Arc<RequestOutput>,
 ) -> Result<(Value, bool), String> {
-    let _transport_slot = CHAT_TRANSPORT_SLOTS.try_acquire()
+    let _transport_slot = CHAT_TRANSPORT_SLOTS
+        .try_acquire()
         .map_err(|_| STREAM_CAPACITY_EXHAUSTED.to_string())?;
-    let send_stream_event = |event: StreamEvent| { output.send(event); };
-    let cancelled_result = || (json!({
-        "response": Value::Null,
-        "fullContent": "",
-        "finishReason": "cancelled_by_user",
-        "context": context,
-    }), true);
+    let send_stream_event = |event: StreamEvent| {
+        output.send(event);
+    };
+    let cancelled_result = || {
+        (
+            json!({
+                "response": Value::Null,
+                "fullContent": "",
+                "finishReason": "cancelled_by_user",
+                "context": context,
+            }),
+            true,
+        )
+    };
 
     let request_future = client
         .post(final_url)
@@ -2204,8 +2264,13 @@ pub async fn interruptRequest(
         .await
         .map_err(|error| error.to_string())?;
         match reason.flatten() {
-            Some(reason) => Ok(json!({ "success": true, "status": "completed", "finishReason": reason })),
-            None => Err(format!("Request {} is no longer running but has no committed terminal result", message_id)),
+            Some(reason) => {
+                Ok(json!({ "success": true, "status": "completed", "finishReason": reason }))
+            }
+            None => Err(format!(
+                "Request {} is no longer running but has no committed terminal result",
+                message_id
+            )),
         }
     };
     // Cancelling this wait never aborts the request owner or its commit.
@@ -2298,7 +2363,11 @@ pub async fn get_active_generations(
     // A group turn can be assembling its next speaker while no generation row
     // exists. Install the consumer on the turn before reading pending messages.
     let turns = app.state::<ActiveGroupTurns>();
-    let turn_keys = turns.0.iter().map(|entry| entry.key().clone()).collect::<Vec<_>>();
+    let turn_keys = turns
+        .0
+        .iter()
+        .map(|entry| entry.key().clone())
+        .collect::<Vec<_>>();
     for key in turn_keys {
         turns.attach_output(&active_requests, &key, stream_channel.clone())?;
     }
@@ -2556,8 +2625,10 @@ async fn finalize_offline_completed<R: Runtime>(
 ) -> Result<Value, String> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
+    type OfflineMessageRow = (String, Option<String>, Option<i64>, Option<String>, bool);
+
     let db = app.state::<DbState>();
-    let row: Option<(String, Option<String>, Option<i64>, Option<String>, bool)> = sqlx::query_as(
+    let row: Option<OfflineMessageRow> = sqlx::query_as(
         "SELECT m.content, m.finish_reason, m.deleted_at, m.agent_id,
                 EXISTS(SELECT 1 FROM active_generations ag
                        WHERE ag.owner_type = m.owner_type AND ag.owner_id = m.owner_id
@@ -2891,15 +2962,8 @@ async fn handle_recovery_failure<R: Runtime>(
     };
     let db = app.state::<DbState>();
     let pool = &db.pool;
-    let committed_content = finalize_stream_error(
-        app,
-        pool,
-        key,
-        partial_content,
-        error,
-        Some(stream_channel),
-    )
-    .await?;
+    let committed_content =
+        finalize_stream_error(app, pool, key, partial_content, error, Some(stream_channel)).await?;
     let Some(committed_content) = committed_content else {
         let terminal = terminal_generation_result(pool, key).await?;
         return Ok(json!({
@@ -3068,12 +3132,11 @@ mod offline_completed_tests {
     async fn recovery_capacity_and_partial_snapshot_failures_preserve_pending_content() {
         let (db, key, _directory, path) = fixture().await;
         let pool = db.pool.clone();
-        let original: (String, Option<String>) = sqlx::query_as(
-            "SELECT content, finish_reason FROM messages",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("pending content");
+        let original: (String, Option<String>) =
+            sqlx::query_as("SELECT content, finish_reason FROM messages")
+                .fetch_one(&pool)
+                .await
+                .expect("pending content");
         let app = tauri::test::mock_app();
         app.manage(db);
         app.manage(ActiveRequests::default());
@@ -3085,7 +3148,10 @@ mod offline_completed_tests {
         for failure in [
             VcpRequestFailure::from(STREAM_CAPACITY_EXHAUSTED.to_string()),
             VcpRequestFailure::recoverable_helper("incomplete snapshot", None),
-            VcpRequestFailure::recoverable_helper("local connection lost", Some("第一行".to_string())),
+            VcpRequestFailure::recoverable_helper(
+                "local connection lost",
+                Some("第一行".to_string()),
+            ),
         ] {
             let requests = app.state::<ActiveRequests>();
             let (_lease, _) = ActiveRequestLease::try_acquire(requests.0.clone(), key.clone())
@@ -3095,20 +3161,24 @@ mod offline_completed_tests {
             output.attach(channel.clone()).expect("replacement WebView");
             let reason = failure.to_string();
             let result = handle_recovery_failure(app.handle(), &key, failure, old_channel).await;
-            assert_eq!(result.expect_err("attachment failure must remain retryable"), reason);
-            let after: (String, Option<String>) = sqlx::query_as(
-                "SELECT content, finish_reason FROM messages",
-            )
-            .fetch_one(&pool)
-            .await
-            .expect("retained content");
+            assert_eq!(
+                result.expect_err("attachment failure must remain retryable"),
+                reason
+            );
+            let after: (String, Option<String>) =
+                sqlx::query_as("SELECT content, finish_reason FROM messages")
+                    .fetch_one(&pool)
+                    .await
+                    .expect("retained content");
             assert_eq!(after, original);
             let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM active_generations")
                 .fetch_one(&pool)
                 .await
                 .expect("pending count");
             assert_eq!(pending, 1);
-            assert!(tokio::fs::try_exists(&path).await.expect("complete backup retained"));
+            assert!(tokio::fs::try_exists(&path)
+                .await
+                .expect("complete backup retained"));
             let event = events.try_recv().expect("replacement consumer notified");
             assert_eq!(event["type"], "error");
             assert!(event["content"].is_null());
@@ -3228,7 +3298,9 @@ mod active_request_tests {
         let mut decoder = SseDecoder::default();
         let mut buffer = bytes::BytesMut::new();
         let mut events = Vec::new();
-        for byte in "\u{feff}: heartbeat\r\ndata: first\rdata: 中国\r\rdata:\n\ndata: discarded".as_bytes() {
+        for byte in
+            "\u{feff}: heartbeat\r\ndata: first\rdata: 中国\r\rdata:\n\ndata: discarded".as_bytes()
+        {
             buffer.extend_from_slice(&[*byte]);
             while let Some(event) = decoder.decode(&mut buffer).unwrap() {
                 events.push(event);
@@ -3243,7 +3315,8 @@ mod active_request_tests {
         use tokio_util::codec::Decoder;
         let content = "x".repeat(600 * 1024);
         let mut decoder = SseDecoder::default();
-        let mut buffer = bytes::BytesMut::from(format!("data: {content}\n\ndata: unfinished\n").as_bytes());
+        let mut buffer =
+            bytes::BytesMut::from(format!("data: {content}\n\ndata: unfinished\n").as_bytes());
         assert_eq!(decoder.decode(&mut buffer).unwrap(), Some(content));
         assert!(decoder.decode_eof(&mut buffer).unwrap().is_none());
     }
@@ -3262,14 +3335,21 @@ mod active_request_tests {
         assert_eq!(reason.as_deref(), Some("stop"));
         assert!(absorb_sse_data("[DONE]", &mut text, &mut reason).unwrap());
         assert_eq!(
-            absorb_sse_data(r#"{"error":{"message":"quota exhausted"}}"#, &mut text, &mut reason),
+            absorb_sse_data(
+                r#"{"error":{"message":"quota exhausted"}}"#,
+                &mut text,
+                &mut reason
+            ),
             Err("quota exhausted".to_string()),
         );
         assert!(absorb_sse_data("{", &mut text, &mut reason).is_err());
         assert_eq!(text, "beforeafter");
     }
 
-    fn event_channel() -> (Channel<StreamEvent>, tokio::sync::mpsc::UnboundedReceiver<Value>) {
+    fn event_channel() -> (
+        Channel<StreamEvent>,
+        tokio::sync::mpsc::UnboundedReceiver<Value>,
+    ) {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let channel = Channel::new(move |body| {
             let _ = sender.send(body.deserialize::<Value>()?);
@@ -3313,7 +3393,8 @@ mod active_request_tests {
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0; 4096];
-            socket.read(&mut request).await.unwrap();
+            let received = socket.read(&mut request).await.unwrap();
+            assert!(received > 0, "client closed before sending a request");
             let body = concat!(
                 "data: {\"choices\":[{\"delta\":{\"content\":\"first\"},\n",
                 "data: \"finish_reason\":\"tool_calls\"}]}\n\n",
@@ -3329,10 +3410,20 @@ mod active_request_tests {
         let output = Arc::new(RequestOutput::default());
         output.bind_initial(Some(channel));
         let (result, aborted) = handle_streaming_request(
-            app.handle(), Client::new(), &endpoint, "", json!({}),
-            "message".into(), "transport".into(), None,
-            CancellationToken::new(), output, false,
-        ).await.unwrap();
+            app.handle(),
+            Client::new(),
+            &endpoint,
+            "",
+            json!({}),
+            "message".into(),
+            "transport".into(),
+            None,
+            CancellationToken::new(),
+            output,
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(result["fullContent"], "firsttail");
         assert_eq!(result["finishReason"], "stop");
         assert!(!aborted);
@@ -3356,21 +3447,36 @@ mod active_request_tests {
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0; 4096];
-            socket.read(&mut request).await.unwrap();
+            let received = socket.read(&mut request).await.unwrap();
+            assert!(received > 0, "client closed before sending a request");
             let body = "data: {\"choices\":[{\"delta\":{\"content\":\"saved partial\"}}]}\n\n";
             socket.write_all(format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n",
                 body.len(),
             ).as_bytes()).await.unwrap();
             socket.shutdown().await.unwrap();
-            assert!(tokio::time::timeout(Duration::from_millis(100), listener.accept()).await.is_err());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
         });
         let app = tauri::test::mock_app();
         let failure = handle_streaming_request(
-            app.handle(), Client::new(), &endpoint, "", json!({}),
-            "message".into(), "transport".into(), None,
-            CancellationToken::new(), Arc::default(), false,
-        ).await.unwrap_err();
+            app.handle(),
+            Client::new(),
+            &endpoint,
+            "",
+            json!({}),
+            "message".into(),
+            "transport".into(),
+            None,
+            CancellationToken::new(),
+            Arc::default(),
+            false,
+        )
+        .await
+        .unwrap_err();
         let (error, partial) = failure.into_parts();
         assert!(error.starts_with("SSE stream read failed:"), "{error}");
         assert_eq!(partial.as_deref(), Some("saved partial"));
@@ -3389,10 +3495,16 @@ mod active_request_tests {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = vec![0; 4096];
             let length = socket.read(&mut request).await.unwrap();
-            assert!(std::str::from_utf8(&request[..length]).unwrap().starts_with("POST "));
+            assert!(std::str::from_utf8(&request[..length])
+                .unwrap()
+                .starts_with("POST "));
             socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"<think>first\"}}]}\n\n").await.unwrap();
             server_release.cancelled().await;
-            assert!(tokio::time::timeout(Duration::from_millis(10), listener.accept()).await.is_err());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), listener.accept())
+                    .await
+                    .is_err()
+            );
         });
         let app = tauri::test::mock_app();
         let output = Arc::new(RequestOutput::default());
@@ -3404,21 +3516,43 @@ mod active_request_tests {
         let request_cancel = cancellation.clone();
         let request = tokio::spawn(async move {
             handle_streaming_request(
-                &request_app, Client::new(), &endpoint, "", json!({}),
-                "message".to_string(), "transport".to_string(), None,
-                request_cancel, request_output, false,
-            ).await
+                &request_app,
+                Client::new(),
+                &endpoint,
+                "",
+                json!({}),
+                "message".to_string(),
+                "transport".to_string(),
+                None,
+                request_cancel,
+                request_output,
+                false,
+            )
+            .await
         });
-        let first = tokio::time::timeout(Duration::from_secs(2), old_events.recv()).await.unwrap().unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(2), old_events.recv())
+            .await
+            .unwrap()
+            .unwrap();
         let (new_channel, mut new_events) = event_channel();
         assert!(output.attach(new_channel).unwrap());
-        let snapshot = tokio::time::timeout(Duration::from_secs(1), new_events.recv()).await.unwrap().unwrap();
+        let snapshot = tokio::time::timeout(Duration::from_secs(1), new_events.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(snapshot["aurora"]["kind"], "snapshot");
         assert_eq!(snapshot["aurora"]["content"], "<think>first");
-        assert!(snapshot["consumerRevision"].as_u64().unwrap() > first["consumerRevision"].as_u64().unwrap());
+        assert!(
+            snapshot["consumerRevision"].as_u64().unwrap()
+                > first["consumerRevision"].as_u64().unwrap()
+        );
         assert!(old_events.try_recv().is_err());
         cancellation.cancel();
-        let (result, aborted) = tokio::time::timeout(Duration::from_secs(1), request).await.unwrap().unwrap().unwrap();
+        let (result, aborted) = tokio::time::timeout(Duration::from_secs(1), request)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         assert!(aborted);
         assert_eq!(result["fullContent"], "<think>first");
         release_server.cancel();
@@ -3435,13 +3569,32 @@ mod active_request_tests {
         let topic = TopicKey::new("group", "group", "topic");
         let _turn = turns.try_acquire(topic.clone()).unwrap();
         let first_key = MessageKey::new(topic.clone(), "first");
-        let (first_lease, _) = ActiveRequestLease::try_acquire(requests.0.clone(), first_key.clone()).unwrap();
+        let (first_lease, _) =
+            ActiveRequestLease::try_acquire(requests.0.clone(), first_key.clone()).unwrap();
         let (original, mut original_events) = event_channel();
-        deliver_request_event(app.handle(), &first_key, Some(original.clone()), StreamEvent::thinking("first".into(), None));
+        deliver_request_event(
+            app.handle(),
+            &first_key,
+            Some(original.clone()),
+            StreamEvent::thinking("first".into(), None),
+        );
         assert_eq!(original_events.recv().await.unwrap()["messageId"], "first");
         let (replacement, mut replacement_events) = event_channel();
         turns.attach_output(&requests, &topic, replacement).unwrap();
-        deliver_request_event(app.handle(), &first_key, Some(original.clone()), StreamEvent::end("first".into(), None, Some("completed".into()), Some("first result".into()), None, None, None));
+        deliver_request_event(
+            app.handle(),
+            &first_key,
+            Some(original.clone()),
+            StreamEvent::end(
+                "first".into(),
+                None,
+                Some("completed".into()),
+                Some("first result".into()),
+                None,
+                None,
+                None,
+            ),
+        );
         assert_eq!(replacement_events.recv().await.unwrap()["type"], "end");
         assert!(!first_lease.entry.output.attach(original.clone()).unwrap());
         let released = first_lease.entry.released.clone();
@@ -3449,10 +3602,18 @@ mod active_request_tests {
         assert!(released.is_cancelled());
 
         let (gap_replacement, mut gap_events) = event_channel();
-        turns.attach_output(&requests, &topic, gap_replacement).unwrap();
+        turns
+            .attach_output(&requests, &topic, gap_replacement)
+            .unwrap();
         let second_key = MessageKey::new(topic, "second");
-        let (_second_lease, _) = ActiveRequestLease::try_acquire(requests.0.clone(), second_key.clone()).unwrap();
-        deliver_request_event(app.handle(), &second_key, Some(original), StreamEvent::thinking("second".into(), None));
+        let (_second_lease, _) =
+            ActiveRequestLease::try_acquire(requests.0.clone(), second_key.clone()).unwrap();
+        deliver_request_event(
+            app.handle(),
+            &second_key,
+            Some(original),
+            StreamEvent::thinking("second".into(), None),
+        );
         assert_eq!(gap_events.recv().await.unwrap()["messageId"], "second");
         assert!(original_events.try_recv().is_err());
         assert!(replacement_events.try_recv().is_err());
@@ -3469,7 +3630,8 @@ mod active_request_tests {
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0; 4096];
-            socket.read(&mut request).await.unwrap();
+            let received = socket.read(&mut request).await.unwrap();
+            assert!(received > 0, "client closed before sending a request");
             socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{").await.unwrap();
             let _ = headers_sent.send(());
             server_release.cancelled().await;
@@ -3477,12 +3639,29 @@ mod active_request_tests {
         let cancellation = CancellationToken::new();
         let request_cancel = cancellation.clone();
         let request = tokio::spawn(async move {
-            handle_non_streaming_request(Client::new(), &endpoint, "", json!({}), "message".into(), None, request_cancel, Arc::default()).await
+            handle_non_streaming_request(
+                Client::new(),
+                &endpoint,
+                "",
+                json!({}),
+                "message".into(),
+                None,
+                request_cancel,
+                Arc::default(),
+            )
+            .await
         });
-        tokio::time::timeout(Duration::from_secs(1), headers_ready).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), headers_ready)
+            .await
+            .unwrap()
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
         cancellation.cancel();
-        let (result, aborted) = tokio::time::timeout(Duration::from_secs(1), request).await.unwrap().unwrap().unwrap();
+        let (result, aborted) = tokio::time::timeout(Duration::from_secs(1), request)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         assert!(aborted);
         assert_eq!(result["finishReason"], "cancelled_by_user");
         release_server.cancel();
@@ -3768,10 +3947,21 @@ mod active_request_tests {
             "generation": "generation-17",
             "accepted": true,
         });
-        assert!(validate_helper_control_ack(&valid, "ack_committed", "message-3", "generation-17").is_ok());
-        assert!(validate_helper_control_ack(&valid, "discard", "message-3", "generation-17").is_err());
-        assert!(validate_helper_control_ack(&valid, "ack_committed", "message-4", "generation-17").is_err());
-        assert!(validate_helper_control_ack(&valid, "ack_committed", "message-3", "generation-18").is_err());
+        assert!(
+            validate_helper_control_ack(&valid, "ack_committed", "message-3", "generation-17")
+                .is_ok()
+        );
+        assert!(
+            validate_helper_control_ack(&valid, "discard", "message-3", "generation-17").is_err()
+        );
+        assert!(
+            validate_helper_control_ack(&valid, "ack_committed", "message-4", "generation-17")
+                .is_err()
+        );
+        assert!(
+            validate_helper_control_ack(&valid, "ack_committed", "message-3", "generation-18")
+                .is_err()
+        );
 
         let rejected = json!({
             "action": "ack_committed_ack",
@@ -3779,6 +3969,12 @@ mod active_request_tests {
             "generation": "generation-17",
             "accepted": false,
         });
-        assert!(validate_helper_control_ack(&rejected, "ack_committed", "message-3", "generation-17").is_err());
+        assert!(validate_helper_control_ack(
+            &rejected,
+            "ack_committed",
+            "message-3",
+            "generation-17"
+        )
+        .is_err());
     }
 }

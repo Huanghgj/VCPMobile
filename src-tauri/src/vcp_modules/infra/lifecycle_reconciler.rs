@@ -71,7 +71,9 @@ pub async fn reconcile_distributed_node(app_handle: &AppHandle, force_reconnect:
     match (distributed_enabled, is_running) {
         (true, false) => {
             if !cfg!(any(target_os = "android", target_os = "ios")) {
-                log::info!("[Lifecycle] Distributed node is a mobile runtime; host startup skipped.");
+                log::info!(
+                    "[Lifecycle] Distributed node is a mobile runtime; host startup skipped."
+                );
                 return;
             }
             let ws_url = settings.distributed_ws_url;

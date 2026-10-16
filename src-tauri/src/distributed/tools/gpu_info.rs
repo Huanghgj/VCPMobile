@@ -32,7 +32,8 @@ impl StreamingTool for GpuInfoTool {
     fn manifest(&self) -> ToolManifest {
         ToolManifest {
             name: "MobileGPUInfo".to_string(),
-            description: "读取 GPU 渲染器信息；系统未公开的负载、频率或显存数据明确报告缺失。".to_string(),
+            description: "读取 GPU 渲染器信息；系统未公开的负载、频率或显存数据明确报告缺失。"
+                .to_string(),
             display_name: "GPU算力监控".to_string(),
             placeholder: Some("{{MobileGPU}}".to_string()),
             invocation_commands: vec![],

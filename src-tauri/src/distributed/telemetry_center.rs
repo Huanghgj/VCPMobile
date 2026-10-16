@@ -46,7 +46,8 @@ pub struct TelemetryCenter {
     /// waiter cannot later commit its native response to these caches.
     pub(super) sensor_sampling: tokio::sync::Mutex<()>,
     #[cfg(target_os = "ios")]
-    device_cache: Mutex<CacheItem<Option<std::sync::Arc<tauri_plugin_vcp_mobile::system::DeviceSnapshot>>>>,
+    device_cache:
+        Mutex<CacheItem<Option<std::sync::Arc<tauri_plugin_vcp_mobile::system::DeviceSnapshot>>>>,
     cpu_usage_cache: Mutex<CacheItem<String>>,
     cpu_temp_cache: Mutex<CacheItem<String>>,
     cpu_freq_cache: Mutex<CacheItem<String>>,
@@ -406,7 +407,13 @@ impl TelemetryCenter {
                 };
                 let mut result = format!(
                     "电量: {}{} | 状态: {} | 温度: {}",
-                    status.level.map(|level| format!("{level}%")).unwrap_or_else(|| "未知".to_string()), pwr_save, status_str, temp_str
+                    status
+                        .level
+                        .map(|level| format!("{level}%"))
+                        .unwrap_or_else(|| "未知".to_string()),
+                    pwr_save,
+                    status_str,
+                    temp_str
                 );
                 for (field, reason) in status.unavailable {
                     result.push_str(&format!(" | {field}: {reason}"));
@@ -525,7 +532,9 @@ impl TelemetryCenter {
                 }
 
                 let format_speed = |kbps: Option<i32>| -> String {
-                    let Some(kbps) = kbps else { return "系统未提供".to_string(); };
+                    let Some(kbps) = kbps else {
+                        return "系统未提供".to_string();
+                    };
                     if kbps >= 1000 {
                         format!("{:.1}Mbps", kbps as f64 / 1000.0)
                     } else {
@@ -537,16 +546,27 @@ impl TelemetryCenter {
 
                 let mut result = format!(
                     "类型: {} | IP: {} | 下行: {} | 上行: {}",
-                    status.r#type, status.ip.unwrap_or_else(|| "系统未提供".to_string()), down_str, up_str
+                    status.r#type,
+                    status.ip.unwrap_or_else(|| "系统未提供".to_string()),
+                    down_str,
+                    up_str
                 );
                 if cfg!(target_os = "ios") {
                     result.push_str(" | 网络路径可用不代表服务器可达");
                 }
                 if let Some(expensive) = status.is_expensive {
-                    result.push_str(if expensive { " | 系统判定高成本路径:是" } else { " | 系统判定高成本路径:否" });
+                    result.push_str(if expensive {
+                        " | 系统判定高成本路径:是"
+                    } else {
+                        " | 系统判定高成本路径:否"
+                    });
                 }
                 if let Some(constrained) = status.is_constrained {
-                    result.push_str(if constrained { " | 低数据模式:是" } else { " | 低数据模式:否" });
+                    result.push_str(if constrained {
+                        " | 低数据模式:是"
+                    } else {
+                        " | 低数据模式:否"
+                    });
                 }
                 for (field, reason) in status.unavailable {
                     result.push_str(&format!(" | {field}: {reason}"));
@@ -568,12 +588,20 @@ impl TelemetryCenter {
     // =================================================================
 
     #[cfg(target_os = "ios")]
-    fn device_snapshot(&self, app: &AppHandle) -> Result<std::sync::Arc<tauri_plugin_vcp_mobile::system::DeviceSnapshot>, String> {
-        let mut cache = self.device_cache.lock().unwrap_or_else(|error| error.into_inner());
+    fn device_snapshot(
+        &self,
+        app: &AppHandle,
+    ) -> Result<std::sync::Arc<tauri_plugin_vcp_mobile::system::DeviceSnapshot>, String> {
+        let mut cache = self
+            .device_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         if let Some(Some(snapshot)) = cache.get_valid() {
             return Ok(snapshot.clone());
         }
-        let snapshot = std::sync::Arc::new(tauri_plugin_vcp_mobile::system::get_device_snapshot(app.clone())?);
+        let snapshot = std::sync::Arc::new(tauri_plugin_vcp_mobile::system::get_device_snapshot(
+            app.clone(),
+        )?);
         cache.update(Some(snapshot.clone()));
         Ok(snapshot)
     }
@@ -582,9 +610,20 @@ impl TelemetryCenter {
     fn capture_cpu_usage(&self, app: &AppHandle) -> String {
         match self.device_snapshot(app) {
             Ok(snapshot) => {
-                let usage = snapshot.cpu_usage_percent.map(|value| format!("{value:.1}%"))
-                    .unwrap_or_else(|| snapshot.unavailable.get("cpuUsagePercent").cloned().unwrap_or_else(|| "等待下次采样".to_string()));
-                format!("{usage} | 逻辑核心:{}/{}", snapshot.active_processor_count, snapshot.processor_count)
+                let usage = snapshot
+                    .cpu_usage_percent
+                    .map(|value| format!("{value:.1}%"))
+                    .unwrap_or_else(|| {
+                        snapshot
+                            .unavailable
+                            .get("cpuUsagePercent")
+                            .cloned()
+                            .unwrap_or_else(|| "等待下次采样".to_string())
+                    });
+                format!(
+                    "{usage} | 逻辑核心:{}/{}",
+                    snapshot.active_processor_count, snapshot.processor_count
+                )
             }
             Err(error) => format!("不可用 ({error})"),
         }
@@ -605,7 +644,12 @@ impl TelemetryCenter {
     #[cfg(target_os = "ios")]
     fn capture_gpu_info(&self, app: &AppHandle) -> String {
         tauri_plugin_vcp_mobile::system::get_gpu_status(app.clone())
-            .map(|gpu| format!("型号: {} | iOS 未提供实时 GPU 负载、频率和显存占用", gpu.renderer))
+            .map(|gpu| {
+                format!(
+                    "型号: {} | iOS 未提供实时 GPU 负载、频率和显存占用",
+                    gpu.renderer
+                )
+            })
             .unwrap_or_else(|error| format!("GPU 不可用 ({error})"))
     }
 
@@ -613,9 +657,16 @@ impl TelemetryCenter {
     fn capture_memory_info(&self, app: &AppHandle) -> String {
         match self.device_snapshot(app) {
             Ok(snapshot) => {
-                let resident = snapshot.process_resident_memory_bytes
+                let resident = snapshot
+                    .process_resident_memory_bytes
                     .map(crate::distributed::tools::sysfs_utils::format_bytes)
-                    .unwrap_or_else(|| snapshot.unavailable.get("processResidentMemoryBytes").cloned().unwrap_or_else(|| "不可用".to_string()));
+                    .unwrap_or_else(|| {
+                        snapshot
+                            .unavailable
+                            .get("processResidentMemoryBytes")
+                            .cloned()
+                            .unwrap_or_else(|| "不可用".to_string())
+                    });
                 format!("物理总内存:{} | 当前 App 驻留:{} | 当前 App 可用预算:{} | 全机可用内存/Swap:系统未提供",
                     crate::distributed::tools::sysfs_utils::format_bytes(snapshot.physical_memory_bytes), resident,
                     crate::distributed::tools::sysfs_utils::format_bytes(snapshot.process_available_memory_bytes))
@@ -627,9 +678,13 @@ impl TelemetryCenter {
     #[cfg(target_os = "ios")]
     fn capture_storage_info(&self, app: &AppHandle) -> String {
         tauri_plugin_vcp_mobile::system::get_free_disk_space(app.clone())
-            .map(|disk| format!("应用所在卷:总量 {} | 可用 {}（卷空间，非 App 占用）",
-                crate::distributed::tools::sysfs_utils::format_bytes(disk.total_bytes),
-                crate::distributed::tools::sysfs_utils::format_bytes(disk.free_bytes)))
+            .map(|disk| {
+                format!(
+                    "应用所在卷:总量 {} | 可用 {}（卷空间，非 App 占用）",
+                    crate::distributed::tools::sysfs_utils::format_bytes(disk.total_bytes),
+                    crate::distributed::tools::sysfs_utils::format_bytes(disk.free_bytes)
+                )
+            })
             .unwrap_or_else(|error| format!("存储不可用 ({error})"))
     }
 
@@ -679,7 +734,14 @@ impl TelemetryCenter {
                     Some("已充满") => "已满",
                     _ => "",
                 };
-                Ok(format!("电量:{}{}", status.level.map(|level| format!("{level}%")).unwrap_or_else(|| "未知".to_string()), suffix))
+                Ok(format!(
+                    "电量:{}{}",
+                    status
+                        .level
+                        .map(|level| format!("{level}%"))
+                        .unwrap_or_else(|| "未知".to_string()),
+                    suffix
+                ))
             })();
             result.unwrap_or_else(|_| "电量:N/A".to_string())
         }

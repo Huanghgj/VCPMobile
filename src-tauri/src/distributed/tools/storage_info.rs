@@ -17,7 +17,8 @@ impl StreamingTool for StorageInfoTool {
     fn manifest(&self) -> ToolManifest {
         ToolManifest {
             name: "MobileStorageInfo".to_string(),
-            description: "读取应用所在存储卷的总量与可用空间；不代表应用自身占用或磁盘健康度。".to_string(),
+            description: "读取应用所在存储卷的总量与可用空间；不代表应用自身占用或磁盘健康度。"
+                .to_string(),
             display_name: "磁盘存储监控".to_string(),
             placeholder: Some("{{MobileStorage}}".to_string()),
             invocation_commands: vec![],

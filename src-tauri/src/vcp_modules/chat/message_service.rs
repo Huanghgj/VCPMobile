@@ -1527,8 +1527,10 @@ async fn finalize_stream_message_inner<R: tauri::Runtime>(
                     .await;
                     if matches!(pending, Ok(false)) {
                         crate::vcp_modules::vcp_client::discard_request_helper(
-                            &app_handle, message_key,
-                        ).await;
+                            &app_handle,
+                            message_key,
+                        )
+                        .await;
                     }
                     let mut event = crate::vcp_modules::vcp_client::StreamEvent::error(
                         message_id.to_string(),
@@ -1537,7 +1539,10 @@ async fn finalize_stream_message_inner<R: tauri::Runtime>(
                     );
                     event.content = Some(final_content.clone());
                     crate::vcp_modules::vcp_client::deliver_request_event(
-                        &app_handle, message_key, stream_channel.clone(), event,
+                        &app_handle,
+                        message_key,
+                        stream_channel.clone(),
+                        event,
                     );
                     return Err(error);
                 }
@@ -1557,7 +1562,10 @@ async fn finalize_stream_message_inner<R: tauri::Runtime>(
             topic_updated_at,
         );
         crate::vcp_modules::vcp_client::deliver_request_event(
-            &app_handle, message_key, stream_channel, event,
+            &app_handle,
+            message_key,
+            stream_channel,
+            event,
         );
     }
 

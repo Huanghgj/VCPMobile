@@ -1,14 +1,14 @@
 use serde::Serialize;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use tauri_plugin_vcp_mobile::events::LifecyclePhase;
+#[cfg(any(target_os = "android", target_os = "ios", test))]
+use tauri_plugin_vcp_mobile::events::NativeLifecycleEvent;
 #[cfg(not(target_os = "ios"))]
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 #[cfg(not(target_os = "ios"))]
 use tokio_util::sync::CancellationToken;
-use tauri_plugin_vcp_mobile::events::LifecyclePhase;
-#[cfg(any(target_os = "android", target_os = "ios", test))]
-use tauri_plugin_vcp_mobile::events::NativeLifecycleEvent;
 
 use crate::vcp_modules::infra::local_server::ServerHandle;
 
@@ -165,6 +165,10 @@ mod tests {
                 "snapshot": true, "transitionEpoch": 3,
             }),
         );
-        assert!(LifecycleState::new().lifecycle_snapshot.try_read().unwrap().is_none());
+        assert!(LifecycleState::new()
+            .lifecycle_snapshot
+            .try_read()
+            .unwrap()
+            .is_none());
     }
 }

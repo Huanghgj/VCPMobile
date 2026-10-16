@@ -399,8 +399,9 @@ impl DistributedClient {
         let validated = if vcp_key.trim().is_empty() {
             Err("distributed authentication key must not be empty".to_string())
         } else {
-            normalize_remote_ws_url(&ws_url)
-                .and_then(|url| stable_remote_identity(&url, &device_name).map(|identity| (url, identity)))
+            normalize_remote_ws_url(&ws_url).and_then(|url| {
+                stable_remote_identity(&url, &device_name).map(|identity| (url, identity))
+            })
         };
         let (ws_url, remote_identity) = match validated {
             Ok(config) => config,
@@ -1197,9 +1198,20 @@ impl DistributedClient {
             let app = _app.clone();
             match tauri::async_runtime::spawn_blocking(move || {
                 tauri_plugin_vcp_mobile::system::get_network_status(app)
-            }).await {
-                Ok(Ok(network)) => network.ip.into_iter()
-                    .flat_map(|addresses| addresses.split(',').map(str::trim).filter(|address| !address.is_empty()).map(str::to_owned).collect::<Vec<_>>())
+            })
+            .await
+            {
+                Ok(Ok(network)) => network
+                    .ip
+                    .into_iter()
+                    .flat_map(|addresses| {
+                        addresses
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|address| !address.is_empty())
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>()
+                    })
                     .collect(),
                 Ok(Err(error)) => {
                     log::warn!("[Distributed] Local IP unavailable: {error}");

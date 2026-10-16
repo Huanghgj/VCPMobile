@@ -152,8 +152,7 @@ impl MobileCliRuntimeState {
                     MobileCliPhase::Unavailable
                 },
                 availability_reason: (!cfg!(target_os = "android")).then(|| {
-                    "VCPMobileCLI currently requires the Android foreground runtime."
-                        .to_string()
+                    "VCPMobileCLI currently requires the Android foreground runtime.".to_string()
                 }),
                 recovery_notice: None,
                 ledger_path: None,

@@ -54,7 +54,9 @@ pub fn run() {
             {
                 let legacy_cleanup_handle = handle.clone();
                 tauri::async_runtime::spawn_blocking(move || {
-                    vcp_modules::update_manager::cleanup_legacy_frontend_ota(&legacy_cleanup_handle);
+                    vcp_modules::update_manager::cleanup_legacy_frontend_ota(
+                        &legacy_cleanup_handle,
+                    );
                 });
             }
 

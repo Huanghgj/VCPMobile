@@ -13,8 +13,9 @@ impl StreamingTool for AmbientSensorTool {
     fn manifest(&self) -> ToolManifest {
         ToolManifest {
             name: "MobileAmbient".to_string(),
-            description: "按需读取可用的环境传感器；气压以 hPa 返回，未公开的光照度或缺失硬件明确说明。"
-                .to_string(),
+            description:
+                "按需读取可用的环境传感器；气压以 hPa 返回，未公开的光照度或缺失硬件明确说明。"
+                    .to_string(),
             display_name: "物理环境传感器".to_string(),
             placeholder: Some("{{MobileAmbient}}".to_string()),
             invocation_commands: vec![],

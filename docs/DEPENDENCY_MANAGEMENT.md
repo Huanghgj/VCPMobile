@@ -158,8 +158,8 @@ Tauri 核心组件必须**严格同版本或遵循官方发布的兼容矩阵**�
 
 | 工具 | 当前版本 | 更新频率建议 | 来源 | 备注 |
 |------|---------|-------------|------|------|
-| Node.js | `22.23.2` (LTS) | 每年 major / 每季度 minor | nodejs.org | CI/Release 固定完整版本 |
-| pnpm | `10.15.0` | 每季度检查 | pnpm.io | CI/Release 固定完整版本，解析由 lockfile 冻结 |
+| Node.js | `24.14.1` (LTS) | 每年 major / 每季度 minor | nodejs.org | CI、Android Release 与 iOS 阶段诊断共享 `.github/toolchain.env`，与本地验证版本一致 |
+| pnpm | `12.6.0` | 每季度检查 | pnpm.io | 三条 workflow 共享 `.github/toolchain.env`，解析由 lockfile 冻结 |
 | Rust Toolchain | `1.97.1` | 每季度检查 | rustup | CI/Release 固定完整版本并与本地验证环境一致 |
 | Java (Temurin) | `17.0.20+8` | 每年 LTS | adoptium.net | CI/Release 固定完整版本，Android 构建必需 |
 | Android command-line tools | `12266719` | 跟随 Android SDK 升级 | Android SDK | CI/Release 固定下载版本 |

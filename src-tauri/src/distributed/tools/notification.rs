@@ -55,7 +55,11 @@ body:「始」通知内容「末」\n\
         let native_app = app.clone();
         let native_title = title.clone();
         tauri::async_runtime::spawn_blocking(move || {
-            tauri_plugin_vcp_mobile::system::send_notification_native(native_app, native_title, body)
+            tauri_plugin_vcp_mobile::system::send_notification_native(
+                native_app,
+                native_title,
+                body,
+            )
         })
         .await
         .map_err(|e| format!("Native notification task failed: {e}"))?

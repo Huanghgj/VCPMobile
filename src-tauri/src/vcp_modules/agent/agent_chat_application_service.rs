@@ -209,11 +209,7 @@ pub async fn internal_process_agent_chat_message(
             let (error, partial_content) = failure.into_parts();
             if recovery_pending {
                 let notice = format!("后台生成连接中断，稍后返回前台可继续接管：{error}");
-                let mut event = StreamEvent::error(
-                    thinking_id.clone(),
-                    context,
-                    notice.clone(),
-                );
+                let mut event = StreamEvent::error(thinking_id.clone(), context, notice.clone());
                 event.content = partial_content;
                 crate::vcp_modules::vcp_client::deliver_request_event(
                     &app_handle,

@@ -57,8 +57,13 @@ pub(super) async fn sample_sensors(app: &AppHandle, demand: SensorDemand) {
     let state = app.state::<DistributedState>();
     let _sample_owner = state.telemetry.sensor_sampling.lock().await;
     let mut snapshot = match tauri_plugin_vcp_mobile::system::sample_sensor_data(
-        app.clone(), demand.location, demand.motion, demand.ambient,
-    ).await {
+        app.clone(),
+        demand.location,
+        demand.motion,
+        demand.ambient,
+    )
+    .await
+    {
         Ok(snapshot) => snapshot,
         Err(error) => {
             let unavailable = format!("本次采样不可用: {error}");
@@ -193,7 +198,11 @@ impl StreamingScheduler {
                             values.insert(spec.placeholder, value);
                         }
                         Err(error) => {
-                            log::warn!("[Distributed] Streaming tool '{}' sample failed: {}", spec.name, error);
+                            log::warn!(
+                                "[Distributed] Streaming tool '{}' sample failed: {}",
+                                spec.name,
+                                error
+                            );
                             values.insert(spec.placeholder, format!("本次采样不可用: {error}"));
                         }
                     }

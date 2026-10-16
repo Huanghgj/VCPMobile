@@ -390,7 +390,11 @@ pub async fn get_system_snapshot(
         message,
         log,
         sync,
-        lifecycle: state.lifecycle_snapshot.read().await.map(|value| value.as_snapshot()),
+        lifecycle: state
+            .lifecycle_snapshot
+            .read()
+            .await
+            .map(|value| value.as_snapshot()),
         database_recovery,
         background_service_failures:
             tauri_plugin_vcp_mobile::events::collect_service_failure_notices(&app),
@@ -482,7 +486,10 @@ pub async fn restart_or_exit_app(
 
     #[cfg(target_os = "ios")]
     {
-        Err("unsupported: iOS does not support restarting or exiting the application by command".to_string())
+        Err(
+            "unsupported: iOS does not support restarting or exiting the application by command"
+                .to_string(),
+        )
     }
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]

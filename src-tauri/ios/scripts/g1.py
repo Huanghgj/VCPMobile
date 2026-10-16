@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
-"""Build G1 on manual GitHub Actions and preserve output for source-led review."""
+"""Run manual iOS stage diagnostics using the G1 device archive build chain."""
 import argparse
+from collections import deque
+from contextlib import contextmanager
+from datetime import datetime, timezone
 import hashlib
+import html
 import io
 import json
 import os
@@ -35,7 +39,118 @@ def digest(path):
 
 def write_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def evidence_dir():
+    return Path(os.environ["RUNNER_TEMP"]) / "vcp-ios-g1"
+
+
+def prepare():
+    evidence = evidence_dir()
+    evidence.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "purpose": "stage-diagnostic", "status": "prepared",
+        "phase": os.environ.get("IOS_DIAGNOSTIC_PHASE", "phase-3"),
+        "profile": os.environ.get("IOS_DIAGNOSTIC_PROFILE", "debug"),
+        "target": "aarch64-apple-ios", "inputs": INPUTS,
+        "developerDir": os.environ.get("IOS_DEVELOPER_DIR") or INPUTS["developerDir"],
+        "commit": run(["git", "rev-parse", "HEAD"]),
+        "ref": os.environ.get("GITHUB_REF"),
+        "runId": os.environ.get("GITHUB_RUN_ID"),
+        "runAttempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+        "imageOS": os.environ.get("ImageOS"), "imageVersion": os.environ.get("ImageVersion"),
+        "availableXcodes": sorted(str(path) for path in Path("/Applications").glob("Xcode*.app")),
+        "stages": [],
+    }
+    write_json(evidence / "ios-build-manifest.json", manifest)
+    return manifest
+
+
+@contextmanager
+def stage(evidence, manifest, name):
+    record = {"name": name, "status": "running", "startedAt": datetime.now(timezone.utc).isoformat()}
+    manifest["stages"].append(record)
+    manifest["activeStage"] = name
+    write_json(evidence / "ios-build-manifest.json", manifest)
+    print(f"::group::{name}", flush=True)
+    try:
+        yield
+        record["status"] = "passed"
+    except Exception as error:
+        record.update({"status": "failed", "error": str(error)})
+        manifest["failedStage"] = name
+        raise
+    finally:
+        record["finishedAt"] = datetime.now(timezone.utc).isoformat()
+        write_json(evidence / "ios-build-manifest.json", manifest)
+        print("::endgroup::", flush=True)
+
+
+def collect_generated_inputs(evidence):
+    """Keep generated project inputs on failure, without copying build products."""
+    for directory, children, files in os.walk(APPLE):
+        children[:] = [name for name in children if name not in {"build", "target", ".build", "Externals", "Assets.xcassets"}]
+        for name in files:
+            source = Path(directory) / name
+            if source.suffix not in {".yml", ".json", ".pbxproj", ".plist", ".xcprivacy", ".xcconfig", ".entitlements", ".xcscheme"} and name != "Package.resolved":
+                continue
+            destination = evidence / "generated-project" / source.relative_to(APPLE)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, destination)
+
+
+def summarize():
+    evidence = evidence_dir()
+    path = evidence / "ios-build-manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else prepare()
+    steps = json.loads(os.environ.get("IOS_DIAGNOSTIC_STEPS", "{}"))
+    outcomes = {name: value.get("outcome", "unknown") for name, value in steps.items()}
+    manifest["workflowSteps"] = outcomes
+    # Setup failures and killed build processes must not remain "prepared"/"running".
+    if any(outcome in {"failure", "cancelled"} for outcome in outcomes.values()):
+        manifest["status"] = "failed"
+        manifest.setdefault("failedStage", next(name for name, outcome in outcomes.items() if outcome in {"failure", "cancelled"}))
+    elif manifest["status"] not in {"built", "failed"}:
+        manifest["status"] = "incomplete"
+    for record in manifest["stages"]:
+        if record["status"] == "running":
+            record["status"] = "interrupted"
+            manifest["failedStage"] = record["name"]
+    try:
+        collect_generated_inputs(evidence)
+    except OSError as error:
+        manifest.setdefault("diagnosticErrors", []).append(f"Generated project collection: {error}")
+    write_json(path, manifest)
+    lines = [
+        "# iOS stage diagnostics", "",
+        f"- Stage: `{manifest['phase']}`; profile: `{manifest['profile']}`; target: `{manifest['target']}`",
+        f"- Commit: `{manifest['commit']}`",
+        f"- Result: **{manifest['status']}**; failed step: `{manifest.get('failedStage', 'none')}`",
+        f"- Xcode: `{manifest['developerDir']}`; SDK: `{manifest.get('sdkVersion', 'not reached')}`", "",
+        "This run provides compilation/link/archive evidence only. Stage acceptance, native behavior and G2 user packaging remain separate.", "",
+        "| Build stage | Result |", "|---|---|",
+        *[f"| {record['name']} | {record['status']} |" for record in manifest["stages"]], "",
+        "| Workflow step | Result |", "|---|---|",
+        *[f"| {name} | {outcome} |" for name, outcome in outcomes.items()], "",
+    ]
+    if manifest.get("error"):
+        lines += ["<pre>" + html.escape(manifest["error"]) + "</pre>", ""]
+    if manifest.get("diagnosticErrors"):
+        lines += ["Diagnostic collection warnings:", "<pre>" + html.escape("\n".join(manifest["diagnosticErrors"])) + "</pre>", ""]
+    if manifest["status"] != "built":
+        logs = sorted(evidence.glob("*.log"), key=lambda item: item.stat().st_mtime)
+        if logs:
+            with logs[-1].open(encoding="utf-8", errors="replace") as stream:
+                tail = "".join(deque(stream, maxlen=60))[-16000:]
+            lines += [f"Last log excerpt (`{logs[-1].name}`); full logs are in the artifact:", "<pre>" + html.escape(tail) + "</pre>", ""]
+    report = "\n".join(lines)
+    (evidence / "summary.md").write_text(report, encoding="utf-8")
+    if os.environ.get("GITHUB_STEP_SUMMARY"):
+        with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as stream:
+            stream.write(report)
 
 
 def icon_entries():
@@ -88,15 +203,18 @@ def overlay(project_dir=APPLE):
 def run(command, *, env=None, log=None, cwd=REPO):
     print("+ " + shlex.join(str(item) for item in command), flush=True)
     if log is None:
-        result = subprocess.run(command, cwd=cwd, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        result = subprocess.run(command, cwd=cwd, env=env, text=True, encoding="utf-8", errors="replace", stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         require(result.returncode == 0, f"Command failed ({result.returncode}): {result.stdout.strip()}")
         return result.stdout.strip()
     with log.open("w", encoding="utf-8") as stream:
-        process = subprocess.Popen(command, cwd=cwd, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        for line in process.stdout:
-            stream.write(line)
-            print(line, end="", flush=True)
-        code = process.wait()
+        stream.write("+ " + shlex.join(str(item) for item in command) + "\n")
+        stream.flush()
+        with subprocess.Popen(command, cwd=cwd, env=env, text=True, encoding="utf-8", errors="replace", stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as process:
+            for line in process.stdout:
+                stream.write(line)
+                stream.flush()
+                print(line, end="", flush=True)
+            code = process.wait()
     require(code == 0, f"Command failed ({code}); see {log.name}")
     return ""
 
@@ -122,7 +240,7 @@ def collect_archives(evidence, manifest, env):
     require(archives, "Build completed without a device archive to collect")
     manifest["archives"] = []
     for index, archive in enumerate(archives, 1):
-        archive_zip = evidence / f"G1-{index}-{archive.name}.zip"
+        archive_zip = evidence / f"{manifest['phase']}-{manifest['profile']}-{index}-{archive.name}.zip"
         run(["ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", str(archive), str(archive_zip)], env=env)
         manifest["archives"].append({"file": archive_zip.name, "sha256": digest(archive_zip)})
         for app in sorted((archive / "Products" / "Applications").glob("*.app")):
@@ -154,41 +272,53 @@ def collect_archives(evidence, manifest, env):
 
 
 def build():
-    require(sys.platform == "darwin" and os.environ.get("GITHUB_ACTIONS") == "true", "Apple builds are restricted to the manual GitHub Actions G1 entry")
-    require(not APPLE.exists(), "G1 requires a fresh checkout without gen/apple; no automatic deletion is performed")
-    evidence = Path(os.environ["RUNNER_TEMP"]) / "vcp-ios-g1"
-    evidence.mkdir(parents=True, exist_ok=False)
-    manifest = {"gate": "G1", "status": "running", "target": "aarch64-apple-ios", "profile": "debug", "inputs": INPUTS, "commit": run(["git", "rev-parse", "HEAD"]), "runId": os.environ.get("GITHUB_RUN_ID"), "runAttempt": os.environ.get("GITHUB_RUN_ATTEMPT"), "imageOS": os.environ.get("ImageOS"), "imageVersion": os.environ.get("ImageVersion")}
+    evidence = evidence_dir()
+    path = evidence / "ios-build-manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else prepare()
+    manifest["status"] = "running"
     try:
-        env = os.environ.copy()
-        env["DEVELOPER_DIR"] = INPUTS["developerDir"]
-        manifest["xcode"] = run(["xcodebuild", "-version"], env=env)
-        manifest["sdkVersion"] = run(["xcrun", "--sdk", "iphoneos", "--show-sdk-version"], env=env)
-        manifest["macOS"] = run(["sw_vers"], env=env)
-        for tool in ["node", "pnpm"]:
-            manifest[tool] = run([tool, "--version"], env=env)
-        manifest["rust"] = run(["rustc", "--version"], env=env)
-        manifest["tauriCli"] = run(["pnpm", "exec", "tauri", "--version"], env=env)
-        ios_config = json.loads((ROOT / "tauri.ios.conf.json").read_text(encoding="utf-8"))
-        env.update({"IPHONEOS_DEPLOYMENT_TARGET": ios_config["bundle"]["iOS"]["minimumSystemVersion"], "SDKROOT": run(["xcrun", "--sdk", "iphoneos", "--show-sdk-path"], env=env), "CARGO_PROFILE_DEV_DEBUG": "1", "CARGO_PROFILE_DEV_STRIP": "false", "CARGO_INCREMENTAL": "0", "CARGO_BUILD_JOBS": "2"})
-        # These overrides select different native-library or signing paths; keep them absent.
-        for key in ["LIBSQLITE3_SYS_USE_PKG_CONFIG", "ZSTD_SYS_USE_PKG_CONFIG", "RING_PREGENERATE_ASM", "APPLE_DEVELOPMENT_TEAM", "IOS_CERTIFICATE", "IOS_CERTIFICATE_PASSWORD", "IOS_MOBILE_PROVISION", "APPLE_CERTIFICATE", "APPLE_CERTIFICATE_PASSWORD", "APPLE_PROVISIONING_PROFILE", "APPLE_API_KEY", "APPLE_API_KEY_PATH", "APPLE_API_ISSUER"]:
-            env.pop(key, None)
-        env["CC_aarch64_apple_ios"] = run(["xcrun", "--sdk", "iphoneos", "--find", "clang"], env=env)
-        env["CXX_aarch64_apple_ios"] = run(["xcrun", "--sdk", "iphoneos", "--find", "clang++"], env=env)
-        env["AR_aarch64_apple_ios"] = run(["xcrun", "--find", "ar"], env=env)
-        manifest["nativeEnvironment"] = {key: env.get(key) for key in ["SDKROOT", "IPHONEOS_DEPLOYMENT_TARGET", "CC_aarch64_apple_ios", "CXX_aarch64_apple_ios", "AR_aarch64_apple_ios", "CARGO_PROFILE_DEV_DEBUG", "CARGO_PROFILE_DEV_STRIP", "LIBSQLITE3_SYS_USE_PKG_CONFIG", "ZSTD_SYS_USE_PKG_CONFIG", "RING_PREGENERATE_ASM"]}
-        xcodegen = install_xcodegen(evidence / "tools")
-        env["PATH"] = str(xcodegen.parent) + os.pathsep + env["PATH"]
-        manifest["xcodegen"] = run([str(xcodegen), "--version"], env=env)
-        run(["rustup", "target", "add", "aarch64-apple-ios"], env=env, log=evidence / "rust-target.log")
-        run(["pnpm", "tauri", "ios", "init", "--ci", "--skip-targets-install"], env=env, log=evidence / "init.log")
-        spec = overlay()
-        run([str(xcodegen), "generate", "--spec", str(spec)], env=env, log=evidence / "overlay.log")
-        manifest["swiftVersion"] = run(["xcrun", "swift", "--version"], env=env)
-        # Tauri owns the one frontend build via beforeBuildCommand.
-        run(["pnpm", "tauri", "ios", "build", "--debug", "--target", "aarch64", "--archive-only", "--no-sign", "--ci", "--", "--locked"], env=env, log=evidence / "build.log")
-        collect_archives(evidence, manifest, env)
+        with stage(evidence, manifest, "toolchain"):
+            require(sys.platform == "darwin" and os.environ.get("GITHUB_ACTIONS") == "true", "Apple builds are restricted to manual GitHub Actions")
+            require(manifest["profile"] in {"debug", "release"}, "Unknown archive profile")
+            require(manifest["phase"] in {f"phase-{index}" for index in range(7)}, "Unknown diagnostic phase")
+            env = os.environ.copy()
+            env["DEVELOPER_DIR"] = manifest["developerDir"]
+            manifest["xcode"] = run(["xcodebuild", "-version"], env=env)
+            manifest["sdkVersion"] = run(["xcrun", "--sdk", "iphoneos", "--show-sdk-version"], env=env)
+            manifest["macOS"] = run(["sw_vers"], env=env)
+            for tool in ["node", "pnpm"]:
+                manifest[tool] = run([tool, "--version"], env=env)
+            manifest["rust"] = run(["rustc", "--version"], env=env)
+            manifest["tauriCli"] = run(["pnpm", "exec", "tauri", "--version"], env=env)
+            ios_config = json.loads((ROOT / "tauri.ios.conf.json").read_text(encoding="utf-8"))
+            env.update({"IPHONEOS_DEPLOYMENT_TARGET": ios_config["bundle"]["iOS"]["minimumSystemVersion"], "SDKROOT": run(["xcrun", "--sdk", "iphoneos", "--show-sdk-path"], env=env), "CARGO_INCREMENTAL": "0", "CARGO_BUILD_JOBS": "2"})
+            if manifest["profile"] == "debug":
+                env.update({"CARGO_PROFILE_DEV_DEBUG": "1", "CARGO_PROFILE_DEV_STRIP": "false"})
+            # These overrides select different native-library or signing paths; keep them absent.
+            for key in ["LIBSQLITE3_SYS_USE_PKG_CONFIG", "ZSTD_SYS_USE_PKG_CONFIG", "RING_PREGENERATE_ASM", "APPLE_DEVELOPMENT_TEAM", "IOS_CERTIFICATE", "IOS_CERTIFICATE_PASSWORD", "IOS_MOBILE_PROVISION", "APPLE_CERTIFICATE", "APPLE_CERTIFICATE_PASSWORD", "APPLE_PROVISIONING_PROFILE", "APPLE_API_KEY", "APPLE_API_KEY_PATH", "APPLE_API_ISSUER"]:
+                env.pop(key, None)
+            env["CC_aarch64_apple_ios"] = run(["xcrun", "--sdk", "iphoneos", "--find", "clang"], env=env)
+            env["CXX_aarch64_apple_ios"] = run(["xcrun", "--sdk", "iphoneos", "--find", "clang++"], env=env)
+            env["AR_aarch64_apple_ios"] = run(["xcrun", "--find", "ar"], env=env)
+            manifest["nativeEnvironment"] = {key: env.get(key) for key in ["SDKROOT", "IPHONEOS_DEPLOYMENT_TARGET", "CC_aarch64_apple_ios", "CXX_aarch64_apple_ios", "AR_aarch64_apple_ios", "CARGO_PROFILE_DEV_DEBUG", "CARGO_PROFILE_DEV_STRIP", "LIBSQLITE3_SYS_USE_PKG_CONFIG", "ZSTD_SYS_USE_PKG_CONFIG", "RING_PREGENERATE_ASM"]}
+            xcodegen = install_xcodegen(evidence / "tools")
+            env["PATH"] = str(xcodegen.parent) + os.pathsep + env["PATH"]
+            manifest["xcodegen"] = run([str(xcodegen), "--version"], env=env)
+            manifest["swiftVersion"] = run(["xcrun", "swift", "--version"], env=env)
+        with stage(evidence, manifest, "rust-target"):
+            run(["rustup", "target", "add", "aarch64-apple-ios"], env=env, log=evidence / "rust-target.log")
+        with stage(evidence, manifest, "project-init"):
+            require(not APPLE.exists(), "Diagnostics require a fresh checkout without gen/apple; no automatic deletion is performed")
+            run(["pnpm", "tauri", "ios", "init", "--ci", "--skip-targets-install"], env=env, log=evidence / "init.log")
+        with stage(evidence, manifest, "project-overlay"):
+            spec = overlay()
+            run([str(xcodegen), "generate", "--spec", str(spec)], env=env, log=evidence / "overlay.log")
+        with stage(evidence, manifest, "device-build"):
+            # Tauri owns the one frontend build via beforeBuildCommand.
+            profile_args = ["--debug"] if manifest["profile"] == "debug" else []
+            run(["pnpm", "tauri", "ios", "build", *profile_args, "--target", "aarch64", "--archive-only", "--no-sign", "--ci", "--", "--locked"], env=env, log=evidence / "build.log")
+        with stage(evidence, manifest, "archive-collection"):
+            collect_archives(evidence, manifest, env)
         manifest["status"] = "built"
     except Exception as error:
         manifest.update({"status": "failed", "error": str(error)})
@@ -199,13 +329,17 @@ def build():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["overlay", "build"])
+    parser.add_argument("command", choices=["prepare", "overlay", "build", "summary"])
     args = parser.parse_args()
     try:
-        if args.command == "overlay":
+        if args.command == "prepare":
+            prepare()
+        elif args.command == "overlay":
             print(overlay())
         elif args.command == "build":
             build()
+        elif args.command == "summary":
+            summarize()
     except (OSError, KeyError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
-        print(f"G1: {error}", file=sys.stderr)
+        print(f"iOS diagnostics: {error}", file=sys.stderr)
         sys.exit(1)
