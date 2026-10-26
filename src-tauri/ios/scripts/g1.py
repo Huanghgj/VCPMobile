@@ -244,6 +244,12 @@ def collect_archives(evidence, manifest, env):
         run(["ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", str(archive), str(archive_zip)], env=env)
         manifest["archives"].append({"file": archive_zip.name, "sha256": digest(archive_zip)})
         for app in sorted((archive / "Products" / "Applications").glob("*.app")):
+            payload_dir = evidence / f"ipa_build_{index}" / "Payload"
+            payload_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(app, payload_dir / app.name, dirs_exist_ok=True)
+            ipa_path = evidence / f"VCPMobile-{manifest['profile']}-arm64.ipa"
+            run(["ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", str(payload_dir), str(ipa_path)], env=env)
+            shutil.rmtree(payload_dir.parent, ignore_errors=True)
             details = evidence / "bundles" / str(index) / app.name
             details.mkdir(parents=True, exist_ok=True)
             try:

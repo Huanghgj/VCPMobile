@@ -1297,28 +1297,48 @@ async fn preprocess_multimodal_messages<R: Runtime>(
                                     }
                                 }
                             } else if media_kind == "video" {
-                                // 视频：抽帧 → 每张帧作为 image_url
-                                let path_clone = path_buf.clone();
-                                let app_clone = app.clone();
-                                match tokio::task::spawn_blocking(move || {
-                                        crate::vcp_modules::media_processor::process_video_for_multimodal(&app_clone, &path_clone)
-                                    }).await {
-                                        Ok(Ok(frames)) => {
-                                            for frame_url in frames {
-                                                new_parts.push(json!({
-                                                    "type": "image_url",
-                                                    "image_url": { "url": frame_url }
-                                                }));
-                                            }
+                                // 视频优化：<= 3.72 MiB 直接以 data:video/mp4;base64 原片直传（保留完整动态画面与声音）；超大视频走高清关键帧 + 音轨双传
+                                let file_len = std::fs::metadata(&path_buf).map(|m| m.len()).unwrap_or(0);
+                                if file_len > 0 && file_len <= 3_900_000 {
+                                    match tokio::fs::read(&path_buf).await {
+                                        Ok(bytes) => {
+                                            use base64::Engine as _;
+                                            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                                            let data_url = format!("data:video/mp4;base64,{}", b64);
+                                            new_parts.push(json!({
+                                                "type": "image_url",
+                                                "image_url": { "url": data_url }
+                                            }));
                                             converted = true;
                                         }
-                                        Ok(Err(e)) => {
-                                            log::warn!("[VCPClient] Video frame extraction failed for attachment CAS {}: {}", short_hash(hash), e);
-                                        }
                                         Err(e) => {
-                                            log::warn!("[VCPClient] Video processing task panicked: {}", e);
+                                            log::warn!("[VCPClient] Direct video read failed for CAS {}: {}", short_hash(hash), e);
                                         }
                                     }
+                                }
+                                if !converted {
+                                    let path_clone = path_buf.clone();
+                                    let app_clone = app.clone();
+                                    match tokio::task::spawn_blocking(move || {
+                                            crate::vcp_modules::media_processor::process_video_for_multimodal(&app_clone, &path_clone)
+                                        }).await {
+                                            Ok(Ok(frames)) => {
+                                                for frame_url in frames {
+                                                    new_parts.push(json!({
+                                                        "type": "image_url",
+                                                        "image_url": { "url": frame_url }
+                                                    }));
+                                                }
+                                                converted = true;
+                                            }
+                                            Ok(Err(e)) => {
+                                                log::warn!("[VCPClient] Video frame extraction failed for attachment CAS {}: {}", short_hash(hash), e);
+                                            }
+                                            Err(e) => {
+                                                log::warn!("[VCPClient] Video processing task panicked: {}", e);
+                                            }
+                                        }
+                                }
                             } else if media_kind == "audio" {
                                 // 音频：提取为 MP3 (32kbps) 或 AAC (32kbps) -> input_audio
                                 let path_clone = path_buf.clone();

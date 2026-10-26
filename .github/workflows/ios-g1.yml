@@ -80,6 +80,7 @@ jobs:
             ${{ runner.temp }}/vcp-ios-g1/*.txt
             ${{ runner.temp }}/vcp-ios-g1/*.md
             ${{ runner.temp }}/vcp-ios-g1/*.zip
+            ${{ runner.temp }}/vcp-ios-g1/*.ipa
             ${{ runner.temp }}/vcp-ios-g1/generated-project/**
             ${{ runner.temp }}/vcp-ios-g1/bundles/**
           if-no-files-found: warn

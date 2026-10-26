@@ -63,7 +63,7 @@ export interface ThemeInfo {
   };
 }
 
-const DEFAULT_THEME = 'themes-star-abyss.ts';
+const DEFAULT_THEME = 'themes-nova-velvet.ts';
 const THEME_NAME_STORAGE_KEY = 'vcp-theme-name';
 const PRESENTATION_STORAGE_KEY = 'vcp-chat-presentation-mode';
 const SMOOTH_STREAMING_STORAGE_KEY = 'vcp-smooth-streaming-enabled';
@@ -81,7 +81,8 @@ const LEGACY_THEME_MAP: Record<string, string> = {
   'themes星渊雪境.css': 'themes-star-abyss.css',
   'themes熊熊假日.css': 'themes-bear-holiday.css',
   'themes雪境晨昏.css': 'themes-snow-morning.css',
-  'themes夜樱猫语.css': 'themes-night-sakura-cat.css'
+  'themes夜樱猫语.css': 'themes-night-sakura-cat.css',
+  'themes魅魔丝绒.css': 'themes-nova-velvet.css'
 };
 
 interface ThemeModule {
@@ -180,13 +181,13 @@ export const useThemeStore = defineStore('theme', () => {
   const storedMode = readStoredValue('vcp-theme-mode');
   // 默认主题「星渊雪境」以亮色示人：无本地偏好时默认 light；
   // 已存储 dark / system 偏好的老用户完全不受影响。
-  const initialMode: ThemeMode = storedMode === 'dark' || storedMode === 'system'
+  const initialMode: ThemeMode = storedMode === 'light' || storedMode === 'system'
     ? storedMode
-    : 'light';
+    : 'dark';
   const mode = ref<ThemeMode>(initialMode);
   // 初值与默认模式（light）保持一致；store 创建时 mode 的 immediate watch
   // 会同步执行 applyTheme 将其纠正为真实值。
-  const isDarkResolved = ref(false);
+  const isDarkResolved = ref(true);
   const lastModeSwitchAt = ref(0);
   const MODE_SWITCH_DEBOUNCE_MS = 420;
 

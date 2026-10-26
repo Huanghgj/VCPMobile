@@ -1,9 +1,9 @@
 :root {
   /* 基础颜色 - 增加预设防止加载闪烁 (匹配 themes黑白简约.css) */
-  --primary-bg: #1c1c1e;
-  --secondary-bg: #28282c;
-  --primary-text: #e0e0e0;
-  --border-color: #3a3a3e;
+  --primary-bg: #13091c;
+  --secondary-bg: #1f102e;
+  --primary-text: #fceef5;
+  --border-color: rgba(255, 105, 165, 0.28);
 
   /* Web 环境先读取 CSS env；Android 启动后由 WindowInsets 四边快照统一覆盖。 */
   --vcp-safe-top: max(env(safe-area-inset-top, 0px), 24px);

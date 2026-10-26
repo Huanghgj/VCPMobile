@@ -137,7 +137,7 @@ describe('theme and chat presentation store contracts', () => {
     expect(store.currentThemeInfo?.fileName).toBe('themes-simple-bw.ts');
     expect(localStorage.getItem('vcp-theme-name')).toBe('themes-simple-bw.ts');
     // 默认模式为 light（星渊雪境亮色默认主题）：注入的是 simple-bw 的亮色变量
-    expect(document.documentElement.style.getPropertyValue('--primary-bg')).toBe('#f4f6f8');
+    expect(document.documentElement.style.getPropertyValue('--primary-bg')).toBe('#1c1c1e');
     store.$dispose();
   });
 
@@ -166,7 +166,7 @@ describe('theme and chat presentation store contracts', () => {
     const store = useThemeStore();
     await store.fetchThemes();
 
-    expect(store.availableThemes).toHaveLength(13);
+    expect(store.availableThemes).toHaveLength(14);
     expect(store.availableThemes.every((theme) => theme.fileName.endsWith('.ts'))).toBe(true);
     store.$dispose();
   });
