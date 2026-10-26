@@ -6,13 +6,13 @@ export const meta = {
 export const variables = {
   dark: {
     "--chat-wallpaper-dark": "'樱夜倒影.webp'",
-    "--primary-bg": "#13091c",
-    "--secondary-bg": "#1f102e",
+    "--primary-bg": "rgba(19, 9, 28, 0.35)",
+    "--secondary-bg": "rgba(31, 14, 46, 0.52)",
     "--tertiary-bg": "#0d0614",
     "--accent-bg": "#3b1754",
     "--border-color": "rgba(255, 105, 165, 0.28)",
     "--input-bg": "rgba(34, 16, 52, 0.82)",
-    "--panel-bg-dark": "rgba(28, 13, 44, 0.78)",
+    "--panel-bg-dark": "rgba(24, 10, 38, 0.56)",
     "--primary-text": "#fceef5",
     "--secondary-text": "#d8b4c8",
     "--highlight-text": "#ff5c9c",
@@ -22,7 +22,7 @@ export const variables = {
     "--user-text": "#ffffff",
     "--agent-text": "#fceef5",
     "--user-bubble-bg": "linear-gradient(135deg, rgba(236, 56, 126, 0.88) 0%, rgba(152, 38, 188, 0.84) 100%)",
-    "--assistant-bubble-bg": "rgba(36, 17, 56, 0.78)",
+    "--assistant-bubble-bg": "rgba(28, 12, 44, 0.64)",
     "--button-bg": "#d83a7c",
     "--button-hover-bg": "#ff529a",
     "--danger-color": "#ff4d6d",
@@ -180,5 +180,20 @@ textarea, input[type="text"], input[type="search"] {
 
 .vcp-markdown-block strong {
   color: var(--highlight-text) !important;
+}
+
+/* === 纯享舔屏模式 & 全局半透黑丝纱光优化 === */
+.vcp-background-layer {
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
+.vcp-workspace-main, .vcp-workspace-row, main {
+  background: transparent !important;
+}
+
+html.nova-pure-lick-mode .vcp-workspace-row {
+  opacity: 0.08 !important;
+  transition: opacity 0.4s ease !important;
 }
 `;

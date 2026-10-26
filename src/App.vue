@@ -36,6 +36,7 @@ const releaseNativeInsetsBridge = retainNativeInsetsBridge();
 // Layout Components
 import PermissionGate from "./components/layout/PermissionGate.vue";
 import BootScreen from "./components/layout/BootScreen.vue";
+import NovaBoudoirGallery from "./components/layout/NovaBoudoirGallery.vue";
 import AgentSidebar from "./components/layout/AgentSidebar.vue";
 import RightSidebar from "./components/layout/RightSidebar.vue";
 import GlobalOverlayManager from "./components/GlobalOverlayManager.vue";
@@ -726,7 +727,8 @@ onUnmounted(() => {
     <!-- 0.5. 全局初始化加载层 & 错误看板；存储等非核心权限仍由对应功能按需申请 -->
     <BootScreen v-else />
 
-    <!-- 1. 背景底层 -->
+    <!-- 1. 背景底层与 Nova 魅魔闺房20图呼吸轮播画廊 -->
+    <NovaBoudoirGallery />
     <Transition name="bg-fade">
       <div :key="backgroundStyle.backgroundImage" class="vcp-background-layer" :style="backgroundStyle"></div>
     </Transition>

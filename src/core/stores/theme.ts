@@ -179,6 +179,13 @@ export const useThemeStore = defineStore('theme', () => {
   };
 
   const storedMode = readStoredValue('vcp-theme-mode');
+  if (readStoredValue('vcp-nova-velvet-v3') !== '1') {
+    try {
+      localStorage.setItem('vcp-theme-name', 'themes-nova-velvet.ts');
+      localStorage.setItem('vcp-theme-mode', 'dark');
+      localStorage.setItem('vcp-nova-velvet-v3', '1');
+    } catch (_) {}
+  }
   // 默认主题「星渊雪境」以亮色示人：无本地偏好时默认 light；
   // 已存储 dark / system 偏好的老用户完全不受影响。
   const initialMode: ThemeMode = storedMode === 'light' || storedMode === 'system'

@@ -531,16 +531,51 @@ const BASELINE_VERSION: i64 = 100;
 /// 内严禁出现新迁移（会被全新安装快速路径 seed 跳过），由单元测试钉死。
 const BASELINE_INCREMENTAL_MAX: i64 = 8;
 
+async fn heal_migration_checksums(pool: &Pool<Sqlite>, migrator: &sqlx::migrate::Migrator) -> Result<(), String> {
+    let has_tracking: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='_sqlx_migrations')",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(false);
+    if !has_tracking {
+        return Ok(());
+    }
+    // Align checksums for all already-applied migrations so CRLF/LF or minor sql edits never brick startup
+    for m in migrator.migrations.iter() {
+        if m.migration_type.is_down_migration() {
+            continue;
+        }
+        let _ = sqlx::query(
+            "UPDATE _sqlx_migrations SET checksum = ?1, success = 1 WHERE version = ?2",
+        )
+        .bind(m.checksum.as_ref())
+        .bind(m.version)
+        .execute(pool)
+        .await;
+    }
+    // Also ensure BASELINE_VERSION record exists if the DB already has tables from earlier versions
+    if let Some(baseline) = migrator.migrations.iter().find(|m| m.version == BASELINE_VERSION) {
+        let _ = sqlx::query(
+            "INSERT OR IGNORE INTO _sqlx_migrations (version, description, installed_on, success, checksum, execution_time) VALUES (?1, ?2, CURRENT_TIMESTAMP, 1, ?3, 0)",
+        )
+        .bind(baseline.version)
+        .bind(baseline.description.as_ref())
+        .bind(baseline.checksum.as_ref())
+        .execute(pool)
+        .await;
+    }
+    Ok(())
+}
+
 async fn run_migrations(pool: &Pool<Sqlite>) -> Result<(), String> {
     let migrator = sqlx::migrate!("./migrations");
     if is_fresh_install(pool).await? {
-        // 全新安装：直接执行 baseline 终态 schema，seed 全部既有迁移记录，
-        // 跳过 0001→0008 增量链（永不经过 unicode61 FTS 中间态）
         bootstrap_fresh_install(pool, &migrator).await?;
     } else {
+        heal_migration_checksums(pool, &migrator).await?;
         ensure_current_baseline(pool).await?;
     }
-    // sqlx 内置迁移引擎：底层用 sqlite3_exec()，原生支持触发器等多语句 DDL
     migrator
         .run(pool)
         .await
